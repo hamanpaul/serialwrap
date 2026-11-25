@@ -1,0 +1,65 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test endpoint_resolve inst4_selected_port_patch_keeps_nested_empty_mapping -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 829b5472bae92831fa04e3d4a523a2e0eb89d5974f856961cc687b3f1ad0b677  crates/sw-cli/tests/endpoint_resolve.rs
+SOURCE_SHA256: 202bdb4bc132866174e17016f3f3485e1068b73211c648141a8bfb4c1367c27a  crates/sw-cli/src/endpoint_resolve.rs
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling libc v0.2.186
+   Compiling crossbeam-utils v0.8.23
+   Compiling memchr v2.8.3
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling generic-array v0.14.7
+   Compiling bit-vec v0.8.0
+   Compiling aho-corasick v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling crc32fast v1.5.0
+   Compiling hashlink v0.10.0
+   Compiling bit-set v0.8.0
+   Compiling cpufeatures v0.2.17
+   Compiling hashbrown v0.16.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling arraydeque v0.5.1
+   Compiling digest v0.10.7
+   Compiling equivalent v1.0.2
+   Compiling crossbeam-channel v0.5.15
+   Compiling sha2 v0.10.9
+   Compiling yaml-rust2 v0.10.4
+   Compiling indexmap v2.11.4
+   Compiling sw-pal v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-pal)
+   Compiling regex-automata v0.4.18
+   Compiling rustix v1.1.5
+   Compiling getrandom v0.3.4
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.12.1
+   Compiling once_cell v1.21.4
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.23.0
+   Compiling fancy-regex v0.16.2
+   Compiling sw-proto v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-proto)
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.31s
+     Running tests/endpoint_resolve.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/endpoint_resolve-0978b8a343434053)
+
+running 1 test
+test inst4_selected_port_patch_keeps_nested_empty_mapping ... FAILED
+
+failures:
+
+---- inst4_selected_port_patch_keeps_nested_empty_mapping stdout ----
+
+thread 'inst4_selected_port_patch_keeps_nested_empty_mapping' (288776) panicked at crates/sw-cli/tests/endpoint_resolve.rs:784:5:
+assertion `left == right` failed
+  left: "profiles:\nsocket_path: 'tcp://127.0.0.1:48716'\n"
+ right: "profiles:\n  {}\nsocket_path: 'tcp://127.0.0.1:48716'\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    inst4_selected_port_patch_keeps_nested_empty_mapping
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p sw-cli --test endpoint_resolve`

@@ -1,0 +1,12 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_auto_selects_port_when_default_port_is_unavailable -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 4d7ce0362ea61c63d1a2f85d71a69688e0e4984a607894c233c973a7b24d1dba  crates/sw-cli/src/rollback.rs
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.19s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_auto_selects_port_when_default_port_is_unavailable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.06s

@@ -1,0 +1,59 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test endpoint_resolve
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 8d0390556f83f73bdeeb57f0d1a97fdc4db600418cef2e09e67222bea119b217  crates/sw-cli/tests/endpoint_resolve.rs
+SOURCE_SHA256: 600506a5fa75b4c5a8e9dbe8a27a77eb1eedf001d991941ad445ee099f6dc87b  crates/sw-cli/src/endpoint_resolve.rs
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.35s
+     Running tests/endpoint_resolve.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/endpoint_resolve-0978b8a343434053)
+
+running 48 tests
+test bench_bad_json ... ok
+test bench_missing_file ... ok
+test bench_non_loopback ... ok
+test bench_nested_format ... ok
+test bench_benches_not_object ... ok
+test bench_bad_utf8 ... ok
+test bench_ok ... ok
+test bench_state_is_dir ... ok
+test bench_unix_value ... ok
+test bogus_backend_uses_platform ... ok
+test bench_not_object ... ok
+test config_alive ... ok
+test config_broken_yaml ... ok
+test config_dangling_fallback ... ok
+test config_dangling_canonical_dead ... ok
+test config_dangling_same_value ... ok
+test config_dangling_system ... ok
+test empty_endpoint_alive_true ... ok
+test empty_endpoint_falls_through ... ok
+test endpoint_wins ... ok
+test explicit_empty_socket ... ok
+test local_management_endpoint_accepts_loopback_only_for_tcp ... ok
+test inst4_selected_port_patch_keeps_nested_empty_mapping ... ok
+test management_endpoint_environment_precedes_config ... ok
+test management_endpoint_explicit_precedes_environment_and_config ... ok
+test config_tcp_not_probed_posix ... ok
+test management_endpoint_rejects_non_loopback_config ... ok
+test no_af_unix_unix_dead ... ok
+test management_endpoint_uses_config_when_environment_is_absent ... ok
+test config_int_socket_path ... ok
+test posix_ignores_serialwrap_endpoint ... ok
+test config_zero_socket_path ... ok
+test sc09_explicit_blank_ignored ... ok
+test sc09_explicit_config_env ... ok
+test sc09_explicit_missing_is_empty ... ok
+test socket_equal_default_is_still_explicit ... ok
+test socket_path_yaml_patch_handles_flow_mapping_without_invalid_yaml ... ok
+test sc09_system_fallback ... ok
+test print_error_writes_stdout_json_and_stderr_line ... ok
+test socket_path_yaml_patch_handles_empty_value_with_comment_without_panic ... ok
+test socket_path_yaml_patch_preserves_every_other_byte ... ok
+test system_config_path_override_is_used_by_cli ... ok
+test socket_path_yaml_patch_updates_quoted_root_key_without_duplicate ... ok
+test win_backend_probes_tcp ... ok
+test sc09_user_beats_system ... ok
+test windows_target_on_demand_uses_configured_socket_path ... ok
+test win_backend_custom_port ... ok
+test win_backend_default_tcp ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

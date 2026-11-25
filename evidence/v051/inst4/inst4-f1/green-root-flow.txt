@@ -1,0 +1,12 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256 mgmt_setup: 6d8321a69c2c4a86575436c3c0355fb3cb9da46030ceed9b2b29fefc696efafc  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256 endpoint_resolve: 600506a5fa75b4c5a8e9dbe8a27a77eb1eedf001d991941ad445ee099f6dc87b  crates/sw-cli/src/endpoint_resolve.rs
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.33s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.07s

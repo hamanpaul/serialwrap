@@ -8,6 +8,7 @@ mod common;
 mod support;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 use support::*;
 
@@ -30,6 +31,15 @@ fn str_field(v: &PyValue, key: &str) -> String {
         PyValue::Str(s) => s,
         other => panic!("key {key} not a string: {other:?}"),
     }
+}
+
+fn without_root_socket_path(bytes: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(bytes).expect("config.yaml 必須是 UTF-8");
+    text.split_inclusive('\n')
+        .filter(|line| !line.starts_with("socket_path:"))
+        .flat_map(str::as_bytes)
+        .copied()
+        .collect()
 }
 
 fn argv_list_field(v: &PyValue, key: &str) -> Vec<Vec<String>> {
@@ -3029,12 +3039,23 @@ fn bundle_setup_ping_timeout_with_released_lock_proceeds() {
 
 #[test]
 fn bundle_setup_auto_selects_port_when_default_port_is_unavailable() {
+    let endpoint = "tcp://127.0.0.1:48716";
     let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
     let t = TestEnv::windows()
         .with_real_service()
         .with_process()
         .with_bundle("0.5.1")
         .with_rpc_listen(mock_listen);
+    t.rpc().respond(endpoint, "health.ping", r#"{"ok":true,"pid":1234,"version":"0.5.1"}"#);
+    t.rpc().respond(
+        endpoint,
+        "health.status",
+        r#"{"ok":true,"pid":1234,"version":"0.5.1","wal":{"healthy":true}}"#,
+    );
+    t.rpc().respond(endpoint, "session.list", r#"{"ok":true,"sessions":[]}"#);
+    t.rpc().respond(endpoint, "alias.list", r#"{"ok":true,"aliases":[]}"#);
+    t.rpc().respond(endpoint, "device.list", r#"{"ok":true,"devices":[]}"#);
+    t.rpc().refuse_first(endpoint, 1);
     let (rc, _out, err) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "bundle setup 應成功完成；stdout={_out} stderr={err}");
     assert!(
@@ -3045,7 +3066,7 @@ fn bundle_setup_auto_selects_port_when_default_port_is_unavailable() {
     // 1. 核對 config.yaml 寫回的新埠
     let config = std::fs::read_to_string(t.config_path()).expect("讀取 config.yaml");
     assert!(
-        config.contains("socket_path: tcp://127.0.0.1:48716"),
+        config.contains("socket_path: 'tcp://127.0.0.1:48716'"),
         "config.yaml 應保存選用的 socket_path：{config}"
     );
 
@@ -3067,6 +3088,180 @@ fn bundle_setup_auto_selects_port_when_default_port_is_unavailable() {
         xml_content.contains(r#"<Arguments>--socket tcp://127.0.0.1:48716</Arguments>"#),
         "Task XML Arguments 應包含 --socket tcp://127.0.0.1:48716：{xml_content}"
     );
+}
+
+#[test]
+fn bundle_setup_selected_port_starts_fake_daemon_and_checks_health() {
+    let endpoint = "tcp://127.0.0.1:48716";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: on-demand\n")
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_listen(mock_listen);
+    let counter = t.process().spawn_counter();
+    t.service().set_start_spawn_counter(Arc::clone(&counter));
+    t.rpc().gate_on_spawn(endpoint, Arc::clone(&counter));
+    t.rpc().respond(endpoint, "health.ping", r#"{"ok":true,"pid":1234,"version":"0.5.1"}"#);
+    t.rpc().respond(
+        endpoint,
+        "health.status",
+        r#"{"ok":true,"pid":1234,"version":"0.5.1","wal":{"healthy":true}}"#,
+    );
+    t.rpc().respond(endpoint, "session.list", r#"{"ok":true,"sessions":[]}"#);
+    t.rpc().respond(endpoint, "alias.list", r#"{"ok":true,"aliases":[]}"#);
+    t.rpc().respond(endpoint, "device.list", r#"{"ok":true,"devices":[]}"#);
+    t.rpc().revive_after_spawn(endpoint, counter, 1234);
+
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(rc, 0, "bundle setup 應啟動新埠 daemon 並通過健康檢查；stdout={out} stderr={err}");
+    assert!(!t.process().spawns().is_empty(), "正式 bundle 首次安裝應啟動 fake daemon");
+    assert_eq!(
+        t.rpc().request_count(endpoint, "health.ping"),
+        1,
+        "健康檢查必須打到自動選用的新埠"
+    );
+}
+
+#[test]
+fn bundle_setup_on_demand_auto_port_preserves_other_config_bytes() {
+    let original = "# 使用者註解保留\nsupervision_mode: on-demand # 模式註解\nwindows:\n  exclude_coms: [COM5]\n# 結尾註解保留\n";
+    let endpoint = "tcp://127.0.0.1:48716";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_config(original)
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_listen(mock_listen);
+    let counter = t.process().spawn_counter();
+    t.rpc().gate_on_spawn(endpoint, Arc::clone(&counter));
+    t.rpc().respond(endpoint, "health.ping", r#"{"ok":true,"pid":1234,"version":"0.5.1"}"#);
+    t.rpc().respond(
+        endpoint,
+        "health.status",
+        r#"{"ok":true,"pid":1234,"version":"0.5.1","wal":{"healthy":true}}"#,
+    );
+    t.rpc().respond(endpoint, "session.list", r#"{"ok":true,"sessions":[]}"#);
+    t.rpc().respond(endpoint, "alias.list", r#"{"ok":true,"aliases":[]}"#);
+    t.rpc().respond(endpoint, "device.list", r#"{"ok":true,"devices":[]}"#);
+    t.rpc().revive_after_spawn(endpoint, counter, 1234);
+
+    let (rc, _out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(rc, 0, "bundle on-demand 首次安裝應成功；stderr={err}");
+    let config = t.config_bytes();
+    assert!(
+        String::from_utf8_lossy(&config).contains("socket_path: 'tcp://127.0.0.1:48716'"),
+        "config.yaml 應保存選用的 socket_path：{}",
+        String::from_utf8_lossy(&config)
+    );
+    assert_eq!(
+        without_root_socket_path(&config),
+        original.as_bytes(),
+        "正式 bundle 首次安裝除 socket_path 外必須逐位元組保留原始 config"
+    );
+}
+
+#[test]
+fn bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint() {
+    let original = "{log_dir: /logs}\n";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_config(original)
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_listen(mock_listen);
+
+    let (rc, out, err) = t.run_from_bundle(&["setup"]);
+
+    assert_ne!(rc, 0, "非空根 flow mapping 不得被自動選埠改寫");
+    assert_eq!(str_field(&json(&out), "error_code"), "INTERNAL_ERROR");
+    assert_eq!(t.config_bytes(), original.as_bytes());
+    assert!(
+        err.contains("socket_path") && err.contains("SERIALWRAP_TCP_PORT"),
+        "stderr 必須提示手動設定 socket_path 或 SERIALWRAP_TCP_PORT：{err}"
+    );
+}
+
+#[test]
+fn bundle_setup_auto_port_supervisor_query_failure_keeps_original_config() {
+    let original = "# 保留註解\nsupervision_mode: windows-task\nwindows:\n  exclude_coms: [COM5]\n";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_supervisor_state("windows-task", true, false)
+        .with_config(original)
+        .with_bundle("0.5.1")
+        .with_rpc_listen(mock_listen);
+    t.service().query_script(vec![TaskQuery::QueryFailed(
+        "受控 supervisor 查詢失敗".to_string(),
+    )]);
+
+    let (rc, out, _err) = t.run_from_bundle(&["setup"]);
+
+    assert_ne!(rc, 0, "supervisor 查詢失敗時 setup 必須中止");
+    assert_eq!(str_field(&json(&out), "error_code"), "INTERNAL_ERROR");
+    assert_eq!(t.config_bytes(), original.as_bytes());
+}
+
+#[test]
+fn bundle_setup_auto_port_switch_failure_keeps_original_config() {
+    let original = "# 使用者註解\nsupervision_mode: on-demand\nwindows:\n  exclude_coms: [COM5]\n";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_config(original)
+        .with_bundle("0.5.1")
+        .with_rpc_listen(mock_listen)
+        .with_fs_fault_replace_suffix("serialwrap.exe.new");
+
+    let (rc, _out, _err) = t.run_from_bundle(&["setup"]);
+
+    assert_ne!(rc, 0, "穩定入口切換失敗時 setup 必須回報失敗");
+    assert_eq!(t.config_bytes(), original.as_bytes());
+}
+
+#[test]
+fn bundle_setup_auto_port_health_failure_keeps_original_config() {
+    let original = "# 使用者註解\nsupervision_mode: on-demand\nwindows:\n  exclude_coms: [COM5]\n";
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_config(original)
+        .with_bundle("0.5.1")
+        .with_rpc_listen(mock_listen);
+
+    let (rc, out, _err) = t.run_from_bundle(&["setup"]);
+
+    assert_ne!(rc, 0, "受控 daemon 未通過新埠健康檢查時 setup 必須回報失敗");
+    assert_eq!(str_field(&json(&out), "error_code"), "TIMEOUT");
+    assert_eq!(t.config_bytes(), original.as_bytes());
+}
+
+#[test]
+fn bundle_setup_ping_timeout_with_held_instance_lock_refuses_second_daemon() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_refused_kind(endpoint, sw_pal::PalErrorKind::TimedOut);
+    let held = t.with_cli_ctx(|ctx| {
+        ctx.p.instance_lock
+            .acquire(
+                std::path::Path::new(&ctx.paths.lock_path),
+                &sw_pal::EndpointSpec::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 48700,
+                },
+            )
+            .expect("測試需先持有 daemon singleton lock")
+    });
+
+    let (rc, out, _err) = t.run_from_bundle(&["setup"]);
+
+    assert_eq!(rc, 2, "ping 逾時且 singleton lock 仍被持有時不得啟動第二個 daemon");
+    assert_eq!(str_field(&json(&out), "error_code"), "DEVICE_STILL_HELD");
+    assert!(t.process().spawns().is_empty(), "不得 spawn 第二個 daemon");
+    drop(held);
 }
 
 #[test]

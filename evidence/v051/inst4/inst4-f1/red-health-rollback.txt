@@ -1,0 +1,27 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_auto_port_health_failure_keeps_original_config -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 90cf529968b11960db92d476e477a2cc2f4c784cdde0aea52e317e1567195506  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 82e1ab4742b7f83dabf9495c20230d65973dbe7e294157dae674992030d8ecfc  crates/sw-cli/src/rollback.rs
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_auto_port_health_failure_keeps_original_config ... FAILED
+
+failures:
+
+---- bundle_setup_auto_port_health_failure_keeps_original_config stdout ----
+
+thread 'bundle_setup_auto_port_health_failure_keeps_original_config' (587716) panicked at crates/sw-cli/tests/mgmt_setup.rs:3217:5:
+assertion `left != right` failed: 受控 daemon 未通過新埠健康檢查時 setup 必須回報失敗
+  left: 0
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bundle_setup_auto_port_health_failure_keeps_original_config
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

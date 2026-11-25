@@ -1,0 +1,30 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup inst4_windows_default_port_selects_first_bindable_port -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+MUTATED_SOURCE_SHA256: 288eae500dd3824c00eb0f92fbf5db851206b27205317aafd2df1c67ecf17b6e  crates/sw-cli/src/setup_cmd.rs
+CONTROLLED_MUTATION: treat the blocked built-in port 48700 as bindable
+
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.90s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test inst4_windows_default_port_selects_first_bindable_port ... FAILED
+
+failures:
+
+---- inst4_windows_default_port_selects_first_bindable_port stdout ----
+
+thread 'inst4_windows_default_port_selects_first_bindable_port' (995330) panicked at crates/sw-cli/tests/mgmt_setup.rs:167:5:
+assertion `left == right` failed
+  left: "tcp://127.0.0.1:48700"
+ right: "tcp://127.0.0.1:48703"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    inst4_windows_default_port_selects_first_bindable_port
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

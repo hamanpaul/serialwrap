@@ -1,0 +1,30 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup inst4_setup_ping_timeout_with_released_lock_allows_setup -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+MUTATED_SOURCE_SHA256: c1bd1b935a8570641d00a10746b0138a65afebcb7fabac4765ba03572f9ee77b  crates/sw-cli/src/setup_cmd.rs
+CONTROLLED_MUTATION: classify a released singleton lock as held
+
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.86s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test inst4_setup_ping_timeout_with_released_lock_allows_setup ... FAILED
+
+failures:
+
+---- inst4_setup_ping_timeout_with_released_lock_allows_setup stdout ----
+
+thread 'inst4_setup_ping_timeout_with_released_lock_allows_setup' (1001825) panicked at crates/sw-cli/tests/mgmt_setup.rs:207:5:
+assertion `left == right` failed
+  left: RunningByInstanceLock
+ right: StoppedByInstanceLock
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    inst4_setup_ping_timeout_with_released_lock_allows_setup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

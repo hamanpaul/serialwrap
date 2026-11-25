@@ -1,0 +1,27 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_auto_port_switch_failure_keeps_original_config -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 90cf529968b11960db92d476e477a2cc2f4c784cdde0aea52e317e1567195506  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 82e1ab4742b7f83dabf9495c20230d65973dbe7e294157dae674992030d8ecfc  crates/sw-cli/src/rollback.rs
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_auto_port_switch_failure_keeps_original_config ... FAILED
+
+failures:
+
+---- bundle_setup_auto_port_switch_failure_keeps_original_config stdout ----
+
+thread 'bundle_setup_auto_port_switch_failure_keeps_original_config' (588826) panicked at crates/sw-cli/tests/mgmt_setup.rs:3203:5:
+assertion `left == right` failed
+  left: [35, 32, 228, 189, 191, 231, 148, 168, 232, 128, 133, 232, 168, 187, 232, 167, 163, 10, 115, 117, 112, 101, 114, 118, 105, 115, 105, 111, 110, 95, 109, 111, 100, 101, 58, 32, 111, 110, 45, 100, 101, 109, 97, 110, 100, 10, 119, 105, 110, 100, 111, 119, 115, 58, 10, 32, 32, 101, 120, 99, 108, 117, 100, 101, 95, 99, 111, 109, 115, 58, 32, 91, 67, 79, 77, 53, 93, 10, 115, 111, 99, 107, 101, 116, 95, 112, 97, 116, 104, 58, 32, 39, 116, 99, 112, 58, 47, 47, 49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 52, 56, 55, 49, 54, 39, 10]
+ right: [35, 32, 228, 189, 191, 231, 148, 168, 232, 128, 133, 232, 168, 187, 232, 167, 163, 10, 115, 117, 112, 101, 114, 118, 105, 115, 105, 111, 110, 95, 109, 111, 100, 101, 58, 32, 111, 110, 45, 100, 101, 109, 97, 110, 100, 10, 119, 105, 110, 100, 111, 119, 115, 58, 10, 32, 32, 101, 120, 99, 108, 117, 100, 101, 95, 99, 111, 109, 115, 58, 32, 91, 67, 79, 77, 53, 93, 10]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bundle_setup_auto_port_switch_failure_keeps_original_config
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

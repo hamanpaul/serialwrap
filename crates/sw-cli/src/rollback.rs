@@ -1656,6 +1656,7 @@ fn execute_change_with_restore(
             return report;
         }
     };
+    let mut auto_selected_port = false;
     if daemon.is_none() && (endpoint_resolve::rpc_backend_is_win(ctx) || matches!(target_mode, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)) {
         let (resolved, source) = match endpoint_resolve::resolve_local_management_endpoint(ctx, explicit_endpoint, None, None) {
             Ok(r) => (r.endpoint, r.source),
@@ -1666,22 +1667,11 @@ fn execute_change_with_restore(
             Ok(selection) => {
                 if selection.auto_selected {
                     target_endpoint = selection.endpoint;
+                    auto_selected_port = true;
                     let _ = ctx.io.err_str(&format!(
                         "serialwrap: setup could not bind built-in TCP port 48700 (reserved or unavailable); selected port {} and will save socket_path\n",
                         target_endpoint.rsplit(':').next().unwrap_or_default()
                     ));
-                    if let Err(error) = endpoint_resolve::save_runtime_config_preserving(ctx, None, Some(&target_endpoint)) {
-                        fail_report(&mut report, StepName::SafetyCheck, OpFailure {
-                            code: ErrorCode::InternalError.as_str(),
-                            phase: "update_safety_check",
-                            reason: Some("config_update_failed"),
-                            message: Some(error.to_string()),
-                            detail: PyDict::new(),
-                        });
-                        clear_journal(ctx, &root, &journal);
-                        drop(lock);
-                        return report;
-                    }
                 }
             }
             Err(crate::setup_cmd::WindowsSetupEndpointError::InvalidLoopbackEndpoint) => {
@@ -1773,10 +1763,12 @@ fn execute_change_with_restore(
         prior_enabled: None,
         prior_restart: None,
     });
-    journal.target = (target_mode != &old_mode && target_endpoint != endpoint).then(|| JournalTarget {
-        mode: target_mode.clone(),
-        endpoint: target_endpoint.clone(),
-    });
+    journal.target = (target_endpoint != endpoint
+        && (target_mode != &old_mode || auto_selected_port))
+        .then(|| JournalTarget {
+            mode: target_mode.clone(),
+            endpoint: target_endpoint.clone(),
+        });
     journal.step = JournalStep::SnapshotTaken;
     if let Err(error) = write_journal(ctx, &root, &journal) { return journal_failure(report, StepName::SafetyCheck, "snapshot_taken", error); }
     crash_if("snapshot_taken:after_effect");
@@ -1873,6 +1865,18 @@ fn execute_change_with_restore(
     journal.step = JournalStep::EntriesSwitching;
     if let Err(error) = write_journal(ctx, &root, &journal) { return journal_failure(report, StepName::BackupAndSwitch, "entries_switching", error); }
     crash_if("entries_switching:before_effect");
+    if auto_selected_port {
+        if let Err(error) = endpoint_resolve::save_runtime_config_preserving(ctx, None, Some(&target_endpoint)) {
+            let failure = OpFailure {
+                code: ErrorCode::InternalError.as_str(),
+                phase: "update_start_and_verify",
+                reason: Some("config_update_failed"),
+                message: Some(error.to_string()),
+                detail: PyDict::new(),
+            };
+            return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
+        }
+    }
     if let Some(previous_backup) = restore_previous {
         if let Err(error) = restore_backup(ctx, previous_backup, false) {
             let failure = layout_op_failure(error, "update_start_and_verify");
@@ -1969,7 +1973,7 @@ fn execute_change_with_restore(
             config_path: endpoint_resolve::config_write_path(ctx),
             old_stop: if legacy_stopped.is_some() { crate::setup_cmd::OldStop::AlreadyStopped } else { crate::setup_cmd::OldStop::Reconcile },
             restart_daemon: false,
-            preserve_config_format: false,
+            preserve_config_format: auto_selected_port,
         };
         let setup_result = match crate::setup_cmd::reconcile(ctx, &setup_req) {
             Ok(result) => result,
@@ -2035,7 +2039,16 @@ fn execute_change_with_restore(
         target_endpoint.clone()
     };
     config.set_mode(target_mode.as_str(), Some(&effective_socket));
-    if let Err(error) = endpoint_resolve::save_runtime_config(ctx, &config) {
+    let config_write = if auto_selected_port {
+        endpoint_resolve::save_runtime_config_preserving(
+            ctx,
+            Some(target_mode.as_str()),
+            Some(&effective_socket),
+        )
+    } else {
+        endpoint_resolve::save_runtime_config(ctx, &config)
+    };
+    if let Err(error) = config_write {
         let failure = OpFailure {
             code: ErrorCode::InternalError.as_str(),
             phase: "update_start_and_verify",
@@ -2107,7 +2120,19 @@ fn execute_change_with_restore(
             return revert_after_failure(ctx, root, journal, original, backup, report, StepName::StartAndVerify, failure, &mut held, with_sudo, target_mode);
         }
     }
-    let started = start_and_verify(ctx, &root, target_mode, &target_endpoint, original.daemon.is_some(), original.daemon.is_some(), &manifest, with_sudo, original.daemon.as_ref());
+    let first_install = op == "install";
+    let verify_selected_endpoint = first_install && auto_selected_port;
+    let started = start_and_verify(
+        ctx,
+        &root,
+        target_mode,
+        &target_endpoint,
+        verify_selected_endpoint || original.daemon.is_some(),
+        verify_selected_endpoint || original.daemon.is_some(),
+        &manifest,
+        with_sudo,
+        original.daemon.as_ref(),
+    );
     crash_if("start_and_verify:started");
     test_pause_after("start_and_verify:started");
     let started = test_force_verify_failure(started);

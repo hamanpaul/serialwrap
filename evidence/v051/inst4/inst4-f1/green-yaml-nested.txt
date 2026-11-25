@@ -1,0 +1,12 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test endpoint_resolve inst4_selected_port_patch_keeps_nested_empty_mapping -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 8d0390556f83f73bdeeb57f0d1a97fdc4db600418cef2e09e67222bea119b217  crates/sw-cli/tests/endpoint_resolve.rs
+SOURCE_SHA256: b4f9c4ff6f90577b41392cb06297b4029287c48e765547de09f427750f9e4d71  crates/sw-cli/src/endpoint_resolve.rs
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.46s
+     Running tests/endpoint_resolve.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/endpoint_resolve-0978b8a343434053)
+
+running 1 test
+test inst4_selected_port_patch_keeps_nested_empty_mapping ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s

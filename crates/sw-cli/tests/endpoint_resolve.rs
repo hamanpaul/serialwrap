@@ -732,7 +732,8 @@ fn socket_path_yaml_patch_preserves_every_other_byte() {
         original,
         "socket_path",
         "tcp://127.0.0.1:48703",
-    );
+    )
+    .expect("根 mapping 更新應成功");
     assert_eq!(
         updated,
         "# 註解\r\nsupervision_mode: windows-task\r\nsocket_path: tcp://127.0.0.1:48703  # keep\r\nwindows:\r\n  exclude_coms: [COM5]\r\n"
@@ -743,7 +744,8 @@ fn socket_path_yaml_patch_preserves_every_other_byte() {
 fn socket_path_yaml_patch_updates_quoted_root_key_without_duplicate() {
     let original = "\"socket_path\": \"tcp://127.0.0.1:48700\"\nnotes: keep\n";
     assert_eq!(
-        replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48703"),
+        replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48703")
+            .expect("根 mapping 更新應成功"),
         "\"socket_path\": \"tcp://127.0.0.1:48703\"\nnotes: keep\n"
     );
 }
@@ -751,7 +753,8 @@ fn socket_path_yaml_patch_updates_quoted_root_key_without_duplicate() {
 #[test]
 fn socket_path_yaml_patch_handles_empty_value_with_comment_without_panic() {
     let original = "socket_path:   # optional\nother: 1\n";
-    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716");
+    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716")
+        .expect("帶註解空值更新應成功");
     assert_eq!(
         updated,
         "socket_path: 'tcp://127.0.0.1:48716'   # optional\nother: 1\n"
@@ -761,7 +764,8 @@ fn socket_path_yaml_patch_handles_empty_value_with_comment_without_panic() {
 #[test]
 fn socket_path_yaml_patch_handles_flow_mapping_without_invalid_yaml() {
     let original = "{}\n";
-    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716");
+    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716")
+        .expect("空 flow mapping 更新應成功");
     assert!(
         !updated.starts_with("{}\nsocket_path"),
         "更新 flow mapping 不得產生非法 YAML 結構，實際：{updated}"
@@ -769,6 +773,40 @@ fn socket_path_yaml_patch_handles_flow_mapping_without_invalid_yaml() {
     assert!(
         sw_proto::yaml11::safe_load(&updated).is_ok(),
         "寫回結果必須可被 YAML 解析器解析，實際：{updated}"
+    );
+}
+
+#[test]
+fn inst4_selected_port_patch_keeps_nested_empty_mapping() {
+    let original = "profiles:\n  {}\n";
+    let updated = replace_root_yaml_scalar_value(
+        original,
+        "socket_path",
+        "tcp://127.0.0.1:48716",
+    )
+    .expect("含巢狀空 mapping 的根 mapping 更新應成功");
+
+    assert_eq!(
+        updated,
+        "profiles:\n  {}\nsocket_path: 'tcp://127.0.0.1:48716'\n"
+    );
+    let before = sw_proto::yaml11::safe_load(original).unwrap();
+    let after = sw_proto::yaml11::safe_load(&updated).unwrap();
+    let (sw_proto::yaml11::YValue::Map(before), sw_proto::yaml11::YValue::Map(after)) =
+        (before, after)
+    else {
+        panic!("根節點必須維持 mapping");
+    };
+    assert_eq!(
+        before.get_str("profiles"),
+        after.get_str("profiles"),
+        "選埠寫回必須保留巢狀空 mapping"
+    );
+    assert_eq!(
+        after.get_str("socket_path"),
+        Some(&sw_proto::yaml11::YValue::Str(
+            "tcp://127.0.0.1:48716".into()
+        ))
     );
 }
 

@@ -1,0 +1,27 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 90cf529968b11960db92d476e477a2cc2f4c784cdde0aea52e317e1567195506  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 202bdb4bc132866174e17016f3f3485e1068b73211c648141a8bfb4c1367c27a  crates/sw-cli/src/endpoint_resolve.rs
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint ... FAILED
+
+failures:
+
+---- bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint stdout ----
+
+thread 'bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint' (511120) panicked at crates/sw-cli/tests/mgmt_setup.rs:3164:5:
+stderr 必須提示手動設定 socket_path 或 SERIALWRAP_TCP_PORT：serialwrap: setup could not bind built-in TCP port 48700 (reserved or unavailable); selected port 48716 and will save socket_path
+serialwrap: setup failed: INTERNAL_ERROR: YamlError: did not find expected <document start> (line 2, column 12)
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bundle_setup_nonempty_root_flow_mapping_fails_closed_with_manual_hint
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

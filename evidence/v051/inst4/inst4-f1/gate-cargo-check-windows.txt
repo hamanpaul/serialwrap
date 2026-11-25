@@ -1,0 +1,381 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo check --workspace --tests --features test-fakes --target x86_64-pc-windows-gnu
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256 endpoint_resolve: 8d0390556f83f73bdeeb57f0d1a97fdc4db600418cef2e09e67222bea119b217  crates/sw-cli/tests/endpoint_resolve.rs
+TEST_SHA256 mgmt_setup: 6d8321a69c2c4a86575436c3c0355fb3cb9da46030ceed9b2b29fefc696efafc  crates/sw-cli/tests/mgmt_setup.rs
+warning: unused import: `std::ffi::CStr`
+  --> crates/sw-pal/src/conformance/mod.rs:20:5
+   |
+20 | use std::ffi::CStr;
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `BufRead` and `BufReader`
+  --> crates/sw-pal/src/conformance/mod.rs:21:15
+   |
+21 | use std::io::{BufRead, BufReader};
+   |               ^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `Child`, `Command`, and `Stdio`
+  --> crates/sw-pal/src/conformance/mod.rs:22:20
+   |
+22 | use std::process::{Child, Command, Stdio};
+   |                    ^^^^^  ^^^^^^^  ^^^^^
+
+warning: unused import: `AtomicBool`
+  --> crates/sw-pal/src/conformance/mod.rs:23:25
+   |
+23 | use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+   |                         ^^^^^^^^^^
+
+warning: unused import: `posix::PosixDeviceSource`
+  --> crates/sw-pal/src/device_source/mod.rs:14:16
+   |
+14 | pub(crate) use posix::PosixDeviceSource;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `PosixDeviceSource` is never constructed
+  --> crates/sw-pal/src/device_source/posix.rs:49:19
+   |
+49 | pub(crate) struct PosixDeviceSource {
+   |                   ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new` is never used
+  --> crates/sw-pal/src/device_source/posix.rs:55:19
+   |
+54 | impl PosixDeviceSource {
+   | ---------------------- associated function in this implementation
+55 |     pub(crate) fn new(dirs: Vec<PathBuf>, allowlist: Option<Vec<String>>) -> Self {
+   |                   ^^^
+
+warning: `sw-pal` (lib) generated 7 warnings (run `cargo fix --lib -p sw-pal` to apply 5 suggestions)
+warning: unused import: `sw_pal::lock::InstanceLockFactory`
+  --> crates/sw-pal/tests/fakes_selftest.rs:70:9
+   |
+70 |     use sw_pal::lock::InstanceLockFactory;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RpcListenerFactory`
+  --> crates/sw-pal/tests/fakes_selftest.rs:71:72
+   |
+71 |     use sw_pal::traits::{DeviceSelection, EndpointSpec, ListenOptions, RpcListenerFactory, SignalWait};
+   |                                                                        ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sw_pal::console_pty::ConsoleTransportFactory`
+  --> crates/sw-pal/tests/fakes_selftest.rs:69:9
+   |
+69 |     use sw_pal::console_pty::ConsoleTransportFactory;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SignalWait`
+  --> crates/sw-pal/tests/fakes_selftest.rs:71:92
+   |
+71 |     use sw_pal::traits::{DeviceSelection, EndpointSpec, ListenOptions, RpcListenerFactory, SignalWait};
+   |                                                                                            ^^^^^^^^^^
+
+warning: `sw-pal` (test "fakes_selftest") generated 4 warnings
+warning: struct `Row` is never constructed
+   --> crates/sw-proto/tests/common/mod.rs:112:12
+    |
+112 | pub struct Row {
+    |            ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `unhex_pub` is never used
+   --> crates/sw-proto/tests/common/mod.rs:127:8
+    |
+127 | pub fn unhex_pub(s: &str) -> Vec<u8> {
+    |        ^^^^^^^^^
+
+warning: function `golden` is never used
+   --> crates/sw-proto/tests/common/mod.rs:132:8
+    |
+132 | pub fn golden(name: &str) -> Vec<Row> {
+    |        ^^^^^^
+
+warning: function `oserror_from_case` is never used
+   --> crates/sw-proto/tests/common/mod.rs:154:8
+    |
+154 | pub fn oserror_from_case(s: &str) -> sw_proto::pycompat::PyOsError {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `pypath_dispatch` is never used
+   --> crates/sw-proto/tests/common/mod.rs:192:8
+    |
+192 | pub fn pypath_dispatch(
+    |        ^^^^^^^^^^^^^^^
+
+warning: `sw-proto` (test "error_codes_sync") generated 5 warnings
+warning: unused import: `std::fs`
+ --> crates/sw-daemon/tests/restart_after_commit.rs:9:5
+  |
+9 | use std::fs;
+  |     ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::process::Command`
+  --> crates/sw-daemon/tests/restart_after_commit.rs:10:5
+   |
+10 | use std::process::Command;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+  --> crates/sw-daemon/tests/restart_after_commit.rs:11:5
+   |
+11 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `support::*`
+  --> crates/sw-daemon/tests/restart_after_commit.rs:13:5
+   |
+13 | use support::*;
+   |     ^^^^^^^^^^
+
+warning: `sw-daemon` (test "restart_after_commit") generated 4 warnings (run `cargo fix --test "restart_after_commit" -p sw-daemon` to apply 4 suggestions)
+warning: struct `HolderSampler` is never constructed
+    --> crates/sw-daemon/tests/handoff_stop.rs:1298:8
+     |
+1298 | struct HolderSampler {
+     |        ^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `start` and `finish` are never used
+    --> crates/sw-daemon/tests/handoff_stop.rs:1304:8
+     |
+1303 | impl HolderSampler {
+     | ------------------ associated items in this implementation
+1304 |     fn start(path: PathBuf) -> HolderSampler {
+     |        ^^^^^
+...
+1329 |     fn finish(mut self) -> (usize, Vec<u32>) {
+     |        ^^^^^^
+
+warning: function `rpc_handoff` is never used
+    --> crates/sw-daemon/tests/handoff_stop.rs:1518:4
+     |
+1518 | fn rpc_handoff(socket: &Path) -> PyDict {
+     |    ^^^^^^^^^^^
+
+warning: function `write_tty_line` is never used
+    --> crates/sw-daemon/tests/handoff_stop.rs:1530:4
+     |
+1530 | fn write_tty_line(path: &str, line: &str) {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `old_bundle_dir` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:119:8
+    |
+119 | pub fn old_bundle_dir() -> PathBuf {
+    |        ^^^^^^^^^^^^^^
+
+warning: function `seed_install_from_old_bundle` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:186:8
+    |
+186 | pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `update_report` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:330:8
+    |
+330 | pub fn update_report(output: &Output) -> PyDict {
+    |        ^^^^^^^^^^^^^
+
+warning: function `handoff_chain` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:343:8
+    |
+343 | pub fn handoff_chain(report: &PyDict) -> Vec<PyDict> {
+    |        ^^^^^^^^^^^^^
+
+warning: function `update_step` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:364:8
+    |
+364 | pub fn update_step<'a>(report: &'a PyDict, name: &str) -> &'a PyDict {
+    |        ^^^^^^^^^^^
+
+warning: function `daemon_pid` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:376:8
+    |
+376 | pub fn daemon_pid(output: &Output) -> Option<u32> {
+    |        ^^^^^^^^^^
+
+warning: function `run_cli` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:585:8
+    |
+585 | pub fn run_cli(cli: &Path, vars: &BTreeMap<String, String>, args: &[&str], timeout: Duration) -> Output {
+    |        ^^^^^^^
+
+warning: function `try_run_cli` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:590:4
+    |
+590 | fn try_run_cli(cli: &Path, vars: &BTreeMap<String, String>, args: &[&str], timeout: Duration) -> Option<Output> {
+    |    ^^^^^^^^^^^
+
+warning: struct `ProductDaemonCleanup` is never constructed
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:617:12
+    |
+617 | pub struct ProductDaemonCleanup {
+    |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `status_pid`, `stop_owned`, and `stop` are never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:627:12
+    |
+626 | impl ProductDaemonCleanup {
+    | ------------------------- associated items in this implementation
+627 |     pub fn new(cli: PathBuf, vars: BTreeMap<String, String>, endpoint: String, install_root: PathBuf, run_dir: &Path) -> ProductDae...
+    |            ^^^
+...
+634 |     fn status_pid(&self) -> Option<u32> {
+    |        ^^^^^^^^^^
+...
+640 |     fn stop_owned(&self, expected: Option<u32>) -> bool {
+    |        ^^^^^^^^^^
+...
+674 |     pub fn stop(&mut self, expected_pid: u32) {
+    |            ^^^^
+
+warning: function `process_start_ticks` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:689:4
+    |
+689 | fn process_start_ticks(pid: u32) -> Option<u64> {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_product_daemon_executable` is never used
+   --> crates/sw-daemon/tests/support/handoff_cli.rs:695:4
+    |
+695 | fn is_product_daemon_executable(pid: u32, exe: &Path, versions: &Path) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `send_and_drop` is never used
+   --> crates/sw-daemon/tests/daemon_process.rs:208:4
+    |
+208 | fn send_and_drop(socket: &std::path::Path, payload: &str) {
+    |    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `recover_tx_payloads` is never used
+    --> crates/sw-daemon/tests/daemon_process.rs:1008:4
+     |
+1008 | fn recover_tx_payloads(env: &IsolatedEnv) -> Vec<String> {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `RELEASE` is never used
+    --> crates/sw-daemon/tests/daemon_process.rs:1584:7
+     |
+1584 | const RELEASE: &str = r#"{"id":7,"method":"device.release","params":{"selector":"COM0"}}"#;
+     |       ^^^^^^^
+
+warning: `sw-daemon` (test "handoff_stop") generated 16 warnings
+warning: `sw-daemon` (test "daemon_process") generated 3 warnings
+    Checking sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+warning: fields `id` and `op` are never read
+   --> crates/sw-proto/tests/common/mod.rs:113:9
+    |
+112 | pub struct Row {
+    |            --- fields in this struct
+113 |     pub id: String,
+    |         ^^
+114 |     pub op: String,
+    |         ^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-proto` (test "config_types_golden") generated 4 warnings (3 duplicates)
+warning: `sw-proto` (test "rpc_types") generated 5 warnings (5 duplicates)
+warning: field `op` is never read
+   --> crates/sw-proto/tests/common/mod.rs:114:9
+    |
+112 | pub struct Row {
+    |            --- field in this struct
+113 |     pub id: String,
+114 |     pub op: String,
+    |         ^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `unhex_pub` is never used
+   --> crates/sw-proto/tests/common/mod.rs:127:8
+    |
+127 | pub fn unhex_pub(s: &str) -> Vec<u8> {
+    |        ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-proto` (test "yaml11_golden") generated 4 warnings (3 duplicates)
+warning: `sw-proto` (test "release_manifest") generated 5 warnings (5 duplicates)
+warning: `sw-proto` (test "pyjson_golden") generated 3 warnings (2 duplicates)
+warning: `sw-proto` (test "pyre_golden") generated 3 warnings (3 duplicates)
+warning: `sw-proto` (test "redos") generated 5 warnings (5 duplicates)
+warning: `sw-proto` (test "wal_types_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "endpoint_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "runtime_paths_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "constants_sync") generated 5 warnings (5 duplicates)
+warning: unused import: `split_os_str`
+ --> crates/sw-pal/tests/osstr.rs:5:30
+  |
+5 | use sw_pal::{join_os_pieces, split_os_str, OsPiece};
+  |                              ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-pal` (test "osstr") generated 1 warning (run `cargo fix --test "osstr" -p sw-pal` to apply 1 suggestion)
+warning: unused import: `std::sync::Arc`
+ --> crates/sw-pal/tests/process_ctl.rs:3:5
+  |
+3 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ChildHandle`
+ --> crates/sw-pal/tests/process_ctl.rs:6:22
+  |
+6 | use sw_pal::traits::{ChildHandle, ProcessCtl};
+  |                      ^^^^^^^^^^^
+
+warning: unused import: `ProcessCtl`
+ --> crates/sw-pal/tests/process_ctl.rs:6:35
+  |
+6 | use sw_pal::traits::{ChildHandle, ProcessCtl};
+  |                                   ^^^^^^^^^^
+
+warning: function `tempfile_dir` is never used
+  --> crates/sw-pal/tests/console_conformance.rs:19:4
+   |
+19 | fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-pal` (test "process_ctl") generated 3 warnings (run `cargo fix --test "process_ctl" -p sw-pal` to apply 2 suggestions)
+warning: `sw-pal` (test "console_conformance") generated 1 warning
+warning: constant `GOLDEN_RUN_DECODE` is never used
+  --> crates/sw-pal/tests/sysenv_mgmt.rs:57:7
+   |
+57 | const GOLDEN_RUN_DECODE: &str = include_str!("golden/run_decode.ndjson");
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `golden_line` is never used
+  --> crates/sw-pal/tests/sysenv_mgmt.rs:60:4
+   |
+60 | fn golden_line(case: &str) -> String {
+   |    ^^^^^^^^^^^
+
+warning: function `golden_str` is never used
+  --> crates/sw-pal/tests/sysenv_mgmt.rs:70:4
+   |
+70 | fn golden_str(line: &str, key: &str) -> Option<String> {
+   |    ^^^^^^^^^^
+
+warning: `sw-pal` (test "sysenv_mgmt") generated 3 warnings
+warning: `sw-pal` (lib test) generated 7 warnings (7 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.55s

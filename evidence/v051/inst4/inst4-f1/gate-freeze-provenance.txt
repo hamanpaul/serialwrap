@@ -1,0 +1,7 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 python3 -m pytest -q tests/test_slice21_case_freeze.py tests/test_slice24_cases.py
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 3bd6c204bff21aa2023c3f7d76300abd73b0f92c9b6d8aa5884003db1306fe91  tests/test_slice21_case_freeze.py
+TEST_SHA256: 2ab08f667e2d9823175a9f3b087b9a586356e7e5ae3043f78aed6915704388f1  tests/test_slice24_cases.py
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 6.93s

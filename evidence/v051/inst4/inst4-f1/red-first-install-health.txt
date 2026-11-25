@@ -1,0 +1,26 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_selected_port_starts_fake_daemon_and_checks_health -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: b3a1b982523abbc23e2bc10b259b7067abd37540b15eabd7b38db4ea9cfb74a7  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 82e1ab4742b7f83dabf9495c20230d65973dbe7e294157dae674992030d8ecfc  crates/sw-cli/src/rollback.rs
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.09s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_selected_port_starts_fake_daemon_and_checks_health ... FAILED
+
+failures:
+
+---- bundle_setup_selected_port_starts_fake_daemon_and_checks_health stdout ----
+
+thread 'bundle_setup_selected_port_starts_fake_daemon_and_checks_health' (638650) panicked at crates/sw-cli/tests/mgmt_setup.rs:3102:5:
+正式 bundle 首次安裝應啟動 fake daemon
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bundle_setup_selected_port_starts_fake_daemon_and_checks_health
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

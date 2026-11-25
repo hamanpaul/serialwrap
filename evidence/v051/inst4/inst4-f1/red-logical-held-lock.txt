@@ -1,0 +1,30 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+MUTATED_SOURCE_SHA256: 754e5601562ee3de099c11d65b4ddaa1b642a0f0910982abdd727207f43081cb  crates/sw-cli/src/setup_cmd.rs
+CONTROLLED_MUTATION: classify an actually held singleton lock as stopped
+
+   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-inst4/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.22s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon ... FAILED
+
+failures:
+
+---- inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon stdout ----
+
+thread 'inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon' (998995) panicked at crates/sw-cli/tests/mgmt_setup.rs:215:5:
+assertion `left == right` failed
+  left: StoppedByInstanceLock
+ right: RunningByInstanceLock
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`

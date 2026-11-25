@@ -1,0 +1,4 @@
+COMMAND: nice -n 10 python3 tests/acceptance/regen_lock.py --check
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+[regen_lock] OK：鎖檔、案例屬性快照與統計檔與 cases.yaml 一致
+[regen_lock] OK：L1 必要集合鎖結構正確

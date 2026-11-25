@@ -1,0 +1,15 @@
+COMMANDS: python3 tests/acceptance/regen_lock.py --l1-add-only --set <set> --platform linux --collect <TMPDIR>/inst4-l1-linux.collect.json
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+TEST_SHA256 endpoint_resolve: 8d0390556f83f73bdeeb57f0d1a97fdc4db600418cef2e09e67222bea119b217  crates/sw-cli/tests/endpoint_resolve.rs
+LOCK_SHA256_BEFORE: b76dc8096bb34c202e3b33f523dc8db0afea5402e979c7cbb999b479b5619312  tests/acceptance/l1_required.lock.json
+d7db74568e902b0bab512c6328dc7cfb31b0e607680fefd15272190bad36da4e  /tmp/sw.A8InjZ/inst4-l1-linux.collect.json
+[regen_lock] wrote l1_required.lock.json：p7_gate:cargo-test-workspace.linux 新增 8 筆、核准移除 0 筆 nodeid
+[regen_lock] wrote l1_required.lock.json：s21_core.linux 新增 8 筆、核准移除 0 筆 nodeid
+[regen_lock] wrote l1_required.lock.json：s22_gate:cargo_workspace.linux 新增 8 筆、核准移除 0 筆 nodeid
+
+ACTUAL_COMMANDS:
+nice -n 10 python3 tests/acceptance/regen_lock.py --l1-add-only --set p7_gate:cargo-test-workspace --platform linux --collect /tmp/sw.A8InjZ/inst4-l1-linux.collect.json
+nice -n 10 python3 tests/acceptance/regen_lock.py --l1-add-only --set s21_core --platform linux --collect /tmp/sw.A8InjZ/inst4-l1-linux.collect.json
+nice -n 10 python3 tests/acceptance/regen_lock.py --l1-add-only --set s22_gate:cargo_workspace --platform linux --collect /tmp/sw.A8InjZ/inst4-l1-linux.collect.json
+LOCK_SHA256_AFTER: 55c5d18b0b12c6659efdead1abf5faa93d28d1f46756e5d7d947a33bf9471962  tests/acceptance/l1_required.lock.json

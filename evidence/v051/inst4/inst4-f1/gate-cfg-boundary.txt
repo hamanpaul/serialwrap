@@ -1,0 +1,2 @@
+COMMAND: nice -n 10 python3 scripts/rust/check_cfg_boundary.py
+HEAD: 646c04565343877646f842fa8f4705b887b59128

@@ -1,0 +1,11 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_ping_timeout_with_held_instance_lock_refuses_second_daemon -- --exact
+HEAD: 646c04565343877646f842fa8f4705b887b59128
+TEST_SHA256: 99c93ee97ac866ea50899b1e1fec7f0bc84e89e764ebb1a88cc3e7706da67c11  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 0be74b7375c71a3941bb54fbf55371949d558918486bce959fd93622cbe28e61  crates/sw-cli/src/setup_cmd.rs
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_ping_timeout_with_held_instance_lock_refuses_second_daemon ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.03s

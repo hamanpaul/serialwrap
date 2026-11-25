@@ -12,7 +12,7 @@ use sw_proto::error_codes::ErrorCode;
 use sw_proto::pycompat::{decode_utf8_strict, py_strip, PyOsError};
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{bench_state_path, resolve_config_path};
-use sw_proto::yaml11::{py_truthy_of, YValue};
+use sw_proto::yaml11::{py_truthy_of, YMap, YValue};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedEndpoint {
@@ -558,49 +558,220 @@ fn root_yaml_key_matches(raw_key: &str, key: &str) -> bool {
             && &raw_key[1..raw_key.len() - 1] == key)
 }
 
-/// 只更新根層純量鍵的值，保留其他行、註解、空白與換行位元組。
-pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> String {
-    let mut output = String::with_capacity(text.len() + key.len() + value.len());
-    let mut found = false;
-    let mut empty_flow_mapping_line = None;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootYamlShape {
+    Empty,
+    EmptyFlow(usize),
+    BlockMapping,
+}
 
-    // 先檢查是否有單獨一行的空 flow mapping "{}"
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == "{}" {
-            empty_flow_mapping_line = Some(idx);
-            break;
+fn yaml_line_body(line: &str) -> &str {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    body.strip_suffix('\r').unwrap_or(body)
+}
+
+fn is_yaml_directive_or_document_marker(body: &str) -> bool {
+    let trimmed = body.trim();
+    let before_comment = yaml_comment_start(trimmed)
+        .map(|comment| &trimmed[..comment])
+        .unwrap_or(trimmed)
+        .trim_end();
+    trimmed.starts_with('%')
+        || before_comment == "---"
+        || before_comment == "..."
+}
+
+fn is_yaml_trivia_line(body: &str) -> bool {
+    let trimmed = body.trim();
+    trimmed.is_empty() || trimmed.starts_with('#') || is_yaml_directive_or_document_marker(body)
+}
+
+fn mapping_key_colon(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'"') => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quote = None;
+                }
+            }
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 1;
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            _ => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => break,
+                b':' if bytes.get(index + 1).is_none_or(|next| {
+                    next.is_ascii_whitespace() || *next == b'#'
+                }) =>
+                {
+                    return Some(index);
+                }
+                _ => {}
+            },
         }
+        index += 1;
+    }
+    None
+}
+
+fn classify_root_yaml_shape(text: &str, root: &YValue) -> Result<RootYamlShape, ConfigError> {
+    let mut first_content = None;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let body = yaml_line_body(line);
+        if is_yaml_trivia_line(body) {
+            continue;
+        }
+        if body.chars().next().is_some_and(char::is_whitespace) {
+            return Err(ConfigError::Value("根 YAML 內容縮排，無法安全保留格式".into()));
+        }
+        first_content = Some((index, body));
+        break;
     }
 
+    let Some((root_index, root_line)) = first_content else {
+        return match root {
+            YValue::Null => Ok(RootYamlShape::Empty),
+            YValue::Map(map) if map.0.is_empty() => Ok(RootYamlShape::Empty),
+            _ => Err(ConfigError::Value(
+                "空白 YAML 根節點不是 mapping".into(),
+            )),
+        };
+    };
+
+    if root_line.starts_with('{') {
+        let comment = yaml_comment_start(root_line).unwrap_or(root_line.len());
+        let mapping_text = root_line[..comment].trim();
+        if mapping_text == "{}" && matches!(root, YValue::Map(map) if map.0.is_empty()) {
+            let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+            if lines.iter().enumerate().any(|(index, line)| {
+                index != root_index && !is_yaml_trivia_line(yaml_line_body(line))
+            }) {
+                return Err(ConfigError::Value(
+                    "空 flow mapping 後含有其他根內容，無法安全保留格式".into(),
+                ));
+            }
+            return Ok(RootYamlShape::EmptyFlow(root_index));
+        }
+        return Err(ConfigError::Value(
+            "非空根 flow mapping 無法安全行級編輯".into(),
+        ));
+    }
+
+    if mapping_key_colon(root_line).is_some() && matches!(root, YValue::Map(_)) {
+        return Ok(RootYamlShape::BlockMapping);
+    }
+    Err(ConfigError::Value(
+        "YAML 根節點不是可安全行級編輯的 block mapping".into(),
+    ))
+}
+
+fn map_with_updates(root: &YValue, updates: &[(&str, &str)]) -> Result<YMap, ConfigError> {
+    let mut map = match root {
+        YValue::Map(map) => map.clone(),
+        YValue::Null => YMap::default(),
+        _ => return Err(ConfigError::Value("YAML 根節點不是 mapping".into())),
+    };
+    for (key, value) in updates {
+        if let Some((_, existing)) = map.0.iter_mut().find(|(candidate, _)| {
+            matches!(candidate, YValue::Str(name) if name == key)
+        }) {
+            *existing = YValue::Str((*value).to_string());
+        } else {
+            map.0.push((
+                YValue::Str((*key).to_string()),
+                YValue::Str((*value).to_string()),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn yaml_values_equal(left: &YValue, right: &YValue) -> bool {
+    match (left, right) {
+        (YValue::Float(left), YValue::Float(right)) => {
+            left == right || (left.is_nan() && right.is_nan())
+        }
+        (YValue::Seq(left), YValue::Seq(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| yaml_values_equal(left, right))
+        }
+        (YValue::Map(left), YValue::Map(right)) => {
+            left.0.len() == right.0.len()
+                && left
+                    .0
+                    .iter()
+                    .zip(&right.0)
+                    .all(|((left_key, left_value), (right_key, right_value))| {
+                        yaml_values_equal(left_key, right_key)
+                            && yaml_values_equal(left_value, right_value)
+                    })
+        }
+        (YValue::Set(left), YValue::Set(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| yaml_values_equal(left, right))
+        }
+        _ => left == right,
+    }
+}
+
+/// 只更新根層純量鍵的值，保留其他行、註解、空白與換行位元組。
+pub fn replace_root_yaml_scalar_value(
+    text: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, ConfigError> {
+    let original = sw_proto::yaml11::safe_load(text).map_err(ConfigError::from)?;
+    let shape = classify_root_yaml_shape(text, &original)?;
+    let expected = map_with_updates(&original, &[(key, value)])?;
+    let mut output = String::with_capacity(text.len() + key.len() + value.len());
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut found = false;
     for (idx, line) in lines.iter().enumerate() {
         let line = *line;
-        let (body, ending) = if let Some(body) = line.strip_suffix('\n') {
-            (body, "\n")
-        } else {
-            (line, "")
-        };
-        let (body, carriage_return) = body
-            .strip_suffix('\r')
-            .map_or((body, ""), |body| (body, "\r"));
+        let body = yaml_line_body(line);
+        let ending = &line[body.len()..];
 
-        if Some(idx) == empty_flow_mapping_line && !found {
-            // 如果原本是空 flow mapping "{}"，替換為乾淨的根純量鍵
-            found = true;
+        if matches!(shape, RootYamlShape::EmptyFlow(root_idx) if idx == root_idx) {
+            let comment = yaml_comment_start(body).unwrap_or(body.len());
+            let mapping_text = body[..comment].trim_end();
+            let spacing = &body[mapping_text.len()..comment];
             output.push_str(key);
             output.push_str(": '");
             output.push_str(&value.replace('\'', "''"));
             output.push('\'');
-            output.push_str(carriage_return);
+            output.push_str(spacing);
+            output.push_str(&body[comment..]);
             output.push_str(ending);
+            found = true;
             continue;
         }
 
-        let replacement = if !body.chars().next().is_some_and(char::is_whitespace)
-            && !body.starts_with('#')
+        let replacement = if shape == RootYamlShape::BlockMapping
+            && !body.chars().next().is_some_and(char::is_whitespace)
+            && !is_yaml_trivia_line(body)
         {
-            body.find(':').and_then(|colon| {
+            mapping_key_colon(body).and_then(|colon| {
                 root_yaml_key_matches(&body[..colon], key).then(|| {
                     found = true;
                     let value_start = colon + 1;
@@ -619,25 +790,23 @@ pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> Str
                         // 空值或只有空白與註解（如 `socket_path:   # optional` 或 `socket_path:`）
                         let scalar = format!("'{}'", value.replace('\'', "''"));
                         format!(
-                            "{} {}{}{}{}{}",
+                            "{} {}{}{}{}",
                             &body[..value_start],
                             scalar,
                             &rest[..comment],
                             &rest[comment..],
-                            carriage_return,
                             ending
                         )
                     } else {
                         let old_value = &rest[leading..value_end];
                         let scalar = replace_scalar_style(old_value, value);
                         format!(
-                            "{}{}{}{}{}{}{}",
+                            "{}{}{}{}{}{}",
                             &body[..value_start],
                             &rest[..leading],
                             scalar,
                             &rest[value_end..comment],
                             &rest[comment..],
-                            carriage_return,
                             ending
                         )
                     }
@@ -660,14 +829,23 @@ pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> Str
         output.push_str(": '");
         output.push_str(&value.replace('\'', "''"));
         output.push('\'');
-        output.push_str(newline);
+        if !matches!(shape, RootYamlShape::EmptyFlow(_)) || lines.is_empty() {
+            output.push_str(newline);
+        }
     }
-    output
+    let updated = output;
+    let parsed = sw_proto::yaml11::safe_load(&updated).map_err(ConfigError::from)?;
+    if !yaml_values_equal(&parsed, &YValue::Map(expected)) {
+        return Err(ConfigError::Value(
+            "更新後 YAML 與原始 mapping 的差異超出指定根鍵".into(),
+        ));
+    }
+    Ok(updated)
 }
 
 /// 更新 config 指定鍵時保留原始 YAML 文字；`None` 欄位完全不動。
 pub fn save_runtime_config_preserving(
-    ctx: &CliCtx<'_>,
+    ctx: &mut CliCtx<'_>,
     mode: Option<&str>,
     socket_path: Option<&str>,
 ) -> Result<(), ConfigError> {
@@ -682,13 +860,27 @@ pub fn save_runtime_config_preserving(
         Vec::new()
     };
     let mut text = decode_utf8_strict(&bytes)?;
+    let mut updates = Vec::new();
     if let Some(mode) = mode {
-        text = replace_root_yaml_scalar_value(&text, "supervision_mode", mode);
+        updates.push(("supervision_mode", mode));
+        text = replace_root_yaml_scalar_value(&text, "supervision_mode", mode)
+            .map_err(|error| manual_socket_path_hint(ctx, error))?;
     }
     if let Some(socket_path) = socket_path {
-        text = replace_root_yaml_scalar_value(&text, "socket_path", socket_path);
+        updates.push(("socket_path", socket_path));
+        text = replace_root_yaml_scalar_value(&text, "socket_path", socket_path)
+            .map_err(|error| manual_socket_path_hint(ctx, error))?;
     }
-    sw_proto::yaml11::safe_load(&text).map_err(ConfigError::from)?;
+    let original_text = decode_utf8_strict(&bytes)?;
+    let original = sw_proto::yaml11::safe_load(&original_text).map_err(ConfigError::from)?;
+    let expected = map_with_updates(&original, &updates)?;
+    let updated = sw_proto::yaml11::safe_load(&text).map_err(ConfigError::from)?;
+    if !yaml_values_equal(&updated, &YValue::Map(expected)) {
+        return Err(manual_socket_path_hint(
+            ctx,
+            ConfigError::Value("更新後 YAML 的解析結果含有非預期差異".into()),
+        ));
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -702,4 +894,14 @@ pub fn save_runtime_config_preserving(
         .fs
         .write_file(&path, text.as_bytes())
         .map_err(|pal_err| config_os_error(&path_text, pal_err))
+}
+
+fn manual_socket_path_hint(ctx: &mut CliCtx<'_>, error: ConfigError) -> ConfigError {
+    let _ = ctx.io.err_str(
+        "serialwrap: 無法安全更新 config.yaml；請手動設定 socket_path 或 SERIALWRAP_TCP_PORT\n",
+    );
+    ConfigError::Value(format!(
+        "{}；請手動設定 socket_path 或 SERIALWRAP_TCP_PORT",
+        error
+    ))
 }
