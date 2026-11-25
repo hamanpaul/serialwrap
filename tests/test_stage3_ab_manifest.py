@@ -65,8 +65,12 @@ def _runner(revision: str, docker_id: str | None = None):
     return fakes.RecordingRunner(script)
 
 
-def _load(path: Path, *, repo_root: Path | None = None):
-    return ab_manifest.load_manifest(path, repo_root=repo_root or Path(path).parent)
+def _load(
+    path: Path, *, repo_root: Path | None = None, trusted_pair_map: Mapping | None = None,
+):
+    return ab_manifest.load_manifest(
+        path, repo_root=repo_root or Path(path).parent, trusted_pair_map=trusted_pair_map,
+    )
 
 
 def _verify(manifest, repo_root: Path):
@@ -1544,6 +1548,7 @@ def test_windows_l15_mapping_cannot_replace_the_tool_revision_with_self_filled_s
     map_ref = doc["platform_settings"]["case_transport_map"]
     map_path = tmp_path / map_ref["path"]
     revision_bytes = map_path.read_bytes()
+    revision_blobs = _repo_snapshot(tmp_path)
     mapping = json.loads(revision_bytes)
     native_id = next(case_id for case_id, row in mapping["cases"].items() if row["requires_native_com"])
     mapping["cases"][native_id]["requires_native_com"] = False
@@ -1559,16 +1564,7 @@ def test_windows_l15_mapping_cannot_replace_the_tool_revision_with_self_filled_s
     _write_json(path, doc)
 
     manifest = _load(path)
-    runner = _runner(manifest.contract_revision)
-    revision_oid = hashlib.sha1(
-        b"blob " + str(len(revision_bytes)).encode("ascii") + b"\0" + revision_bytes
-    ).hexdigest()
-    current_bytes = map_path.read_bytes()
-    current_oid = hashlib.sha1(
-        b"blob " + str(len(current_bytes)).encode("ascii") + b"\0" + current_bytes
-    ).hexdigest()
-    runner.script["git:rev-parse"] = [{"rc": 0, "stdout": revision_oid, "stderr": ""}]
-    runner.script["git:hash-object"] = [{"rc": 0, "stdout": current_oid, "stderr": ""}]
+    runner = _ToolRevisionRecordingRunner(tmp_path, revision_blobs)
     violations = ab_manifest.verify_frozen(
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
     )
@@ -1692,10 +1688,36 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
                 stdout, rc = self.contract_revision + "\n", 0
             elif "rev-parse" in args and args[-1] == "HEAD":
                 stdout, rc = self.tool_revision + "\n", 0
+            elif "rev-parse" in args and args[-1].endswith("^{commit}"):
+                revision = args[-1][:-len("^{commit}")]
+                stdout, rc = (revision + "\n", 0) if revision == self.tool_revision else ("", 1)
+            elif "rev-parse" in args and args[-1].endswith("^{tree}") and ":" in args[-1]:
+                tree = args[-1].split(":", 1)[1][:-len("^{tree}")]
+                members = [relative for relative in self.blobs if relative.startswith(tree.rstrip("/") + "/")]
+                stdout, rc = (_git_blob_oid("\n".join(sorted(members)).encode("utf-8")) + "\n", 0) if members else ("", 1)
             elif "rev-parse" in args and ":" in args[-1]:
                 relative = args[-1].split(":", 1)[1]
                 data = self.blobs.get(relative)
                 stdout, rc = (_git_blob_oid(data) + "\n", 0) if data is not None else ("", 1)
+            elif "ls-tree" in args:
+                revision = args[args.index("-z") + 1]
+                tree = args[-1].removeprefix(":(literal)").rstrip("/")
+                if revision != self.tool_revision:
+                    stdout, rc = "", 1
+                else:
+                    members = sorted(
+                        relative for relative in self.blobs
+                        if relative.startswith(tree + "/")
+                        and "__pycache__" not in relative.split("/")
+                        and not relative.endswith(".pyc")
+                    )
+                    stdout, rc = ("\0".join(members) + ("\0" if members else ""), 0)
+            elif "ls-files" in args:
+                relative = args[-1].removeprefix(":(literal)")
+                if relative in self.blobs:
+                    stdout, rc = (relative + "\0", 0) if "-z" in args else (relative + "\n", 0)
+                else:
+                    stdout, rc = "", 1
             elif "hash-object" in args:
                 candidate = Path(args[-1])
                 if not candidate.is_absolute():
@@ -2027,6 +2049,249 @@ def test_windows_l15_trusted_pair_map_schema_is_closed_and_validates_synthetic_p
     invalid = copy.deepcopy(value)
     invalid["pairs"]["T3-COM0COM-PAIR"].pop("daemon_port")
     assert list(jsonschema.Draft202012Validator(schema).iter_errors(invalid))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["tools/stage3/__init__.py", "tools/uart_stdio_bridge/bridge.py"],
+    ids=["stage3-module", "uart-bridge-module"],
+)
+def test_tool_revision_rejects_deleted_file_from_frozen_tool_tree(tmp_path, relative):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    revision_blobs = _repo_snapshot(tmp_path)
+    (tmp_path / relative).unlink()
+    tree = "tools/stage3" if relative.startswith("tools/stage3/") else "tools/uart_stdio_bridge"
+    changed_tree = fakes.tree_sha256(tmp_path / tree)
+    manifest = replace(
+        manifest,
+        tools=tuple(
+            replace(item, tree_sha256=changed_tree)
+            if isinstance(item, ab_manifest.FrozenTree) and item.path == tree else item
+            for item in manifest.tools
+        ),
+    )
+    runner = _ToolRevisionRecordingRunner(tmp_path, revision_blobs)
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert f"tool revision tree mismatch: {tree} missing {relative}" in violations
+
+
+def test_tool_revision_rejects_deleted_entire_frozen_tool_tree(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    revision_blobs = _repo_snapshot(tmp_path)
+    import shutil
+
+    shutil.rmtree(tmp_path / "tools/stage3")
+    violations = ab_manifest._tool_revision_frozen_errors(
+        manifest, repo_root=tmp_path, run=_ToolRevisionRecordingRunner(tmp_path, revision_blobs),
+        tool_revision="1" * 40,
+    )
+    assert "tool revision tree mismatch: tools/stage3 missing tree" in violations
+
+
+def test_tool_revision_rejects_deleted_contract_tree_file(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    extra = tmp_path / "contracts" / "extra-versioned-input.yaml"
+    extra.write_text("schema: frozen\n", encoding="utf-8")
+    revision_blobs = _repo_snapshot(tmp_path)
+    relative = "contracts/extra-versioned-input.yaml"
+    (tmp_path / relative).unlink()
+    violations = ab_manifest._tool_revision_frozen_errors(
+        manifest, repo_root=tmp_path, run=_ToolRevisionRecordingRunner(tmp_path, revision_blobs),
+        tool_revision="1" * 40,
+    )
+    assert f"tool revision tree mismatch: contracts missing {relative}" in violations
+
+
+def test_tool_revision_rejects_extra_file_in_frozen_tool_tree(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    revision_blobs = _repo_snapshot(tmp_path)
+    relative = "tools/stage3/unreviewed-extra.py"
+    (tmp_path / relative).write_text("# extra\n", encoding="utf-8")
+    violations = ab_manifest._tool_revision_frozen_errors(
+        manifest, repo_root=tmp_path, run=_ToolRevisionRecordingRunner(tmp_path, revision_blobs),
+        tool_revision="1" * 40,
+    )
+    assert f"tool revision tree mismatch: tools/stage3 extra {relative}" in violations
+
+
+def test_tool_revision_accepts_complete_frozen_trees(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    assert ab_manifest._tool_revision_frozen_errors(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+    ) == []
+
+
+@pytest.mark.parametrize("path_kind", ["absolute", "relative-escape"], ids=["absolute-outside", "relative-escape"])
+def test_windows_l15_mapping_outside_repo_is_rejected_even_with_refreshed_hashes(tmp_path, path_kind):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    ref = doc["platform_settings"]["case_transport_map"]
+    original_path = tmp_path / ref["path"]
+    outside = tmp_path.parent / f"{tmp_path.name}-external-map.json"
+    outside.write_bytes(original_path.read_bytes())
+    map_value = str(outside) if path_kind == "absolute" else f"../{outside.name}"
+    ref["path"] = map_value
+    ref["sha256"] = fakes.sha256_file(outside)
+    tool = next(item for item in doc["tools"] if item["path"] == "tests/acceptance/windows_l15_case_transport_map.json")
+    tool["path"] = map_value
+    tool["sha256"] = ref["sha256"]
+    _write_json(path, doc)
+    trusted = _synthetic_trusted_pair_map(tmp_path)
+    try:
+        manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    except HarnessError as exc:
+        assert "case transport map" in exc.detail and "repo" in exc.detail
+        return
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+        trusted_pair_map=trusted,
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert any("case transport map" in item and "repo" in item for item in violations)
+
+
+def test_windows_l15_mapping_content_cannot_be_self_hashed_outside_repo(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    ref = doc["platform_settings"]["case_transport_map"]
+    original_path = tmp_path / ref["path"]
+    outside = tmp_path.parent / f"{tmp_path.name}-mutated-map.json"
+    changed = _read_json(original_path)
+    non_native_case = next(case_id for case_id, row in changed["cases"].items()
+                           if not row["requires_native_com"])
+    changed["cases"][non_native_case]["allowed_transports"].append("pty")
+    _write_json(outside, changed)
+    ref["path"] = str(outside)
+    ref["sha256"] = fakes.sha256_file(outside)
+    tool = next(item for item in doc["tools"] if item["path"] == "tests/acceptance/windows_l15_case_transport_map.json")
+    tool["path"] = str(outside)
+    tool["sha256"] = ref["sha256"]
+    _write_json(path, doc)
+    trusted = _synthetic_trusted_pair_map(tmp_path)
+    try:
+        manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    except HarnessError as exc:
+        assert "case transport map" in exc.detail and "repo" in exc.detail
+        return
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path,
+        run=_ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path)),
+        tool_revision="1" * 40, trusted_pair_map=trusted,
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert any("case transport map" in item and "repo" in item for item in violations)
+
+
+def test_windows_l15_mapping_inside_repo_is_version_controlled(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    trusted = _synthetic_trusted_pair_map(tmp_path)
+    manifest = _load(path, trusted_pair_map=trusted)
+    assert ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path,
+        run=_ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path)),
+        tool_revision="1" * 40, trusted_pair_map=trusted,
+        source_reader=_trusted_source_reader(tmp_path),
+    ) == []
+
+
+@pytest.mark.parametrize("defect", ["same", "casefold-alias", "device-path-alias", "duplicate-id"],
+                         ids=["same-port", "case-insensitive-port", "device-path-alias", "duplicate-port-id"])
+def test_windows_l15_trusted_pair_requires_distinct_endpoint_names_and_ids(tmp_path, defect):
+    path = _windows_l15_transport_fixture(tmp_path)
+    trusted = _synthetic_trusted_pair_map(tmp_path)
+    pair_id = trusted["selected_pair_id"]
+    pair = trusted["pairs"][pair_id]
+    doc = _read_json(path)
+    if defect == "same":
+        pair["daemon_port"] = pair["dut_port"]
+        manifest_ports = ("COM20", "COM20")
+    elif defect == "casefold-alias":
+        pair["daemon_port"] = "com20"
+        manifest_ports = ("COM20", "com20")
+    elif defect == "device-path-alias":
+        pair["daemon_port"] = "\\\\.\\com20"
+        manifest_ports = ("COM20", "\\\\.\\com20")
+    else:
+        pair["daemon_side_port_id"] = pair["dut_side_port_id"]
+        map_ref = doc["platform_settings"]["case_transport_map"]
+        map_path = tmp_path / map_ref["path"]
+        mapping = _read_json(map_path)
+        mapping["approved_pairs"][pair_id]["daemon_side_port_id"] = pair["dut_side_port_id"]
+        _write_json(map_path, mapping)
+        digest = fakes.sha256_file(map_path)
+        map_ref["sha256"] = digest
+        next(item for item in doc["tools"] if item["path"] == map_ref["path"])["sha256"] = digest
+        manifest_ports = ("COM20", "COM21")
+    doc["dut"]["com_pair"] = {"bridge_side": manifest_ports[0], "daemon_side": manifest_ports[1]}
+    doc["test_device_allowlist"] = list(manifest_ports)
+    _write_json(path, doc)
+    with pytest.raises(HarnessError) as caught:
+        ab_manifest.load_manifest(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+def test_trusted_pair_schema_documents_loader_distinctness_validation():
+    schema_path = Path(__file__).resolve().parent / "acceptance" / "stage3_trusted_pair_map.schema.json"
+    schema = _read_json(schema_path)
+    description = schema["$defs"]["TrustedPair"].get("description", "")
+    assert "loader" in description.casefold()
+    assert "不重複" in description
+
+
+def test_verify_bundle_reports_component_with_sha256_but_no_path(tmp_path):
+    violations = ab_manifest.verify_bundle(
+        tmp_path,
+        {"components": {"cli": {"sha256": "a" * 64}}},
+        label="side A",
+    )
+    assert "release component identity invalid: side A cli" in violations
+
+
+def test_verify_bundle_reports_component_with_path_but_no_sha256(tmp_path):
+    violations = ab_manifest.verify_bundle(
+        tmp_path,
+        {"components": {"cli": {"path": "bin/cli"}}},
+        label="side A",
+    )
+    assert "release component identity invalid: side A cli" in violations
+
+
+def test_verify_bundle_ignores_valid_digest_only_named_assets(tmp_path):
+    doc = {"components": {"assets": {
+        "skill_sha256": "a" * 64,
+        "skill_windows_sha256": "b" * 64,
+        "profiles_sha256": "c" * 64,
+    }}}
+    assert ab_manifest.verify_bundle(tmp_path, doc, label="side A") == []
+
+
+def test_verify_bundle_rechecks_complete_component_file_identity(tmp_path):
+    component = tmp_path / "bin" / "serialwrap"
+    component.parent.mkdir()
+    component.write_bytes(b"release component\n")
+    doc = {"components": {"cli": {
+        "path": "bin/serialwrap",
+        "sha256": fakes.sha256_file(component),
+    }}}
+    assert ab_manifest.verify_bundle(tmp_path, doc, label="side A") == []
+
+
+def test_stage3_t3_changelog_has_only_current_optional_base_behavior():
+    repo = Path(__file__).resolve().parents[1]
+    assert not (repo / "changelog.d" / "stage3-t3-ab-manifest-r1.md").exists()
+    fragment = (repo / "changelog.d" / "rust-p9-03-ab-manifest.md").read_text(encoding="utf-8")
+    assert "`base_revision` 是選用" in fragment
+    assert "要求可信 base revision" not in fragment
 
 
 @pytest.mark.parametrize(

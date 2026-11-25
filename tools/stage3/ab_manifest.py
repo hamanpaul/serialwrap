@@ -841,12 +841,41 @@ def _read_transport_map(path: Path) -> Mapping[str, Any]:
         if any(not isinstance(item.get(key), str) or not item[key]
                for key in ("dut_side_port_id", "daemon_side_port_id", "decision_ref")):
             raise _invalid(f"case transport map approved_pairs.{pair_id} is incomplete")
+        if item["dut_side_port_id"] == item["daemon_side_port_id"]:
+            raise _invalid(f"case transport map approved_pairs.{pair_id} endpoints must be distinct")
     for port_id, substitute in root["physical_substitutes"].items():
         item = _closed_object(substitute, {"platform", "decision_ref"}, set(),
                               f"case transport map physical_substitutes.{port_id}")
         if item.get("platform") != "windows" or not isinstance(item.get("decision_ref"), str) or not item["decision_ref"]:
             raise _invalid(f"case transport map physical_substitutes.{port_id} is invalid")
     return root
+
+
+def _windows_com_identity(value: str) -> str:
+    """以 Windows COM 名稱的大小寫不敏感身分比對，並摺疊 Win32 裝置路徑前綴。"""
+    candidate = value.strip().replace("/", "\\")
+    prefix = "\\\\.\\"
+    if candidate.startswith(prefix):
+        candidate = candidate[len(prefix):]
+    return candidate.casefold()
+
+
+def _com_pair_allowlist_matches(manifest: AbManifest, actual_pair: Mapping[str, str]) -> bool:
+    ports = (actual_pair.get("bridge_side"), actual_pair.get("daemon_side"))
+    if any(not isinstance(port, str) or not port for port in ports):
+        return False
+    identities = tuple(_windows_com_identity(port) for port in ports)
+    allowlist = manifest.test_device_allowlist
+    if any(not isinstance(port, str) or not port for port in allowlist):
+        return False
+    allowlist_identities = tuple(_windows_com_identity(port) for port in allowlist)
+    return (
+        len(identities) == 2
+        and len(set(identities)) == 2
+        and len(allowlist) == 2
+        and len(set(allowlist_identities)) == 2
+        and set(allowlist_identities) == set(identities)
+    )
 
 
 def _trusted_pair_map(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -864,6 +893,9 @@ def _trusted_pair_map(value: Mapping[str, Any]) -> Mapping[str, Any]:
         pair = _closed_object(pair_value, _TRUSTED_PAIR_FIELDS, set(), f"trusted_pair_map.pairs.{pair_id}")
         if any(not isinstance(pair.get(key), str) or not pair[key] for key in _TRUSTED_PAIR_FIELDS):
             raise _invalid(f"trusted_pair_map.pairs.{pair_id} is incomplete")
+        if (_windows_com_identity(pair["dut_port"]) == _windows_com_identity(pair["daemon_port"])
+                or pair["dut_side_port_id"] == pair["daemon_side_port_id"]):
+            raise _invalid(f"trusted_pair_map.pairs.{pair_id} endpoints must be distinct")
     if selected_pair_id not in pairs:
         raise _invalid("trusted_pair_map selected_pair_id is missing from pairs")
     return root
@@ -887,6 +919,8 @@ def _validate_windows_l15_transport(
     map_file = _frozen(dict(map_value), "platform_settings.case_transport_map")
     if not isinstance(map_file, FrozenFile):
         raise _invalid("case_transport_map must be a frozen file")
+    if _repo_relative_path(repo_root, map_file.path) is None:
+        raise _invalid("case transport map must resolve to a regular path inside repo_root")
     matching_tools = [item for item in manifest.tools if item.path == map_file.path and isinstance(item, FrozenFile)]
     if len(matching_tools) != 1:
         raise _invalid("case_transport_map must appear exactly once in frozen tools")
@@ -935,6 +969,21 @@ def _validate_windows_l15_transport(
         ):
             if trusted_pair.get(trusted_key) != declared_pair.get(declared_key):
                 raise _invalid("trusted_pair_map selected pair differs from frozen approval")
+    trusted_ports = None
+    if trusted_pair is not None:
+        trusted_ports = (_windows_com_identity(trusted_pair["dut_port"]),
+                         _windows_com_identity(trusted_pair["daemon_port"]))
+        if trusted_ports[0] == trusted_ports[1]:
+            raise _invalid("trusted_pair_map endpoints must be distinct Windows COM ports")
+    if manifest.dut.transport == "com0com-pair":
+        actual_pair = manifest.dut.com_pair
+        if (not isinstance(actual_pair, Mapping)
+                or not _com_pair_allowlist_matches(manifest, actual_pair)):
+            raise _invalid("dut.com_pair and test_device_allowlist must contain exactly two distinct COM endpoints")
+        if (trusted_ports is not None
+                and (_windows_com_identity(actual_pair.get("bridge_side", "")) != trusted_ports[0]
+                     or _windows_com_identity(actual_pair.get("daemon_side", "")) != trusted_ports[1])):
+            raise _invalid("dut.com_pair endpoints do not match trusted_pair_map")
 
     for case_id in sorted(required_ids):
         row = cases[case_id]
@@ -966,7 +1015,7 @@ def _validate_windows_l15_transport(
             actual_pair = manifest.dut.com_pair
             if (manifest.dut.transport != "com0com-pair" or manifest.dut.com_pair is None
                     or any(not isinstance(value, str) or not value for value in actual_pair.values())
-                    or set(manifest.test_device_allowlist) != set(actual_pair.values())):
+                    or not _com_pair_allowlist_matches(manifest, actual_pair)):
                 raise _invalid(f"native COM case {case_id} does not match the approved pair")
             if port_id != pair["dut_side_port_id"]:
                 raise _invalid(f"native COM case {case_id} port_id does not match approved DUT endpoint")
@@ -979,11 +1028,9 @@ def _validate_windows_l15_transport(
                     raise _invalid(f"native COM case {case_id} uses a pair other than the trusted selected pair")
                 actual_pair = manifest.dut.com_pair
                 if (not isinstance(actual_pair, Mapping)
-                        or actual_pair.get("bridge_side") != trusted_pair["dut_port"]
-                        or actual_pair.get("daemon_side") != trusted_pair["daemon_port"]
-                        or set(manifest.test_device_allowlist) != {
-                            trusted_pair["dut_port"], trusted_pair["daemon_port"],
-                        }):
+                        or _windows_com_identity(actual_pair.get("bridge_side", "")) != trusted_ports[0]
+                        or _windows_com_identity(actual_pair.get("daemon_side", "")) != trusted_ports[1]
+                        or not _com_pair_allowlist_matches(manifest, actual_pair)):
                     raise _invalid("dut.com_pair and test_device_allowlist do not match trusted_pair_map")
                 if (port_id != trusted_pair["dut_side_port_id"]
                         or decision_ref != trusted_pair["decision_ref"]
@@ -1170,6 +1217,7 @@ def runtime_digest(manifest_doc: Mapping[str, Any]) -> str:
 
 
 def _declared_files(value: Any, path: tuple[str, ...] = ()) -> list[tuple[str, Mapping[str, Any]]]:
+    """列出形狀像檔案宣告的元件；只含具名 digest 的 assets 字串不會成為檔案。"""
     found: list[tuple[str, Mapping[str, Any]]] = []
     if isinstance(value, Mapping):
         if "path" in value or "sha256" in value:
@@ -1188,7 +1236,7 @@ def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: s
     components = _components(manifest_doc)
     violations: list[str] = []
     for component, obj in _declared_files(components):
-        raw_path = obj["path"]
+        raw_path = obj.get("path")
         digest = obj.get("sha256")
         if (not isinstance(raw_path, str) or not raw_path
                 or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
@@ -1380,11 +1428,21 @@ def verify_case_coverage(
 
 
 def _repo_relative_path(root: Path, value: str) -> str | None:
-    """將 repo 內路徑轉成不跟隨 symlink 的 POSIX 相對路徑。"""
+    """將真正位於 repo 內的 POSIX manifest 路徑轉成相對路徑。"""
+    if not isinstance(value, str) or not value or "\\" in value:
+        return None
+    windows_path = PureWindowsPath(value)
+    if windows_path.is_absolute() and not Path(value).is_absolute():
+        return None
+    path_parts = value.split("/")
+    if any(part in (".", "..") for part in path_parts):
+        return None
     candidate = _path(root, value)
     try:
+        root_absolute = Path(os.path.abspath(root))
         absolute = Path(os.path.abspath(candidate))
-        relative = absolute.relative_to(Path(os.path.abspath(root)))
+        relative = absolute.relative_to(root_absolute)
+        absolute.resolve().relative_to(root_absolute.resolve())
     except (OSError, ValueError):
         return None
     pure = PurePosixPath(relative.as_posix())
@@ -1393,48 +1451,67 @@ def _repo_relative_path(root: Path, value: str) -> str | None:
     return pure.as_posix()
 
 
-def _frozen_repo_paths(m: AbManifest, repo_root: Path) -> tuple[set[str], set[str], set[str]]:
-    """列出 repo 內必須由 tool_revision 收錄的來源，以及可選的已追蹤凍結檔。"""
+def _frozen_repo_paths(
+    m: AbManifest, repo_root: Path,
+) -> tuple[set[str], set[str], set[str], list[str]]:
+    """分類版本受控檔、版本受控樹與可由 SHA 凍結的執行產物。"""
     files: set[str] = set()
     trees: set[str] = set()
-    optional_files: set[str] = set()
+    execution_files: set[str] = set()
+    path_errors: list[str] = []
 
-    def add_file(item: FrozenFile | None, *, optional: bool = False) -> None:
+    def add_required_file(item: FrozenFile | None, label: str) -> None:
         if item is None:
             return
         relative = _repo_relative_path(repo_root, item.path)
-        if relative is not None:
-            (optional_files if optional else files).add(relative)
+        if relative is None:
+            path_errors.append(f"tool revision path outside repo: {label} {item.path}")
+            return
+        files.add(relative)
 
-    def add_tree(item: FrozenTree) -> None:
+    def add_execution_file(item: FrozenFile | None) -> None:
+        if item is None:
+            return
         relative = _repo_relative_path(repo_root, item.path)
+        if relative is None:
+            try:
+                resolved = _path(repo_root, item.path).resolve()
+                relative = resolved.relative_to(Path(repo_root).resolve()).as_posix()
+            except (OSError, ValueError):
+                relative = None
         if relative is not None:
-            trees.add(relative)
+            execution_files.add(relative)
 
-    add_file(m.case_list)
-    add_file(m.case_lock)
-    add_file(m.candidate_context, optional=True)
-    add_file(m.required_cases_lock)
-    add_file(m.allowed_differences, optional=True)
-    add_file(m.acceptance, optional=True)
+    def add_tree(item: FrozenTree, label: str) -> None:
+        relative = _repo_relative_path(repo_root, item.path)
+        if relative is None:
+            path_errors.append(f"tool revision path outside repo: {label} {item.path}")
+            return
+        trees.add(relative)
+
+    add_required_file(m.case_list, "case_list")
+    add_required_file(m.case_lock, "case_lock")
+    add_execution_file(FrozenFile(str(m.source_path), m.source_sha256))
+    add_execution_file(m.candidate_context)
+    add_required_file(m.required_cases_lock, "required_cases_lock")
+    add_required_file(m.allowed_differences, "allowed_differences")
+    add_required_file(m.acceptance, "acceptance")
     for item in m.profile_files:
-        add_file(item, optional=True)
+        add_required_file(item, "profile")
     for item in (m.suite.selftest_report, m.suite.testbed_template, m.suite.realhw_config_template):
-        add_file(item, optional=True)
+        add_execution_file(item)
     for item in m.tools:
         if isinstance(item, FrozenFile):
-            add_file(item)
+            add_required_file(item, "tool")
         else:
-            add_tree(item)
+            add_tree(item, "tool tree")
     for side in m.sides:
-        add_file(side.release_manifest, optional=True)
+        add_execution_file(side.release_manifest)
         for _component, component_ref in _declared_files(_components(side.manifest_doc)):
             raw_path = component_ref.get("path")
             if isinstance(raw_path, str):
                 absolute = side.bundle_dir.joinpath(*PurePosixPath(raw_path).parts)
-                relative = _repo_relative_path(repo_root, str(absolute))
-                if relative is not None:
-                    optional_files.add(relative)
+                add_execution_file(FrozenFile(str(absolute), "0" * 64))
 
     if m.stage == "3":
         for relative in (
@@ -1442,7 +1519,10 @@ def _frozen_repo_paths(m: AbManifest, repo_root: Path) -> tuple[set[str], set[st
             "tests/acceptance/stage3_required_cases.schema.json",
             "docs/rust-refactor/evidence/denominators/source-manifest.json",
         ):
-            files.add(relative)
+            if _repo_relative_path(repo_root, relative) is None:
+                path_errors.append(f"tool revision path outside repo: Stage 3 input {relative}")
+            else:
+                files.add(relative)
         # contract_revision 凍結整個 contracts tree；tool_revision 必須同時錨定其原始檔位元組。
         trees.add("contracts")
         source_manifest = repo_root / "docs/rust-refactor/evidence/denominators/source-manifest.json"
@@ -1459,137 +1539,203 @@ def _frozen_repo_paths(m: AbManifest, repo_root: Path) -> tuple[set[str], set[st
                 attachment = source.get("attachment")
                 if isinstance(attachment, str):
                     relative = _repo_relative_path(repo_root, f"{evidence_root}/{attachment}")
-                    if relative is not None:
+                    if relative is None:
+                        path_errors.append(f"tool revision path outside repo: seed attachment {attachment}")
+                    else:
                         files.add(relative)
 
     map_ref = m.platform_settings.get("case_transport_map")
     if isinstance(map_ref, Mapping) and isinstance(map_ref.get("path"), str):
-        relative = _repo_relative_path(repo_root, map_ref["path"])
-        if relative is not None:
-            files.add(relative)
+        add_required_file(_frozen(dict(map_ref), "platform_settings.case_transport_map"), "case transport map")
 
-    # 再現 tree digest 同一範圍：排除 __pycache__ 與 *.pyc，其餘工作樹檔案都必須在版本中有同 bytes blob。
-    for tree in sorted(trees):
-        root = repo_root.joinpath(*PurePosixPath(tree).parts)
-        try:
-            if not stat.S_ISDIR(root.lstat().st_mode):
-                continue
-        except OSError:
-            continue
-        for current, dirs, names in os.walk(root, topdown=True, followlinks=False):
-            current_path = Path(current)
-            dirs[:] = [name for name in dirs if name != "__pycache__" and not (current_path / name).is_symlink()]
-            for name in names:
-                path = current_path / name
-                if path.suffix == ".pyc" or path.is_symlink() or not path.is_file():
-                    continue
-                relative = _repo_relative_path(repo_root, str(path))
-                if relative is not None:
-                    files.add(relative)
-    optional_files -= files
-    return files, trees, optional_files
+    execution_files -= files
+    return files, trees, execution_files, path_errors
 
 
 def _tool_revision_for_checks(repo_root: Path, run: Runner, tool_revision: str | None) -> str | None:
     revision = tool_revision
     if revision is None:
-        result = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"])
+        try:
+            result = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"])
+        except OSError:
+            return None
         if result.rc != 0 or result.timed_out:
             return None
         revision = result.stdout.strip()
-    return revision if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision) else None
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return None
+    try:
+        result = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"])
+    except OSError:
+        return None
+    if result.rc != 0 or result.timed_out or result.stdout.strip() != revision:
+        return None
+    return revision
 
 
-def _tool_revision_path_errors(
-    *, repo_root: Path, relative: str, revision: str, run: Runner, map_path: str | None = None,
-    optional_if_untracked: bool = False,
+def _tool_revision_input_errors(
+    *, repo_root: Path, relative: str, revision: str, run: Runner,
+    map_path: str | None = None, execution_artifact: bool = False,
 ) -> list[str]:
+    """以唯一的原始 blob 比對入口核對單檔版本輸入或執行產物。"""
     path = repo_root.joinpath(*PurePosixPath(relative).parts)
     prefix = "case transport map tool revision" if relative == map_path else "tool revision"
+    tracked_in_index = True
+    if execution_artifact:
+        try:
+            tracked = run([
+                "git", "-C", str(repo_root), "ls-files", "--error-unmatch", "-z", "--", f":(literal){relative}",
+            ])
+        except OSError:
+            return [f"tool revision unavailable: {relative}"]
+        if tracked.timed_out:
+            return [f"tool revision unavailable: {relative}"]
+        if tracked.rc == 0:
+            tracked_in_index = True
+        elif tracked.rc == 1 and not tracked.stdout:
+            tracked_in_index = False
+        else:
+            return [f"tool revision unavailable: {relative}"]
     try:
         mode = path.lstat().st_mode
     except OSError:
+        # 獨立 SHA 檢查會回報缺失的執行產物；若版本中或 index 中有此路徑，仍在此 fail closed。
+        if execution_artifact and not tracked_in_index:
+            try:
+                expected = run([
+                    "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}:{relative}",
+                ])
+            except OSError:
+                return [f"tool revision unavailable: {relative}"]
+            if expected.rc == 1 and not expected.stdout and not expected.timed_out:
+                return []
+            return [f"tool revision mismatch: {relative}"]
         return [f"{prefix} mismatch: {relative}"]
     if not stat.S_ISREG(mode):
         return [f"{prefix} mismatch: {relative}"]
     try:
-        expected = run(["git", "-C", str(repo_root), "rev-parse", "--verify", f"{revision}:{relative}"])
+        expected = run([
+            "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}:{relative}",
+        ])
+    except OSError:
+        return [f"{prefix} unavailable: {relative}"]
+    if expected.timed_out:
+        return [f"{prefix} unavailable: {relative}"]
+    expected_oid = expected.stdout.strip()
+    if expected.rc == 1 and not expected_oid:
+        if execution_artifact and not tracked_in_index:
+            return []
+        return [f"{prefix} mismatch: {relative}"]
+    if expected.rc != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", expected_oid):
+        return [f"{prefix} unavailable: {relative}"]
+    try:
         actual = run(["git", "-C", str(repo_root), "hash-object", "--no-filters", "--", str(path)])
     except OSError:
         return [f"{prefix} unavailable: {relative}"]
-    if expected.timed_out or actual.timed_out:
+    if actual.timed_out:
         return [f"{prefix} unavailable: {relative}"]
-    expected_oid = expected.stdout.strip()
     actual_oid = actual.stdout.strip()
-    if expected.rc != 0 and optional_if_untracked:
-        return []
-    if (expected.rc != 0 or actual.rc != 0
-            or not re.fullmatch(r"[0-9a-f]{40,64}", expected_oid)
-            or not re.fullmatch(r"[0-9a-f]{40,64}", actual_oid)):
+    if actual.rc != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", actual_oid):
         return [f"{prefix} mismatch: {relative}"]
     if expected_oid != actual_oid:
         return [f"{prefix} mismatch: {relative}"]
     return []
 
 
+def _tool_revision_tree_errors(
+    *, repo_root: Path, tree: str, revision: str, run: Runner,
+) -> list[str]:
+    """以完整 revision 成員集合和工作樹雙向比較，再逐檔比原始 blob。"""
+    root = repo_root.joinpath(*PurePosixPath(tree).parts)
+    prefix = f"tool revision tree mismatch: {tree}"
+    try:
+        mode = root.lstat().st_mode
+    except OSError:
+        return [f"{prefix} missing tree"]
+    if not stat.S_ISDIR(mode):
+        return [f"{prefix} non-directory tree"]
+    try:
+        tree_oid = run([
+            "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}:{tree}^{{tree}}",
+        ])
+        listed = run([
+            "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
+            "--", f":(literal){tree}",
+        ])
+    except OSError:
+        return [f"tool revision unavailable: {tree}"]
+    if (tree_oid.rc != 0 or tree_oid.timed_out or not tree_oid.stdout.strip()
+            or listed.rc != 0 or listed.timed_out):
+        return [f"tool revision unavailable: {tree}"]
+    revision_members = {
+        item for item in listed.stdout.split("\0")
+        if item and "__pycache__" not in PurePosixPath(item).parts and not item.endswith(".pyc")
+    }
+
+    working_members: set[str] = set()
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for current, dirs, names in os.walk(root, topdown=True, followlinks=False, onerror=raise_walk_error):
+            current_path = Path(current)
+            for name in list(dirs):
+                directory = current_path / name
+                if not stat.S_ISDIR(directory.lstat().st_mode):
+                    return [f"{prefix} non-regular file: {directory.relative_to(repo_root).as_posix()}"]
+                if name == "__pycache__":
+                    dirs.remove(name)
+            for name in names:
+                path = current_path / name
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    return [f"{prefix} non-regular file: {path.relative_to(repo_root).as_posix()}"]
+                if path.suffix == ".pyc":
+                    continue
+                working_members.add(path.relative_to(repo_root).as_posix())
+    except OSError:
+        return [f"{prefix} unreadable tree"]
+
+    missing = sorted(revision_members - working_members)
+    extra = sorted(working_members - revision_members)
+    violations = [f"{prefix} missing {relative}" for relative in missing]
+    violations.extend(f"{prefix} extra {relative}" for relative in extra)
+    for relative in sorted(revision_members & working_members):
+        violations.extend(_tool_revision_input_errors(
+            repo_root=repo_root, relative=relative, revision=revision, run=run,
+        ))
+    return violations
+
+
 def _tool_revision_frozen_errors(
     m: AbManifest, *, repo_root: Path, run: Runner, tool_revision: str | None,
 ) -> list[str]:
-    """以 tool_revision 唯一錨定所有 repo 凍結輸入的原始 Git blob 位元組。
-
-    tool_revision 預設取執行時 HEAD，Task 6 可固定傳入；case 清單、分母鎖、出口目錄、seed
-    附件、Windows 映射及 tools 內 FrozenFile／FrozenTree 都逐檔比對 revision blob。T1 CI
-    `--base` 治理該 revision 的只增歷史；T3 不另造歷史錨點。工作樹自填 SHA 不能改寫此信任鏈。
-    """
+    """以同一輸入比較器錨定檔案、完整樹與明確豁免的執行產物。"""
     revision = _tool_revision_for_checks(repo_root, run, tool_revision)
     if revision is None:
         return ["tool revision unavailable"]
-    files, _trees, optional_files = _frozen_repo_paths(m, repo_root)
+    files, trees, execution_files, path_errors = _frozen_repo_paths(m, repo_root)
     map_ref = m.platform_settings.get("case_transport_map")
     map_path = None
     if isinstance(map_ref, Mapping) and isinstance(map_ref.get("path"), str):
         map_path = _repo_relative_path(repo_root, map_ref["path"])
-    violations: list[str] = []
+    violations: list[str] = list(path_errors)
     for relative in sorted(files):
-        violations.extend(_tool_revision_path_errors(
+        violations.extend(_tool_revision_input_errors(
             repo_root=repo_root, relative=relative, revision=revision, run=run, map_path=map_path,
         ))
-    for relative in sorted(optional_files):
-        violations.extend(_tool_revision_path_errors(
+    for tree in sorted(trees):
+        violations.extend(_tool_revision_tree_errors(repo_root=repo_root, tree=tree, revision=revision, run=run))
+    for relative in sorted(execution_files):
+        violations.extend(_tool_revision_input_errors(
             repo_root=repo_root,
             relative=relative,
             revision=revision,
             run=run,
             map_path=map_path,
-            optional_if_untracked=True,
+            execution_artifact=True,
         ))
     return violations
-
-
-def _tool_revision_map_errors(
-    m: AbManifest, *, repo_root: Path, run: Runner, tool_revision: str | None,
-) -> list[str]:
-    """以 no-filters Git blob 身分核對 Windows L1.5 映射的原始 bytes。"""
-    if m.exit_item_id != "S3-L15-RELEASE-AB-WINDOWS":
-        return []
-    value = m.platform_settings.get("case_transport_map")
-    if not isinstance(value, Mapping):
-        return ["case transport map tool revision unavailable: missing map reference"]
-    try:
-        map_file = _frozen(dict(value), "platform_settings.case_transport_map")
-    except HarnessError:
-        return ["case transport map tool revision unavailable: invalid map reference"]
-    if not isinstance(map_file, FrozenFile):
-        return ["case transport map tool revision unavailable: map is not a file"]
-    relative = _repo_relative_path(repo_root, map_file.path)
-    if relative is None:
-        return [f"case transport map tool revision mismatch: {map_file.path}"]
-    revision = _tool_revision_for_checks(repo_root, run, tool_revision)
-    if revision is None:
-        return [f"case transport map tool revision unavailable: {map_file.path}"]
-    return _tool_revision_path_errors(
-        repo_root=repo_root, relative=relative, revision=revision, run=run, map_path=relative,
-    )
 
 
 def verify_frozen(
@@ -1599,14 +1745,31 @@ def verify_frozen(
 ) -> list[str]:
     """重算凍結輸入、bundle 元件及案例涵蓋。
 
-    ``tool_revision`` 是唯一可信版本錨點；省略時由 Git 讀取執行時 HEAD，Task 6 可傳固定 SHA。
-    所有位於 repo 內的凍結檔與樹成員都以 `git hash-object --no-filters` 的工作樹原始 blob
-    身分，逐一比對該 revision 同路徑的 blob。T1 CI `--base` 為已提交 revision 提供只增治理；
-    ``base_revision`` 在此僅為呼叫端提供時的額外檢查，不是 Stage 3 的必填參數。
+    凍結輸入分類（plan 10 Task 3；Stage 3 另依 §0.4）：
+
+    | 輸入 | 類別與依據 | 路徑規則 | 比對方式／測試 |
+    |---|---|---|---|
+    | case_list、case_lock | 版本受控；Task 3 案例涵蓋 | 固定為 canonical repo 路徑 | 同路徑原始 blob；`test_tool_revision_rejects_self_hashed_canonical_case_attribute_changes` |
+    | required_cases_lock、required_case_set、case_ids、seed | 版本受控；Task 3、R4-01 | 鎖與 seed 附件只能位於 repo_root | 同路徑 blob；case_ids／family／seed 與鎖交叉綁定 |
+    | stage_exits、Stage 3 lock schema、seed source-manifest／附件 | 版本受控；Task 3、R4-01 | repo 內相對路徑，不得逃出 repo_root | 同路徑原始 blob；`test_tool_revision_rejects_deleted_contract_tree_file` |
+    | Windows L1.5 case_transport_map | 版本受控；R12-01、§0.4 | 必須是 repo_root 內的 regular-file 路徑 | 同路徑原始 blob；`test_windows_l15_mapping_outside_repo_is_rejected_even_with_refreshed_hashes` |
+    | tools FrozenFile／FrozenTree、contracts 樹 | 版本受控；Task 3、§0.4 | repo 內路徑，不接受外部或逃逸路徑 | 單檔 blob；樹完整集合雙向比較後逐檔比 bytes；`test_tool_revision_rejects_deleted_file_from_frozen_tool_tree` |
+    | allowed_differences、acceptance、profile_files 與其他 repo 內已追蹤輸入 | 版本受控；Task 3 凍結宣告 | repo 內路徑 | 同路徑原始 blob |
+    | manifest source bytes、candidate_context、sidecar／bundle、suite selftest／testbed／realhw 樣板 | 執行產物；Task 3、§0.4 | 可在 repo 外；repo 內執行產物要查 Git index | 載入 SHA 與 manifest／side 交叉綁定；`test_tool_revision_rejects_staged_new_file_used_as_frozen_selftest_report` |
+    | Docker image name／digest | 執行產物；Task 3 DUT 驗證 | 不使用 repo 檔案路徑 | 以 image inspect 比對核准 digest |
+
+    ``tool_revision`` 是唯一可信版本錨點；省略時由 Git 讀取執行時 HEAD，Task 6 可固定傳入。
+    單檔使用 ``git hash-object --no-filters`` 比較工作樹 bytes 和同路徑 revision blob；樹使用相同
+    排除規則比對 revision 與工作樹的完整成員集合，再逐檔比 bytes。執行產物只有在 ``git ls-files
+    --error-unmatch`` 明確確認不在 index、且指定 revision 也沒有該路徑時才豁免；Git 查詢失敗一律拒絕。
+    T1 CI `--base` 治理該 revision 的只增歷史；``base_revision`` 僅為呼叫端提供時的額外檢查。
+
+    `trusted_pair_map` 是呼叫端注入的執行期權威對照，不是 repo 凍結檔；它經結構驗證後與公開映射、manifest pair、逐案 ID 及 allowlist 交叉綁定。
 
     `S3-L15-RELEASE-AB-WINDOWS` 必須由呼叫端另注入非公開可信 COM 對照；缺少時固定回報
-    `trusted pair map missing: BLOCKED-OWNER BO-P9-01`。對照由編排者在 T5B 依原生 COM 盤點建立，
-    實際埠名只存非公開位置；公開證據只放去識別 ID 與對照 SHA-256。T3 只用合成資料測試。
+    `trusted pair map missing: BLOCKED-OWNER BO-P9-01`。兩端 COM 名稱以大小寫不敏感規則比較，並摺疊
+    Win32 裝置命名空間前綴後再比對；去識別 ID 必須不同，allowlist 恰含兩端。實際埠名只存非公開位置，
+    公開證據只放去識別 ID 與對照 SHA-256。T3 只用合成資料測試。
     """
     root = Path(repo_root).resolve()
     if root != m.repo_root:
@@ -1692,8 +1855,11 @@ def verify_frozen(
             m, root, base_revision=base_revision, source_reader=source_reader,
         ))
 
-    result = run(["git", "-C", str(root), "rev-parse", "HEAD:contracts"])
-    if result.rc != 0 or result.timed_out:
+    try:
+        result = run(["git", "-C", str(root), "rev-parse", "HEAD:contracts"])
+    except OSError:
+        result = None
+    if result is None or result.rc != 0 or result.timed_out:
         violations.append(f"contract_revision unavailable: repo {m.contract_revision}")
     else:
         actual = result.stdout.strip()

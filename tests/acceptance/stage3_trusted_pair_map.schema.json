@@ -37,6 +37,7 @@
   "$defs": {
     "TrustedPair": {
       "type": "object",
+      "description": "JSON Schema 可驗證欄位型別與必填值，但不能動態比較兩個欄位是否相等；呼叫端 loader 另檢查兩個 Windows COM 埠（含大小寫與 Win32 裝置路徑前綴等價名稱）及兩個去識別端點 ID 各自不重複。",
       "additionalProperties": false,
       "required": [
         "dut_port",
