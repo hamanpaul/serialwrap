@@ -599,11 +599,21 @@ def _copy_seed_attachment(root: Path, rel: str) -> None:
     _copy_repo_file(root, rel)
 
 
+# 指定 seed revision（tools.stage3.required_cases.SEED_REVISION）的 Git blob SHA-256，
+# 以 ``git show <SEED_REVISION>:<path> | sha256sum`` 取得並釘在此處，作為與附件、source
+# manifest、分母鎖互相獨立的信任來源。若有人在同一 PR 同時改動這些常數、附件、manifest 與鎖，
+# 屬 PR 審查治理範圍（比照 Task 1 required_cases 的首版基準），不在本替身的防護範圍內。
+_SEED_BLOB_SHA256 = {
+    "tests/acceptance/cases.yaml": "b5e70e8c77687a1526e98a77a909bd729817fd67c66f28c4a09fb5d11ed235c6",
+    "tests/acceptance/cases.lock.json": "4799a83c655b45c693603704e0fd3b3776f84f04c12b4a4cdd293183e51b861d",
+}
+
+
 def _seed_source_reader(root: Path, revision: str, repo_path: str) -> bytes | None:
     """提供 T1 checker 的指定 revision 來源 bytes。
 
-    來源取自本 repo 已提交的公開 seed 附件（``REPO_ROOT``），與假 repo 內待驗的附件複本分開，
-    避免以待驗附件自證；純記憶體 fixture 不啟動 Git。
+    取本 repo 已提交的公開 seed 附件，且只在其 SHA-256 等於釘定的指定 blob SHA 時回傳；
+    否則回 None，讓 T1 checker 以來源不可得拒絕。純記憶體 fixture 不啟動 Git。
     """
     from tools.stage3 import required_cases
 
@@ -616,7 +626,12 @@ def _seed_source_reader(root: Path, revision: str, repo_path: str) -> bytes | No
     if source is None:
         return None
     path = REPO_ROOT / "docs" / "rust-refactor" / "evidence" / "denominators" / source
-    return path.read_bytes() if path.is_file() else None
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != _SEED_BLOB_SHA256[repo_path]:
+        return None
+    return data
 
 
 def write_fake_repo(root: Path, *, layer: str = "l1.5", acceptance_state: str = "current") -> Path:

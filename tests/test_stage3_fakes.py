@@ -1101,3 +1101,29 @@ def test_fake_repo_rejects_seed_source_with_changed_line_endings(tmp_path, monke
 
     with pytest.raises(ValueError, match="seed"):
         fakes.write_fake_repo(tmp_path / "repo")
+
+
+def test_fake_repo_rejects_consistently_rewritten_seed(tmp_path, monkeypatch):
+    """附件、source manifest 與分母鎖的 seed SHA 一起改成一致的新值時，仍須拒絕（R8-01）。
+
+    信任來源是替身釘定的指定 revision blob SHA，而不是待驗的附件本身。
+    """
+    fakes = _fakes()
+    source_root = _copy_repo_subset(tmp_path / "source")
+    monkeypatch.setattr(fakes, "REPO_ROOT", source_root)
+    fakes.write_fake_repo(tmp_path / "control")
+
+    rel = _SEED_ATTACHMENTS[0]
+    seed = source_root / rel
+    old_sha = hashlib.sha256(seed.read_bytes()).hexdigest()
+    seed.write_bytes(seed.read_bytes() + "# 非指定 revision 的改動\n".encode("utf-8"))
+    new_sha = hashlib.sha256(seed.read_bytes()).hexdigest()
+    for meta in ("docs/rust-refactor/evidence/denominators/source-manifest.json",
+                 "tests/acceptance/stage3_required_cases.lock.json"):
+        path = source_root / meta
+        text = path.read_text(encoding="utf-8")
+        assert old_sha in text, meta
+        path.write_text(text.replace(old_sha, new_sha), encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match="seed"):
+        fakes.write_fake_repo(tmp_path / "repo")
