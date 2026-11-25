@@ -11,7 +11,7 @@ use sw_core::deferred::InvalidateReason;
 use sw_core::drain::StopKind;
 use sw_core::human_console::out_ring::OutItem;
 use sw_core::human_console::ConsoleTransportKind;
-use sw_core::mailbox::ControlEvent;
+use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_core::op_runner::{OpOutcome, OpSpec};
 use sw_core::session_core::*;
 use sw_core::tx_writer::TxClass;
@@ -75,6 +75,54 @@ fn raw_input_becomes_human_tx() {
     assert_eq!(permit.owner_gen, h.fence.with(|f| f.owner_gen));
     assert_eq!(permit.replay_hold, None);
     assert_eq!(payload, b"\x1b[A");
+}
+
+#[test]
+fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input() {
+    const PASSWORD_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    password_regex: 'Password:'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+
+    let mut raw = CoreHarness::new(PASSWORD_PROFILE);
+    raw.to_ready();
+    raw.connect_stream_console("raw", ConsoleTransportKind::TcpTelnet);
+    raw.rx.observe_password_prompt_bytes(b"stale input\r\n");
+    raw.rx.observe_password_prompt_bytes(b"Password: ");
+    let raw_epoch = raw.epoch();
+    raw.data(DataEvent::UartRxChunk {
+        epoch: raw_epoch,
+        rx_seq: 1,
+        wal_seq: 1,
+        bytes: b"stale input\r\n".to_vec(),
+    });
+    let raw_effects = raw.input("raw", b"part");
+    let raw_secret = raw_effects.iter().find_map(|effect| match effect {
+        Effect::HumanTx { permit, .. } => permit.secret_tx,
+        _ => None,
+    });
+
+    let mut line = CoreHarness::new(PASSWORD_PROFILE);
+    line.to_ready();
+    line.connect_stream_console("owner", ConsoleTransportKind::TcpTelnet);
+    line.connect_stream_console("line", ConsoleTransportKind::TcpTelnet);
+    line.rx.observe_password_prompt_bytes(b"stale input\r\n");
+    line.rx.observe_password_prompt_bytes(b"Password: ");
+    let line_epoch = line.epoch();
+    line.data(DataEvent::UartRxChunk {
+        epoch: line_epoch,
+        rx_seq: 1,
+        wal_seq: 1,
+        bytes: b"stale input\r\n".to_vec(),
+    });
+    let line_effects = line.input("line", b"part\r");
+    let line_secret = start_ops(&line_effects)
+        .into_iter()
+        .find_map(|spec| match spec {
+            OpSpec::Command(command) => command.req.secret_tx,
+            _ => None,
+        });
+    assert!(
+        raw_secret.is_some() && line_secret.is_some(),
+        "reader 已看見新提示後，舊 RX event 不得撤銷 raw/line-buffer secret 判定：raw={raw_secret:?}, line={line_secret:?}"
+    );
 }
 
 #[test]
