@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 19,
+  "x-catalog-revision": 20,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -854,15 +854,15 @@
       "properties": {
         "session_id": {
           "type": "string",
-          "x-note": "形式 A：session 別名（與 device_by_id 互斥）"
+          "x-note": "session 別名 owner；Rust dynamic 列可同時附 device_by_id"
         },
         "device_by_id": {
           "type": "string",
-          "x-note": "形式 B：device 別名（與 session_id 互斥）"
+          "x-note": "device 別名 owner；可與 session_id 並存"
         },
         "profile": {
           "type": "string",
-          "x-note": "僅形式 B 可能出現"
+          "x-note": "by-id 指派時可能出現"
         },
         "updated_at": {
           "type": "string"
@@ -881,11 +881,9 @@
       },
       "required": [
         "updated_at",
-        "alias",
-        "effective",
-        "conflict"
+        "alias"
       ],
-      "oneOf": [
+      "anyOf": [
         {
           "required": [
             "session_id"
@@ -905,7 +903,7 @@
         "effective",
         "conflict"
       ],
-      "x-order-note": "alias.list 先輸出 state.json 重載後的列，再附 effective 與 conflict；新指派 by-id 列欄位順序見 x-order-new-by-id（alias_registry.py:44-52）"
+      "x-order-note": "alias.list 可為既有 Python 凍結輸出（不含 effective 與 conflict），或 Rust 輸出（可同時含 session_id 與 device_by_id，並附 effective 與 conflict）；by-id 列欄位順序見 x-order-new-by-id"
     },
     "ErrorResponse": {
       "type": "object",
@@ -1256,14 +1254,16 @@
         ]
       },
       "errors": [
+        "INVALID_ARGS",
         "SESSION_NOT_FOUND"
       ],
       "error_order": [
-        "SESSION_NOT_FOUND"
+        "SESSION_NOT_FOUND",
+        "INVALID_ARGS"
       ],
       "side_effects": [
         {
-          "what": "profile.alias 改寫、alias registry 更新、_save_state()（無 INVALID_ARGS 檢查，alias 可為空字串）",
+          "what": "profile.alias 改寫、alias registry 更新、_save_state()；Rust selector claim 衝突回 INVALID_ARGS",
           "when": "on_success",
           "idempotent": false
         }

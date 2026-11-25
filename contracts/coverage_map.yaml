@@ -106,6 +106,13 @@ entries:
     - cargo:sw-daemon::dispatch::issue281_yaml_target_alias_is_not_overridden_by_by_id_assignment
     - cargo:sw-daemon::dispatch::issue281_alias_conflict_keeps_first_materialized_and_marks_conflict
     - cargo:sw-daemon::dispatch::issue281_conflicting_by_id_claim_falls_back_to_automatic_when_owner_not_live
+    - cargo:sw-daemon::dispatch::issue281_offline_registry_owner_keeps_auto_alias_unique_after_restart
+    - cargo:sw-daemon::dispatch::issue281_released_restore_does_not_claim_offline_owner_alias
+    - cargo:sw-daemon::dispatch::issue281_parallel_alias_set_same_name_has_one_conflict
+    - cargo:sw-daemon::dispatch::issue281_alias_set_racing_alias_assign_has_one_owner
+    - cargo:sw-daemon::dispatch::issue281_by_id_assignment_does_not_shadow_com_or_session_id
+    - cargo:sw-daemon::dispatch::issue281_unassign_re_resolves_live_selector_before_and_after_restart
+    - cargo:sw-daemon::dispatch::issue281_rust_alias_list_actual_response_validates_rpc_schema
     owner_phase: P7
   bc:DF-01:
     nodeids:

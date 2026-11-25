@@ -3734,6 +3734,43 @@ fn i281_dynamic_spec() -> RigSpec {
     }
 }
 
+fn i281_two_dynamic_spec() -> RigSpec {
+    RigSpec {
+        yaml: I281_DYNAMIC_TEMPLATES.to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into()), (BY_ID_B.into(), REAL_B.into())],
+        explicit_target_count: 0,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    }
+}
+
+fn i281_validate_alias_list_schema(response: &PyDict) {
+    let schema_path = support::data_root().join("contracts/rpc_schema.json");
+    let payload = dumps(&PyValue::Dict(response.clone()), &RPC_WIRE);
+    let script = r#"
+import json, sys, jsonschema
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+schema = {
+    "$schema": document.get("$schema", "https://json-schema.org/draft/2020-12/schema"),
+    "$defs": document.get("$defs", {}),
+    **document["x-methods"]["alias.list"]["result"],
+}
+jsonschema.validate(instance=json.loads(sys.argv[2]), schema=schema)
+"#;
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(schema_path)
+        .arg(payload)
+        .output()
+        .expect("執行 Python JSON Schema 驗證器");
+    assert!(
+        output.status.success(),
+        "Rust alias.list 實際回應不符合 rpc_schema.json：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn i281_session_alias_row(session_id: &str, updated_at: &str) -> PyDict {
     let mut row = PyDict::new();
     row.insert("session_id", PyValue::from(session_id));
@@ -4211,6 +4248,303 @@ fn issue281_conflicting_by_id_claim_falls_back_to_automatic_when_owner_not_live(
             .and_then(PyValue::as_str),
         Some("SESSION_NOT_FOUND")
     );
+}
+
+fn i281_assert_offline_owner_keeps_name(rig: &ServiceRig) {
+    let session = rig.session("COM0").expect("dynamic COM0 session");
+    assert_eq!(session.get("alias"), Some(&PyValue::from("t+2")));
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"t+1"}"#)
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "離線 owner 的 t+1 不得解析到新 session"
+    );
+    let aliases = rig.call("alias.list", "{}");
+    let offline = i281_alias_from_list(&aliases, "t+1").expect("離線 owner 列仍保留");
+    let active = i281_alias_from_list(&aliases, "t+2").expect("新 session 自動 alias 列存在");
+    assert_eq!(offline.get("effective"), Some(&PyValue::Bool(false)));
+    assert_eq!(offline.get("conflict"), Some(&PyValue::Bool(true)));
+    assert_eq!(active.get("effective"), Some(&PyValue::Bool(true)));
+}
+
+/// issue 281：離線裝置已登錄 t+1 時，新動態 session 不得覆寫其 claim；daemon 重啟後仍保留唯一 selector。
+#[test]
+fn issue281_offline_registry_owner_keeps_auto_alias_unique_after_restart() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "t+1".into(),
+        i281_device_alias_row(BY_ID_B, "2026-10-01T00:00:00Z"),
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+    wait_until("動態 COM0 session", || rig.session("COM0").is_some());
+    i281_assert_offline_owner_keeps_name(&rig);
+
+    let restarted = i281_restart(rig, i281_dynamic_spec());
+    wait_until("重啟後動態 COM0 session", || restarted.session("COM0").is_some());
+    i281_assert_offline_owner_keeps_name(&restarted);
+}
+
+/// issue 281：RELEASED 佔位還原也必須尊重另一個離線裝置已登錄的自動名稱。
+#[test]
+fn issue281_released_restore_does_not_claim_offline_owner_alias() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "t+1".into(),
+        i281_device_alias_row(BY_ID_B, "2026-10-01T00:00:00Z"),
+    );
+    loaded.released.insert(
+        "t:COM0".into(),
+        ReleasedRow {
+            by_id: PyValue::from(BY_ID_A),
+            released_by: PyValue::from("agent"),
+            released_at: PyValue::from("2026-10-03T00:00:00Z"),
+            reason: PyValue::Null,
+        },
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+    let released = rig.session("t:COM0").expect("RELEASED 佔位 session");
+    assert_eq!(released.get("state"), Some(&PyValue::from("RELEASED")));
+    assert_eq!(released.get("alias"), Some(&PyValue::from("t+2")));
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"t+1"}"#)
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "RELEASED session 不得搶用離線 owner 的 selector"
+    );
+    let offline = i281_alias_from_list(&rig.call("alias.list", "{}"), "t+1")
+        .expect("離線 owner 列仍保留");
+    assert_eq!(offline.get("conflict"), Some(&PyValue::Bool(true)));
+}
+
+/// issue 281：兩個並行 alias.set 同名時，提交端重驗 claim，只允許一個請求成功。
+#[test]
+fn issue281_parallel_alias_set_same_name_has_one_conflict() {
+    let rig = ServiceRig::build(i281_two_dynamic_spec());
+    wait_until("dynamic COM0 session", || rig.session("COM0").is_some());
+    wait_until("dynamic COM1 session", || rig.session("COM1").is_some());
+    let sid_a = s(&rig.session("COM0").expect("COM0 session"), "session_id").to_string();
+    let sid_b = s(&rig.session("COM1").expect("COM1 session"), "session_id").to_string();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let hook_barrier = barrier.clone();
+    rig.mgr
+        .set_alias_pre_lock_hook_for_test(Box::new(move || {
+            hook_barrier.wait();
+        }));
+    let rig = Arc::new(rig);
+    let first_rig = rig.clone();
+    let first_sid = sid_a.clone();
+    let first = std::thread::spawn(move || {
+        first_rig.call(
+            "alias.set",
+            &format!(r#"{{"session_id":"{first_sid}","alias":"parallel-name"}}"#),
+        )
+    });
+    let second_rig = rig.clone();
+    let second_sid = sid_b.clone();
+    let second = std::thread::spawn(move || {
+        second_rig.call(
+            "alias.set",
+            &format!(r#"{{"session_id":"{second_sid}","alias":"parallel-name"}}"#),
+        )
+    });
+    barrier.wait();
+    let first = first.join().expect("第一個 alias.set 執行緒");
+    let second = second.join().expect("第二個 alias.set 執行緒");
+    let first_ok = first.get("ok") == Some(&PyValue::Bool(true));
+    let second_ok = second.get("ok") == Some(&PyValue::Bool(true));
+    assert_ne!(first_ok, second_ok, "同名並行設定只能成功一次：{}, {}", j(&first), j(&second));
+    let rejected = if first_ok { &second } else { &first };
+    assert_eq!(
+        rejected.get("error_code").and_then(PyValue::as_str),
+        Some("INVALID_ARGS"),
+        "落敗請求應回既有衝突錯誤碼：{}",
+        j(rejected)
+    );
+    let winner_sid = if first_ok { sid_a } else { sid_b };
+    let selector = rig.call("session.get_state", r#"{"selector":"parallel-name"}"#);
+    let selected = match selector.get("session") {
+        Some(PyValue::Dict(session)) => session
+            .get("session_id")
+            .and_then(PyValue::as_str),
+        _ => None,
+    };
+    assert_eq!(selected, Some(winner_sid.as_str()));
+}
+
+/// issue 281：alias.set 初始檢查後由 alias.assign 先取得名稱時，alias.set 提交端必須拒絕覆寫。
+#[test]
+fn issue281_alias_set_racing_alias_assign_has_one_owner() {
+    let rig = ServiceRig::build(i281_two_dynamic_spec());
+    wait_until("dynamic COM0 session", || rig.session("COM0").is_some());
+    wait_until("dynamic COM1 session", || rig.session("COM1").is_some());
+    let sessions = rig.call("session.list", "{}");
+    let sessions = sessions.get("sessions").and_then(PyValue::as_array).unwrap();
+    let session_a = sessions
+        .iter()
+        .filter_map(PyValue::as_dict_ref)
+        .find(|session| session.get("device_by_id").and_then(PyValue::as_str) == Some(BY_ID_A))
+        .expect("BY_ID_A session");
+    let session_b = sessions
+        .iter()
+        .filter_map(PyValue::as_dict_ref)
+        .find(|session| session.get("device_by_id").and_then(PyValue::as_str) == Some(BY_ID_B))
+        .expect("BY_ID_B session");
+    let sid_a = s(session_a, "session_id").to_string();
+    let sid_b = s(session_b, "session_id").to_string();
+    let alias_a = s(session_a, "alias").to_string();
+    let entered_barrier = Arc::new(std::sync::Barrier::new(2));
+    let hook_barrier = entered_barrier.clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    rig.mgr
+        .set_alias_pre_lock_hook_for_test(Box::new(move || {
+            let _ = entered_tx.send(());
+            hook_barrier.wait();
+        }));
+    let rig = Arc::new(rig);
+    let set_rig = rig.clone();
+    let set_sid = sid_a.clone();
+    let set_call = std::thread::spawn(move || {
+        set_rig.call(
+            "alias.set",
+            &format!(r#"{{"session_id":"{set_sid}","alias":"shared-name"}}"#),
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("alias.set 應先完成無 claim 檢查並停在交錯點");
+
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_B}","alias":"shared-name"}}"#),
+    );
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&assigned));
+    entered_barrier.wait();
+    let set = set_call.join().expect("alias.set 執行緒");
+    assert_eq!(set.get("error_code").and_then(PyValue::as_str), Some("INVALID_ARGS"));
+    let selected = rig.call("session.get_state", r#"{"selector":"shared-name"}"#);
+    let selected_sid = selected
+        .get("session")
+        .and_then(PyValue::as_dict_ref)
+        .and_then(|session| session.get("session_id"))
+        .and_then(PyValue::as_str);
+    assert_eq!(selected_sid, Some(sid_b.as_str()));
+    assert_eq!(
+        rig.session(&sid_a).and_then(|row| row.get("alias").cloned()),
+        Some(PyValue::from(alias_a))
+    );
+}
+
+/// issue 281：alias.assign 不得覆蓋其他 session 的 COM 或 session ID selector。
+#[test]
+fn issue281_by_id_assignment_does_not_shadow_com_or_session_id() {
+    let rig = ServiceRig::build(i281_two_dynamic_spec());
+    wait_until("dynamic COM0 session", || rig.session("COM0").is_some());
+    wait_until("dynamic COM1 session", || rig.session("COM1").is_some());
+    let sessions = rig.call("session.list", "{}");
+    let sessions = sessions.get("sessions").and_then(PyValue::as_array).unwrap();
+    let target = sessions
+        .iter()
+        .filter_map(PyValue::as_dict_ref)
+        .find(|session| session.get("device_by_id").and_then(PyValue::as_str) == Some(BY_ID_A))
+        .expect("BY_ID_A session");
+    let other = sessions
+        .iter()
+        .filter_map(PyValue::as_dict_ref)
+        .find(|session| session.get("device_by_id").and_then(PyValue::as_str) == Some(BY_ID_B))
+        .expect("BY_ID_B session");
+    let other_com = s(other, "com").to_string();
+    let other_sid = s(other, "session_id").to_string();
+    let _target_sid = s(target, "session_id");
+    let mut failures = Vec::new();
+    for alias in [other_com, other_sid.clone()] {
+        let assigned = rig.call(
+            "alias.assign",
+            &format!(r#"{{"by_id":"{BY_ID_A}","alias":"{alias}"}}"#),
+        );
+        if assigned.get("error_code").and_then(PyValue::as_str) != Some("INVALID_ARGS") {
+            failures.push(format!("alias.assign({alias})={}", j(&assigned)));
+        }
+        let selected = rig.call(
+            "session.get_state",
+            &format!(r#"{{"selector":"{alias}"}}"#),
+        );
+        let selected_sid = selected
+            .get("session")
+            .and_then(PyValue::as_dict_ref)
+            .and_then(|session| session.get("session_id"))
+            .and_then(PyValue::as_str);
+        if selected_sid != Some(other_sid.as_str()) {
+            failures.push(format!("selector {alias} 指到 {selected_sid:?}：{}", j(&selected)));
+        }
+    }
+    assert!(failures.is_empty(), "selector 名稱衝突未拒絕：{failures:?}");
+}
+
+/// issue 281：解除目前生效的 alias.assign 後即時回復優先序解析，重啟也不得復活舊 selector。
+#[test]
+fn issue281_unassign_re_resolves_live_selector_before_and_after_restart() {
+    let rig = ServiceRig::build(i281_dynamic_spec());
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_A}","alias":"bench"}}"#),
+    );
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&assigned));
+    assert_eq!(
+        rig.session("bench").and_then(|session| session.get("alias").cloned()),
+        Some(PyValue::from("bench")),
+        "解除前 bench 應是目前 session selector"
+    );
+
+    let unassigned = rig.call("alias.unassign", r#"{"alias":"bench"}"#);
+    assert_eq!(unassigned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&unassigned));
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"bench"}"#)
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "解除成功後 bench 不得繼續作 selector"
+    );
+    assert_eq!(
+        rig.session("COM0").and_then(|session| session.get("alias").cloned()),
+        Some(PyValue::from("t+1")),
+        "解除後線上 actor/profile 應回復自動 alias"
+    );
+    let automatic = i281_alias_from_list(&rig.call("alias.list", "{}"), "t+1")
+        .expect("自動 alias 列應恢復");
+    assert_eq!(automatic.get("effective"), Some(&PyValue::Bool(true)));
+
+    let restarted = i281_restart(rig, i281_dynamic_spec());
+    wait_until("重啟後動態 COM0 session", || restarted.session("COM0").is_some());
+    assert_eq!(
+        restarted.call("session.get_state", r#"{"selector":"bench"}"#)
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "重啟後 bench 仍不得作 selector"
+    );
+    assert_eq!(
+        restarted
+            .call("session.get_state", r#"{"selector":"t+1"}"#)
+            .get("ok"),
+        Some(&PyValue::Bool(true)),
+        "重啟後自動 alias 應維持有效"
+    );
+}
+
+/// issue 281：真實 Rust alias.list RPC 回應須通過其 JSON Schema result 驗證。
+#[test]
+fn issue281_rust_alias_list_actual_response_validates_rpc_schema() {
+    let rig = ServiceRig::build(i281_dynamic_spec());
+    let session_id = s(&rig.session("COM0").expect("COM0 session"), "session_id").to_string();
+    let assigned = rig.call(
+        "alias.set",
+        &format!(r#"{{"session_id":"{session_id}","alias":"rust-schema-alias"}}"#),
+    );
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&assigned));
+    let actual = rig.call("alias.list", "{}");
+    i281_validate_alias_list_schema(&actual);
 }
 
 #[test]

@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 20
+revision: 21
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -271,8 +271,8 @@ changes:
     ab_participation: "absolute_only"
     phases: ["P7"]
     case_ids: ["bc18-alias-precedence-and-persistence"]
-    compatibility_impact: "Rust 0.5.1 的 dynamic／pin session 依序採用目前 device_by_id 自訂 alias、session_id 自訂 alias、自動 alias；alias.set 與 alias.assign 成功後立即更新 selector，並跨 daemon 重啟及 pin template 切換保留。只有目前生效 alias、session_id 與 COM 可作 selector；alias.list 顯示 effective 與 conflict。舊 registry 列依名稱推定自動／自訂來源且保留原列。重名時先登錄的 claim 保留名稱，後續 session 回到自動 alias；YAML targets 與 Python 0.4.x 不變。"
-    approval_conditions: "依 OD-111、OD-112 與 i281 編排者定案：by-id alias 優先於 session alias，session alias 優先於自動 alias；遷移舊列不刪除；衝突保留先登錄者並標示，後續 session 使用自動 alias；RELEASED 還原不得依賴 registry 插入順序；YAML target alias 不受影響；不新增錯誤碼。"
+    compatibility_impact: "Rust 0.5.1 的 dynamic／pin session 依序採用目前 device_by_id 自訂 alias、session_id 自訂 alias、自動 alias；alias.set 與 alias.assign 成功後立即更新 selector，alias.unassign 也立即依該優先序重算線上 actor 與 profile，並跨 daemon 重啟及 pin template 切換保留。自動 alias 配發與 RELEASED 還原會保留離線裝置已登錄的名稱，改用未占用的自動名稱並在原列標示衝突。alias.assign 遇其他 session 的 COM／session ID selector 回既有 INVALID_ARGS；alias.set 與 alias.assign 透過共用操作鎖序列化，若 alias.set 提交時另一操作已取得同名 claim，回既有 INVALID_ARGS。alias.assign 遇既有 registry claim 時仍保留先登錄者並標示衝突，不覆寫 owner，依既有規則回成功並讓新裝置使用安全的自動 alias；不新增錯誤碼。只有目前生效 alias、session_id 與 COM 可作 selector；alias.list 顯示 effective 與 conflict，schema 同時接受 Python 凍結輸出及 Rust 可帶 session_id 與 device_by_id 的輸出。舊 registry 列依名稱推定自動／自訂來源且保留原列。YAML targets 與 Python 0.4.x 不變。"
+    approval_conditions: "依 OD-111、OD-112 與 i281 編排者定案：by-id alias 優先於 session alias，session alias 優先於自動 alias；遷移舊列不刪除；衝突保留先登錄者並標示，後續 session 使用自動 alias；離線 claim 仍保留名稱；COM／session ID selector 不可被 alias 遮蔽；alias.unassign 即時重算線上 selector；RELEASED 還原不得依賴 registry 插入順序；YAML target alias 不受影響；不新增錯誤碼。"
     related_decisions: ["OD-111", "OD-112"]
   - id: "SC-01"
     kind: "SC"

@@ -232,6 +232,57 @@ def test_session_public_instance_validates():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_python_alias_list_actual_response_validates_rpc_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """以隔離的 Python Service RPC 輸出驗證舊版 alias.list 列仍符合契約。"""
+    import jsonschema
+    import sw_core.constants as constants
+    import sw_core.service as service_module
+    import sw_core.wal as wal_module
+
+    root = tmp_path / "serialwrap"
+    paths = {
+        "state": root / "state",
+        "config": root / "config",
+        "data": root / "data",
+        "wal": root / "wal",
+        "events": root / "events",
+        "events_runtime": root / "events-runtime",
+        "by_id": root / "by-id",
+        "by_path": root / "by-path",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(constants, "SYSTEM_CONFIG_PATH", str(root / "system-config.yaml"))
+    monkeypatch.setattr(service_module, "EVENTS_DIR", str(paths["events"]))
+    monkeypatch.setattr(service_module, "EVENTS_RUNTIME_DIR", str(paths["events_runtime"]))
+    monkeypatch.setattr(service_module, "EVENTS_LOG_PATH", str(paths["events_runtime"] / "events.ndjson"))
+    monkeypatch.setattr(wal_module, "WAL_DIR", str(paths["wal"]))
+
+    svc = service_module.SerialwrapService(
+        [],
+        by_id_dir=str(paths["by_id"]),
+        by_path_dir=str(paths["by_path"]),
+        state_path=str(paths["state"] / "state.json"),
+    )
+    svc.start()
+    try:
+        assigned = svc.rpc("alias.assign", {"by_id": "/fake/python-device", "alias": "python-alias"})
+        assert assigned["ok"] is True
+        response = svc.rpc("alias.list", {})
+
+        schema = _schema()
+        result_schema = {
+            "$schema": schema.get("$schema", "https://json-schema.org/draft/2020-12/schema"),
+            "$defs": schema.get("$defs", {}),
+            **schema["x-methods"]["alias.list"]["result"],
+        }
+        jsonschema.validate(instance=response, schema=result_schema)
+    finally:
+        svc.stop()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_command_record_order_matches_arbiter():
     """驗證 CommandArbiter 命令記錄的鍵順序與 $defs.CommandRecord.x-order 完全一致。"""
     from sw_core.arbiter import CommandArbiter
@@ -725,6 +776,7 @@ _PRECEDENCE_TRIGGER: dict[str, dict[str, Any]] = {
 }
 
 _NOT_SERVICE_TESTABLE: dict[str, str] = {
+    "alias.set": "Rust 0.5.1 的 INVALID_ARGS 僅由 manager 在有效 session 的 selector claim 衝突時產生；凍結 Python 基線沒有此錯誤，錄製替身無法同時模擬 manager 的 SESSION_NOT_FOUND 優先序，Rust 端由 issue281 並行 alias.set 測試覆蓋",
     "command.cancel": "CMD_NOT_FOUND 與 CMD_NOT_CANCELABLE 同出於單一 arbiter 呼叫的內部判定，無法由替身同時造成，留待 P2 整合測試",
     "result.tail": "cmd_id 分支（CMD_NOT_FOUND）與 com/selector 分支（SESSION_NOT_FOUND）互斥，同一請求不會同時成立",
     "daemon.handoff_stop": "交接 method 由 daemon 層處理，不經 service._dispatch",
