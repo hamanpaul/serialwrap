@@ -249,7 +249,7 @@ fn i294_human_prompt_before_agent_echo_does_not_complete() {
 
     let id = h.submit_ok("echo AGENT");
     wait_tx(&h, b"echo AGENT\n");
-    h.inject_rx(b"root@t:/# ");
+    h.inject_rx_processed(b"root@t:/# ");
     let before_agent_echo = h.command_get(&id);
     assert_eq!(
         before_agent_echo["status"],
@@ -257,7 +257,7 @@ fn i294_human_prompt_before_agent_echo_does_not_complete() {
         "human 的舊 prompt 不得完成 agent 命令：{before_agent_echo:?}"
     );
 
-    h.inject_rx(b"echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    h.inject_rx_processed(b"echo AGENT\r\nAGENT\r\nroot@t:/# ");
     let rec = h.wait_done(&id);
     assert_eq!(rec["status"], PyValue::from("done"));
     assert_eq!(rec["stdout"], PyValue::from("AGENT"));
@@ -335,27 +335,36 @@ fn i294_deferred_human_prompt_between_queued_commands_does_not_complete_next() {
     let console = h.attach_pty_console("i294-deferred-order");
     let tx_count = h.wal_tx_payloads().len();
 
-    let first = h.submit_ok("echo FIRST");
+    // A 以 producer marker 收尾，不在 B 的命令邊界前留下 shell prompt；
+    // 讓延後 human line 的 RX prompt 明確落在 B TX 之後，驗證該 human TX 證據。
+    let first = h.submit_with("echo FIRST", |r| {
+        r.completion_regex = Some("(?m)^FIRST\\r?$".into())
+    });
     wait_tx(&h, b"echo FIRST\n");
     let second = h.submit_ok("echo SECOND");
     console.push_input(b"echo HUMAN\n");
     assert_eq!(h.command_get(&first)["status"], PyValue::from("running"));
 
-    h.inject_rx(b"echo FIRST\r\nFIRST\r\nroot@t:/# ");
+    h.inject_rx_reader_processed(b"echo FIRST\r\nFIRST\r\n");
     let first_result = h.wait_done(&first);
     assert_eq!(first_result["stdout"], PyValue::from("FIRST"));
     wait_tx(&h, b"echo HUMAN\n");
 
-    h.inject_rx(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
     wait_tx(&h, b"echo SECOND\n");
-    h.inject_rx(b"root@t:/# ");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo FIRST\necho HUMAN\necho SECOND\n".to_vec(),
+        "A 完成後 human TX 與命令 B TX 的邊界都已建立"
+    );
+    h.inject_rx_processed(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
+    h.inject_rx_processed(b"root@t:/# ");
     assert_eq!(
         h.command_get(&second)["status"],
         PyValue::from("running"),
         "deferred human 的 prompt 在第二筆 command echo 前不得完成"
     );
 
-    h.inject_rx(b"echo SECOND\r\nSECOND\r\nroot@t:/# ");
+    h.inject_rx_processed(b"echo SECOND\r\nSECOND\r\nroot@t:/# ");
     let second_result = h.wait_done(&second);
     assert_eq!(second_result["status"], PyValue::from("done"));
     assert_eq!(second_result["stdout"], PyValue::from("SECOND"));
@@ -534,19 +543,31 @@ fn i294_raw_half_line_does_not_poison_next_agent_echo() {
 
 #[test]
 fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-wrapped-echo-human");
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
     let tx_count = h.wal_tx_payloads().len();
     let command = format!("echo {} {}", "x".repeat(50), "y".repeat(40));
     let id = h.submit_ok(&command);
     let tx = format!("{command}\n");
     wait_tx(&h, tx.as_bytes());
 
-    let first = format!("root@t:/# {}\r\r\n", &command[..65]);
-    h.inject_rx(first.as_bytes());
+    let incomplete = format!(
+        "root@t:/# {}\r\r\nroot@t:/# ",
+        &command[..65]
+    );
+    // 第一段只有折行命令前綴，後面刻意有舊 prompt。human TX 使無 echo 降階保持歧義；
+    // 若把折行前綴誤認為完整 echo，這個 prompt 會讓命令提早 done，下面 running 斷言會失敗。
+    h.inject_rx_processed(incomplete.as_bytes());
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    let first = format!("\r\nroot@t:/# {}\r\r\n", &command[..65]);
+    h.inject_rx_processed(first.as_bytes());
     assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
 
     let tail = format!("{}\r\nWRAPPED\r\nroot@t:/# ", &command[65..]);
-    h.inject_rx(tail.as_bytes());
+    h.inject_rx_processed(tail.as_bytes());
     let rec = h.wait_done(&id);
     assert_eq!(rec["status"], PyValue::from("done"));
     assert_eq!(rec["stdout"], PyValue::from("WRAPPED"));
@@ -555,6 +576,29 @@ fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
         wal_tx_bytes_since(&h, tx_count),
         tx.as_bytes().to_vec(),
         "折行 echo 判定不重送命令"
+    );
+}
+
+#[test]
+fn i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let command = "cat /tmp/job";
+    let id = h.submit_ok(command);
+    wait_tx(&h, b"cat /tmp/job\n");
+
+    h.inject_rx_processed(
+        b"cat /tmp/job\r\ncat /tmp/job\r\nnext\r\nroot@t:/# ",
+    );
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("next"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat /tmp/job\n".to_vec(),
+        "文件化的重複 echo 相容處理不增加或重送 TX"
     );
 }
 

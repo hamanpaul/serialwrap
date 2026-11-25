@@ -254,6 +254,17 @@ mod tests {
             repeated.evaluate("ls\r\nls\r\na b\r\nroot@t:/# ", false, false),
             Evaluation::Complete { stdout: "a b".into() }
         );
+
+        // i1-R2-01 編排者裁決：這是保留的窄範圍相容行為，即使第一行也可能是合法 stdout。
+        let documented_compatibility = evaluator("cat /tmp/job", r"(?m)^root@t:.*# ");
+        assert_eq!(
+            documented_compatibility.evaluate(
+                "cat /tmp/job\r\ncat /tmp/job\r\nnext\r\nroot@t:/# ",
+                false,
+                false,
+            ),
+            Evaluation::Complete { stdout: "next".into() }
+        );
     }
 
     #[test]

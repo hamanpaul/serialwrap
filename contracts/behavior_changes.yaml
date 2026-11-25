@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 21
+revision: 22
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -264,14 +264,14 @@ changes:
       python: null
       rust:
         stage: "slice-2.1"
-    approved_at_revision: 20
+    approved_at_revision: 22
     spec_refs: ["issue-294", "issue-262", "issue-271", "OD-112", "OD-114"]
     reconciliation_refs: ["issue-294", "issue-262", "issue-271"]
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P5"]
     case_ids: ["l15-half-prompt"]
-    compatibility_impact: "Rust 0.5.1 i294-i1 的一般 agent line／background 命令（未指定 completion_regex、非 passthrough）以本命令完整 echo 作 prompt 搜尋下界，接受完整 prompt 前綴及已有串流證據的終端折行；echo 後 prompt 必須從 snapshot 最後一行行首開始、不得早於 echo 結束位置，且完整匹配清理後 snapshot 尾端。完成與 stdout 擷取使用同一 RX snapshot；stdout 從已確認的 echo 結束位置直接擷取，不因輸出行尾等於命令字串而剝除，echo 前的 human 殘餘不進入正常 stdout。command TX 起點只在 OS 接受寫入時記錄，WouldBlock 不建立 human TX 證據；已確認送出的 agent 換行會結束 raw human 半行狀態，但該半行仍使目前命令不能以 echo 錨定。找不到 echo 時，若判定窗口內沒有可信 human TX，僅在 prompt 位於 snapshot 尾端且是最後一行行首時維持既有完成相容性；若窗口內有可信 human TX，期限到時回 PROMPT_TIMEOUT、partial=true、recovery_action=NONE，保留可用輸出，不送救援鍵且不自動重送。只有 human 交錯且無 echo 時會由原本成功結果改為 partial。Python 基線凍結且不具此行為。此為第一階段；issue 262 的 prompt 身分誤判與 issue 271 的同行 stdout 裁切由 i294-i2 處理，本條目在 i2 完成前維持 APPROVED。"
+    compatibility_impact: "Rust 0.5.1 i294-i1 的一般 agent line／background 命令（未指定 completion_regex、非 passthrough）以本命令完整 echo 作 prompt 搜尋下界，接受完整 prompt 前綴及已有串流證據的終端折行；echo 後 prompt 必須從 snapshot 最後一行行首開始、不得早於 echo 結束位置，且完整匹配清理後 snapshot 尾端。完成與 stdout 擷取使用同一 RX snapshot；stdout 從已確認的 echo 結束位置直接擷取，不因輸出行尾等於命令字串而剝除，echo 前的 human 殘餘不進入正常 stdout。相容限制：echo 之後的第一行恰好等於命令、而且後面還有輸出時，視為重複 echo 並刪除；需要保留這種輸出時，請使用 completion_regex 或 marker。command TX 起點只在 OS 接受寫入時記錄，WouldBlock 不建立 human TX 證據；已確認送出的 agent 換行會結束 raw human 半行狀態，但該半行仍使目前命令不能以 echo 錨定。找不到 echo 時，若判定窗口內沒有可信 human TX，僅在 prompt 位於 snapshot 尾端且是最後一行行首時維持既有完成相容性；若窗口內有可信 human TX，期限到時回 PROMPT_TIMEOUT、partial=true、recovery_action=NONE，保留可用輸出，不送救援鍵且不自動重送。只有 human 交錯且無 echo 時會由原本成功結果改為 partial。Python 基線凍結且不具此行為。此為第一階段；issue 262 的 prompt 身分誤判與 issue 271 的同行 stdout 裁切由 i294-i2 處理，本條目在 i2 完成前維持 APPROVED。"
     approval_conditions: "依 OD-111、OD-112、OD-114 與 2026-11-24 i294 編排者定案分兩階段實作；i1 不改 Python、completion_regex、passthrough、登入／recover 行為、錯誤碼集合或既有案例分母；無 echo 且無 human TX 仍以尾端最後行 prompt 相容完成，無 echo 且有 human TX 才保留輸出並回 partial，不重送、不送救援鍵。i1 不宣稱 issue 262、issue 271 已解決；完成 i2 後才推進 IMPLEMENTED。"
     related_decisions: ["OD-111", "OD-112", "OD-114"]
   - id: "SC-01"

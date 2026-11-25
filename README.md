@@ -404,6 +404,14 @@ serialwrap cmd submit --selector COM0 --mode background --source agent:bg --cmd 
 serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
 ```
 
+Agent `line` and `background` commands without `--completion-regex` anchor prompt
+search after the full command echo and use one RX snapshot for completion and
+stdout extraction. Prefix prompts are supported, and text before the echo is
+excluded from normal stdout. Compatibility limitation: if the first line after
+the echo exactly equals the command and more output follows, that line is treated
+as a repeated echo and removed. Use `completion_regex` or a marker when that
+output must be preserved.
+
 `interactive` is for full-screen or key-driven workflows:
 
 ```bash
@@ -2478,6 +2486,12 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```
 
 `command.get` 會直接帶 `stdout`。
+
+未指定 `--completion-regex` 的 agent `line`／`background` 命令，會以完整命令
+echo 作為 prompt 搜尋下界；完成與 stdout 擷取共用同一份 RX snapshot，支援
+prefix prompt，echo 前的文字不納入一般 stdout。相容限制：echo 之後的第一行
+恰好等於命令、而且後面還有輸出時，視為重複 echo 並刪除；需要保留這種輸出時，
+請使用 `completion_regex` 或 marker。
 
 對於沒有回 shell prompt 的 noisy console，`cmd submit --completion-regex` 可在
 `line` 或 `background` 模式等待命令專屬的 producer 完成標記。請使用每次新產生、

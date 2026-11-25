@@ -106,6 +106,7 @@ entries:
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::human_tx_observation_tracks_only_accepted_segments
     - cargo:sw-core::command_exec::i294_background_uses_command_echo_boundary
     - cargo:sw-core::command_exec::i294_deferred_human_prompt_between_queued_commands_does_not_complete_next
+    - cargo:sw-core::command_exec::i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line
     - cargo:sw-core::command_exec::i294_fragmented_wrapped_echo_waits_for_complete_command
     - cargo:sw-core::command_exec::i294_human_prompt_before_agent_echo_does_not_complete
     - cargo:sw-core::command_exec::i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx
