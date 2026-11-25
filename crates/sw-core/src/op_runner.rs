@@ -8,13 +8,16 @@
 //! TX 一律經該 epoch 的 `TxWriterHandle`，permit 的 `op_id` 為授權 grant 的 `op_id`（帳本以 op 為單位，
 //! 由 actor 在終態處理點 `SettleTx`）。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use sw_pal::traits::{Clock, TxOutcome};
 use sw_proto::config_types::{ProfileTemplate, SessionProfile};
-use sw_proto::pycompat::{a2b_base64_lenient, clean_text, py_strip, splitlines, PyErr};
+use sw_proto::pycompat::{
+    a2b_base64_lenient, clean_text, clean_text_with_source_ranges, py_strip, splitlines, PyErr,
+};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{compile, valid_completion_regex, PyFlags, PyRegex};
@@ -194,12 +197,24 @@ pub fn extract_command_stdout(
     prompt_regex: &PyRegex,
     completion: Option<&PyRegex>,
 ) -> String {
-    let mut lines = prompt_cut_lines(raw, prompt_regex, completion);
-    strip_command_echo_lines(raw, &mut lines, command);
-    lines.join("\n").trim_matches('\n').to_string()
+    let mut cut = prompt_cut_lines(raw, prompt_regex, completion);
+    strip_command_echo_lines(
+        raw,
+        &mut cut.lines,
+        command,
+        &cut.echo_text,
+        cut.cleaned_start,
+    );
+    cut.lines.join("\n").trim_matches('\n').to_string()
 }
 
-fn strip_command_echo_lines(raw: &str, lines: &mut Vec<String>, command: &str) {
+fn strip_command_echo_lines(
+    raw: &str,
+    lines: &mut Vec<String>,
+    command: &str,
+    echo_text: &str,
+    cleaned_start: usize,
+) {
     if !command.is_empty() {
         let stripped = py_strip(command);
         let mut removed = false;
@@ -212,14 +227,17 @@ fn strip_command_echo_lines(raw: &str, lines: &mut Vec<String>, command: &str) {
         }
         if !removed {
             // 修正 PR（fix/wrapped-echo-false-positive 34c3a84）語意：只接受「命令原文＋終端折行插入字元」。
-            // 插入字元須有原始串流證據（rulings/p5.md P5-70f6ce7-1）：換行只在 raw 含 BusyBox `\r\r\n`、
-            // 多一個空白只在 raw 含 readline `" \r"` 時可跳過；一般 CRLF stdout 不得拼接（sol P5-70f6ce7-1）。
-            let wraps = WrapEvidence {
-                newline: raw.contains("\r\r\n"),
-                space: raw.contains(" \r"),
-            };
-            if wraps.newline || wraps.space {
-                if let Some(n) = strip_wrapped_command_echo(&lines, stripped, wraps) {
+            // 插入字元須在候選位置對應原始 BusyBox `\r\r\n` 或 readline `" \r"`；其他位置的標記不得授權拼接。
+            // 一般 CRLF／空白 stdout 不得拼接（rulings/p5.md P5-70f6ce7-1）。
+            let (cleaned, source_ranges) = clean_text_with_source_ranges(raw);
+            let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
+            if !wraps.is_empty() {
+                if let Some(n) = strip_wrapped_command_echo(
+                    echo_text,
+                    stripped,
+                    &wraps,
+                    cleaned_start,
+                ) {
                     lines.drain(..n);
                 }
             }
@@ -228,11 +246,18 @@ fn strip_command_echo_lines(raw: &str, lines: &mut Vec<String>, command: &str) {
 }
 
 /// `clean_text` 後依最後一個 prompt（completion 模式下只裁完成標記之後的尾 prompt）截斷並切行。
+struct PromptCut {
+    lines: Vec<String>,
+    echo_text: String,
+    /// `echo_text[0]` 在完整清理後 snapshot 中的字元位置。
+    cleaned_start: usize,
+}
+
 fn prompt_cut_lines(
     raw: &str,
     prompt_regex: &PyRegex,
     completion: Option<&PyRegex>,
-) -> Vec<String> {
+) -> PromptCut {
     let cleaned = clean_text(raw);
     let prompt_start = last_match_start(prompt_regex, &cleaned);
     let completion_end = completion
@@ -248,20 +273,64 @@ fn prompt_cut_lines(
             text = char_prefix(&cleaned, start);
         }
     }
-    splitlines(text.trim_start_matches('\n'))
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    let trimmed = text.trim_start_matches('\n');
+    let cleaned_start = text.chars().count().saturating_sub(trimmed.chars().count());
+    PromptCut {
+        lines: splitlines(trimmed)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        echo_text: trimmed.to_string(),
+        cleaned_start,
+    }
 }
 
 /// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt；修正 PR `_WRAP_MIN_SEGMENT`），也以此保守估計回顯最多佔幾行。
 const WRAP_MIN_SEGMENT: usize = 20;
 
-/// 原始串流中的終端折行證據：`newline` 為 BusyBox `\r\r\n`、`space` 為 bash readline `" \r"`。
-#[derive(Clone, Copy)]
+/// 清理後字元索引對應的原始串流折行證據。
+#[derive(Clone, Default)]
 pub(crate) struct WrapEvidence {
-    pub(crate) newline: bool,
-    pub(crate) space: bool,
+    newline_positions: HashSet<usize>,
+    space_positions: HashSet<usize>,
+}
+
+impl WrapEvidence {
+    pub(crate) fn from_raw(
+        raw: &str,
+        cleaned: &str,
+        source_ranges: &[std::ops::Range<usize>],
+    ) -> Self {
+        let mut evidence = Self::default();
+        let bytes = raw.as_bytes();
+        debug_assert_eq!(cleaned.chars().count(), source_ranges.len());
+        for (position, (ch, source)) in cleaned.chars().zip(source_ranges).enumerate() {
+            if ch == '\n'
+                && source.start > 0
+                && bytes.get(source.start - 1..source.end) == Some(b"\r\r\n")
+            {
+                evidence.newline_positions.insert(position);
+            }
+            if ch == ' '
+                && bytes.get(source.start..source.end.saturating_add(1)) == Some(b" \r")
+            {
+                evidence.space_positions.insert(position);
+            }
+        }
+        evidence
+    }
+
+    fn is_empty(&self) -> bool {
+        self.newline_positions.is_empty() && self.space_positions.is_empty()
+    }
+
+    fn is_wrap_at(&self, position: usize, ch: char) -> bool {
+        match ch {
+            '\n' => self.newline_positions.contains(&position),
+            ' ' => self.space_positions.contains(&position),
+            _ => false,
+        }
+    }
 }
 
 /// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
@@ -271,52 +340,74 @@ pub(crate) fn match_wrapped_echo(
     text: &[char],
     start: usize,
     command: &[char],
-    wraps: WrapEvidence,
+    wraps: &WrapEvidence,
+    text_base: usize,
 ) -> Option<usize> {
     let (mut i, mut j) = (start, 0usize);
     let mut last_wrap: Option<usize> = None;
     while j < command.len() {
         let ch = *text.get(i)?;
+        if wraps.is_wrap_at(text_base.saturating_add(i), ch) {
+            if j == 0 {
+                return None;
+            }
+            let column = last_wrap.map_or(start + j, |w| j - w);
+            if column < WRAP_MIN_SEGMENT {
+                return None;
+            }
+            last_wrap = Some(j);
+            i += 1;
+            continue;
+        }
         if ch == command[j] {
             i += 1;
             j += 1;
             continue;
         }
-        let allowed = (ch == '\n' && wraps.newline) || (ch == ' ' && wraps.space);
-        if j == 0 || !allowed {
-            return None;
-        }
-        let column = last_wrap.map_or(start + j, |w| j - w);
-        if column < WRAP_MIN_SEGMENT {
-            return None;
-        }
-        last_wrap = Some(j);
-        i += 1;
+        return None;
     }
     Some(i)
 }
 
-/// 修正 PR `_strip_wrapped_command_echo`：`lines` 已 `clean_text` 並切行；命令須從第一行開始（容許殘留 prompt），
-/// 完整結束在某一行的行尾，才把這幾行視為回顯。回傳要移除的行數。
+/// 修正 PR `_strip_wrapped_command_echo`：命令須從裁切區第一行開始（容許殘留 prompt），並完整結束於某行行尾。
+/// 回傳要移除的行數；候選插入點只查詢其原始來源位置的折行證據。
 fn strip_wrapped_command_echo(
-    lines: &[String],
+    text: &str,
     command: &str,
-    wraps: WrapEvidence,
+    wraps: &WrapEvidence,
+    text_base: usize,
 ) -> Option<usize> {
-    if command.is_empty() || lines.is_empty() {
+    if command.is_empty() || text.is_empty() {
         return None;
     }
     let cmd: Vec<char> = command.chars().collect();
-    let window = &lines[..lines.len().min(cmd.len() / WRAP_MIN_SEGMENT + 2)];
-    let text: Vec<char> = window.join("\n").chars().collect();
-    for start in 0..lines[0].chars().count() {
-        if let Some(end) = match_wrapped_echo(&text, start, &cmd, wraps) {
-            if end == text.len() || text[end] == '\n' {
-                return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
+    let chars: Vec<char> = text.chars().collect();
+    let first_line_len = chars
+        .iter()
+        .position(|ch| is_splitline(*ch))
+        .unwrap_or(chars.len());
+    for start in 0..first_line_len {
+        if let Some(end) = match_wrapped_echo(&chars, start, &cmd, wraps, text_base) {
+            if end == chars.len()
+                || chars.get(end).is_some_and(|ch| is_splitline(*ch))
+            {
+                let line_count = chars[..end]
+                    .iter()
+                    .filter(|ch| is_splitline(**ch))
+                    .count()
+                    .saturating_add(1);
+                return Some(line_count.min(splitlines(text).len()));
             }
         }
     }
     None
+}
+
+fn is_splitline(ch: char) -> bool {
+    matches!(
+        ch,
+        '\n' | '\r' | '\x0b' | '\x0c' | '\x1c'..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），

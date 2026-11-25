@@ -373,7 +373,7 @@ impl RxShared {
         human_tx_state(&window)
     }
 
-    /// 持有 RX watermark 鎖跨越單次 OS submit；只有已接受的 TX 才提交觀察狀態。
+    /// 在 RX 鎖下於 OS submit 前擷取 watermark；只在已接受或結果不明時提交 human TX 觀察。
     /// WouldBlock 不留下 human TX，也不固定 command 起點，下一次實際提交會重新取 watermark。
     pub(crate) fn observe_tx_submit(
         &self,
@@ -382,13 +382,18 @@ impl RxShared {
         human_payload: Option<(&[u8], bool, usize)>,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
-        let candidate_boundary = {
+        let (candidate_boundary, candidate_human_rx_offset) = {
             let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let boundary = command_op_id
                 .filter(|_| !command_boundary_recorded)
                 .map(|_| command_boundary(&window));
+            let human_rx_offset = human_payload.map(|_| {
+                window
+                    .trimmed
+                    .saturating_add(window.text.chars().count() as u64)
+            });
             window.tx_submit_pending = true;
-            boundary
+            (boundary, human_rx_offset)
         };
         let pending_guard = TxSubmitPendingGuard { rx: self };
         let step = submit();
@@ -409,11 +414,24 @@ impl RxShared {
                     let start = offset.min(payload.len());
                     let end = start.saturating_add(*count).min(payload.len());
                     if end > start {
-                        record_human_tx_locked(&mut window, &payload[start..end], raw_input);
+                        let rx_offset = candidate_human_rx_offset
+                            .expect("human submit 前應擷取 RX offset");
+                        record_human_tx_locked(
+                            &mut window,
+                            &payload[start..end],
+                            raw_input,
+                            rx_offset,
+                        );
                     }
                 }
                 (Some((_, raw_input, _)), SubmitStep::Pending) => {
-                    record_human_tx_unknown_locked(&mut window, raw_input);
+                    let rx_offset =
+                        candidate_human_rx_offset.expect("human submit 前應擷取 RX offset");
+                    record_human_tx_unknown_locked(
+                        &mut window,
+                        raw_input,
+                        rx_offset,
+                    );
                 }
                 _ => {}
             }
@@ -785,21 +803,22 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
     }
 }
 
-fn record_human_tx_locked(window: &mut RxWindow, payload: &[u8], raw_input: bool) {
+fn record_human_tx_locked(
+    window: &mut RxWindow,
+    payload: &[u8],
+    raw_input: bool,
+    rx_offset: u64,
+) {
     window.human_tx_generation = window.human_tx_generation.saturating_add(1);
-    window.last_human_tx_rx_offset = window
-        .trimmed
-        .saturating_add(window.text.chars().count() as u64);
+    window.last_human_tx_rx_offset = rx_offset;
     if raw_input && !payload.is_empty() {
         update_raw_line_state(window, payload);
     }
 }
 
-fn record_human_tx_unknown_locked(window: &mut RxWindow, raw_input: bool) {
+fn record_human_tx_unknown_locked(window: &mut RxWindow, raw_input: bool, rx_offset: u64) {
     window.human_tx_generation = window.human_tx_generation.saturating_add(1);
-    window.last_human_tx_rx_offset = window
-        .trimmed
-        .saturating_add(window.text.chars().count() as u64);
+    window.last_human_tx_rx_offset = rx_offset;
     if raw_input {
         window.human_raw_line_open = true;
     }

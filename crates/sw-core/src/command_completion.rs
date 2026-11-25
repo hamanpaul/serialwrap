@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use sw_proto::pycompat::clean_text;
+use sw_proto::pycompat::{clean_text, clean_text_with_source_ranges};
 use sw_proto::pyre::PyRegex;
 
 use crate::op_runner::{match_wrapped_echo, WrapEvidence};
@@ -38,14 +38,11 @@ impl<'a> CompletionEvaluator<'a> {
         human_tx_seen: bool,
         raw_half_line: bool,
     ) -> Evaluation {
-        let cleaned = clean_text(raw);
-        let wraps = WrapEvidence {
-            newline: raw.contains("\r\r\n"),
-            space: raw.contains(" \r"),
-        };
+        let (cleaned, source_ranges) = clean_text_with_source_ranges(raw);
+        let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
 
         if !raw_half_line {
-            if let Some(echo) = find_command_echo(&cleaned, self.command, self.prompt, wraps) {
+            if let Some(echo) = find_command_echo(&cleaned, self.command, self.prompt, &wraps) {
                 let Some(prompt) = tail_prompt_range(&cleaned, self.prompt)
                     .filter(|prompt| prompt.start >= echo.after_line)
                 else {
@@ -99,7 +96,7 @@ fn find_command_echo(
     cleaned: &str,
     command: &str,
     prompt: &PyRegex,
-    wraps: WrapEvidence,
+    wraps: &WrapEvidence,
 ) -> Option<EchoRange> {
     let command_chars: Vec<char> = command.chars().collect();
     let chars: Vec<char> = cleaned.chars().collect();
@@ -125,6 +122,7 @@ fn find_command_echo(
                 local_start,
                 &command_chars,
                 wraps,
+                line_start,
             ) else {
                 continue;
             };
@@ -184,6 +182,22 @@ mod tests {
 
     #[test]
     fn complete_echo_and_prefix_prompt_share_snapshot() {
+        for (raw, marker) in [
+            ("noiseX\x08\x1b[31m\r\r\n", "\r\r\n"),
+            ("noiseX\x08\x1b[32m \r", " \r"),
+        ] {
+            let (cleaned, sources) = clean_text_with_source_ranges(raw);
+            assert_eq!(cleaned, clean_text(raw));
+            let position = cleaned.chars().count() - 1;
+            let source = &sources[position];
+            let marker_range = if marker == "\r\r\n" {
+                source.start - 1..source.end
+            } else {
+                source.start..source.end + 1
+            };
+            assert_eq!(&raw[marker_range], marker);
+        }
+
         let prpl = evaluator("echo x", r"(?m)^root@prplOS:.*# ");
         assert_eq!(
             prpl.evaluate("old human\nroot@prplOS:~# echo x\r\nx\r\nroot@prplOS:~# ", false, false),

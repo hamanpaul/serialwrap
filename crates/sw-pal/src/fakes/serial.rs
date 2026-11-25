@@ -328,6 +328,7 @@ pub(crate) struct FakeDeviceInner {
     configs: Mutex<Vec<SerialConfig>>,
     read_errors: AtomicUsize,
     on_os_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_os_submit_after_write_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     paused: Mutex<bool>,
     paused_cond: Condvar,
     pause_released: Mutex<bool>,
@@ -367,6 +368,7 @@ impl FakeDeviceInner {
             configs: Mutex::new(Vec::new()),
             read_errors: AtomicUsize::new(0),
             on_os_submit_hook: Mutex::new(None),
+            on_os_submit_after_write_hook: Mutex::new(None),
             paused: Mutex::new(false),
             paused_cond: Condvar::new(),
             pause_released: Mutex::new(false),
@@ -757,6 +759,15 @@ impl FakeDevice {
         *self
             .inner
             .on_os_submit_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// 測試同步點：Fake OS 已接收這次寫入、`write_gated` 尚未回傳時呼叫；僅供 `test-fakes` 交錯測試使用。
+    pub fn on_os_submit_after_write(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .on_os_submit_after_write_hook
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
@@ -1277,6 +1288,15 @@ impl SerialWriter for FakeSerialWriter {
                         .unwrap_or_else(|e| e.into_inner())
                         .extend_from_slice(&data[..to_accept]);
                     check_tx_triggers_and_matches(&self.inner);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_after_write_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
                     committed = to_accept;
                     SubmitStep::Accepted(to_accept)
                 });

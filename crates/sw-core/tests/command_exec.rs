@@ -274,6 +274,184 @@ fn i294_human_prompt_before_agent_echo_does_not_complete() {
 }
 
 #[test]
+fn i294_unrelated_busybox_wrap_marker_does_not_join_plain_crlf_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-unrelated-busybox-wrap");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let command = format!("/tmp/{}", "x".repeat(60));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    // BusyBox 折行標記屬於前面的雜訊行；ANSI 與 backspace 清理後仍不得把證據移到候選 echo。
+    let unrelated = format!(
+        "root@t:/# \r\nnoiseX\x08\x1b[31m\r\r\n\x1b[0m{}\r\n{}\r\nroot@t:/# ",
+        &command[..40],
+        &command[40..]
+    );
+    let checks = h.rx.snapshot_wait_progress_for_test().0;
+    let expected_end = h
+        .rx
+        .snapshot_len()
+        .saturating_add(unrelated.chars().count() as u64);
+    h.inject_rx_reader_processed(unrelated.as_bytes());
+    h.wait_for("BusyBox 無關標記的 evaluator 判定", |rig| {
+        let status = rig.command_get(&id)["status"].clone();
+        let (_, checked_end) = rig.rx.snapshot_wait_progress_for_test();
+        status != "running"
+            || (rig.rx.snapshot_wait_progress_for_test().0 > checks && checked_end >= expected_end)
+    });
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無關的 BusyBox 標記不得拼接普通 CRLF；未完成 human TX 後的舊 prompt 也不能完成命令"
+    );
+
+    h.inject_rx_processed(format!("{command}\r\nOK\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OK"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("echo HUMAN\n{tx}").as_bytes());
+}
+
+#[test]
+fn i294_unrelated_readline_wrap_marker_does_not_join_plain_space_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-unrelated-readline-wrap");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let command = format!("/tmp/{}", "x".repeat(60));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    // readline 標記只在前面的雜訊行；候選 echo 中的普通空白不是折行插入點。
+    let unrelated = format!(
+        "root@t:/# \r\nnoise \r\n{} {}\r\nroot@t:/# ",
+        &command[..40],
+        &command[40..]
+    );
+    let checks = h.rx.snapshot_wait_progress_for_test().0;
+    let expected_end = h
+        .rx
+        .snapshot_len()
+        .saturating_add(unrelated.chars().count() as u64);
+    h.inject_rx_reader_processed(unrelated.as_bytes());
+    h.wait_for("readline 無關標記的 evaluator 判定", |rig| {
+        let status = rig.command_get(&id)["status"].clone();
+        let (_, checked_end) = rig.rx.snapshot_wait_progress_for_test();
+        status != "running"
+            || (rig.rx.snapshot_wait_progress_for_test().0 > checks && checked_end >= expected_end)
+    });
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無關的 readline 標記不得授權候選 echo 的普通空白；human 舊 prompt 也不能完成命令"
+    );
+
+    h.inject_rx_processed(format!("{command}\r\nOK\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OK"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("echo HUMAN\n{tx}").as_bytes());
+}
+
+#[test]
+fn i294_human_reply_arriving_inside_submit_does_not_poison_next_no_echo_command() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human-submit-race");
+    let before_generation = h.rx.human_tx_state().generation;
+    let reply = b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ".to_vec();
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    let called = Arc::new(AtomicBool::new(false));
+    let called_hook = Arc::clone(&called);
+    let (arrived_tx, arrived_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if called_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let expected = rx.total_bytes().saturating_add(reply.len() as u64);
+        dev.push_rx(&reply);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+        arrived_tx.send(()).expect("測試仍等待 submit 交錯點");
+        resume_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("測試應釋放仍在 OS submit 閉包內的 writer");
+    }));
+
+    console.push_input(b"echo HUMAN\n");
+    arrived_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human TX 已寫入，但 submit 尚未回傳");
+    assert!(
+        h.rx.text_from(0).ends_with("echo HUMAN\r\nHUMAN\r\nroot@t:/# "),
+        "完整 human echo、輸出與 prompt 已由 reader 收到"
+    );
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        before_generation,
+        "TX observation 尚未提交，writer 仍停在 submit 閉包內"
+    );
+    resume_tx.send(()).expect("writer hook 尚在等待釋放");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.wait_for("human TX observation 已提交", |rig| {
+        rig.rx.human_tx_state().generation > before_generation
+    });
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    h.inject_rx_processed(b"NO_ECHO\r\nroot@t:/# ");
+    h.advance(Duration::from_millis(200));
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("NO_ECHO"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_ECHO\n");
+}
+
+#[test]
+fn i294_incomplete_human_reply_still_makes_no_echo_command_partial() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human-incomplete-reply");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let id = h.submit_with("printf AGENT", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf AGENT\n");
+    h.inject_rx_processed(b"AGENT\r\nroot@t:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "human 回應尚無 prompt 時，不可由無 echo agent prompt 降階完成"
+    );
+
+    h.advance(Duration::from_millis(200));
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(result["stdout"], PyValue::from("AGENT"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo HUMAN\nprintf AGENT\n");
+}
+
+#[test]
 fn i294_shipped_prefix_prompts_handle_split_and_co_packed_rx() {
     run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", false);
     run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", true);
@@ -554,7 +732,7 @@ fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
     wait_tx(&h, tx.as_bytes());
 
     let incomplete = format!(
-        "root@t:/# {}\r\r\nroot@t:/# ",
+        "noiseX\x08\r\nroot@t:/# {}\x1b[31m\r\r\n\x1b[0mroot@t:/# ",
         &command[..65]
     );
     // 第一段只有折行命令前綴，後面刻意有舊 prompt。human TX 使無 echo 降階保持歧義；
@@ -562,7 +740,10 @@ fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
     h.inject_rx_processed(incomplete.as_bytes());
     assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
 
-    let first = format!("\r\nroot@t:/# {}\r\r\n", &command[..65]);
+    let first = format!(
+        "\r\nroot@t:/# {}\x1b[31m\r\r\n\x1b[0m",
+        &command[..65]
+    );
     h.inject_rx_processed(first.as_bytes());
     assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
 
