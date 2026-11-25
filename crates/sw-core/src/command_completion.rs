@@ -10,6 +10,11 @@ use sw_proto::pyre::PyRegex;
 
 use crate::op_runner::{match_wrapped_echo, WrapEvidence};
 
+/// 每個 evaluator snapshot 最多走訪的折行 matcher 狀態數。
+const MAX_ECHO_MATCH_STEPS: usize = 2_000_000;
+const MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE: usize = 2_000_000;
+const ECHO_MATCH_STEPS_PER_CHAR: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Evaluation {
     Pending,
@@ -42,7 +47,10 @@ impl<'a> CompletionEvaluator<'a> {
         let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
 
         if !raw_half_line {
-            if let Some(echo) = find_command_echo(&cleaned, self.command, self.prompt, &wraps) {
+            let mut metrics = EchoSearchMetrics::default();
+            if let Some(echo) =
+                find_command_echo(&cleaned, self.command, self.prompt, &wraps, &mut metrics)
+            {
                 let Some(prompt) = tail_prompt_range(&cleaned, self.prompt)
                     .filter(|prompt| prompt.start >= echo.after_line)
                 else {
@@ -92,42 +100,72 @@ struct EchoRange {
     after_line: usize,
 }
 
+#[derive(Debug, Default)]
+struct EchoSearchMetrics {
+    candidate_checks: usize,
+    prefix_scan_chars: usize,
+    matcher_steps: usize,
+    prefix_budget_exhausted: bool,
+}
+
 fn find_command_echo(
     cleaned: &str,
     command: &str,
     prompt: &PyRegex,
     wraps: &WrapEvidence,
+    metrics: &mut EchoSearchMetrics,
 ) -> Option<EchoRange> {
     let command_chars: Vec<char> = command.chars().collect();
     let chars: Vec<char> = cleaned.chars().collect();
     let first = *command_chars.first()?;
     let mut line_start = 0usize;
+    let mut previous_line_empty = false;
+    let mut remaining_match_steps = chars
+        .len()
+        .saturating_add(command_chars.len())
+        .saturating_mul(ECHO_MATCH_STEPS_PER_CHAR)
+        .clamp(64, MAX_ECHO_MATCH_STEPS);
 
     while line_start < chars.len() {
-        let line_end = chars[line_start..]
-            .iter()
-            .position(|c| *c == '\n')
-            .map_or(chars.len(), |n| line_start + n);
-        for candidate in line_start..line_end {
-            if candidate == line_start && line_start > 0 && chars[line_start - 1] == '\n' {
-                let previous_line_start = chars[..line_start - 1]
-                    .iter()
-                    .rposition(|ch| *ch == '\n')
-                    .map_or(0, |index| index + 1);
-                if previous_line_start == line_start - 1
-                    && wraps.is_wrap_at(line_start - 1, '\n')
+        let line_end = (line_start..chars.len())
+            .find(|index| chars[*index] == '\n')
+            .unwrap_or(chars.len());
+        let line_chars = &chars[line_start..line_end];
+        let line: String = line_chars.iter().collect();
+        let mut line_prefix_scan_chars = 0usize;
+        for (local_start, (byte_start, ch)) in line.char_indices().enumerate() {
+            if ch != first {
+                continue;
+            }
+            metrics.candidate_checks = metrics.candidate_checks.saturating_add(1);
+            let candidate = line_start + local_start;
+            if local_start > 0 {
+                let next_scan_chars = line_prefix_scan_chars.saturating_add(local_start);
+                if next_scan_chars > MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE {
+                    metrics.prefix_budget_exhausted = true;
+                    break;
+                }
+                line_prefix_scan_chars = next_scan_chars;
+                metrics.prefix_scan_chars = metrics
+                    .prefix_scan_chars
+                    .saturating_add(local_start);
+                let prefix = &line[..byte_start];
+                if !prompt
+                    .search(prefix)
+                    .is_some_and(|matched| matched.start == 0 && matched.end == local_start)
                 {
                     continue;
                 }
             }
-            if chars[candidate] != first {
-                continue;
-            }
-            let prefix = char_slice(cleaned, line_start..candidate);
-            if !prefix.is_empty() && !is_complete_prompt_prefix(&prefix, prompt) {
+            if candidate == line_start
+                && previous_line_empty
+                && line_start > 0
+                && wraps.is_wrap_at(line_start - 1, '\n')
+            {
                 continue;
             }
             let local_start = candidate - line_start;
+            let before_steps = remaining_match_steps;
             let Some(local_end) = match_wrapped_echo(
                 &chars[line_start..],
                 local_start,
@@ -135,9 +173,16 @@ fn find_command_echo(
                 wraps,
                 line_start,
                 |local_end| chars.get(line_start + local_end) == Some(&'\n'),
+                &mut remaining_match_steps,
             ) else {
+                metrics.matcher_steps = metrics
+                    .matcher_steps
+                    .saturating_add(before_steps - remaining_match_steps);
                 continue;
             };
+            metrics.matcher_steps = metrics
+                .matcher_steps
+                .saturating_add(before_steps - remaining_match_steps);
             let command_end = line_start + local_end;
             return Some(EchoRange {
                 _command: candidate..command_end,
@@ -147,15 +192,10 @@ fn find_command_echo(
         if line_end == chars.len() {
             break;
         }
+        previous_line_empty = line_end == line_start;
         line_start = line_end + 1;
     }
     None
-}
-
-fn is_complete_prompt_prefix(prefix: &str, prompt: &PyRegex) -> bool {
-    prompt
-        .search(prefix)
-        .is_some_and(|matched| matched.start == 0 && matched.end == prefix.chars().count())
 }
 
 /// 無 echo 的相容降階只接受 snapshot 尾端、最後一行行首的完整 prompt match。
@@ -390,4 +430,79 @@ mod tests {
             Evaluation::Uncertain { stdout: "root@t:/# echo x\nx".into() }
         );
     }
+
+    #[test]
+    fn i294_long_rx_echo_search_is_bounded() {
+        let evaluator = evaluator("echo x", r"(?m)^root@t:.*# ");
+        let long_line = format!("{}\nroot@t:/# ", "e".repeat(100_000));
+        let (cleaned, source_ranges) = clean_text_with_source_ranges(&long_line);
+        let wraps = WrapEvidence::from_raw(&long_line, &cleaned, &source_ranges);
+        let input_chars = cleaned.chars().count();
+        let mut metrics = EchoSearchMetrics::default();
+        let started = std::time::Instant::now();
+        let _ = find_command_echo(
+            &cleaned,
+            "echo x",
+            evaluator.prompt,
+            &wraps,
+            &mut metrics,
+        );
+        assert!(
+            metrics.prefix_budget_exhausted,
+            "長單行同首字元候選應受每行 prefix 預算限制：{metrics:?}"
+        );
+        assert!(
+            metrics.candidate_checks <= input_chars,
+            "候選檢查不得超過輸入字元數：{metrics:?}"
+        );
+        assert!(
+            metrics.prefix_scan_chars
+                <= MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE
+                    * (cleaned.chars().filter(|ch| *ch == '\n').count() + 1),
+            "prompt 前綴掃描須受每行固定預算限制：{metrics:?}"
+        );
+        assert!(
+            metrics.matcher_steps <= MAX_ECHO_MATCH_STEPS,
+            "折行 matcher 必須有固定步數上限：{metrics:?}"
+        );
+
+        assert_eq!(
+            evaluator.evaluate(&long_line, false, false),
+            Evaluation::Complete {
+                stdout: "e".repeat(100_000)
+            }
+        );
+
+        let short_lines = (0..2_000)
+            .map(|index| format!("e{index}\n"))
+            .collect::<String>()
+            + "root@t:/# ";
+        assert_eq!(
+            evaluator.evaluate(&short_lines, false, false),
+            Evaluation::Complete {
+                stdout: short_lines.trim_end_matches("root@t:/# ").trim_end_matches('\n').to_string()
+            }
+        );
+        assert_eq!(
+            evaluator.evaluate("human residue\nroot@t:/# ", true, false),
+            Evaluation::Uncertain {
+                stdout: "human residue".into()
+            }
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "長 RX 完成判定超過寬鬆上限：{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn i294_end_anchored_prompt_prefix_keeps_echo_stdout_boundary() {
+        let evaluator = evaluator("echo x", r"(?m)^root@t:/# $");
+        assert_eq!(
+            evaluator.evaluate("root@t:/# echo x\r\nx\r\nroot@t:/# ", false, false),
+            Evaluation::Complete { stdout: "x".into() }
+        );
+    }
+
 }

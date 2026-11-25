@@ -508,6 +508,59 @@ fn i294_completion_snapshot_ignores_later_rx() {
 }
 
 #[test]
+fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            deadline_tx.send(()).expect("test waits for deadline barrier");
+            resume_rx.recv().expect("test releases deadline barrier");
+        })));
+
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    let id = h.submit_with("echo LATE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo LATE\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+
+    h.advance(Duration::from_millis(200));
+    deadline_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("waiter must reach the configured deadline before late RX");
+    h.inject_rx_reader_processed(b"echo LATE\r\nLATE\r\nroot@t:/# ");
+    h.rx.record_human_tx_for_test(b"late human TX");
+    resume_tx.send(()).expect("deadline waiter remains paused");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+}
+
+#[test]
+fn i294_completion_before_deadline_still_completes() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    let id = h.submit_with("echo ON_TIME", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo ON_TIME\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+    h.inject_rx_processed(b"echo ON_TIME\r\nON_TIME\r\nroot@t:/# ");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ON_TIME"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+}
+
+#[test]
 fn i294_deferred_human_prompt_between_queued_commands_does_not_complete_next() {
     let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
     let console = h.attach_pty_console("i294-deferred-order");

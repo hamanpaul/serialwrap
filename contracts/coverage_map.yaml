@@ -100,11 +100,15 @@ entries:
     nodeids:
     - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
     - cargo:sw-core::command_completion::tests::echo_boundary_preserves_command_like_output_lines
+    - cargo:sw-core::command_completion::tests::i294_end_anchored_prompt_prefix_keeps_echo_stdout_boundary
+    - cargo:sw-core::command_completion::tests::i294_long_rx_echo_search_is_bounded
     - cargo:sw-core::command_completion::tests::no_echo_human_tx_is_uncertain_but_clean_no_echo_tail_prompt_completes
     - cargo:sw-core::command_completion::tests::raw_half_line_is_not_accepted_as_clean_echo
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::command_boundary_retries_after_would_block
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::human_tx_observation_tracks_only_accepted_segments
     - cargo:sw-core::command_exec::i294_background_uses_command_echo_boundary
+    - cargo:sw-core::command_exec::i294_completion_before_deadline_still_completes
+    - cargo:sw-core::command_exec::i294_late_echo_and_prompt_after_deadline_do_not_complete
     - cargo:sw-core::command_exec::i294_deferred_human_prompt_between_queued_commands_does_not_complete_next
     - cargo:sw-core::command_exec::i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line
     - cargo:sw-core::command_exec::i294_fragmented_wrapped_echo_waits_for_complete_command

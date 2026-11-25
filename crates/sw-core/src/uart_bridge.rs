@@ -142,6 +142,9 @@ pub struct RxShared {
     /// 測試交錯：命中 completion snapshot 後、waiter 收到結果前暫停。
     #[cfg(feature = "test-fakes")]
     snapshot_wait_match_hook: Mutex<Option<Arc<dyn Fn(&RxSnapshot) + Send + Sync>>>,
+    /// 測試交錯：snapshot wait 確認逾時後、呼叫端收回結果前暫停。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_deadline_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl RxShared {
@@ -171,6 +174,8 @@ impl RxShared {
             snapshot_wait_end: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
             snapshot_wait_match_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_deadline_hook: Mutex::new(None),
         })
     }
 
@@ -258,6 +263,17 @@ impl RxShared {
     ) {
         *self
             .snapshot_wait_match_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_snapshot_wait_deadline_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self
+            .snapshot_wait_deadline_hook
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = hook;
     }
@@ -371,6 +387,15 @@ impl RxShared {
     pub fn human_tx_state(&self) -> HumanTxState {
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         human_tx_state(&window)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn record_human_tx_for_test(&self, payload: &[u8]) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let rx_offset = window
+            .trimmed
+            .saturating_add(window.text.chars().count() as u64);
+        record_human_tx_locked(&mut window, payload, true, rx_offset);
     }
 
     /// 在 RX 鎖下於 OS submit 前擷取 watermark；只在已接受或結果不明時提交 human TX 觀察。
@@ -571,21 +596,22 @@ impl RxShared {
         self.wait_for_match_from(from, timeout, clock, |text| re.search(text).is_some())
     }
 
-    /// 等待 predicate 成功並回傳命中時使用的同一份 snapshot；超時回 `None`。
+    /// 等待 predicate 成功，或回傳逾時前最後實際檢查的 snapshot。
     pub fn wait_for_snapshot_from<T>(
         &self,
         from: u64,
         timeout: Duration,
         clock: &dyn Clock,
         mut matches: impl FnMut(&RxSnapshot) -> Option<T>,
-    ) -> Option<(RxSnapshot, T)> {
+    ) -> SnapshotWaitResult<T> {
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
         if clock.mono_ns() >= deadline {
-            return None;
+            return SnapshotWaitResult::TimedOut { last_snapshot: None };
         }
 
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut last_snapshot = None;
         while clock.mono_ns() < deadline {
             if window.tx_submit_pending {
                 let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
@@ -597,7 +623,11 @@ impl RxShared {
                 window = next;
                 continue;
             }
+            if clock.mono_ns() >= deadline {
+                break;
+            }
             let snapshot = snapshot_from_window(&window, from);
+            last_snapshot = Some(snapshot.clone());
             let revision = window.revision;
             drop(window);
 
@@ -624,7 +654,7 @@ impl RxShared {
                 {
                     hook(&snapshot);
                 }
-                return Some((snapshot, value));
+                return SnapshotWaitResult::Matched { snapshot, value };
             }
 
             window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -639,7 +669,17 @@ impl RxShared {
                 .unwrap_or_else(|error| error.into_inner());
             window = next;
         }
-        None
+        drop(window);
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = self
+            .snapshot_wait_deadline_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            hook();
+        }
+        SnapshotWaitResult::TimedOut { last_snapshot }
     }
 
     #[cfg(feature = "test-fakes")]
@@ -728,8 +768,16 @@ pub struct RxSnapshot {
     pub text: String,
     /// 同一把鎖下讀取的 `(epoch, rx_seq)`。
     pub watermark: (u64, u64),
+    /// 同一個 RX watermark 下的 human TX 狀態。
+    pub human_tx_state: HumanTxState,
     /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
     pub trimmed_before_from: bool,
+}
+
+/// 一次 completion snapshot 等待的結果。逾時時只附上 deadline 前實際檢查過的最後 snapshot。
+pub enum SnapshotWaitResult<T> {
+    Matched { snapshot: RxSnapshot, value: T },
+    TimedOut { last_snapshot: Option<RxSnapshot> },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -770,6 +818,7 @@ fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
         base,
         text: window.text_from(base).to_string(),
         watermark: window.watermark,
+        human_tx_state: human_tx_state(window),
         trimmed_before_from: base > from,
     }
 }
@@ -789,6 +838,7 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
             base: window.trimmed,
             text: String::new(),
             watermark: window.watermark,
+            human_tx_state,
             trimmed_before_from: false,
         }
     } else {

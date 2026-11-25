@@ -33,7 +33,9 @@ use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared, WaitMatchOutcome, WaitOutcome};
+use crate::uart_bridge::{
+    RunCancel, RxShared, SnapshotWaitResult, WaitMatchOutcome, WaitOutcome,
+};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
@@ -362,12 +364,17 @@ pub(crate) fn match_wrapped_echo(
     wraps: &WrapEvidence,
     text_base: usize,
     valid_end: impl Fn(usize) -> bool,
+    remaining_steps: &mut usize,
 ) -> Option<usize> {
     // 在「標記空白是命令字元」與「標記空白是 readline 插入」間保留兩條候選路徑。
     // exact 分支優先，但只有完整命令緊接行界線才採用；若後續字元不合，會回溯插入分支。
     let mut pending = vec![(start, 0usize, None::<usize>)];
     let mut visited = HashSet::new();
     while let Some((i, j, last_wrap)) = pending.pop() {
+        if *remaining_steps == 0 {
+            return None;
+        }
+        *remaining_steps -= 1;
         if !visited.insert((i, j, last_wrap)) {
             continue;
         }
@@ -946,44 +953,45 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         let wait_chunk = silence_limit.min(remaining);
         let pre_rx = ctx.rx.snapshot_len();
         if let Some(evaluator) = echo_evaluator.as_ref() {
-            let hit = ctx.rx.wait_for_snapshot_from(
+            let mut last_wait_uncertain = None;
+            let wait = ctx.rx.wait_for_snapshot_from(
                 pre_offset,
                 secs(wait_chunk),
                 &*ctx.clock,
                 |snapshot| {
+                    let human_tx_state = snapshot.human_tx_state;
                     match evaluator.evaluate(
                         &snapshot.text,
                         pending_human_before
-                            || ctx.rx.human_tx_state().generation > human_tx_before.generation,
-                        human_tx_before.raw_line_open
-                            || ctx.rx.human_tx_state().raw_line_open,
+                            || human_tx_state.generation > human_tx_before.generation,
+                        human_tx_before.raw_line_open || human_tx_state.raw_line_open,
                     ) {
-                        CompletionEvaluation::Complete { stdout } => Some(stdout),
-                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => {
+                        CompletionEvaluation::Complete { stdout } => {
+                            last_wait_uncertain = None;
+                            Some(stdout)
+                        }
+                        CompletionEvaluation::Pending => {
+                            last_wait_uncertain = None;
+                            None
+                        }
+                        CompletionEvaluation::Uncertain { stdout } => {
+                            last_wait_uncertain = Some(stdout);
                             None
                         }
                     }
                 },
             );
-            if let Some((_snapshot, stdout)) = hit {
-                completion_stdout = Some(stdout);
-                matched = true;
-                break;
-            }
-            let snapshot = ctx.rx.snapshot_from(pre_offset);
-            match evaluator.evaluate(
-                &snapshot.text,
-                pending_human_before
-                    || ctx.rx.human_tx_state().generation > human_tx_before.generation,
-                human_tx_before.raw_line_open || ctx.rx.human_tx_state().raw_line_open,
-            ) {
-                CompletionEvaluation::Complete { stdout } => {
+            match wait {
+                SnapshotWaitResult::Matched { value: stdout, .. } => {
                     completion_stdout = Some(stdout);
                     matched = true;
                     break;
                 }
-                CompletionEvaluation::Uncertain { stdout } => uncertain_stdout = Some(stdout),
-                CompletionEvaluation::Pending => uncertain_stdout = None,
+                SnapshotWaitResult::TimedOut { last_snapshot } => {
+                    if last_snapshot.is_some() {
+                        uncertain_stdout = last_wait_uncertain;
+                    }
+                }
             }
         } else if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
             matched = true;
@@ -991,19 +999,6 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         }
         if ctx.rx.snapshot_len() == pre_rx {
             break;
-        }
-    }
-    if !matched && uncertain_stdout.is_none() {
-        if let Some(evaluator) = echo_evaluator.as_ref() {
-            let snapshot = ctx.rx.snapshot_from(pre_offset);
-            if let CompletionEvaluation::Uncertain { stdout } = evaluator.evaluate(
-                &snapshot.text,
-                pending_human_before
-                    || ctx.rx.human_tx_state().generation > human_tx_before.generation,
-                human_tx_before.raw_line_open || ctx.rx.human_tx_state().raw_line_open,
-            ) {
-                uncertain_stdout = Some(stdout);
-            }
         }
     }
     if !matched {
