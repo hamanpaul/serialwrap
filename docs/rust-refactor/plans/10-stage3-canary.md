@@ -198,6 +198,10 @@ M6 後 → M3 選配工具 4～7；Canary 累積時間另列，不擋預設 1.0.
   - T3 只做映射的格式與驗證（schema、loader、verify_frozen）。測試用的合成映射只能讀 capabilities，並註明不是權威規則。
   - 權威映射檔由 T5B 建立，內容由編排者負責。gb10 沒有 COM port。逐案的 runner、實際平台、允許的 transport、核准 pair 或實體替代的去識別端點 ID、decision_ref，都由編排者在 T5B 依原生 COM 實機盤點後填入，並經擁有者核准。
   - 找不到 runner 來源的案例，要先補上 runner 或另行裁決處置，才能凍結映射。
+- **可信的實際 pair 對照（T3 第 2 輪 R2-03，同樣交編排者）**：
+  - 現況：T3 會逐案核對 `port_id` 是否等於映射中核准 pair 的 DUT 側去識別 ID，但 manifest 的實際 `dut.com_pair`（例如 COM20／COM21）只和同一份 manifest 自填的 `test_device_allowlist` 比對，缺少可信的「實際埠 ↔ 去識別 ID」對照。把兩邊同步改成 COM400／COM401，仍可通過載入與 `verify_frozen`。
+  - 處置：T3 在 `load_manifest`／`verify_frozen` 提供可注入的可信 pair 對照介面。對 `S3-L15-RELEASE-AB-WINDOWS`，沒有注入可信對照時一律 fail closed，回 BLOCKED-OWNER（同 BO-P9-01），不得視為通過。
+  - 可信對照由編排者在 T5B 的原生 COM 實機盤點時建立。實際埠名只存放於擁有者可控的非公開位置；公開證據只放去識別 ID 與該對照檔的 sha256，並由 manifest context 凍結這個 sha256。
 
 **公開證據契約（R7-01；適用全部 kind、歷史沿用及下文所有複製／封存要求）**：
 
