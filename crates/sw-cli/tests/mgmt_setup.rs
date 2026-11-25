@@ -3307,6 +3307,117 @@ fn bundle_setup_auto_port_interrupted_recovery_without_config_reselects_port() {
     assert!(t.journal_json().is_none(), "交易回復成功後應清除 journal");
 }
 
+#[cfg(unix)]
+fn posix_file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("讀取檔案 metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// inst4-f2 V051-a0b00f2-1：journal 綁定原交易 config；切換環境路徑時 fail closed。
+#[cfg(unix)]
+#[test]
+fn inst4_f2_interrupted_setup_refuses_changed_config_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let t = TestEnv::posix().with_bundle(CURRENT_VERSION).with_process();
+    let config_a = t.config_dir().join("transaction-a.yaml");
+    let config_b = t.config_dir().join("user-b.yaml");
+    let config_b_original = "# 使用者設定 B\nsupervision_mode: on-demand\nsocket_path: tcp://127.0.0.1:48731\n".as_bytes();
+    let config_a_text = config_a.display().to_string();
+    let mut t = t
+        .with_var("SERIALWRAP_CONFIG", &config_a_text)
+        .with_crash_at("entries_switching:after_effect");
+
+    assert!(!config_a.exists(), "交易前 A 必須不存在");
+    let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    let config_a_after_crash = std::fs::read(&config_a).expect("交易應已建立 A");
+    let journal_before = t.journal_bytes().expect("交易中斷後必須留下 journal");
+
+    std::fs::write(&config_b, config_b_original).expect("建立使用者設定 B");
+    std::fs::set_permissions(
+        &config_b,
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .expect("設定 B 權限");
+    let config_b_mode = posix_file_mode(&config_b);
+    let config_b_text = config_b.display().to_string();
+    t.clear_crash();
+    t = t.with_var("SERIALWRAP_CONFIG", &config_b_text);
+
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(std::fs::read(&config_b).expect("B 必須保留"), config_b_original);
+    assert_eq!(posix_file_mode(&config_b), config_b_mode, "B 的 mode 必須完整保留");
+    assert_eq!(rc, 2, "config 路徑與 journal 不一致時 setup 必須安全停止：{out} {err}");
+    assert!(out.contains("config_path_mismatch"), "應回報 config 路徑不一致：{out}");
+    assert!(err.contains(&config_b_text), "stderr 應指出當次解析到的 config 路徑：{err}");
+    assert_eq!(std::fs::read(&config_a).expect("安全停止不得改寫 A"), config_a_after_crash);
+    assert_eq!(t.journal_bytes().as_deref(), Some(journal_before.as_slice()), "拒絕復原時 journal 必須保留且不改寫");
+}
+
+/// inst4-f2 V051-a0b00f2-2：切換失敗後回復既有 POSIX config 的內容與 mode。
+#[cfg(unix)]
+#[test]
+fn inst4_f2_switch_failure_restores_existing_config_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
+    let t = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_fs_fault_replace_suffix(".new");
+    std::fs::set_permissions(
+        t.config_path(),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .expect("設定原始 config 權限");
+
+    let (rc, out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(rc, 2, "入口切換注入失敗時 setup 必須回報失敗：{out}");
+    assert!(out.contains("\"reverted\":true"), "切換失敗必須完成回復：{out}");
+    assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), original);
+    assert_eq!(posix_file_mode(&t.config_path()), 0o640, "回復必須保留原始 0640 mode");
+}
+
+/// inst4-f2 V051-a0b00f2-2：journal 中斷復原後回復既有 POSIX config 的內容與 mode。
+#[cfg(unix)]
+#[test]
+fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
+    let mut t = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_crash_at("entries_switching:after_effect");
+    std::fs::set_permissions(
+        t.config_path(),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .expect("設定原始 config 權限");
+
+    let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    assert!(t.journal_json().is_some(), "交易中斷後必須留下 journal");
+    t.clear_crash();
+
+    let recovery = t.recover().expect("journal");
+
+    assert!(recovery.ok, "中斷復原必須成功：{recovery:?}");
+    assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), original);
+    assert_eq!(posix_file_mode(&t.config_path()), 0o640, "journal 復原必須保留原始 0640 mode");
+}
+
 #[test]
 fn bundle_setup_ping_timeout_with_held_instance_lock_refuses_second_daemon() {
     let endpoint = TestEnv::win_endpoint();

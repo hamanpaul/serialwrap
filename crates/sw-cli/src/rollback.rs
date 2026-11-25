@@ -760,7 +760,13 @@ pub struct AutostartPlan {
 pub struct OriginalSnapshot {
     pub current: Option<CurrentRelease>,
     pub entries: Vec<EntrySnapshot>,
+    /// 原交易使用的 config 絕對路徑；舊 journal 缺少此欄位時復原必須 fail closed。
+    pub config_path: Option<String>,
+    /// config 在原交易開始前是否存在；不可由復原時的環境重新推導。
+    pub config_existed: Option<bool>,
     pub config_sha256: Option<String>,
+    /// 原本不存在的 config 由交易建立後，記錄最後一次交易寫入內容以確認復原可安全移除。
+    pub config_written_sha256: Option<String>,
     pub supervisor: SupervisorSnapshot,
     pub daemon: Option<DaemonSnapshot>,
     pub daemon_start: &'static str,
@@ -807,6 +813,74 @@ pub fn write_journal(ctx: &CliCtx, root: &InstallRoot, j: &Journal) -> Result<()
     ctx.p.fs.sync_dir(&root.root).map_err(|error| layout_io(&root.root, error.py_message))
 }
 
+fn absolute_config_write_path(ctx: &CliCtx<'_>) -> Result<PathBuf, LayoutError> {
+    let path = crate::endpoint_resolve::config_write_path(ctx);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = std::env::current_dir().map_err(|error| layout_io(Path::new("."), error.to_string()))?;
+    Ok(cwd.join(path))
+}
+
+fn journal_config_path(ctx: &CliCtx<'_>, original: &OriginalSnapshot) -> Result<PathBuf, (&'static str, String)> {
+    let recorded = original.config_path.as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| ("config_path_unknown", "journal 缺少原交易 config 絕對路徑；保留 journal，未修改檔案".to_string()))?;
+    if !recorded.is_absolute() {
+        return Err(("config_path_unknown", "journal 記錄的 config 路徑不是絕對路徑；保留 journal，未修改檔案".into()));
+    }
+    let resolved = absolute_config_write_path(ctx).map_err(|error| {
+        ("config_path_mismatch", format!("無法解析當次 SERIALWRAP_CONFIG 路徑；保留 journal，未修改檔案：{error}"))
+    })?;
+    if resolved != recorded {
+        return Err(("config_path_mismatch", format!(
+            "當次 SERIALWRAP_CONFIG 路徑與交易 journal 不一致；journal={}，當次={}；保留 journal，未修改任何檔案",
+            recorded.display(), resolved.display()
+        )));
+    }
+    let Some(config_existed) = original.config_existed else {
+        return Err(("config_state_unknown", "journal 缺少原交易 config 是否存在的狀態；保留 journal，未修改檔案".into()));
+    };
+    if config_existed != original.config_sha256.is_some() {
+        return Err(("config_state_unknown", "journal 的 config 存在狀態與原始 SHA-256 不一致；保留 journal，未修改檔案".into()));
+    }
+    if !config_existed && ctx.p.fs.exists(&recorded) {
+        let Some(expected) = original.config_written_sha256.as_deref() else {
+            return Err(("config_ownership_unknown", format!(
+                "原交易前 config 不存在，但目前檔案沒有交易寫入 SHA-256 可供確認：{}；保留 journal，未修改檔案",
+                recorded.display()
+            )));
+        };
+        let actual = hash_path(ctx, &recorded).map_err(|error| {
+            ("config_ownership_unknown", format!("無法確認交易建立的 config：{error}"))
+        })?;
+        if actual != expected {
+            return Err(("config_ownership_unknown", format!(
+                "目前 config 內容與交易寫入記錄不一致：{}；保留 journal，未修改檔案",
+                recorded.display()
+            )));
+        }
+    }
+    Ok(recorded)
+}
+
+fn record_transaction_config(ctx: &CliCtx<'_>, root: &InstallRoot, journal: &mut Journal) -> Result<(), LayoutError> {
+    let path = absolute_config_write_path(ctx)?;
+    let original = journal.original.as_mut().ok_or_else(|| layout_io(&root.root, "journal 缺少原始 config snapshot"))?;
+    let recorded = original.config_path.as_deref().map(PathBuf::from)
+        .ok_or_else(|| layout_io(&root.root, "journal 缺少原交易 config 路徑"))?;
+    if path != recorded {
+        return Err(layout_io(&path, format!("當次 SERIALWRAP_CONFIG 路徑與交易 journal 不一致：{}", recorded.display())));
+    }
+    original.config_written_sha256 = if ctx.p.fs.exists(&recorded) {
+        let bytes = ctx.p.fs.read(&recorded).map_err(|error| layout_io(&recorded, error.py_message))?;
+        Some(sha256_hex(&bytes))
+    } else {
+        None
+    };
+    write_journal(ctx, root, journal)
+}
+
 pub fn persist_original_snapshot(
     ctx: &CliCtx,
     root: &InstallRoot,
@@ -825,11 +899,12 @@ pub fn persist_original_snapshot(
             copy_file(ctx, &root.bin.join(name), &entry_dir.join(name))?;
         }
     }
-    let config_path = crate::endpoint_resolve::config_write_path(ctx);
+    let config_path = absolute_config_write_path(ctx)?;
+    let config_existed = ctx.p.fs.exists(&config_path);
     let config_sha256 = if ctx.p.fs.exists(&config_path) {
         let bytes = ctx.p.fs.read(&config_path).map_err(|error| layout_io(&config_path, error.py_message))?;
         let path = dir.join("config.yaml");
-        ctx.p.fs.atomic_write(&path, &bytes, None).map_err(|error| layout_io(&path, error.py_message))?;
+        copy_file(ctx, &config_path, &path)?;
         Some(sha256_hex(&bytes))
     } else { None };
     let current_bytes = if ctx.p.fs.exists(&root.current_file) {
@@ -874,7 +949,10 @@ pub fn persist_original_snapshot(
     let original = OriginalSnapshot {
         current: install_layout::read_current(root)?,
         entries,
+        config_path: Some(config_path.to_string_lossy().into_owned()),
+        config_existed: Some(config_existed),
         config_sha256,
+        config_written_sha256: None,
         supervisor: sup.clone(),
         daemon: daemon.clone(),
         daemon_start,
@@ -919,6 +997,11 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         Ok(journal) => journal,
         Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "journal_corrupt", message)),
     };
+    if let Some(original) = journal.original.as_ref() {
+        if let Err((reason, message)) = journal_config_path(ctx, original) {
+            return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), reason, message));
+        }
+    }
     if journal.step == JournalStep::Lock || journal.step == JournalStep::Verify || journal.step == JournalStep::SafetyCheck || journal.step == JournalStep::SnapshotTaken {
         return finish_recovery(ctx, root, &journal_path, &journal, false, PyDict::new());
     }
@@ -1876,9 +1959,17 @@ fn execute_change_with_restore(
             };
             return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
         }
+        if let Err(error) = record_transaction_config(ctx, &root, &mut journal) {
+            let failure = layout_op_failure(error, "update_start_and_verify");
+            return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
+        }
     }
     if let Some(previous_backup) = restore_previous {
         if let Err(error) = restore_backup(ctx, previous_backup, false) {
+            let failure = layout_op_failure(error, "update_start_and_verify");
+            return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
+        }
+        if let Err(error) = record_transaction_config(ctx, &root, &mut journal) {
             let failure = layout_op_failure(error, "update_start_and_verify");
             return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
         }
@@ -1990,6 +2081,12 @@ fn execute_change_with_restore(
                 return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
             }
         };
+        if op == "install" {
+            if let Err(error) = record_transaction_config(ctx, &root, &mut journal) {
+                let failure = layout_op_failure(error, "update_start_and_verify");
+                return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
+            }
+        }
         let legacy = crate::setup_cmd::detect_legacy_install(ctx, &home).map_or(PyValue::Null, PyValue::Dict);
         report.detail.insert("setup", PyValue::Dict(setup_result.clone()));
         report.detail.insert("legacy", legacy);
@@ -2056,6 +2153,10 @@ fn execute_change_with_restore(
             message: Some(error.to_string()),
             detail: PyDict::new(),
         };
+        return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
+    }
+    if let Err(error) = record_transaction_config(ctx, &root, &mut journal) {
+        let failure = layout_op_failure(error, "update_start_and_verify");
         return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
     }
     }
@@ -3361,7 +3462,10 @@ fn parse_original(value: &PyDict) -> Result<OriginalSnapshot, String> {
             _ => return Err("original.current 必須為物件或 null".into()),
         },
         entries,
+        config_path: optional_string_field(value, "config_path")?,
+        config_existed: optional_bool_field(value, "config_existed")?,
         config_sha256: optional_string_field(value, "config_sha256")?,
+        config_written_sha256: optional_string_field(value, "config_written_sha256")?,
         supervisor,
         daemon: match value.get("daemon") {
             None | Some(PyValue::Null) => None,
@@ -3553,10 +3657,11 @@ fn original_install_state_matches(
     if current != original.current || capture_entries(ctx, root).map_err(|error| error.to_string())? != original.entries {
         return Ok(false);
     }
-    let config_path = crate::endpoint_resolve::config_write_path(ctx);
-    match (&original.config_sha256, ctx.p.fs.exists(&config_path)) {
-        (None, false) => Ok(true),
-        (Some(expected), true) => {
+    let config_path = original.config_path.as_deref().map(PathBuf::from)
+        .ok_or_else(|| "journal 缺少原交易 config 絕對路徑".to_string())?;
+    match (original.config_existed, original.config_sha256.as_deref(), ctx.p.fs.exists(&config_path)) {
+        (Some(false), None, false) => Ok(true),
+        (Some(true), Some(expected), true) => {
             let bytes = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
             Ok(sha256_hex(&bytes) == *expected)
         }
@@ -3663,15 +3768,19 @@ impl RestoreProgress {
 fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal, backup: Option<&Path>, progress: &mut RestoreProgress) -> Result<(), String> {
     let original = journal.original.as_ref().ok_or("journal 缺少 original snapshot")?;
     let snapshot = journal.snapshot_dir.as_deref().map(PathBuf::from).ok_or("journal 缺少 snapshot_dir")?;
+    let config_path = journal_config_path(ctx, original).map_err(|(_, message)| message)?;
     let source = backup.unwrap_or(&snapshot);
     // state.json 與 benches.state.json 可能在新版運作期間更新（例如 RELEASED）；
     // 回退只還原設定，不可用舊備份覆蓋目前的持久化狀態。
-    let config_path = crate::endpoint_resolve::config_write_path(ctx);
-    match original.config_sha256.as_deref() {
-        Some(expected) => {
+    match (original.config_existed, original.config_sha256.as_deref()) {
+        (Some(true), Some(expected)) => {
             let original_config = snapshot.join("config.yaml");
             if !ctx.p.fs.exists(&original_config) {
                 return Err("原始 config.yaml 快照不存在".into());
+            }
+            let original_bytes = ctx.p.fs.read(&original_config).map_err(|error| error.py_message)?;
+            if sha256_hex(&original_bytes) != expected {
+                return Err("原始 config.yaml 還原來源與 journal SHA-256 不一致".into());
             }
             copy_replace(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
             let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
@@ -3679,7 +3788,7 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
                 return Err("還原後的 config.yaml 與原始快照不一致".into());
             }
         }
-        None => {
+        (Some(false), None) => {
             if ctx.p.fs.exists(&config_path) {
                 ctx.p.fs.remove_file(&config_path).map_err(|error| error.py_message)?;
                 if let Some(parent) = config_path.parent() {
@@ -3687,6 +3796,7 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
                 }
             }
         }
+        _ => return Err("journal 的 config 原始存在狀態與 SHA-256 不一致".into()),
     }
     for name in ["profiles", "supervisor"] {
         let from = source.join(name);
@@ -3910,12 +4020,13 @@ fn verify_restored(
 }
 
 fn verify_original_config(ctx: &CliCtx<'_>, original: &OriginalSnapshot) -> Result<(), String> {
-    let config_path = crate::endpoint_resolve::config_write_path(ctx);
-    match (original.config_sha256.as_deref(), ctx.p.fs.exists(&config_path)) {
-        (None, false) => Ok(()),
-        (None, true) => Err("原始安裝沒有 config.yaml，但回復後檔案仍存在".into()),
-        (Some(_), false) => Err("原始安裝的 config.yaml 在回復後遺失".into()),
-        (Some(expected), true) => {
+    let config_path = original.config_path.as_deref().map(PathBuf::from)
+        .ok_or_else(|| "journal 缺少原交易 config 絕對路徑".to_string())?;
+    match (original.config_existed, original.config_sha256.as_deref(), ctx.p.fs.exists(&config_path)) {
+        (Some(false), None, false) => Ok(()),
+        (Some(false), None, true) => Err("原始安裝沒有 config.yaml，但回復後檔案仍存在".into()),
+        (Some(true), Some(_), false) => Err("原始安裝的 config.yaml 在回復後遺失".into()),
+        (Some(true), Some(expected), true) => {
             let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
             if sha256_hex(&restored) == expected {
                 Ok(())
@@ -3923,6 +4034,7 @@ fn verify_original_config(ctx: &CliCtx<'_>, original: &OriginalSnapshot) -> Resu
                 Err("還原後的 config.yaml 與原始 SHA-256 不一致".into())
             }
         }
+        _ => Err("journal 的 config 原始存在狀態與 SHA-256 不一致".into()),
     }
 }
 
@@ -4275,7 +4387,10 @@ fn daemon_value(snapshot: Option<&DaemonSnapshot>) -> PyValue {
 fn original_value(original: &OriginalSnapshot) -> PyValue {
     PyValue::Dict(PyDict::from_pairs(vec![
         ("autostart".into(), autostart_value(&original.autostart)),
+        ("config_existed".into(), original.config_existed.map(PyValue::Bool).unwrap_or(PyValue::Null)),
+        ("config_path".into(), opt_str(original.config_path.as_deref())),
         ("config_sha256".into(), opt_str(original.config_sha256.as_deref())),
+        ("config_written_sha256".into(), opt_str(original.config_written_sha256.as_deref())),
         ("current".into(), current_value(original.current.as_ref())),
         ("daemon".into(), daemon_value(original.daemon.as_ref())),
         ("daemon_start".into(), str_value(original.daemon_start)),
