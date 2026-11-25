@@ -736,6 +736,9 @@ pub struct SessionCore {
     released_reason: PyValue,
     /// agent Interactive Lease（P5-T14；`interactive_session_id` 由此導出）。
     lease: Option<InteractiveLease>,
+    /// p279：明確 close／detach 撤權的 TCP client lifetime；只供 mirror lease 簿記判斷。
+    /// Recovery／Clear 等保留既有 client lifetime 的 drain 不清此集合；EOF 或新 accept 才結算。
+    tcp_mirror_revocations: HashSet<(String, u64)>,
     /// 已到期 lease 的 tombstone（每 session FIFO 16，#54）。
     tombstones: Tombstones,
     /// 前景 op 的待辦（以 op_id 索引；回覆與狀態副作用於 `OpFinished` 套用）。
@@ -776,7 +779,7 @@ pub struct SessionCore {
     /// P6：human console 狀態（ownership、line editor、DeferredBuffer、human TX lane、回放保留）。
     human: crate::human_console::HumanConsoleState,
     /// P6 增補 #11：drain Phase 1 時的 human lease owner 與 timeout（05 §3.1 第 1 步）。
-    retained_human: Option<(String, f64)>,
+    retained_human: Option<(String, f64, Option<u64>)>,
     /// P6 Task 6：目前前景命令的 admission（`fg_finish` 依此 resume）。
     fg_adm: Option<FgAdmission>,
     /// P6 增補 #12：self-test suspend 的世代（drain Phase 1 重設 ownership 時遞增）；各 probe 的 suspend 旗標
@@ -1100,6 +1103,7 @@ impl SessionCore {
             released_at: None,
             released_reason: PyValue::Null,
             lease: None,
+            tcp_mirror_revocations: HashSet::new(),
             tombstones: Tombstones::new(),
             pending_ops: HashMap::new(),
             background: IndexMap::new(),
@@ -2962,6 +2966,7 @@ impl SessionCore {
             self.quiet_since = None;
         }
         self.state = state;
+        self.sync_tcp_console_lease(now);
     }
 
     fn set_last_error(&mut self, error: Option<String>, detail: Option<String>) {
@@ -6586,6 +6591,7 @@ impl SessionCore {
         {
             return Vec::new();
         }
+        self.sync_tcp_console_lease(now);
         // 手動 attach／recover（或其他 login run）持有 probe：Python `_prepare_reprobe_locked` 照常排程（前移
         // `next_reprobe_at`），worker 取不到 probe 鎖才跳過（審查 c11aa89_92e0223 L-3）。
         let probe_busy = self.login_run.is_some() || self.foreground.is_some();
@@ -7464,15 +7470,23 @@ impl SessionCore {
     // ---------------- lease ----------------
 
     /// 開新 lease：owner_gen 遞增（舊 LeaseOwner job 由 fence `OwnerMismatch` 撤銷）。
-    fn open_lease(
+    fn open_lease(&mut self, owner: &str, timeout_s: f64, recovery_mode: bool, now: Mono) -> String {
+        self.open_lease_with_tcp_mirror(owner, timeout_s, recovery_mode, now, None)
+    }
+
+    /// 開啟保留的 lease；TCP mirror 沿用原 client lifetime，LeaseIndex 仍在 Reply 前發布。
+    fn open_lease_with_tcp_mirror(
         &mut self,
         owner: &str,
         timeout_s: f64,
         recovery_mode: bool,
         now: Mono,
+        mirror_client_lifetime: Option<u64>,
     ) -> String {
+        // 既有授權路徑重授仍登記的 TCP client 時清除撤權；marker 仍只取呼叫端傳入值。
+        self.clear_tcp_mirror_revocation_for_human_owner(owner);
         let id = self.next_uuid();
-        let lease = InteractiveLease::new(
+        let mut lease = InteractiveLease::new(
             id.clone(),
             owner.to_string(),
             self.wall_iso(),
@@ -7480,13 +7494,17 @@ impl SessionCore {
             now,
             recovery_mode,
         );
+        lease.mirror_client_lifetime = mirror_client_lifetime;
         self.lease = Some(lease);
         self.bump_owner_gen();
         // P6：`_open_interactive_locked` → `bridge.set_interactive_owner(owner)`；全域 LeaseIndex 先於 Reply（07 Task 7）。
         self.human_set_owner(Some(owner));
-        self.lease_index(LeaseIndexOp::Insert {
-            interactive_id: id.clone(),
-        });
+        let index = if mirror_client_lifetime.is_some() {
+            LeaseIndexOp::InsertTcpMirror { interactive_id: id.clone() }
+        } else {
+            LeaseIndexOp::Insert { interactive_id: id.clone() }
+        };
+        self.lease_index(index);
         id
     }
 
@@ -7721,6 +7739,9 @@ impl SessionCore {
     fn interactive_close(&mut self, interactive_id: &str) -> PyDict {
         if !self.lease_matches(interactive_id) {
             return self.lease_lookup_error(interactive_id);
+        }
+        if let Some(lease) = self.lease.as_ref().cloned() {
+            self.mark_tcp_mirror_revoked_for_lease(&lease);
         }
         self.close_lease(false);
         pydict! { "ok" => true, "interactive_id" => interactive_id }
@@ -10104,6 +10125,8 @@ pub struct PtyInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseIndexOp {
     Insert { interactive_id: String },
+    /// p279：索引仍可解析一般 RPC，但供 daemon 交接摘要辨識不應發布 Lease admission flag 的 TCP mirror。
+    InsertTcpMirror { interactive_id: String },
     Remove { interactive_id: String },
 }
 

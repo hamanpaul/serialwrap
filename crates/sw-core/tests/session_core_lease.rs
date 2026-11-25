@@ -57,6 +57,17 @@ fn human_txs(effects: &[Effect]) -> Vec<(TxClass, String, Vec<u8>)> {
         .collect()
 }
 
+fn close_tcp_mirror_publicly(h: &mut CoreHarness, client_id: &str) {
+    let lease = h.core.active_lease().expect("TCP raw owner mirror lease");
+    assert_eq!(lease.owner, format!("human:{client_id}"));
+    let interactive_id = lease.interactive_id.clone();
+    let response = h
+        .rpc(SessionRequest::InteractiveClose { interactive_id })
+        .expect("interactive-close RPC");
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert!(h.core.human_console().consoles.contains_key(client_id), "close lease 保留 console");
+}
+
 /// 比照 reader：先寫入 RX 視窗（`RxShared::append`）再送 `UartRxChunk`。
 fn feed_rx(h: &mut CoreHarness, bytes: &[u8]) -> Vec<Effect> {
     let epoch = h.epoch();
@@ -888,6 +899,7 @@ fn human_reboot_opens_lease() {
     let mut h = ready();
     h.connect_stream_console("c1", ConsoleTransportKind::TcpTelnet);
     h.connect_stream_console("c2", ConsoleTransportKind::TcpTelnet);
+    close_tcp_mirror_publicly(&mut h, "c1");
     let e0 = h.core.generations().input_epoch;
     let fx = h.input("c2", b"reboot\r");
     let grant = fx
@@ -1076,6 +1088,7 @@ fn human_timeout_promoted_only_for_internal_origin() {
     let mut h = ready();
     h.connect_stream_console("c1", ConsoleTransportKind::TcpTelnet);
     h.connect_stream_console("c2", ConsoleTransportKind::TcpTelnet);
+    close_tcp_mirror_publicly(&mut h, "c1");
     let fx = h.input("c2", b"ls\r");
     let grant = fx
         .iter()
@@ -1328,6 +1341,14 @@ fn human_line_timeout_sends_no_rescue_keys() {
         });
     }
     let _ = rig.get_state();
+    let state = rig.get_state();
+    let interactive_id = state
+        .get("interactive_session_id")
+        .and_then(PyValue::as_str)
+        .expect("TCP mirror ID")
+        .to_string();
+    let closed = rig.request(SessionRequest::InteractiveClose { interactive_id });
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)), "{closed:?}");
     let epoch = rig.fence.with(|f| f.input_epoch);
     rig.data_sender()
         .send(DataEvent::ConsoleInputBytes {

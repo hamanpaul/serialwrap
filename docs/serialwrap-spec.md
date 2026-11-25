@@ -171,7 +171,9 @@ sequenceDiagram
   2. 執行 agent 命令
   3. `bridge.resume_interactive()` → 恢復 owner、flush deferred buffer 到 UART
 - Human 在 agent 執行期間的按鍵輸入會累積在 deferred buffer（不做 local echo），agent 完成後一次性 flush 到 UART，由 target 自然回顯。
-- Agent 命令**不再需要等待 human 關閉 minicom**；超時回 `SESSION_INTERACTIVE_BUSY` 的情境僅保留給 agent-vs-agent interactive lease 衝突。
+- Agent 命令**不再需要等待 human 關閉 minicom**；human lease 在活動視窗內與 agent interactive lease 衝突時仍回 `SESSION_INTERACTIVE_BUSY`，閒置時可 soft-preempt；agent-vs-agent 衝突亦回此碼。
+
+Rust 0.5.1（BC-23）在 Windows TCP/Telnet raw owner 上補 session-layer lifetime mirror lease，讓 self-test、human activity reprobe 暫緩與 agent interactive arbitration 看見 TCP human；EOF 僅移除該 client lifetime 的鏡像，不清除替換後 owner。鏡像只在內部 LeaseIndex 標記，不產生 `AdmissionFlag::Lease`，因此 handoff 不會只因 TCP console 持續連線而被阻擋。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease；既有 mirror 簿記由同步路徑撤除，raw ownership、admission、suspend／resume、deferred input、回放及 raw／line 輸入路由維持修前 Rust 基線。guard 開放至下一次同步之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。PTY 路徑與 Python 基線語意不變。此鏡像不改變 agent 命令與 human 命令的來源政策：已有 human lease 時，bare `source: "human"` 的預設 line `command.submit` 在執行 gate 回 `SESSION_INTERACTIVE_BUSY` 且零 TX；`file.push`／`file.pull` 仍沿 RPC agent 路徑與既有傳輸 gate 執行。Windows 原生與 Tera Term smoke 不由此 Rust Linux 測試證明。
 
 #### Line-Buffer 模式
 

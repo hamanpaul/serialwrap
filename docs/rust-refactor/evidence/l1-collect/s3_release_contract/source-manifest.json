@@ -1,0 +1,79 @@
+{
+  "platforms": {
+    "linux": {
+      "checkout": "e5cee8c3c5242f25b9aca4fb0d8b6485de9ff112",
+      "collection_argv": [
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "tests/contract_blackbox",
+        "-m",
+        "core_portable or posix_only"
+      ],
+      "collector": "編排者",
+      "nodeid_count": 938,
+      "nodeids_sha256": "cc0c229d4d5436c3b5a2485d23cd7aad0bea24d76a269d8d14514e6ba67be4f2",
+      "os": "Linux x86_64（WSL2 Ubuntu）",
+      "python": "3.12.3",
+      "raw_bytes": 92032,
+      "raw_lines": 940,
+      "raw_sha256": "d5bdcef80ba9a2f851b3c963242393c4e4a63396310b06e282f612ad93070cd0",
+      "return_code": 0,
+      "selector": {
+        "argv": [
+          "-q",
+          "tests/contract_blackbox",
+          "-m",
+          "core_portable or posix_only"
+        ],
+        "markexpr": "core_portable or posix_only",
+        "paths": [
+          "tests/contract_blackbox"
+        ]
+      },
+      "summary": "938/1067 tests collected (129 deselected)"
+    },
+    "windows": {
+      "checkout": "e5cee8c3c5242f25b9aca4fb0d8b6485de9ff112",
+      "collection_argv": [
+        "py",
+        "-3.12",
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "tests/contract_blackbox",
+        "-m",
+        "core_portable or windows_native"
+      ],
+      "collector": "a250113",
+      "nodeid_count": 265,
+      "nodeids_sha256": "3e732108a55ac02194a9ac6174a393cba8634529ebba0a79782d007605939658",
+      "os": "Windows 10.0.26100（原生命令提示字元，非 WSL）",
+      "python": "3.12.3",
+      "raw_bytes": 27522,
+      "raw_lines": 274,
+      "raw_sha256": "734093d9b292be4277e5c2fc4594863562deedcb835d0889af49b5b89664c660",
+      "return_code": 0,
+      "selector": {
+        "argv": [
+          "-q",
+          "tests/contract_blackbox",
+          "-m",
+          "core_portable or windows_native"
+        ],
+        "markexpr": "core_portable or windows_native",
+        "paths": [
+          "tests/contract_blackbox"
+        ]
+      },
+      "summary": "265/420 tests collected (155 deselected)"
+    }
+  },
+  "schema_version": 1,
+  "set_id": "s3_release_contract",
+  "source_note": "兩平台 nodeid 清單完全由本 repo 指定 revision 的測試原始碼產生，並與 L1 鎖等值；原始輸出不公開，由收集方保存。公開 manifest 僅列原始檔摘要與 nodeid 清單的數量及摘要 hash。"
+}

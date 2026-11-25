@@ -1358,8 +1358,8 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09", "BC-10", "BC-13"})
-_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25", "BC-10": "2026-11-24", "BC-13": "2026-11-22"}
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09", "BC-10", "BC-13", "BC-23"})
+_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25", "BC-10": "2026-11-24", "BC-13": "2026-11-22", "BC-23": "2026-11-24"}
 
 
 def test_bc_real_five_bcs_registered() -> None:
@@ -1403,7 +1403,7 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
         approved_at = bc08["approved_at_revision"]
         assert type(approved_at) is int and 0 < approved_at <= catalog["revision"]
         # BC-08 的內容與最後變更核准 revision 綁定；變更 BC-08 時須同時更新此指紋與 revision。
-        assert approved_at == 21
+        assert approved_at == 24
         content = {key: value for key, value in bc08.items() if key != "approved_at_revision"}
         canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         assert hashlib.sha256(canonical).hexdigest() == "deed7e4e4a4cbf8d1133f23423782b438d73c6e0873715c693822f483dbe457c"
@@ -1509,7 +1509,8 @@ def test_bc09_timeout_recovery_keys_registered() -> None:
     """BC-09 記錄 p290 的 Rust-only profile、recovery 與 setup 遷移契約。"""
     behavior = yaml.safe_load((ROOT / "contracts" / "behavior_changes.yaml").read_text(encoding="utf-8"))
     change = next(item for item in behavior["changes"] if item["id"] == "BC-09")
-    assert behavior["revision"] == 21
+    # 全檔 revision 會隨後續 BC 登錄前進；只要求不小於 BC-09 的核准 revision。
+    assert behavior["revision"] >= change["approved_at_revision"]
     assert change["kind"] == "BC"
     assert change["status"] == "IMPLEMENTED"
     assert change["approval"] == {
@@ -1518,7 +1519,7 @@ def test_bc09_timeout_recovery_keys_registered() -> None:
         "decision_ref": "OD-111",
         "basis": "owner_decision",
     }
-    assert change["approved_at_revision"] == 21
+    assert change["approved_at_revision"] == 24
     assert change["scope"] == "rust_only"
     assert change["ab_participation"] == "absolute_only"
     assert change["applies_to"]["python"] is None

@@ -1,0 +1,120 @@
+{
+  "$defs": {
+    "ExitPlatform": {
+      "additionalProperties": false,
+      "properties": {
+        "case_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "layer": {
+          "enum": [
+            "L1.5",
+            "L2",
+            "L3"
+          ]
+        },
+        "required_case_set": {
+          "const": "slice_2.4"
+        }
+      },
+      "required": [
+        "required_case_set",
+        "layer",
+        "case_ids"
+      ],
+      "type": "object"
+    },
+    "FrozenFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "Seed": {
+      "additionalProperties": false,
+      "properties": {
+        "case_lock": {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        "cases": {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        "decision_ref": {
+          "const": "OD-113"
+        },
+        "excluded_case_ids": {
+          "const": [
+            "lr-mixed"
+          ]
+        },
+        "revision": {
+          "const": "59d8c7f1eb7de1ae2a90cefd6df21ce945d695d2"
+        }
+      },
+      "required": [
+        "revision",
+        "cases",
+        "case_lock",
+        "decision_ref",
+        "excluded_case_ids"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://serialwrap.local/schemas/stage3_required_cases",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "exits": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "$ref": "#/$defs/ExitPlatform"
+        },
+        "minProperties": 1,
+        "propertyNames": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "type": "object"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^S3-[A-Z0-9-]+$"
+      },
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "seed": {
+      "$ref": "#/$defs/Seed"
+    }
+  },
+  "required": [
+    "schema_version",
+    "seed",
+    "exits"
+  ],
+  "title": "Stage 3 逐出口案例分母鎖",
+  "type": "object"
+}

@@ -143,6 +143,26 @@ impl HumanConsoleState {
             .is_some_and(|c| c.client_lifetime == lifetime)
     }
 
+    /// p279：目前 active／suspended／pending raw owner 中仍存活的 TCP Telnet client。
+    /// PTY 與 com0com 不參與此鏡像；順序遵守 ownership 的優先層次，不另行授予 raw owner。
+    pub(crate) fn live_tcp_raw_owner(&self) -> Option<(String, u64)> {
+        [
+            self.ownership.interactive_owner.as_deref(),
+            self.ownership.suspended_owner.as_deref(),
+            self.ownership.pending_owner.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|owner| {
+            let client_id = owner.strip_prefix("human:").filter(|id| !id.is_empty())?;
+            let console = self.consoles.get(client_id)?;
+            (console.kind == ConsoleTransportKind::TcpTelnet
+                && self.is_live(client_id, console.client_lifetime)
+                && self.peer_present.get(client_id).copied().unwrap_or(true))
+                .then(|| (owner.to_string(), console.client_lifetime))
+        })
+    }
+
     /// 配下一個 `client_lifetime`（同 id 重新連入亦不同）。
     pub fn alloc_lifetime(&mut self) -> u64 {
         self.next_lifetime = self.next_lifetime.saturating_add(1);
