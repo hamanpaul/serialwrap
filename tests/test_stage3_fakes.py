@@ -768,3 +768,51 @@ def test_policy_dict_loads(tmp_path):
     assert policy.status == "frozen"
     assert policy.platforms["linux"].utc_offset_minutes == 0
     assert policy.platforms["windows"].utc_offset_minutes == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "overrides"),
+    [
+        ("1A", {}),
+        ("1B", {}),
+        ("2.1", {}),
+        ("2.4", {}),
+        ("2.1", {"sides.1.cli_sha_override": "0" * 64}),
+    ],
+)
+def test_pre_stage3_release_manifests_follow_current_contract(tmp_path, stage, overrides):
+    """Stage 3 以前的 A/B release manifest 都必須通過現行 schema，且 component 雜湊可獨立重算。
+
+    現行 contracts/release_manifest.schema.json 對任何 daemon 實作都要求 entry／runtime／package；
+    非退役 Rust daemon 比照 scripts/rust/mkbundle.sh 的 Stage 2 相容欄位。CLI SHA 負向案例除了
+    兩側 CLI 身分不同外，其餘 release manifest 也必須合法。
+
+    1A／1B 的 A 側依 Task 3 load_manifest 為 Python CLI 基線；現行 schema 只接受 Rust CLI，
+    因此這兩個階段只以 schema 驗 B 側，A 側仍核對 component 雜湊。
+    """
+    import jsonschema
+
+    fakes = _fakes()
+    manifest_path = fakes.write_ab_manifest(tmp_path / f"pre-{stage}", stage=stage, platform="linux", **overrides)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    repo = manifest_path.parent
+    schema = json.loads((REPO_ROOT / "contracts/release_manifest.schema.json").read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+
+    for side in manifest["sides"]:
+        bundle_dir = repo / side["bundle_dir"]
+        release = json.loads((repo / side["release_manifest"]["path"]).read_text(encoding="utf-8"))
+        if not (stage in {"1A", "1B"} and side["label"] == "A"):
+            errors = [error.message for error in validator.iter_errors(release)]
+            assert errors == [], f"{side['label']} release manifest schema errors: {errors}"
+        daemon = release["components"]["daemon"]
+        assert "retirement" not in release
+        assert daemon["runtime"]["sha256"] == hashlib.sha256(
+            (bundle_dir / daemon["runtime"]["path"]).read_bytes()
+        ).hexdigest()
+        assert daemon["package"]["tree_sha256"] == fakes.package_tree_sha256(bundle_dir / "py")
+        assert release["components"]["python_cli_delegate"]["tree_sha256"] == fakes.package_tree_sha256(bundle_dir / "py")
+        if daemon["implementation"] == "rust":
+            assert daemon["entry"] == [daemon["launcher"]["path"]], "非退役 Rust daemon 的 entry 指向 Rust launcher"
+        else:
+            assert daemon["entry"] == ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]

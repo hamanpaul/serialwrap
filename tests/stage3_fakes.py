@@ -315,10 +315,17 @@ def make_bundle(
         "git_revision": revision,
         "launcher": {"path": daemon.relative_to(root).as_posix(), "sha256": sha256_file(daemon)},
     }
-    if daemon_impl == "python":
+    if daemon_impl == "python" or not include_retirement:
+        # 現行 release manifest schema 對任何 daemon 實作都要求 entry／runtime／package；非退役 Rust
+        # daemon 比照 scripts/rust/mkbundle.sh 的 Stage 2 相容欄位，entry 指向 Rust launcher。
+        daemon_entry = (
+            ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]
+            if daemon_impl == "python"
+            else [daemon.relative_to(root).as_posix()]
+        )
         daemon_component.update(
             {
-                "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
+                "entry": daemon_entry,
                 "runtime": {
                     "path": "py/bin/python3",
                     "python_version": "3.12.0",
