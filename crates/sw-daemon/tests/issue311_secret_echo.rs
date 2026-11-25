@@ -266,6 +266,28 @@ fn build_controlled_login_rig_with_pause(
     prompt: &str,
     pause_secret_tx: bool,
 ) -> ControlledLoginRig {
+    build_controlled_login_rig_with_step(
+        secret,
+        prompt,
+        pause_secret_tx.then_some(FakeWriteStep::PauseBeforeSubmit),
+        false,
+    )
+}
+
+fn build_controlled_login_rig_with_result(
+    secret: &str,
+    prompt: &str,
+    secret_tx_step: FakeWriteStep,
+) -> ControlledLoginRig {
+    build_controlled_login_rig_with_step(secret, prompt, Some(secret_tx_step), true)
+}
+
+fn build_controlled_login_rig_with_step(
+    secret: &str,
+    prompt: &str,
+    secret_tx_step: Option<FakeWriteStep>,
+    pause_after_secret_tx: bool,
+) -> ControlledLoginRig {
     let event = event_rig();
     let log_dir = tempfile::tempdir().expect("agent log 目錄位於 TMPDIR");
     let log_path = log_dir.path().join("agent-log");
@@ -285,11 +307,26 @@ fn build_controlled_login_rig_with_pause(
     let device = serial.add_device(REAL_A);
     device.on_tx_match("^$", Box::new(|_| b"\r\nlogin: ".to_vec()));
     let password_prompt_device = device.clone();
+    let submit_secret_crlf = Arc::new(AtomicBool::new(false));
+    let submit_secret_crlf_hook = Arc::clone(&submit_secret_crlf);
+    let submit_secret_crlf_device = device.clone();
+    device.on_os_submit(Box::new(move || {
+        if submit_secret_crlf_hook.swap(false, Ordering::SeqCst) {
+            // 在 secret bytes 被 fake OS 接受前先把舊 CRLF 放入 RX queue，並讓實際 reader 等待受控釋放。
+            submit_secret_crlf_device.hold_rx_reads();
+            submit_secret_crlf_device.push_rx(b"\r\n");
+        }
+    }));
+    let secret_tx_step_for_password_prompt = secret_tx_step.clone();
+    let submit_secret_crlf_on_next_tx = Arc::clone(&submit_secret_crlf);
     device.on_tx_match(
         "^root$",
         Box::new(move |_| {
-            if pause_secret_tx {
-                password_prompt_device.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+            if let Some(step) = &secret_tx_step_for_password_prompt {
+                password_prompt_device.script_write(vec![step.clone()]);
+                if pause_after_secret_tx {
+                    submit_secret_crlf_on_next_tx.store(true, Ordering::SeqCst);
+                }
             }
             b"\r\nPassword: ".to_vec()
         }),
@@ -301,9 +338,13 @@ fn build_controlled_login_rig_with_pause(
         &secret_pattern,
         Box::new(move |_| {
             let _ = secret_seen_tx.send(());
-            echo_release_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("測試釋放分段登入 secret 回顯")
+            if pause_after_secret_tx {
+                Vec::new()
+            } else {
+                echo_release_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("測試釋放分段登入 secret 回顯")
+            }
         }),
     );
     let (ready_probe_seen_tx, ready_probe_seen) = crossbeam_channel::bounded(1);
@@ -336,10 +377,10 @@ fn build_controlled_login_rig_with_pause(
         vec![event.engine.clone()],
     );
     assert!(service.svc.attach_engine(event.engine.clone()));
-    if pause_secret_tx {
+    if secret_tx_step.is_some() {
         assert!(
             device.wait_paused(Duration::from_secs(10)),
-            "受控登入 secret TX 未停在 OS 提交前；tx={:?}; session={:?}",
+            "受控登入 secret TX 未停在指定提交點；tx={:?}; session={:?}",
             String::from_utf8_lossy(&device.tx_since(0)),
             service.session("COM0")
         );
@@ -1128,6 +1169,83 @@ fn controlled_output_leaks(
     .collect()
 }
 
+struct UnblockFakeTxOnDrop(sw_pal::fakes::serial::FakeDevice);
+
+impl Drop for UnblockFakeTxOnDrop {
+    fn drop(&mut self) {
+        self.0.release_pause();
+        self.0.release_rx_reads();
+    }
+}
+
+fn run_login_secret_echo_while_tx_report_is_pending(
+    secret_tx_step: FakeWriteStep,
+    expected_tx_suffix: &[u8],
+    tx_result: &str,
+) {
+    let rig = build_controlled_login_rig_with_result(SECRET, PROMPT, secret_tx_step);
+    let _unblock = UnblockFakeTxOnDrop(rig.device.clone());
+    let log_path = start_log(&rig.service);
+    let console = login_sentinel_console(&rig.service);
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+
+    let tx = rig.device.tx_since(0);
+    assert!(
+        tx.ends_with(expected_tx_suffix),
+        "{tx_result} fake UART TX bytes 不符合受控部分提交；tx={tx:?}"
+    );
+    assert_eq!(
+        rig.device.rx_bytes_pending(),
+        2,
+        "secret 提交前放入的 CRLF 必須留在 fake OS RX queue"
+    );
+
+    let read_before_echo = rig.device.rx_bytes_read();
+    let echo = format!("{SECRET}\r\n").into_bytes();
+    let queued = rig.device.rx_bytes_pending() + echo.len();
+    rig.device.push_rx(&echo);
+    rig.device.release_rx_reads();
+    wait_controlled_rx(
+        &rig.device,
+        read_before_echo + queued,
+        "正式 RX reader 消耗提交前 CRLF 與受控 secret echo",
+    );
+    let state = rig.service.session("COM0").expect("登入中的 session");
+    assert_eq!(
+        state.get("state").and_then(PyValue::as_str),
+        Some("ATTACHING"),
+        "TX 結果仍暫停，五出口檢查必須發生在登入清理之前：{state:?}"
+    );
+    let leaks = controlled_output_leaks(&rig.service, &log_path, &console, SECRET);
+    assert!(
+        leaks.is_empty(),
+        "{tx_result} TX 回報尚未結算，正式 reader 五個出口都不得收到 secret 明文；leaks={leaks:?}"
+    );
+    assert_controlled_outputs(
+        &rig.service,
+        &log_path,
+        &console,
+        SECRET,
+        true,
+        false,
+        &baseline,
+    );
+
+    rig.device.release_pause();
+    support::wait_until("部分／未知 secret TX 結束登入流程", || {
+        rig.service
+            .session("COM0")
+            .and_then(|session| {
+                session
+                    .get("state")
+                    .and_then(PyValue::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|state| state != "ATTACHING")
+    });
+}
+
 fn run_controlled_login_case(
     secret: &str,
     prompt: &str,
@@ -1557,6 +1675,30 @@ fn issue311_login_echo_is_masked_when_crlf_is_buffered_at_secret_submit() {
         true,
         false,
         &baseline,
+    );
+}
+
+#[test]
+fn issue311_login_partial_secret_tx_masks_echo_before_login_cleanup() {
+    run_login_secret_echo_while_tx_report_is_pending(
+        FakeWriteStep::AcceptThenErrorPause(
+            SECRET.len(),
+            sw_pal::traits::PalError::io(5, "受控部分 TX"),
+        ),
+        SECRET.as_bytes(),
+        "partial",
+    );
+}
+
+#[test]
+fn issue311_login_unknown_secret_tx_masks_echo_before_login_cleanup() {
+    run_login_secret_echo_while_tx_report_is_pending(
+        FakeWriteStep::UnknownPause {
+            confirmed: SECRET.len() + 1,
+            error: sw_pal::traits::PalError::io(5, "受控未知 TX"),
+        },
+        b"i311secret\n",
+        "unknown",
     );
 }
 

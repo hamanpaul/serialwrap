@@ -275,8 +275,12 @@ pub enum FakeWriteStep {
     Accept(usize),
     /// 接受 n bytes 後回 `Completed(n)` 加 error。
     AcceptThenError(usize, PalError),
+    /// 接受 n bytes 後先暫停，再回 `Completed(n)` 加 error，供 reader／TX 結算交錯測試。
+    AcceptThenErrorPause(usize, PalError),
     /// 回 `TxOutcome::Unknown { confirmed }` 加 error。
     Unknown { confirmed: usize, error: PalError },
+    /// 提交 confirmed bytes 後先暫停，再回 `Unknown`，供 reader／TX 結算交錯測試。
+    UnknownPause { confirmed: usize, error: PalError },
     /// 經 gate 提交後（已交 OS、in_flight 已設）於 gate 外阻塞直到 `CancelToken::cancel`，回 `Completed(accept_before_cancel)`。
     BlockUntilCancel { accept_before_cancel: usize },
     /// 經 gate 提交後於 gate 外阻塞直到 `FakeDevice::release_block`（模擬 D-state；不持 Fence 鎖）。
@@ -1365,6 +1369,43 @@ impl SerialWriter for FakeSerialWriter {
                     },
                 }
             }
+            FakeWriteStep::AcceptThenErrorPause(n, err) => {
+                let to_accept = n.min(data.len());
+                let mut committed = 0;
+                let submit_res = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    self.inner
+                        .tx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&data[..to_accept]);
+                    check_tx_triggers_and_matches(&self.inner);
+                    committed = to_accept;
+                    SubmitStep::Accepted(to_accept)
+                });
+                match submit_res {
+                    Ok(_) => {
+                        do_pause(&self.inner);
+                        TxResult {
+                            outcome: TxOutcome::Completed(committed),
+                            error: Some(err),
+                        }
+                    }
+                    Err(SubmitRevoked) => TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    },
+                }
+            }
             FakeWriteStep::Unknown { confirmed, error } => {
                 let to_accept = confirmed.min(data.len());
                 let submit_res = gate.submit(&mut || {
@@ -1395,6 +1436,45 @@ impl SerialWriter for FakeSerialWriter {
                         outcome: TxOutcome::Unknown { confirmed },
                         error: Some(error),
                     },
+                    Err(SubmitRevoked) => TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    },
+                }
+            }
+            FakeWriteStep::UnknownPause { confirmed, error } => {
+                let to_accept = confirmed.min(data.len());
+                let submit_res = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    if to_accept > 0 {
+                        self.inner
+                            .tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&data[..to_accept]);
+                        check_tx_triggers_and_matches(&self.inner);
+                        SubmitStep::Accepted(to_accept)
+                    } else {
+                        SubmitStep::Pending
+                    }
+                });
+                match submit_res {
+                    Ok(_) => {
+                        do_pause(&self.inner);
+                        TxResult {
+                            outcome: TxOutcome::Unknown { confirmed },
+                            error: Some(error),
+                        }
+                    }
                     Err(SubmitRevoked) => TxResult {
                         outcome: TxOutcome::NotSubmitted,
                         error: None,
