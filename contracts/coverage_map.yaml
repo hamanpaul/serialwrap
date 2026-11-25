@@ -60,9 +60,16 @@ entries:
     owner_phase: P5
   bc:BC-16:
     nodeids:
+    - cargo:sw-core::session_core_console::issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input
     - cargo:sw-daemon::issue311_secret_echo::issue312_raw_password_input_is_meta_only_until_enter
     - cargo:sw-daemon::issue311_secret_echo::issue312_line_buffer_password_input_is_meta_only_until_enter
     - cargo:sw-daemon::issue311_secret_echo::issue312_console_unlock_prompt_without_password_regex_match_is_meta_only
+    - cargo:sw-daemon::issue311_secret_echo::issue312_reader_actor_console_interleave_masks_raw_password_before_rx_delivery
+    - cargo:sw-daemon::issue311_secret_echo::issue312_reader_actor_console_interleave_masks_line_buffer_password_before_rx_delivery
+    - cargo:sw-daemon::issue311_secret_echo::issue312_invalid_utf8_before_password_prompt_does_not_disable_masking
+    - cargo:sw-daemon::issue311_secret_echo::issue312_buffered_crlf_cannot_revoke_human_echo_mask
+    - cargo:sw-daemon::issue311_secret_echo::issue312_detaching_second_console_does_not_settle_raw_owner_secret
+    - cargo:sw-daemon::issue311_secret_echo::issue312_natural_disconnect_settles_meta_with_human_source
     owner_phase: P6
   bc:DF-01:
     nodeids:

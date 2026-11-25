@@ -731,13 +731,10 @@ pub struct SessionCore {
     self_test_probes: SelfTestProbes,
     /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
     last_rx_wal_seq: u64,
-    /// RX 目前未終止行，用來辨識 profile 密碼提示與 console unlock 提示。
-    password_prompt_line: String,
-    /// 最近一行仍符合密碼提示，且尚未收到 RX 行終止符。
-    password_prompt_active: bool,
-    /// 人類已在密碼提示後開始輸入，等 human TX 行終止符結算。
-    human_password_active: bool,
-    human_password_len: usize,
+    /// 已被 human 行消耗的 reader prompt generation；TX/console lifecycle 不改寫 reader tracker。
+    password_prompt_consumed_generation: u64,
+    /// 目前取得此 prompt 的 human 輸入者與連線世代。
+    password_prompt_claim: Option<(u64, String, u64)>,
     pending_release: Option<PendingRelease>,
     pending_auto_login: bool,
     shutdown_requested: bool,
@@ -1095,10 +1092,8 @@ impl SessionCore {
             force_poll_after_clear: Vec::new(),
             self_test_probes: SelfTestProbes::default(),
             last_rx_wal_seq: 0,
-            password_prompt_line: String::new(),
-            password_prompt_active: false,
-            human_password_active: false,
-            human_password_len: 0,
+            password_prompt_consumed_generation: 0,
+            password_prompt_claim: None,
             pending_release: None,
             pending_auto_login: false,
             shutdown_requested: false,
@@ -5867,11 +5862,6 @@ impl SessionCore {
         }
     }
 
-    fn observe_password_prompt(&mut self, bytes: &[u8]) {
-        self.deps.rx.observe_password_prompt_bytes(bytes);
-        self.password_prompt_active = self.deps.rx.is_password_prompt_active();
-    }
-
     fn rx_chunk(&mut self, epoch: u64, bytes: &[u8], wal_seq: u64, now: Mono) -> Vec<Effect> {
         if self.generations.conn_epoch != Some(epoch) || bytes.is_empty() {
             return Vec::new();
@@ -5881,7 +5871,6 @@ impl SessionCore {
         self.last_rx_wal_seq = wal_seq;
         // RX 恢復即重臂 transport stall 一次性告警（#150，Python `_mark_session_rx`）。
         self.transport_stall_warned = false;
-        self.observe_password_prompt(bytes);
         let chunk = clean_text(&String::from_utf8_lossy(bytes));
         if self.is_passthrough() {
             // SC-35：passthrough 不 arm quiet，只重設安靜視窗。

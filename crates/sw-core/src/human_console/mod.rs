@@ -42,6 +42,12 @@ pub struct ConsoleRecord {
     pub internal: bool,
     pub attached_at: Mono,
     pub line: LineEditor,
+    /// reader 曾在目前尚未結束的輸入行期間辨識到密碼提示。
+    pub secret_line_latched: bool,
+    /// 目前尚未送出換行的 secret bytes 長度，與 client lifetime 一起結算。
+    pub secret_line_len: usize,
+    /// 令該行進入 secret 狀態的 reader prompt generation。
+    pub secret_line_generation: u64,
 }
 
 /// 07 D-22：回放保留；`remaining`＝本 hold 尚未結算的 HumanReplay 數。

@@ -150,6 +150,7 @@ struct PasswordPromptTracker {
     pending_bytes: Vec<u8>,
     current_line: String,
     active: bool,
+    generation: u64,
 }
 
 impl PasswordPromptTracker {
@@ -177,24 +178,29 @@ impl PasswordPromptTracker {
 
     fn append_line_bytes(&mut self, bytes: &[u8]) {
         self.pending_bytes.extend_from_slice(bytes);
-        match std::str::from_utf8(&self.pending_bytes) {
-            Ok(s) => {
-                self.current_line.push_str(s);
-                self.pending_bytes.clear();
-                self.trim_line_and_check();
-            }
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                if valid_up_to > 0 {
-                    let valid_str = unsafe {
-                        std::str::from_utf8_unchecked(&self.pending_bytes[..valid_up_to])
-                    };
-                    self.current_line.push_str(valid_str);
-                    self.pending_bytes.drain(..valid_up_to);
+        loop {
+            match std::str::from_utf8(&self.pending_bytes) {
+                Ok(s) => {
+                    self.current_line.push_str(s);
+                    self.pending_bytes.clear();
                     self.trim_line_and_check();
+                    break;
                 }
-                if let Some(err_len) = e.error_len() {
-                    self.pending_bytes.drain(..err_len);
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid_str = unsafe {
+                            std::str::from_utf8_unchecked(&self.pending_bytes[..valid_up_to])
+                        };
+                        self.current_line.push_str(valid_str);
+                        self.pending_bytes.drain(..valid_up_to);
+                        self.trim_line_and_check();
+                    }
+                    if let Some(err_len) = e.error_len() {
+                        self.pending_bytes.drain(..err_len);
+                        continue;
+                    }
+                    break;
                 }
             }
         }
@@ -229,7 +235,11 @@ impl PasswordPromptTracker {
                     .iter()
                     .any(|word| line.contains(word))
         });
-        self.active |= profile_match || unlock_match;
+        let matched = profile_match || unlock_match;
+        if matched && !self.active {
+            self.generation = self.generation.saturating_add(1);
+        }
+        self.active |= matched;
     }
 }
 
@@ -289,11 +299,9 @@ impl RxShared {
             .active
     }
 
-    pub fn clear_password_prompt(&self) {
-        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
-        tracker.pending_bytes.clear();
-        tracker.current_line.clear();
-        tracker.active = false;
+    pub fn password_prompt_snapshot(&self) -> (bool, u64) {
+        let tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        (tracker.active, tracker.generation)
     }
 
     pub fn observe_password_prompt_bytes(&self, data: &[u8]) {
@@ -452,18 +460,23 @@ impl RxShared {
         let mut matched = false;
         for (index, byte) in data.iter().enumerate() {
             if armed.expire_on_line_end && matches!(byte, b'\r' | b'\n') {
-                let pending_len = armed.pending.len();
-                visible.resize(visible.len().saturating_add(pending_len), b'*');
-                rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
-                armed.pending.fill(0);
-                armed.pending.clear();
-                armed.secret.fill(0);
+                if !armed.pending.is_empty() {
+                    let pending_len = armed.pending.len();
+                    visible.resize(visible.len().saturating_add(pending_len), b'*');
+                    rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
+                    armed.pending.fill(0);
+                    armed.pending.clear();
+                    armed.secret.fill(0);
+                    visible.push(*byte);
+                    rx_window.push(*byte);
+                    visible.extend_from_slice(&data[index + 1..]);
+                    rx_window.extend_from_slice(&data[index + 1..]);
+                    matched = true;
+                    break;
+                }
                 visible.push(*byte);
                 rx_window.push(*byte);
-                visible.extend_from_slice(&data[index + 1..]);
-                rx_window.extend_from_slice(&data[index + 1..]);
-                matched = true;
-                break;
+                continue;
             }
             armed.pending.push(*byte);
             while !armed.secret.starts_with(&armed.pending) {
@@ -1029,6 +1042,8 @@ impl ReaderPublisher<'_> {
 
     fn publish_inner(&mut self, chunk: &MaskedRxChunk) -> bool {
         let data = chunk.bytes.as_slice();
+        // reader 是提示 tracker 的唯一 RX 寫入者；先更新，再通知 observer 或 actor。
+        self.ctx.rx.observe_password_prompt_bytes(data);
         let wal_entry = self.ctx.wal.append(WalAppendReq {
             com: &self.ctx.com,
             dir: "RX",
@@ -1067,7 +1082,6 @@ impl ReaderPublisher<'_> {
             self.ctx.epoch,
             self.rx_seq,
         );
-        self.ctx.rx.observe_password_prompt_bytes(data);
         if let Some(hook) = self.after_rx_append {
             hook();
         }

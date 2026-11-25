@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 15
+revision: 16
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -219,7 +219,7 @@ changes:
     ab_participation: "absolute_only"
     phases: ["P6"]
     case_ids: ["bc16-human-password-raw", "bc16-human-password-line-buffer", "bc16-console-unlock-prompt"]
-    compatibility_impact: "RX 最近一行符合 profile password_regex，或符合 console_unlock_env 的可辨識提示，且提示後尚未收到 CR/LF 時，human TX 到下一個 CR/LF 前不寫入 WAL payload；每行寫一筆含 secret byte 長度與 human source 的 META。CR/LF 本身照常記錄，UART 寫入位元組不變，判定窗外的 human TX 照舊記錄。若 profile 沒有符合的 password_regex，且 console unlock 提示不符合辨識條件，密碼仍會明文記錄。Python 基線維持不變。"
+    compatibility_impact: "reader 依 RX 位元組順序作為 password prompt tracker 的唯一寫入者；actor 只讀取 reader 發布的狀態與提示世代，不重放 RX。raw 與 line-buffer console 以 client_id 和連線 lifetime 綁定 secret 輸入行：取得提示世代後，該行維持 secret 至該輸入者送出 CR/LF；TX payload 不記錄，每行只寫含 secret byte 長度及 human source 的 META，CR/LF 與 UART 位元組照常保留。自然斷線、明確 detach、session stop 會結算該輸入者未完成的 secret META；其他 console 的生命週期不清除其狀態。secret human echo 由 reader 在發布前依輸入內容遮罩；提示前綴含無效 UTF-8 時仍會繼續處理同一 RX chunk 的有效文字。若 profile 沒有符合的 password_regex，且 console unlock 提示不符合辨識條件，密碼仍會明文記錄。Python 基線維持不變。"
     approval_conditions: "依 OD-111 只改 Rust、保留 Python 基線；依 v051 issue 312 裁決，raw 逐鍵與 line-buffer 都須以 ServiceRig 驗證 WAL、mirror、log.tail_raw、log.tail_text、wal.range 與 UART 位元組，並明列 prompt 未匹配時的明文限制。"
     related_decisions: ["OD-111"]
   - id: "SC-01"
