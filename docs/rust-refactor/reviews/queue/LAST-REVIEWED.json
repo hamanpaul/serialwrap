@@ -36,7 +36,7 @@
   "fix/282-stop-push-residual-line": "4c145af",
   "fix/297-shutdown-pending-ops-flush": "3d92bd9",
   "fix/276-windows-task-start-hold": "006a6a4",
-  "fix/ci-thin-timing-margins": "f06eb10",
+  "fix/ci-thin-timing-margins": "854e1bb",
   "fix/289-doctor-profile-template-fields": "39a0ad3",
   "fix/306-self-test-probe-safety": "dd118b9",
   "fix/311-secret-echo-masking": "7f47a5b",
