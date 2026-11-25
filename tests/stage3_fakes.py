@@ -7,6 +7,7 @@ import io
 import gzip
 import json
 import hashlib
+import ast
 import os
 import platform
 import re
@@ -215,7 +216,10 @@ def tree_sha256(root: Path) -> str:
     """依相對 POSIX 路徑排序，雜湊執行期樹中的一般檔案。"""
     root = Path(root)
     rows: list[str] = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda item: item.relative_to(root).as_posix().encode("utf-8"),
+    ):
         rel = path.relative_to(root)
         if "__pycache__" in rel.parts or path.suffix == ".pyc":
             continue
@@ -246,6 +250,21 @@ def package_tree_sha256(py_dir: Path) -> str:
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
 
+def _task_xml_template_sha256() -> str:
+    """依 mkbundle.sh 還原 Rust render_task_xml 樣板字串並計算摘要。"""
+    source_path = REPO_ROOT / "crates" / "sw-pal" / "src" / "service_ctl.rs"
+    source = source_path.read_text(encoding="utf-8")
+    start = source.index('pub const TASK_XML_TEMPLATE: &str = concat!(')
+    match = re.search(r"concat!\((.*?)\n\s*\);", source[start:], re.S)
+    if match is None:
+        raise ValueError("找不到 render_task_xml 樣板")
+    parts = re.findall(r'^\s*("(?:\\.|[^"\\])*")\s*,?\s*$', match.group(1), re.M)
+    if not parts:
+        raise ValueError("render_task_xml 樣板為空")
+    template = "".join(ast.literal_eval(part) for part in parts)
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
 def _write_json(path: Path, value: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(jsonio.dumps_report(value), encoding="utf-8", newline="\n")
@@ -271,7 +290,12 @@ def make_bundle(
     retirement_marker: bool | None = None,
     target: str = "x86_64-unknown-linux-gnu",
 ) -> Path:
-    """建立 component 雜湊可重算的合成 bundle；不執行其中的 CLI 或 daemon。"""
+    """建立摘要可重算的合成 bundle；不執行其中的 CLI 或 daemon。
+
+    非退役 bundle 的資產沿用部署位置 ``py/sw_core``。Task 16 尚未完整定案退役
+    bundle 的 profiles／supervisor 資產位置；退役 fixture 暫放在 bundle 內的
+    ``assets/``，其摘要一律按該處實際檔案計算，待 Task 16 定案。
+    """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     bin_dir = root / "bin"
@@ -298,14 +322,24 @@ def make_bundle(
         (runtime / "sw_core" / "__init__.py").write_text("\"\"\"測試用套件。\"\"\"\n", encoding="utf-8", newline="\n")
         (runtime / "sw_core" / "cli.py").write_text("# 測試用 Python CLI\n", encoding="utf-8", newline="\n")
 
-    assets_dir = root / "assets"
-    assets_dir.mkdir(exist_ok=True)
-    skill = assets_dir / "SKILL.md"
-    skill_win = assets_dir / "SKILL_WINDOWS.md"
-    profiles = assets_dir / "profiles.yaml"
-    supervisor = assets_dir / "serialwrap.service"
-    for path, text in ((skill, "# 測試技能\n"), (skill_win, "# Windows 測試技能\n"),
-                       (profiles, "defaults: {}\n"), (supervisor, "[Service]\n")):
+    if include_retirement:
+        assets_dir = root / "assets"
+        supervisor = assets_dir / "systemd_units.py"
+    else:
+        assets_dir = runtime / "sw_core" / "assets"
+        supervisor = runtime / "sw_core" / "systemd_units.py"
+    skill_dir = assets_dir / "skill"
+    profiles = assets_dir / "profiles"
+    skill = skill_dir / "SKILL.md"
+    skill_win = skill_dir / "SKILL_WINDOWS.md"
+    profile = profiles / "default.yaml"
+    for path, text in (
+        (skill, "# 測試技能\n"),
+        (skill_win, "# Windows 測試技能\n"),
+        (profile, "defaults: {}\n"),
+        (supervisor, "# 測試用 supervisor 定義\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="\n")
 
     revision = "0" * 40
@@ -334,7 +368,7 @@ def make_bundle(
                 "package": {
                     "name": "serialwrap",
                     "version": version,
-                    "wheel_sha256": sha256_text("fixture wheel"),
+                    "wheel_sha256": None,
                     "tree_sha256": package_tree_sha256(runtime),
                 },
             }
@@ -351,9 +385,13 @@ def make_bundle(
         "assets": {
             "skill_sha256": sha256_file(skill),
             "skill_windows_sha256": sha256_file(skill_win),
-            "profiles_sha256": sha256_file(profiles),
+            "profiles_sha256": tree_sha256(profiles),
         },
-        "supervisor": {"default_mode": "on-demand", "definition_sha256": sha256_file(supervisor)},
+        "supervisor": {
+            "default_mode": "on-demand",
+            "definition_sha256": sha256_file(supervisor),
+            "task_xml_template_sha256": _task_xml_template_sha256(),
+        },
     }
     if not include_retirement:
         components["python_cli_delegate"] = {

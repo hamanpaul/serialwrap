@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import ast
 import json
+import re
 import shutil
 import stat
 import tarfile
@@ -298,6 +300,152 @@ def _independent_package_tree_sha256(py_dir: Path) -> str:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             rows.append(f"sw_core/{relative.as_posix()}\0{digest}\n")
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
+def _independent_task_xml_template_sha256() -> str:
+    """依 mkbundle.sh 從 Rust 樣板字串逐段還原後計算 SHA-256。"""
+    source_path = REPO_ROOT / "crates/sw-pal/src/service_ctl.rs"
+    source = source_path.read_text(encoding="utf-8")
+    start = source.index('pub const TASK_XML_TEMPLATE: &str = concat!(')
+    match = re.search(r"concat!\((.*?)\n\s*\);", source[start:], re.S)
+    assert match is not None
+    parts = re.findall(r'^\s*("(?:\\.|[^"\\])*")\s*,?\s*$', match.group(1), re.M)
+    assert parts
+    template = "".join(ast.literal_eval(part) for part in parts)
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
+def _assert_bundle_sums_match_files(bundle: Path) -> None:
+    expected = []
+    for path in sorted(bundle.rglob("*"), key=lambda item: item.relative_to(bundle).as_posix()):
+        rel = path.relative_to(bundle).as_posix()
+        if path.is_file() and path.name not in {"SHA256SUMS", "release-manifest.json"}:
+            expected.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}\n")
+    assert (bundle / "SHA256SUMS").read_text(encoding="utf-8") == "".join(expected)
+
+
+@pytest.mark.parametrize(
+    ("target", "suffix"),
+    [("x86_64-unknown-linux-gnu", ""), ("x86_64-pc-windows-gnu", ".exe")],
+)
+@pytest.mark.parametrize("daemon_impl", ["rust", "python"])
+def test_make_bundle_nonretired_manifest_summaries_recompute_from_real_paths(
+    tmp_path, daemon_impl, target, suffix
+):
+    fakes = _fakes()
+    bundle = fakes.make_bundle(
+        tmp_path / daemon_impl,
+        stage="2.4",
+        daemon_impl=daemon_impl,
+        target=target,
+    )
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    components = manifest["components"]
+    cli = components["cli"]
+    daemon = components["daemon"]
+    runtime = daemon["runtime"]
+    package = daemon["package"]
+    delegate = components["python_cli_delegate"]
+
+    assert cli["path"] == f"bin/serialwrap{suffix}"
+    assert hashlib.sha256((bundle / cli["path"]).read_bytes()).hexdigest() == cli["sha256"]
+    assert daemon["launcher"]["path"] == f"bin/serialwrapd{suffix}"
+    assert hashlib.sha256((bundle / daemon["launcher"]["path"]).read_bytes()).hexdigest() == daemon["launcher"]["sha256"]
+    assert runtime["path"] == "py/bin/python3"
+    assert hashlib.sha256((bundle / runtime["path"]).read_bytes()).hexdigest() == runtime["sha256"]
+    expected_daemon_entry = (
+        ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]
+        if daemon_impl == "python"
+        else [daemon["launcher"]["path"]]
+    )
+    assert daemon["entry"] == expected_daemon_entry
+    assert (bundle / daemon["entry"][0]).is_file()
+    if daemon_impl == "python":
+        assert (bundle / daemon["entry"][-1]).is_file()
+    assert package["wheel_sha256"] is None
+    assert package["tree_sha256"] == _independent_package_tree_sha256(bundle / "py")
+    assert delegate["entry"] == ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
+    assert (bundle / delegate["entry"][0]).is_file()
+    assert (bundle / "py/sw_core/cli.py").is_file()
+    assert delegate["tree_sha256"] == _independent_package_tree_sha256(bundle / "py")
+
+    asset_root = bundle / "py/sw_core/assets"
+    skill = asset_root / "skill/SKILL.md"
+    skill_windows = asset_root / "skill/SKILL_WINDOWS.md"
+    profiles = asset_root / "profiles"
+    systemd_units = bundle / "py/sw_core/systemd_units.py"
+    assert hashlib.sha256(skill.read_bytes()).hexdigest() == components["assets"]["skill_sha256"]
+    assert hashlib.sha256(skill_windows.read_bytes()).hexdigest() == components["assets"]["skill_windows_sha256"]
+    assert components["assets"]["profiles_sha256"] == _independent_tree_sha256(profiles)
+    assert hashlib.sha256(systemd_units.read_bytes()).hexdigest() == components["supervisor"]["definition_sha256"]
+    assert components["supervisor"]["task_xml_template_sha256"] == _independent_task_xml_template_sha256()
+    _assert_bundle_sums_match_files(bundle)
+
+
+@pytest.mark.parametrize(
+    ("target", "suffix"),
+    [("x86_64-unknown-linux-gnu", ""), ("x86_64-pc-windows-gnu", ".exe")],
+)
+def test_make_bundle_retired_manifest_summaries_recompute_from_real_paths(tmp_path, target, suffix):
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "retired", stage="3", daemon_impl="rust", target=target)
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    components = manifest["components"]
+
+    assert manifest["retirement"] == {"python_daemon": "removed"}
+    assert not (bundle / "py").exists()
+    assert "package" not in components["daemon"]
+    assert "python_cli_delegate" not in components
+    cli = components["cli"]
+    daemon = components["daemon"]
+    assert cli["path"] == f"bin/serialwrap{suffix}"
+    assert hashlib.sha256((bundle / cli["path"]).read_bytes()).hexdigest() == cli["sha256"]
+    assert daemon["launcher"]["path"] == f"bin/serialwrapd{suffix}"
+    assert hashlib.sha256((bundle / daemon["launcher"]["path"]).read_bytes()).hexdigest() == daemon["launcher"]["sha256"]
+
+    # Task 16 尚未完整定案退役 bundle 的 profiles／supervisor 資產位置；fixture 選用 bundle 內實檔，待 Task 16 定案。
+    asset_root = bundle / "assets"
+    skill = asset_root / "skill/SKILL.md"
+    skill_windows = asset_root / "skill/SKILL_WINDOWS.md"
+    profiles = asset_root / "profiles"
+    systemd_units = asset_root / "systemd_units.py"
+    assert hashlib.sha256(skill.read_bytes()).hexdigest() == components["assets"]["skill_sha256"]
+    assert hashlib.sha256(skill_windows.read_bytes()).hexdigest() == components["assets"]["skill_windows_sha256"]
+    assert components["assets"]["profiles_sha256"] == _independent_tree_sha256(profiles)
+    assert hashlib.sha256(systemd_units.read_bytes()).hexdigest() == components["supervisor"]["definition_sha256"]
+    assert components["supervisor"]["task_xml_template_sha256"] == _independent_task_xml_template_sha256()
+    _assert_bundle_sums_match_files(bundle)
+
+
+@pytest.mark.parametrize(
+    ("relative", "manifest_group", "field"),
+    [
+        ("py/sw_core/assets/profiles/default.yaml", "assets", "profiles_sha256"),
+        ("py/sw_core/assets/skill/SKILL.md", "assets", "skill_sha256"),
+        ("py/sw_core/systemd_units.py", "supervisor", "definition_sha256"),
+    ],
+)
+def test_make_bundle_nonretired_asset_mutations_change_declared_summaries(
+    tmp_path, relative, manifest_group, field
+):
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "bundle", stage="2.4", daemon_impl="rust")
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    components = manifest["components"]
+    old_package_tree = components["daemon"]["package"]["tree_sha256"]
+    old_delegate_tree = components["python_cli_delegate"]["tree_sha256"]
+    path = bundle / relative
+    original = path.read_bytes()
+    path.write_bytes(original + b"modified fixture content\n")
+
+    if field == "profiles_sha256":
+        recalculated = _independent_tree_sha256(path.parent)
+    else:
+        recalculated = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert recalculated != components[manifest_group][field]
+    new_package_tree = _independent_package_tree_sha256(bundle / "py")
+    assert new_package_tree != old_package_tree
+    assert new_package_tree != old_delegate_tree
 
 
 def test_make_bundle_python_delegate_tree_is_real_before_retirement(tmp_path):
