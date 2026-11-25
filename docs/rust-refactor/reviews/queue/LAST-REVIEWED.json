@@ -39,7 +39,7 @@
   "fix/ci-thin-timing-margins": "1ec1992",
   "fix/289-doctor-profile-template-fields": "39a0ad3",
   "fix/306-self-test-probe-safety": "dd118b9",
-  "fix/311-secret-echo-masking": "dfe159b",
+  "fix/311-secret-echo-masking": "37fe9ae",
   "fix/288-submit-console-line-limit": "48b519b",
   "fix/279-tcp-console-lease": "b8483d9",
   "fix/290-timeout-recovery-keys": "8ba50ed",
