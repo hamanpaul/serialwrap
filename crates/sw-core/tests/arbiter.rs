@@ -871,6 +871,25 @@ fn cancel_queued_removes_from_heap() {
 }
 
 #[test]
+fn queue_has_accepted_ignores_terminal_registry_residue() {
+    let registry = CommandRegistry::new();
+    let mut queue = SessionQueue::new();
+    let admitted = registry
+        .admit(req("echo stale"), true, "stale".into(), T)
+        .expect("命令應先完成 admission");
+    queue.push(admitted.queued, &registry);
+
+    registry.cancel("stale", T);
+
+    assert_eq!(queue.len(), 1, "測試保留 queue registry 殘項");
+    assert_eq!(queue.physical_len(), 1, "測試保留 heap 實體項目");
+    assert!(
+        !queue.has_accepted(&registry),
+        "registry 已終態的項目不得讓 self-test 誤判忙碌"
+    );
+}
+
+#[test]
 fn pending_excludes_interactive() {
     let r = CommandRegistry::new();
     r.admit(req("a"), true, "c1".into(), T).expect("admit");

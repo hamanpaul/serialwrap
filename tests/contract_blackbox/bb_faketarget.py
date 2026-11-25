@@ -61,6 +61,11 @@ _PRINTF_CHUNK_GAP_S = 0.05
 _WRITE_SLICE = 4096
 
 
+_SELF_TEST_FRAMEWORK_RE = re.compile(
+    r"^\( (.+) \) && printf '\\n__SW_ST_%s_OK__\\n' '([0-9a-fA-F]+)'$"
+)
+
+
 class FakeTarget:
     def __init__(
         self,
@@ -602,6 +607,17 @@ class FakeTarget:
                 self._schedule(prompt_b)
             return
 
+        framework = _SELF_TEST_FRAMEWORK_RE.fullmatch(cmd)
+        if framework is not None:
+            self._run_self_test_framework(
+                echo,
+                framework.group(1),
+                framework.group(2),
+                prompt_b,
+                d,
+            )
+            return
+
         m = _SLEEP_RE.match(cmd)
         if m:
             self._schedule(echo, delay_s=d)
@@ -633,3 +649,59 @@ class FakeTarget:
         elif cmd == "echo":
             out += b"\r\n"
         self._schedule(out + prompt_b, delay_s=d)
+
+    def _run_self_test_framework(
+        self,
+        echo: bytes,
+        inner: str,
+        marker_nonce: str,
+        prompt_b: bytes,
+        delay_s: float,
+    ) -> None:
+        """模擬 self-test shell 包裝，只在可模擬的 inner 成功時輸出 marker。"""
+        marker = f"\n__SW_ST_{marker_nonce}_OK__\n".encode("ascii")
+
+        spec = self.scripts.get(inner.encode("utf-8"))
+        if spec is not None:
+            script_delay_s, reply = float(spec[0]), bytes(spec[1])
+            self._schedule(echo)
+            self._schedule(reply, delay_s=script_delay_s)
+            if len(spec) < 3 or spec[2]:
+                self._schedule(marker + prompt_b)
+            return
+
+        m = _SLEEP_RE.match(inner)
+        if m:
+            self._schedule(echo, delay_s=delay_s)
+            self._schedule(marker + prompt_b, delay_s=float(m.group(1)))
+            return
+
+        m = _YES_HEAD_RE.match(inner)
+        if m:
+            n = int(m.group(1))
+            payload = (b"y\n" * (n // 2 + 1))[:n]
+            self._schedule(echo + payload + marker + prompt_b, delay_s=delay_s)
+            return
+
+        m = _PRINTF_RANGE_RE.match(inner)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            lines = [f"M{i}\r\n".encode("ascii") for i in range(lo, hi + 1)] if lo <= hi else []
+            self._schedule(echo, delay_s=delay_s)
+            if lines:
+                per = -(-len(lines) // _PRINTF_CHUNKS)
+                for i in range(0, len(lines), per):
+                    self._schedule(b"".join(lines[i : i + per]), delay_s=_PRINTF_CHUNK_GAP_S)
+            self._schedule(marker + prompt_b, delay_s=_PRINTF_CHUNK_GAP_S)
+            return
+
+        if inner.startswith("echo "):
+            inner_output = (inner[5:] + "\r\n").encode("utf-8")
+        elif inner == "echo":
+            inner_output = b"\r\n"
+        else:
+            # 未知命令沿用舊版對外反應：回顯整行、送 prompt，不產生成功 marker。
+            self._schedule(echo + prompt_b, delay_s=delay_s)
+            return
+
+        self._schedule(echo + inner_output + marker + prompt_b, delay_s=delay_s)

@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{bounded, Sender};
 use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_core::uart_bridge::{
-    ReaderCtx, ReaderExit, RxShared, spawn_reader, spawn_reader_with_test_hooks,
+    spawn_reader, spawn_reader_with_test_hooks, ReaderCtx, ReaderExit, RxShared, WaitMatchOutcome,
 };
 use sw_core::wal::{WalAppendReq, WalConfig, WalWriter};
 use sw_pal::fakes::clock::FakeClock;
@@ -22,7 +22,7 @@ use sw_pal::traits::{
     Clock, ConsoleIo, DevicePath, IoWaker, PalError, PalErrorKind, ReadOutcome, SerialBackend,
     SerialConfig, SerialReader,
 };
-use sw_proto::pyre::{PyFlags, compile};
+use sw_proto::pyre::{compile, PyFlags};
 
 const IO_POLL: Duration = Duration::from_millis(200);
 
@@ -286,12 +286,11 @@ fn rx_is_in_wal_before_actor_sees_it_with_exact_seq() {
             .expect("WAL 內容"),
     )
     .expect("WAL 為 UTF-8");
-    assert!(
-        text.lines()
-            .nth(1)
-            .unwrap()
-            .contains("\"source\":\"device\"")
-    );
+    assert!(text
+        .lines()
+        .nth(1)
+        .unwrap()
+        .contains("\"source\":\"device\""));
     assert_eq!(rx.snapshot_len(), 7);
     let _ = stop_and_join(&stop, &port.waker, worker);
 }
@@ -342,6 +341,68 @@ fn wait_for_regex_zero_timeout_is_false() {
     let regex = compile("ready", PyFlags::default()).unwrap();
     let clock = FakeClock::at(10, 0);
     assert!(rx.wait_for_regex(&regex, Duration::ZERO, &*clock).is_none());
+}
+
+#[test]
+fn shutdown_wait_match_returns_absolute_unicode_end_after_trim() {
+    let rx = RxShared::new(32, 0);
+    rx.append("甲".repeat(20).as_bytes(), 1, 3, 1);
+    rx.append(b"\n__MARK__\r\n# ", 2, 3, 2);
+    assert_eq!(rx.trimmed(), 1, "前綴應已被 RX 視窗裁切");
+
+    let marker = compile(r"(?m)^__MARK__\r?$", PyFlags::default()).unwrap();
+    let prompt = compile(r"# $", PyFlags::default()).unwrap();
+    let clock = FakeClock::at(3, 0);
+    let end = match rx.wait_for_regex_end_from_shutdown_cancellable(
+        &marker,
+        0,
+        Duration::from_secs(1),
+        &*clock,
+    ) {
+        WaitMatchOutcome::Matched { end } => end,
+        other => panic!("marker 應命中，收到 {other:?}"),
+    };
+    assert_eq!(end, 30, "絕對字元位置須含 Unicode 與 trim 偏移");
+    assert_eq!(
+        rx.wait_for_regex_from_shutdown_cancellable(&prompt, end, Duration::from_secs(1), &*clock,),
+        sw_core::uart_bridge::WaitOutcome::Matched,
+        "同一 RX chunk 內標記後的 prompt 應可命中"
+    );
+}
+
+#[test]
+fn shutdown_wait_match_reports_timeout_and_cancellation() {
+    let rx = RxShared::new(32, 0);
+    let marker = compile("marker", PyFlags::default()).unwrap();
+    let clock = FakeClock::at(3, 0);
+    assert_eq!(
+        rx.wait_for_regex_end_from_shutdown_cancellable(&marker, 0, Duration::ZERO, &*clock,),
+        WaitMatchOutcome::TimedOut
+    );
+
+    let waiting_rx = Arc::clone(&rx);
+    let waiting_clock = Arc::clone(&clock);
+    let waiter = thread::spawn(move || {
+        waiting_rx.wait_for_regex_end_from_shutdown_cancellable(
+            &marker,
+            0,
+            Duration::from_secs(5),
+            &*waiting_clock,
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while rx.regex_wait_starts_for_test() == 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(
+        rx.regex_wait_starts_for_test() > 0,
+        "waiter 應已進入 RX 等待"
+    );
+    rx.cancel_shutdown_waits();
+    assert_eq!(
+        waiter.join().expect("取消等待應正常返回"),
+        WaitMatchOutcome::Cancelled
+    );
 }
 
 #[test]
@@ -451,8 +512,14 @@ fn completion_cannot_overtake_its_rx_chunk() {
         .expect("reader RX 應命中 prompt");
     assert_eq!((matched.epoch, matched.rx_seq), (3, 1));
     assert!(matches!(
-        data_rx.recv_timeout(Duration::from_secs(1)).expect("RX chunk 送達 data lane"),
-        DataEvent::UartRxChunk { epoch: 3, rx_seq: 1, .. }
+        data_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("RX chunk 送達 data lane"),
+        DataEvent::UartRxChunk {
+            epoch: 3,
+            rx_seq: 1,
+            ..
+        }
     ));
 
     control_tx
@@ -464,8 +531,13 @@ fn completion_cannot_overtake_its_rx_chunk() {
         })
         .expect("completion 送出");
     assert!(matches!(
-        control_rx.recv_timeout(Duration::from_secs(1)).expect("completion 送達 control lane"),
-        ControlEvent::LoginFinished { after_rx_seq: Some(1), .. }
+        control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion 送達 control lane"),
+        ControlEvent::LoginFinished {
+            after_rx_seq: Some(1),
+            ..
+        }
     ));
 
     stop.store(true, Ordering::Release);
@@ -521,7 +593,9 @@ fn op_finished_waits_for_reader_rx_match_watermark() {
         })
         .expect("OpFinished 送出");
     assert!(matches!(
-        control_rx.recv_timeout(Duration::from_secs(1)).expect("OpFinished control lane"),
+        control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("OpFinished control lane"),
         ControlEvent::OpFinished {
             after_rx_seq: Some(5),
             ..
@@ -824,11 +898,9 @@ fn data_lane_backpressure_blocks_reader_after_wal() {
         .unwrap_or(false);
     drop(data_rx);
     if !stopped_while_lane_full {
-        assert!(
-            joined_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("關閉 data lane 後 reader 應解除阻塞")
-        );
+        assert!(joined_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("關閉 data lane 後 reader 應解除阻塞"));
     }
     joiner.join().expect("join observer 應正常結束");
 
@@ -947,7 +1019,13 @@ fn rx_observer_panic_isolated_reader_continues() {
 // ---------------------------------------------------------------- P6 Task 9（增補 #21）：reader → ConsoleHub
 
 /// hub tap：容量 `cap` 的 rx channel 與共用 `HubStatus`。
-fn hub_tap(cap: usize) -> (sw_core::human_console::hub::HubTap, crossbeam_channel::Receiver<Arc<[u8]>>, Arc<sw_core::human_console::hub::HubStatus>) {
+fn hub_tap(
+    cap: usize,
+) -> (
+    sw_core::human_console::hub::HubTap,
+    crossbeam_channel::Receiver<Arc<[u8]>>,
+    Arc<sw_core::human_console::hub::HubStatus>,
+) {
     let (tx, rx) = bounded::<Arc<[u8]>>(cap);
     let status = Arc::new(sw_core::human_console::hub::HubStatus::new());
     let tap = sw_core::human_console::hub::HubTap {
@@ -972,16 +1050,24 @@ fn reader_sends_to_hub_after_wal() {
     let worker = spawn_reader(port.reader, ctx, Arc::clone(&stop));
     for chunk in [&b"one"[..], &b"two"[..]] {
         port.dev.push_rx(chunk);
-        let got = hub_rx.recv_timeout(Duration::from_secs(1)).expect("hub 收到 RX");
+        let got = hub_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("hub 收到 RX");
         assert_eq!(&*got, chunk);
         // 收到當下，WAL 已有同一 bytes 的 RX 紀錄（WAL→console 順序，06 §4.1）
-        let wal_text = String::from_utf8(wfs.contents(Path::new("/w/raw.wal.ndjson")).unwrap_or_default()).unwrap();
+        let wal_text = String::from_utf8(
+            wfs.contents(Path::new("/w/raw.wal.ndjson"))
+                .unwrap_or_default(),
+        )
+        .unwrap();
         let b64 = match chunk {
             b"one" => "b25l",
             _ => "dHdv",
         };
         assert!(wal_text.contains(b64), "hub 收到前 WAL 已寫入 {chunk:?}");
-        let ev = data_rx.recv_timeout(Duration::from_secs(1)).expect("data lane");
+        let ev = data_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("data lane");
         assert!(matches!(ev, DataEvent::UartRxChunk { ref bytes, .. } if bytes == chunk));
     }
     let _ = stop_and_join(&stop, &port.waker, worker);
@@ -1000,12 +1086,20 @@ fn reader_hub_full_does_not_block() {
     ctx.hub = Some(tap);
     let worker = spawn_reader(port.reader, ctx, Arc::clone(&stop));
     port.dev.push_rx(b"a");
-    data_rx.recv_timeout(Duration::from_secs(1)).expect("第一個 chunk");
+    data_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("第一個 chunk");
     // hub 不消費：rx channel 已滿
     let t = Instant::now();
     port.dev.push_rx(b"b");
-    let ev = data_rx.recv_timeout(Duration::from_secs(1)).expect("第二個 chunk 仍進 data lane");
-    assert!(t.elapsed() < Duration::from_millis(10), "hub 滿時 reader 不阻塞（10 ms 內送進 data lane）：{:?}", t.elapsed());
+    let ev = data_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("第二個 chunk 仍進 data lane");
+    assert!(
+        t.elapsed() < Duration::from_millis(10),
+        "hub 滿時 reader 不阻塞（10 ms 內送進 data lane）：{:?}",
+        t.elapsed()
+    );
     assert!(matches!(ev, DataEvent::UartRxChunk { ref bytes, .. } if bytes == b"b"));
     assert_eq!(status.rx_dropped_chunks.load(Ordering::Relaxed), 1);
     let _ = stop_and_join(&stop, &port.waker, worker);

@@ -1,0 +1,1 @@
+[regen_lock] wrote l1_required.lock.json：s22_gate:cargo_workspace.linux 新增 2 筆、核准移除 0 筆 nodeid

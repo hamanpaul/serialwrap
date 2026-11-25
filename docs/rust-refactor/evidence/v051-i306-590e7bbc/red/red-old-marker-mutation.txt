@@ -1,0 +1,21 @@
+   Compiling sw-core v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.48s
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-9ea7f8391a1b6845)
+
+running 1 test
+
+thread 'execution_marker_requires_terminated_line_before_prompt' (90007) panicked at crates/sw-core/tests/self_test_safety.rs:1070:5:
+assertion `left == right` failed: PyDict({"ok": Bool(true), "classification": Str("OK"), "session": Dict(PyDict({"session_id": Str("t:COM0"), "profile": Str("t"), "com": Str("COM0"), "alias": Str("t+1"), "act_no": Int(Small(1)), "device_by_id": Str("/s/by-id/usb-A"), "platform": Str("shell"), "profile_source": Str("yaml-target"), "command_capable": Bool(true), "state": Str("READY"), "last_error": Null, "last_error_detail": Null, "detached_at": Null, "last_ready_at": Str("wall-rig"), "vtty": Null, "attached_real_path": Str("/fake/tty-A"), "bridge_generation": Int(Small(1)), "recovering": Bool(false), "interactive_session_id": Null, "foreground_busy": Bool(false), "fg_cmd_expected_duration_s": Null, "console_count": Int(Small(0)), "last_state_change_at": Str("wall-rig"), "last_rx_at": Str("wall-rig"), "last_tx_at": Str("wall-rig"), "last_probe_at": Str("wall-rig"), "reprobe_attempts": Int(Small(0)), "next_reprobe_at": Null, "reprobe_exhausted": Bool(false), "boot_quiet_remaining_s": Null, "ready_reconfirm_pending": Bool(false), "ready_reconfirm_failed": Bool(false), "ready_reconfirm_remaining_s": Null, "boot_evidence_wait_remaining_s": Null, "idle_for_ms": Null, "last_rx_age_s": Null, "last_tx_age_s": Null, "rx_bytes_last_10s": Int(Small(70)), "rx_rate_bps": Int(Small(7)), "outstanding_commands": Int(Small(0)), "activity_classification": Str("newly-attached"), "released_by": Null, "released_at": Null, "released_reason": Null, "capture": Null, "drain_stalled": Bool(false), "drain_timeout_epoch": Null})), "attached_real_path": Str("/fake/tty-A"), "current_real_path": Str("/fake/tty-A"), "attached_vtty": Null, "bridge_generation": Int(Small(1)), "probe_ok": Bool(true), "recommended_action": Str("none"), "probe_evidence": Dict(PyDict({"tx_complete": Bool(true), "execution_marker": Bool(true), "probe_rc_zero": Bool(true), "prompt_after_marker": Bool(true)})), "interactive_owner": Null, "human_attached": Bool(false), "human_active": Bool(false), "recovery_mode": Bool(false), "command_capable": Bool(true)})
+  left: Bool(true)
+ right: Bool(false)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test execution_marker_requires_terminated_line_before_prompt ... FAILED
+
+failures:
+
+failures:
+    execution_marker_requires_terminated_line_before_prompt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p sw-core --test self_test_safety`

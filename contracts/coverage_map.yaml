@@ -66,6 +66,36 @@ entries:
     - cargo:sw-core::console_line_limit::rpc_submit_uses_profile_after_set_profile
     - cargo:sw-core::console_line_limit::zero_or_negative_line_limit_rejects_nonempty_command
     owner_phase: P5
+  bc:BC-13:
+    nodeids:
+    - cargo:sw-core::rx_reader::shutdown_wait_match_reports_timeout_and_cancellation
+    - cargo:sw-core::rx_reader::shutdown_wait_match_returns_absolute_unicode_end_after_trim
+    - cargo:sw-core::self_test_safety::any_line_prompt_after_marker_confirms_ready_same_chunk_split_chunk_and_requires_prompt
+    - cargo:sw-core::self_test_safety::echo_of_complete_probe_payload_never_confirms_ready
+    - cargo:sw-core::self_test_safety::echo_only_never_confirms_ready
+    - cargo:sw-core::self_test_safety::execution_marker_noise_around_complete_line_is_accepted
+    - cargo:sw-core::self_test_safety::execution_marker_requires_following_prompt
+    - cargo:sw-core::self_test_safety::execution_marker_requires_terminated_line_before_prompt
+    - cargo:sw-core::self_test_safety::failed_probe_rc_never_confirms_ready
+    - cargo:sw-core::self_test_safety::idle_probe_reserves_slot_before_tx
+    - cargo:sw-core::self_test_safety::marker_and_prompt_in_same_chunk_confirm_ready
+    - cargo:sw-core::self_test_safety::marker_and_prompt_split_after_unicode_trim_confirm_ready
+    - cargo:sw-core::self_test_safety::newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk
+    - cargo:sw-core::self_test_safety::probe_printed_marker_then_nonzero_rc_never_confirms_ready
+    - cargo:sw-core::self_test_safety::self_test_terminal_paths_release_only_own_reservation
+    - cargo:sw-core::self_test_safety::stale_probe_cannot_confirm_new_generation
+    - cargo:sw-core::shutdown_pending_waits::shutdown_cancels_verified_self_test_waits
+    - cargo:sw-core::shutdown_pending_waits::shutdown_discards_suspended_self_test_human_bytes
+    - cargo:sw-core::tx_writer::self_test_probe_requires_current_reservation
+    - cargo:sw-daemon::self_test_safety::rpc_any_line_prompt_after_marker_confirms_ready
+    - cargo:sw-daemon::self_test_safety::rpc_echo_only_target_remains_unconfirmed
+    - cargo:sw-daemon::self_test_safety::rpc_probe_and_submit_have_deterministic_order
+    - cargo:sw-daemon::self_test_safety::rpc_probe_evidence_preserves_each_boolean
+    - cargo:sw-daemon::self_test_safety::rpc_probe_evidence_reports_failure_scenarios_and_pending_state
+    - cargo:sw-daemon::self_test_safety::rpc_probe_printed_marker_then_nonzero_rc_does_not_confirm_ready
+    - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
+    - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
+    owner_phase: P7
   bc:BC-23:
     nodeids:
     - cargo:sw-core::tcp_console_lease::tcp_mirror_lifecycle_and_guards
@@ -2705,6 +2735,7 @@ l1_only_approvals:
   "bc:BC-06": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-13": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-23": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
