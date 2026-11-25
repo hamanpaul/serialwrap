@@ -12,7 +12,7 @@ use sw_core::human_console::ownership::InputRoute;
 use sw_core::human_console::ConsoleTransportKind;
 use sw_core::mailbox::ControlEvent;
 use sw_core::op_runner::OpOutcome;
-use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::session_core::{Effect, LeaseIndexOp, SessionRequest};
 use sw_core::tx_writer::TxClass;
 use sw_pal::traits::TxOutcome;
 use sw_proto::{pydict, pyjson::PyValue};
@@ -78,9 +78,17 @@ fn tx_payloads(h: &CoreHarness, class: TxClass) -> Vec<String> {
 
 /// 供 cc1746d8／HEAD log 逐行比對的共同層觀測；刻意不輸出 lease 或 LeaseIndex。
 fn trace_common(phase: &str, h: &CoreHarness) {
+    trace_common_with_lease_insert(phase, h, None);
+}
+
+fn trace_common_with_lease_insert(
+    phase: &str,
+    h: &CoreHarness,
+    lease_index_insert: Option<bool>,
+) {
     let ownership = &h.core.human_console().ownership;
     eprintln!(
-        "R7-COMMON phase={phase} owner={:?} suspended={:?} pending={:?} depth={} agent_active={} admission_blocked={} deferred_a={} deferred_b={} route_a={:?} route_b={:?} route_c={:?} replay={:?} raw_tx={:?}",
+        "R7-COMMON phase={phase} lease_index_insert={lease_index_insert:?} owner={:?} suspended={:?} pending={:?} depth={} agent_active={} admission_blocked={} deferred_a={} deferred_b={} route_a={:?} route_b={:?} route_c={:?} replay={:?} raw_tx={:?}",
         ownership.interactive_owner,
         ownership.suspended_owner,
         ownership.pending_owner,
@@ -94,6 +102,64 @@ fn trace_common(phase: &str, h: &CoreHarness) {
         ownership.peek_route("c"),
         tx_payloads(h, TxClass::HumanReplay),
         tx_payloads(h, TxClass::HumanRaw),
+    );
+}
+
+/// cc1746d8／p279 共用的 human interactive_open 與 agent handoff 觀測。
+fn interactive_open_handoff_common() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+
+    // HEAD accept 會先建 mirror；先用公開 close 讓兩邊都經同一條 interactive_open 授權路徑。
+    if let Some(lease) = h.core.active_lease() {
+        let id = lease.interactive_id.clone();
+        h.rpc(close_req(&id)).expect("close accept-time TCP mirror");
+    }
+
+    let (opened, effects) = h.rpc_full(open_req("human:a", 60.0, "", false));
+    let opened = opened.expect("interactive_open human:a");
+    assert_eq!(opened.get("ok"), Some(&PyValue::Bool(true)));
+    let lease_index_ops: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::LeaseIndex(op) => Some(op),
+            _ => None,
+        })
+        .collect();
+    let lease_index_insert = lease_index_ops
+        .first()
+        .is_some_and(|op| matches!(op, LeaseIndexOp::Insert { .. }));
+    trace_common_with_lease_insert("r9b-interactive-open-human", &h, Some(lease_index_insert));
+
+    let agent_open = h.rpc(open_req("agent:r9b-common", 60.0, "", false));
+    let agent_open = agent_open.expect("agent interactive_open soft handoff");
+    assert_eq!(agent_open.get("soft_preempted"), Some(&PyValue::Bool(true)));
+    eprintln!(
+        "R7-ADMISSION phase=r9b-agent-open ok={:?} soft_preempted={:?}",
+        agent_open.get("ok"),
+        agent_open.get("soft_preempted"),
+    );
+    trace_common("r9b-agent-open", &h);
+
+    let agent_id = agent_open
+        .get("interactive_id")
+        .and_then(PyValue::as_str)
+        .expect("agent lease id")
+        .to_string();
+    let (closed, close_effects) = h.rpc_full(close_req(&agent_id));
+    let closed = closed.expect("agent interactive_close handoff");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    assert!(close_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::Remove { interactive_id }) if interactive_id == &agent_id
+    )));
+    trace_common("r9b-agent-close", &h);
+
+    assert_eq!(lease_index_ops.len(), 1, "interactive_open 本批只應有一筆 LeaseIndex op");
+    assert!(
+        lease_index_insert,
+        "interactive_open human:a must use LeaseIndexOp::Insert, preserving pre-package admission",
     );
 }
 
@@ -396,6 +462,7 @@ fn close_scan_self_heal_then_agent_command() {
 #[test]
 fn guard_off_tcp_raw_matches_pre_package_baseline() {
     // mirror 簿記的套件專屬斷言位於 tcp_console_lease.rs；以下共同觀測必須在 cc1746d8 與 HEAD 逐行相同。
+    interactive_open_handoff_common();
     expiry_while_flash_guard_is_closed();
     eof_before_agent_close();
     handoff_freezes_before_close_eof_and_replacement_accept();

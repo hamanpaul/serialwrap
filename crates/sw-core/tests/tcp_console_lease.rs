@@ -495,22 +495,28 @@ fn tcp_mirror_revocation_records_pruned_after_active_detach_without_eof() {
 #[test]
 fn tcp_mirror_existing_interactive_open_clears_revocation() {
     let mut h = tcp_ready(&["a"]);
-    let lifetime = h.lifetime("a");
     close_mirror_publicly(&mut h, "a");
     assert!(h.core.active_lease().is_none(), "明確 close 先撤除舊 mirror");
     assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 1);
 
-    let opened = h
-        .rpc(open_req("human:a", 60.0, "", false))
-        .expect("既有 interactive_open 路徑重新授予同一 TCP client");
+    let (opened, effects) = h.rpc_full(open_req("human:a", 60.0, "", false));
+    let opened = opened.expect("既有 interactive_open 路徑重新授予同一 TCP client");
     assert_eq!(opened.get("ok"), Some(&PyValue::Bool(true)));
     let lease = h.core.active_lease().expect("interactive_open 已授予 human lease");
     assert_eq!(lease.owner, "human:a");
-    assert_eq!(
-        lease.mirror_client_lifetime,
-        Some(lifetime),
-        "既有路徑重授同一 TCP client 時 lease 保留 lifetime mirror 標記",
-    );
+    assert_eq!(lease.mirror_client_lifetime, None, "interactive_open 維持修前普通 lease 記法");
+    let lease_index_ops: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::LeaseIndex(op) => Some(op),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lease_index_ops.len(), 1, "本批只發一筆 LeaseIndex op");
+    assert!(matches!(
+        lease_index_ops[0],
+        LeaseIndexOp::Insert { interactive_id } if interactive_id == &lease.interactive_id
+    ));
     assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 0);
 
     let id = lease.interactive_id.clone();
@@ -518,7 +524,100 @@ fn tcp_mirror_existing_interactive_open_clears_revocation() {
     assert_eq!(
         h.core.active_lease().map(|current| current.interactive_id.as_str()),
         Some(id.as_str()),
-        "後續 sync 保留既有 interactive_open mirror",
+        "後續 sync 保留既有 interactive_open lease",
+    );
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, None);
+}
+
+#[test]
+fn tcp_mirror_interactive_close_revokes_regular_human_lease() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+
+    // 先以 interactive_open 建立普通 human lease，再 accept TCP console；此 lease 必須維持修前記法。
+    let (opened, open_effects) = h.rpc_full(open_req("human:a", 60.0, "", false));
+    let opened = opened.expect("interactive_open human:a");
+    let old_id = opened
+        .get("interactive_id")
+        .and_then(PyValue::as_str)
+        .expect("human lease id")
+        .to_string();
+    assert!(open_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::Insert { interactive_id }) if interactive_id == &old_id
+    )));
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, None);
+
+    let lifetime = h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.active_lease().map(|lease| lease.interactive_id.as_str()), Some(old_id.as_str()));
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, None);
+    let probe = start_non_strict_self_test(&mut h);
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:a"));
+
+    let (closed, close_effects) = h.rpc_full(close_req(&old_id));
+    let closed = closed.expect("interactive_close human:a");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    assert!(
+        close_effects.iter().all(|effect| !matches!(
+            effect,
+            Effect::LeaseIndex(LeaseIndexOp::InsertTcpMirror { .. })
+        )),
+        "explicit close effects must not immediately insert a TCP mirror"
+    );
+    assert!(h.core.active_lease().is_none(), "explicit close leaves no replacement lease");
+    assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 1);
+    assert_eq!(
+        h.core.human_console().consoles["a"].client_lifetime,
+        lifetime,
+        "revocation is recorded for the currently registered TCP lifetime",
+    );
+    let stale = h.rpc(status_req(&old_id, 80)).expect("查詢已 close 的舊 id");
+    assert_eq!(stale.get("error_code"), Some(&PyValue::from("INTERACTIVE_NOT_FOUND")));
+
+    // Tick 執行 reprobe 同步；刻意不送 Hub scan，因其 self-heal 可按修前語意重新授予 owner。
+    let tick = h.advance(Duration::from_secs(1));
+    assert!(tick.iter().all(|effect| !matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::InsertTcpMirror { .. })
+    )));
+    assert!(h.core.active_lease().is_none(), "reprobe sync 不得補回 mirror");
+
+    let resumed = finish_self_test(&mut h, probe);
+    assert!(resumed.iter().all(|effect| !matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::InsertTcpMirror { .. })
+    )));
+    assert!(h.core.active_lease().is_none(), "self-test resume sync 不得補回 mirror");
+
+    // interactive_open 會先走 refresh；重授同一 human 的既有路徑清除撤權，但仍開普通 lease。
+    let (refreshed, refresh_effects) = h.rpc_full(open_req("human:a", 60.0, "", false));
+    let refreshed = refreshed.expect("interactive_open refresh 後重新授予普通 human lease");
+    let refreshed_id = refreshed
+        .get("interactive_id")
+        .and_then(PyValue::as_str)
+        .expect("refreshed human lease id")
+        .to_string();
+    assert_ne!(refreshed_id, old_id);
+    assert!(refresh_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::Insert { interactive_id }) if interactive_id == &refreshed_id
+    )));
+    assert!(refresh_effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::InsertTcpMirror { .. })
+    )));
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, None);
+    assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 0);
+
+    let reprobe = h.advance(Duration::from_secs(1));
+    assert!(reprobe.iter().all(|effect| !matches!(
+        effect,
+        Effect::LeaseIndex(LeaseIndexOp::InsertTcpMirror { .. })
+    )));
+    assert_eq!(
+        h.core.active_lease().map(|lease| lease.interactive_id.as_str()),
+        Some(refreshed_id.as_str()),
+        "後續 reprobe 保留普通 lease，不建立新 mirror",
     );
 }
 

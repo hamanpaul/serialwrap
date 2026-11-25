@@ -241,7 +241,7 @@ mirror SHALL 隨目前存活的 TCP raw owner（active、suspended 或 pending�
 
 上述 mirror 行為適用於 guard 開放期間。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease；既有 mirror 簿記會在同步路徑撤除。guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。此例外期間 raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由 SHALL 維持修前 Rust 基線；guard 開放時仍適用上述 mirror 驗收。
 
-明確 `interactive_close` 只抑制同步路徑為仍登記的同一 client lifetime 新建 mirror；self-heal、retained／stash 還原或 `interactive_open` 等既有路徑依修前條件重新授予該 client 時，會清除撤權並以 lifetime 標記記錄 mirror。`console_detach`、EOF、stale prune 與 release close-all 會在該 lifetime 離開 console table 時立即清除撤權，不等待 EOF。
+明確 `interactive_close` 關閉仍登記 TCP client 的 human lease（不論是 mirror 或普通 lease）後，同步不得立即補回 mirror。self-heal、retained／stash 還原與 `interactive_open` 等既有授權路徑重新授予該 client 時，以目前 console lifetime 清除撤權，並維持各路徑修前的 Lease／LeaseIndex 記法；`interactive_open` 的普通 human lease 仍是 `Insert`，不帶 mirror 標記。`console_detach`、EOF、stale prune 與 release close-all 會在該 lifetime 離開 console table 時立即清除撤權，不等待 EOF。
 
 EOF 與 detach SHALL 依 `(client_id, client_lifetime)` 精確移除 mirror，不呼叫清 owner 的路徑。當 client A 離線、client B 已成為 raw owner時，A 的 EOF、舊 stash close 或 expiry SHALL NOT 清除 B 的 ownership；agent soft preempt 後 close／expiry SHALL 保留 B 並只清掉 A 的 deferred bytes。不得新增第二 console 即時接班；未被既有 ownership 指定的第二 console 仍沿用 self-heal。
 

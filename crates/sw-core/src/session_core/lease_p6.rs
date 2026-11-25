@@ -126,10 +126,12 @@ impl SessionCore {
             } else {
                 !stash.expired(now) && self.human_peer_present(&cid)
             };
-            if let Some(lifetime) = stash.mirror_client_lifetime.filter(|_| stash_alive) {
+            if stash_alive {
+                self.clear_tcp_mirror_revocation_for_human_owner(&stash.owner);
+            }
+            if stash.mirror_client_lifetime.is_some() && stash_alive {
                 // TCP mirror 只作簿記；raw handback 與回放沿既有 PostClose／resume 路徑。
                 // resume 後的 sync 依當下存活 client 重建鏡像，guard 關閉時則只撤簿記。
-                self.clear_tcp_mirror_revocation_for_client_lifetime(&cid, lifetime);
                 self.forget_stashed_tcp_mirror();
             } else if stash_alive {
                 self.stashed_human.take();
@@ -389,12 +391,39 @@ impl SessionCore {
     }
 
     pub(super) fn mark_tcp_mirror_revoked_for_lease(&mut self, lease: &InteractiveLease) {
-        let (Some(lifetime), Some(client_id)) =
-            (lease.mirror_client_lifetime, lease.human_client_id())
-        else {
+        let Some(client_id) = lease.human_client_id() else {
             return;
         };
-        self.mark_tcp_mirror_revoked_for_client(client_id, lifetime);
+        let lifetime = lease.mirror_client_lifetime.or_else(|| {
+            self.human
+                .consoles
+                .get(client_id)
+                .filter(|console| {
+                    console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
+                })
+                .map(|console| console.client_lifetime)
+        });
+        if let Some(lifetime) = lifetime {
+            self.mark_tcp_mirror_revoked_for_client(client_id, lifetime);
+        }
+    }
+
+    /// 既有授權路徑重授仍登記的 TCP human owner 時清除該 console 目前 lifetime 的撤權。
+    pub(super) fn clear_tcp_mirror_revocation_for_human_owner(&mut self, owner: &str) {
+        let Some(client_id) = owner.strip_prefix("human:") else {
+            return;
+        };
+        let lifetime = self
+            .human
+            .consoles
+            .get(client_id)
+            .filter(|console| {
+                console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
+            })
+            .map(|console| console.client_lifetime);
+        if let Some(lifetime) = lifetime {
+            self.clear_tcp_mirror_revocation_for_client_lifetime(client_id, lifetime);
+        }
     }
 
     /// 新 accept 代表同一 client id 已進入新的 lifetime，舊撤權不延伸至新連線。
