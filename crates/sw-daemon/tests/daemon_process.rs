@@ -284,7 +284,7 @@ fn daemon_reports_absolute_path_for_relative_environment_wal_dir() {
 
 #[test]
 fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
-    if std::env::var_os("SW_I304_DOCTOR_CHILD_EXPECTED").is_some() {
+    if std::env::var_os("SW_I304_DOCTOR_CHILD").is_some() {
         run_doctor_child();
         return;
     }
@@ -355,10 +355,17 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     );
     let doctor_cwd = env.root.join("doctor-cwd");
     fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
-    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd, true);
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
     assert!(
         doctor.status.success(),
         "隔離 doctor process 必須比對通過；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        doctor_process_wal_dir_ok(&doctor.stdout),
+        Some(true),
+        "隔離 doctor process 必須確認 WAL 目錄一致；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -464,10 +471,17 @@ fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restar
     );
     let doctor_cwd = env.root.join("doctor-cwd");
     fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
-    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd, true);
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
     assert!(
         doctor.status.success(),
         "改回原字串後隔離 doctor process 必須比對通過；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        doctor_process_wal_dir_ok(&doctor.stdout),
+        Some(true),
+        "改回原字串後隔離 doctor process 必須確認 WAL 目錄一致；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -497,10 +511,17 @@ fn daemon_and_doctor_in_different_working_directories_do_not_match_relative_wal_
         "SERIALWRAP_WAL_DIR".to_string(),
         doctor_wal.display().to_string(),
     );
-    let doctor = run_isolated_doctor(&env, &doctor_vars, &doctor_cwd, false);
+    let doctor = run_isolated_doctor(&env, &doctor_vars, &doctor_cwd);
     assert!(
         doctor.status.success(),
         "隔離 doctor process 必須在不同實體 WAL 目錄下回報不一致；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        doctor_process_wal_dir_ok(&doctor.stdout),
+        Some(false),
+        "隔離 doctor process 必須將不同實體 WAL 目錄判為不一致；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -517,7 +538,6 @@ fn run_isolated_doctor(
     env: &IsolatedEnv,
     vars: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
-    expected_ok: bool,
 ) -> std::process::Output {
     let test_exe = std::env::current_exe().expect("取得 daemon_process 測試執行檔");
     Command::new(&test_exe)
@@ -528,10 +548,7 @@ fn run_isolated_doctor(
         ])
         .env_clear()
         .envs(vars)
-        .env(
-            "SW_I304_DOCTOR_CHILD_EXPECTED",
-            if expected_ok { "true" } else { "false" },
-        )
+        .env("SW_I304_DOCTOR_CHILD", "1")
         .current_dir(cwd)
         .output()
         .unwrap_or_else(|error| {
@@ -544,11 +561,6 @@ fn run_isolated_doctor(
 }
 
 fn run_doctor_child() {
-    let expected_ok = match std::env::var("SW_I304_DOCTOR_CHILD_EXPECTED").as_deref() {
-        Ok("true") => true,
-        Ok("false") => false,
-        other => panic!("doctor child 缺少有效期望值：{other:?}"),
-    };
     let fake_env = std::env::vars()
         .fold(sw_pal::fakes::FakeSysEnv::builder(), |builder, (key, value)| {
             builder.var(&key, &value)
@@ -573,13 +585,20 @@ fn run_doctor_child() {
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(
-        doctor_wal_dir_ok(&stdout),
-        Some(expected_ok),
-        "doctor WAL 比對結果不符；stdout={} stderr={}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
+    let wal_dir_ok = doctor_wal_dir_ok(&stdout).unwrap_or_else(|| {
+        panic!(
+            "doctor 輸出缺少 wal_dir check；stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    println!("I304_DOCTOR_WAL_DIR_OK={wal_dir_ok}");
+}
+
+fn doctor_process_wal_dir_ok(output: &[u8]) -> Option<bool> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .find_map(|line| line.strip_prefix("I304_DOCTOR_WAL_DIR_OK=")?.parse().ok())
 }
 
 fn doctor_wal_dir_ok(output: &[u8]) -> Option<bool> {
