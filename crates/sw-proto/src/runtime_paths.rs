@@ -177,6 +177,28 @@ fn env_path(
     pypath::expanduser(f, &raw, env, home)
 }
 
+/// 解析 config.yaml 的 `wal_dir`；相對路徑以實際讀取的 config 檔所在目錄為基準。
+///
+/// 不以字串 `normpath` 消去 `..`：檔案系統必須先解析路徑中的 symlink，再套用後續 `..`。
+pub fn resolve_config_wal_dir(
+    env: &EnvSnapshot,
+    f: PathFlavor,
+    home: &dyn HomeLookup,
+    config_path: &str,
+    cfg: &RuntimeConfig,
+) -> Option<String> {
+    let configured = match cfg.wal_dir() {
+        Some(YValue::Str(raw)) if !py_strip(raw).is_empty() => raw,
+        _ => return None,
+    };
+    let expanded = pypath::expanduser(f, configured, env, home);
+    if pypath::isabs(f, &expanded) {
+        return Some(expanded);
+    }
+    let config_dir = pypath::dirname(f, config_path);
+    Some(pypath::join(f, &config_dir, &[&expanded]))
+}
+
 /// 解析有效 WAL 目錄：環境變數 > config.yaml `wal_dir` > `<state_dir>/wal`。
 ///
 /// `wal_dir` 的相對路徑以實際讀取的 config 檔所在目錄為基準；`~` 依平台路徑風格展開。
@@ -195,17 +217,8 @@ pub fn resolve_wal_dir(
     {
         return pypath::expanduser(f, raw, env, home);
     }
-
-    let configured = match cfg.wal_dir() {
-        Some(YValue::Str(raw)) if !py_strip(raw).is_empty() => raw,
-        _ => return pypath::join(f, state_dir, &["wal"]),
-    };
-    let expanded = pypath::expanduser(f, configured, env, home);
-    if pypath::isabs(f, &expanded) {
-        return pypath::normpath(f, &expanded);
-    }
-    let config_dir = pypath::dirname(f, config_path);
-    pypath::normpath(f, &pypath::join(f, &config_dir, &[&expanded]))
+    resolve_config_wal_dir(env, f, home, config_path, cfg)
+        .unwrap_or_else(|| pypath::join(f, state_dir, &["wal"]))
 }
 
 /// `_xdg(name, fallback_rel)`：`os.environ.get(name) or os.path.join(expanduser("~"), fallback_rel)`；空字串視為未設且不 expanduser。

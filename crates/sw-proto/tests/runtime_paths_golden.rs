@@ -188,7 +188,7 @@ fn test_resolve_wal_dir_env_config_and_default_priority() {
     let cases = [
         (None, "/state/wal"),
         (Some("archive/wal"), "/cfg/sub/archive/wal"),
-        (Some("../archive/wal"), "/cfg/archive/wal"),
+        (Some("../archive/wal"), "/cfg/sub/../archive/wal"),
         (Some("~/serialwrap-wal"), "/fixture/home/serialwrap-wal"),
         (Some("   "), "/state/wal"),
     ];
@@ -238,6 +238,34 @@ fn test_resolve_wal_dir_env_config_and_default_priority() {
 }
 
 #[test]
+fn test_resolve_wal_dir_preserves_dotdot_for_symlink_resolution() {
+    let env = env_of(&[
+        ("HOME", "/fixture/home"),
+        ("SERIALWRAP_STATE_DIR", "/state"),
+    ]);
+    let cases = [
+        ("../wal", "/fixture/config/link/../wal"),
+        ("/fixture/config/link/../wal", "/fixture/config/link/../wal"),
+    ];
+    for (configured, expected) in cases {
+        let text = format!("wal_dir: {configured}\n");
+        let cfg = RuntimeConfig::from_text(Some(&text)).expect("config");
+        assert_eq!(
+            resolve_wal_dir(
+                &env,
+                PathFlavor::Posix,
+                &H,
+                "/state",
+                "/fixture/config/link/config.yaml",
+                &cfg,
+            ),
+            expected,
+            "wal_dir={configured:?}"
+        );
+    }
+}
+
+#[test]
 fn test_resolve_wal_dir_windows_relative_uses_config_parent() {
     let env = EnvSnapshot::from_pairs_fold_upper([
         ("USERPROFILE".to_string(), r"C:\Fixture\Users\demo".to_string()),
@@ -258,7 +286,7 @@ fn test_resolve_wal_dir_windows_relative_uses_config_parent() {
             r"C:\config\serialwrap\config.yaml",
             &cfg,
         ),
-        r"C:\config\archive\wal"
+        r"C:\config\serialwrap\..\archive\wal"
     );
 }
 

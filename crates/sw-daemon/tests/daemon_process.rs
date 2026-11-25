@@ -232,15 +232,15 @@ fn config_wal_dir_is_used_by_daemon_startup_and_writes() {
         "wal_dir: ../audit/custom-wal\n",
     )
     .expect("寫入 config.yaml");
-    let expected_dir = env.root.join("audit").join("custom-wal");
-    let expected_wal = expected_dir.join("raw.wal.ndjson");
+    let reported_dir = env.config_dir.join("../audit/custom-wal");
+    let expected_wal = env.root.join("audit/custom-wal/raw.wal.ndjson");
 
     let mut daemon = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
     let health = health_status(&env.socket);
     assert_eq!(
         health["wal_path"],
-        expected_wal.display().to_string(),
+        reported_dir.join("raw.wal.ndjson").display().to_string(),
         "health.status 必須回報 config wal_dir 實際使用的路徑"
     );
     let contents = fs::read_to_string(&expected_wal).unwrap_or_else(|error| {
@@ -255,6 +255,114 @@ fn config_wal_dir_is_used_by_daemon_startup_and_writes() {
         "custom WAL 至少須包含一筆有效 JSON 紀錄"
     );
 
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+#[test]
+fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
+    let mut env = isolated_env_with_pty_target();
+    env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    fs::create_dir_all(env.system_config.parent().expect("system config parent"))
+        .expect("建立 system config 目錄");
+    fs::write(&env.system_config, "wal_dir: archive/wal\n").expect("寫入 system config");
+    let expected_dir = env
+        .system_config
+        .parent()
+        .expect("system config parent")
+        .join("archive/wal");
+    let expected_wal = expected_dir.join("raw.wal.ndjson");
+
+    let mut first = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        expected_wal.display().to_string(),
+        "第一次啟動必須以 system config 父目錄解析 wal_dir"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(first.wait(LONG).code(), Some(0), "{}", first.stderr());
+
+    assert!(
+        env.config_dir.join("config.yaml").is_file(),
+        "daemon 綁定 endpoint 後必須複製 system config 到 user config"
+    );
+    let mut second = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        expected_wal.display().to_string(),
+        "user config 複本重啟後仍須指向相同 WAL 目錄"
+    );
+    let contents = fs::read_to_string(&expected_wal).unwrap_or_else(|error| {
+        panic!(
+            "重啟後未繼續寫入原 WAL 目錄：{}（{error}，stderr={}）",
+            expected_wal.display(),
+            second.stderr()
+        )
+    });
+    assert!(
+        contents.lines().any(|line| pyjson::loads(line).is_ok()),
+        "原 WAL 目錄必須保有有效 JSON 紀錄"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+}
+
+#[test]
+fn config_wal_dir_preserves_symlink_dotdot_filesystem_semantics() {
+    let mut env = isolated_env_with_pty_target();
+    env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    let project = env.root.join("vault/project");
+    fs::create_dir_all(&project).expect("建立 config 實體目錄");
+    fs::write(project.join("config.yaml"), "wal_dir: ../wal\n").expect("寫入 config.yaml");
+    let config_link = env.root.join("linked-config");
+    let link_kind = sw_pal::native()
+        .fs
+        .symlink_or_copy_dir(&config_link, &project)
+        .expect("建立 config 目錄 symlink／複本");
+    env.vars.insert(
+        "SERIALWRAP_CONFIG".to_string(),
+        config_link.join("config.yaml").display().to_string(),
+    );
+    let expected_dir = match link_kind {
+        sw_pal::fs_ops::LinkKind::Symlink => env.root.join("vault/wal"),
+        sw_pal::fs_ops::LinkKind::Copied => env.root.join("wal"),
+    };
+    fs::create_dir_all(&expected_dir).expect("建立預期 WAL 目錄");
+    let expected_wal = expected_dir.join("raw.wal.ndjson");
+
+    let mut daemon = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    let health = health_status(&env.socket);
+    let health_path = PathBuf::from(
+        health["wal_path"]
+            .as_str()
+            .expect("health.status wal_path 必須是字串"),
+    );
+    let actual_dir = fs::canonicalize(
+        health_path
+            .parent()
+            .expect("health.status wal_path 必須有父目錄"),
+    )
+    .unwrap_or_else(|error| panic!("無法解析 daemon WAL 目錄：{error}"));
+    let expected_dir =
+        fs::canonicalize(&expected_dir).unwrap_or_else(|error| panic!("無法解析預期 WAL 目錄：{error}"));
+    assert_eq!(
+        actual_dir, expected_dir,
+        "wal_dir 的 `..` 必須由檔案系統在 symlink 解析後套用"
+    );
+    let contents = fs::read_to_string(&expected_wal).unwrap_or_else(|error| {
+        panic!(
+            "config wal_dir 未寫入預期實體目錄：{}（{error}，stderr={}）",
+            expected_wal.display(),
+            daemon.stderr()
+        )
+    });
+    assert!(
+        contents.lines().any(|line| pyjson::loads(line).is_ok()),
+        "預期實體 WAL 目錄必須包含有效 JSON 紀錄"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
 }

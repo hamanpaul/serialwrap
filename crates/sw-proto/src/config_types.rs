@@ -951,6 +951,11 @@ impl RuntimeConfig {
         upsert_str_key(&mut self.data, "socket_path", endpoint);
     }
 
+    /// 僅更新頂層 `wal_dir`；其餘設定原樣保留。
+    pub fn set_wal_dir(&mut self, path: &str) {
+        upsert_str_key(&mut self.data, "wal_dir", path);
+    }
+
     /// `yaml.safe_dump(data, allow_unicode=True)`（PyYAML 預設 `sort_keys=True`）的位元組等價輸出。
     ///
     /// 已知殘差（非契約，見 plan P4-T6）：PyYAML 對「同一物件被多處參照」會輸出 anchor／alias（`&id001`／`*id001`），

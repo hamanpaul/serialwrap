@@ -1,6 +1,7 @@
 //! P4-T13 `doctor` 全部檢查原生與 version_pairing（SC-25）失敗測試。
 mod support;
 
+use std::fs;
 use std::time::Duration;
 
 use support::*;
@@ -656,6 +657,52 @@ fn wal_dir_config_mismatch_is_reported() {
     assert!(
         s(check, "fix").contains("config.yaml")
             && s(check, "fix").contains("wal_dir")
+    );
+}
+
+#[test]
+fn wal_dir_comparison_resolves_symlink_before_dotdot() {
+    let t = TestEnv::posix();
+    let root = t
+        .config_dir()
+        .parent()
+        .expect("config_dir parent")
+        .to_path_buf();
+    let project = root.join("vault/project");
+    let config_link = root.join("linked-config");
+    let actual = root.join("wal");
+    let symlink_target = root.join("vault/wal");
+    fs::create_dir_all(&project).expect("建立 config 實體目錄");
+    fs::create_dir_all(&actual).expect("建立錯誤候選 WAL 目錄");
+    fs::create_dir_all(&symlink_target).expect("建立 symlink 目標 WAL 目錄");
+    fs::write(project.join("config.yaml"), "wal_dir: ../wal\n").expect("寫入 config.yaml");
+    let link_kind = t.with_cli_ctx(|ctx| {
+        ctx.p
+            .fs
+            .symlink_or_copy_dir(&config_link, &project)
+            .expect("建立 config 目錄 symlink／複本")
+    });
+    let t = t.with_var(
+        "SERIALWRAP_CONFIG",
+        &config_link.join("config.yaml").display().to_string(),
+    );
+    let ep = t.default_socket();
+    let t = t.with_rpc_ok(
+        &ep,
+        "health.status",
+        &format!(
+            r#"{{"ok":true,"wal_path":"{}/raw.wal.ndjson"}}"#,
+            actual.display()
+        ),
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "wal_dir");
+    assert_eq!(
+        b(check, "ok"),
+        link_kind == sw_pal::fs_ops::LinkKind::Copied,
+        "symlink 必須先解析再套用 `..`；純複本才可能與詞法正規化路徑相同"
     );
 }
 

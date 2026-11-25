@@ -99,9 +99,13 @@ entries:
   bc:BC-17:
     nodeids:
     - cargo:sw-proto::runtime_paths_golden::test_resolve_wal_dir_env_config_and_default_priority
+    - cargo:sw-proto::runtime_paths_golden::test_resolve_wal_dir_preserves_dotdot_for_symlink_resolution
     - cargo:sw-proto::runtime_paths_golden::test_resolve_wal_dir_windows_relative_uses_config_parent
     - cargo:sw-proto::runtime_config_write::runtime_config_set_mode_keeps_other_keys
     - cargo:sw-daemon::daemon_process::config_wal_dir_is_used_by_daemon_startup_and_writes
+    - cargo:sw-daemon::daemon_process::config_wal_dir_preserves_symlink_dotdot_filesystem_semantics
+    - cargo:sw-daemon::daemon_process::system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart
+    - cargo:sw-cli::mgmt_doctor::wal_dir_comparison_resolves_symlink_before_dotdot
     - cargo:sw-cli::mgmt_doctor::wal_dir_config_mismatch_is_reported
     - cargo:sw-cli::mgmt_doctor::wal_dir_mismatch
     - cargo:sw-cli::mgmt_setup::s1m241_assessment_matching_ping_is_reported_once

@@ -1116,6 +1116,23 @@ fn check_daemon_endpoint(ctx: &CliCtx) -> Check {
     }
 }
 
+fn comparable_wal_path(flavor: PathFlavor, path: &str) -> String {
+    match flavor {
+        PathFlavor::Posix => path.to_string(),
+        PathFlavor::Windows => path.replace('/', "\\").to_lowercase(),
+    }
+}
+
+fn wal_dirs_match(ctx: &CliCtx, flavor: PathFlavor, expected: &str, daemon: &str) -> bool {
+    let resolved_expected = ctx.p.env.realpath(Path::new(expected));
+    let resolved_daemon = ctx.p.env.realpath(Path::new(daemon));
+    if let (Ok(expected), Ok(daemon)) = (resolved_expected, resolved_daemon) {
+        return comparable_wal_path(flavor, &expected.to_string_lossy())
+            == comparable_wal_path(flavor, &daemon.to_string_lossy());
+    }
+    comparable_wal_path(flavor, expected) == comparable_wal_path(flavor, daemon)
+}
+
 /// `wal_dir`（advisory）：daemon 實際 WAL 路徑與共用解析器的有效值是否一致。
 fn check_wal_dir(ctx: &CliCtx) -> Check {
     let flavor = flavor_of(ctx);
@@ -1149,8 +1166,7 @@ fn check_wal_dir(ctx: &CliCtx) -> Check {
     }
     let daemon_dir = pypath::dirname(flavor, &str_of(wal_path));
     let shell_override = py_strip(ctx.env.get("SERIALWRAP_WAL_DIR").unwrap_or("")).to_string();
-    let mismatch =
-        pypath::normpath(flavor, &expected_dir) != pypath::normpath(flavor, &daemon_dir);
+    let mismatch = !wal_dirs_match(ctx, flavor, &expected_dir, &daemon_dir);
     if mismatch {
         let detail = if shell_override.is_empty() {
             format!(

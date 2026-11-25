@@ -44,9 +44,10 @@ use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::release_manifest::parse_current_release;
 use sw_proto::runtime_paths::{
-    resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot, NativeTraits, PathsError,
-    RuntimePaths,
+    resolve_config_wal_dir, resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot,
+    NativeTraits, PathsError, RuntimePaths,
 };
+use sw_proto::yaml11::YValue;
 
 use crate::code_identity::{capture as capture_code_identity, CodeIdentity};
 use crate::framing::{RpcHandler, RpcServer, RpcStopAccept};
@@ -1598,6 +1599,21 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
         } else {
             RuntimeConfig::from_text(None).map_err(|e| e.to_string())?
         };
+        let flavor = flavor_of(&p.caps);
+        let relative_wal_dir = match cfg.wal_dir() {
+            Some(YValue::Str(raw)) if !py_strip(raw).is_empty() => {
+                let expanded = pypath::expanduser(flavor, raw, env, &home);
+                !pypath::isabs(flavor, &expanded)
+            }
+            _ => false,
+        };
+        if read_path != write_path && relative_wal_dir {
+            if let Some(resolved) =
+                resolve_config_wal_dir(env, flavor, &home, &read_path, &cfg)
+            {
+                cfg.set_wal_dir(&resolved);
+            }
+        }
         cfg.set_socket(endpoint);
         let wp = PathBuf::from(&write_path);
         if let Some(parent) = wp.parent().filter(|d| !d.as_os_str().is_empty()) {
