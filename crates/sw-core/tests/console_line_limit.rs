@@ -114,6 +114,19 @@ fn human_console_line_is_not_limited() {
     h.to_ready();
     h.connect_stream_console("c1", ConsoleTransportKind::TcpTelnet);
     h.connect_stream_console("c2", ConsoleTransportKind::TcpTelnet);
+    // BC-23：第二個 TCP console 的 line 會被第一個 raw owner 的 lease 擋下；先明確關閉 lease，
+    // 再驗證 human line 路徑不套用 profile 上限。
+    let interactive_id = h
+        .core
+        .active_lease()
+        .expect("第一個 TCP console 建立 human lease")
+        .interactive_id
+        .clone();
+    let closed = h
+        .rpc(SessionRequest::InteractiveClose { interactive_id })
+        .expect("interactive-close 回覆");
+    assert_eq!(closed["ok"], PyValue::Bool(true));
+    assert!(h.core.active_lease().is_none(), "line 測試不應保留 raw owner lease");
     let line = "A".repeat(30);
     let fx = h.input("c2", format!("{line}\r").as_bytes());
     assert_eq!(started_commands(&fx), vec![line]);

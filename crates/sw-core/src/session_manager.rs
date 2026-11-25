@@ -591,6 +591,8 @@ struct Inner {
     stopping: bool,
     /// interactive_id → session_id。
     interactive: HashMap<String, String>,
+    /// p279：目前 active lease 中的 TCP owner mirror ID（不出現在 RPC/state）。
+    tcp_mirror_leases: HashSet<String>,
     /// 動態偵測當時的 real_path（sticky 的 TOCTOU 比對；#95 HIGH#2）。
     probe_paths: HashMap<String, String>,
     /// P8 Task 8：flash-critical 的 COM（Python `_flash_critical_coms`；#83 RACE-2 final）。
@@ -645,6 +647,7 @@ impl Inner {
             inflight: HashMap::new(),
             stopping: false,
             interactive: HashMap::new(),
+            tcp_mirror_leases: HashSet::new(),
             probe_paths: HashMap::new(),
             flash_critical: HashSet::new(),
             handoff_frozen: false,
@@ -6288,11 +6291,17 @@ impl EffectExecutor for ManagerExec {
                 let mut inner = lock(&self.shared.inner);
                 match op {
                     crate::session_core::LeaseIndexOp::Insert { interactive_id } => {
+                        inner.tcp_mirror_leases.remove(&interactive_id);
                         inner.interactive.insert(interactive_id, sid);
+                    }
+                    crate::session_core::LeaseIndexOp::InsertTcpMirror { interactive_id } => {
+                        inner.interactive.insert(interactive_id.clone(), sid);
+                        inner.tcp_mirror_leases.insert(interactive_id);
                     }
                     crate::session_core::LeaseIndexOp::Remove { interactive_id } => {
                         if inner.interactive.get(&interactive_id) == Some(&sid) {
                             inner.interactive.remove(&interactive_id);
+                            inner.tcp_mirror_leases.remove(&interactive_id);
                         }
                     }
                 }
@@ -8634,6 +8643,11 @@ impl SessionManager {
         let inner = lock(&self.shared.inner);
         let sid = inner.interactive.get(interactive_id)?;
         inner.sessions.get(sid).map(|e| e.profile.com.clone())
+    }
+
+    /// p279：供 daemon handoff 摘要辨識 TCP mirror；此內部標記不透出 RPC/state。
+    pub fn interactive_is_tcp_mirror(&self, interactive_id: &str) -> bool {
+        lock(&self.shared.inner).tcp_mirror_leases.contains(interactive_id)
     }
 
     /// 先隱含呼叫 `begin_shutdown`；回傳每個 drain 目標是否在 `budget` 內收斂。

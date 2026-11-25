@@ -883,7 +883,27 @@ automatically, no `--endpoint` needed, #131). Each session exposes a human
 console as a loopback TCP listener that speaks **Telnet** — connect with
 TeraTerm (Service: Telnet) or PuTTY (Telnet) for char-at-a-time interaction
 with remote echo; the `host:port` is shown as `console_endpoint` in
-`session list`.
+`session list`. The first Telnet console holds raw ownership just like a
+`console-attach`ed minicom on Linux. In the Rust 0.5.1 daemon (BC-23), a
+session-layer mirror lease makes `self-test` report `human_attached` /
+`human_active`, applies idle soft-preempt and reprobe deferral, and preserves
+agent interactive arbitration. A default line `command.submit` with bare
+`--source human` finishes with `SESSION_INTERACTIVE_BUSY` and no UART write
+while that human lease exists. An explicit `session.interactive_close` for a still-registered TCP client's
+human lease, whether a mirror or regular lease, prevents sync from immediately
+recreating its mirror. Existing grant paths clear that revocation for the
+console's current lifetime and keep their pre-package lease representation;
+`interactive_open` remains a regular `Insert` lease without a mirror marker. Detach, EOF, stale pruning and release close-all clear revocation when
+the lifetime leaves the session console table, without waiting for EOF. During
+flash, handoff or release guards, TCP
+mirror leases are not created, replayed or promoted; existing mirror records
+are removed through the sync path while raw ownership and input routing follow
+the pre-package Rust behavior. After a guard opens, a TCP human may briefly
+have no mirror lease until the next sync, and agent commands follow the
+existing arbitration. PTY and Python behavior are unchanged. `file.push` and
+`file.pull` keep their agent execution policy and normal transfer gates (#275).
+This package verifies Linux native TCP with fake UART/WAL only; native Windows
+and TeraTerm smoke are scheduled separately.
 
 ```powershell
 serialwrap.exe daemon start        # spawns serialwrapd.exe detached, binds tcp loopback
@@ -2986,7 +3006,7 @@ serialwrap wal current-seq
   - 後端自動依平台選擇，`SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）可覆寫；`pyserial` 為 Windows 後端執行期依賴（`pyproject` `sys_platform=='win32'`）。
 - **human console（PORT-2）**
   - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
-  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。
+  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。**Rust 0.5.1（BC-23）**在 session 層鏡像 TCP raw owner 的 lease，令 `self-test` 回報 `human_attached`／`human_active`，並套用閒置 soft preempt、agent interactive 仲裁與 reprobe 暫緩；明確 `interactive_close` 關閉仍登記 TCP client 的 human lease（不論是 mirror 或普通 lease），同步不會立即補回 mirror。self-heal、retained／stash 還原或 `interactive_open` 等既有授權路徑重新授予該 client 時，以目前 console lifetime 清除撤權，並維持各路徑修前的 Lease／LeaseIndex 記法；`interactive_open` 的普通 human lease 仍是 `Insert`，不帶 mirror 標記。detach、EOF、stale prune 與 release close-all 在 lifetime 離開 console table 時立即清除撤權，不必等待 EOF；已有 human lease 時，預設 line mode 的 bare `--source human` `command.submit` 終態為 `SESSION_INTERACTIVE_BUSY` 且零 UART TX。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease，既有 mirror 簿記由同步路徑撤除，raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由維持修前 Rust 基線；guard 開放至下一次同步之間 TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。PTY 與 Python 語意不變。`file.push`／`file.pull` 仍按 agent 路徑及既有傳輸 gate 執行。此包僅驗證 Linux native TCP listener 搭配 fake UART，Windows 原生與 Tera Term smoke 另行安排。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
 - **Rust daemon 的 console 後端（Slice 2.2）**：依平台選擇——Linux/WSL 為 PTY、Windows 為 loopback Telnet listener；`SERIALWRAP_CONSOLE_BACKEND`（`auto`／`pty`／`tcp`，不分大小寫）可覆寫，Linux 上設 `tcp` 即走與 Windows 相同的 Telnet listener（每個 bridge 一個 `127.0.0.1` ephemeral port，recover／clear 後重新綁定），`session console-attach` 回 `{"client_id": null, "endpoint": "127.0.0.1:<port>", "transport": "tcp", "protocol": "telnet"}` 且不開 lease（OD-85），`session list` 每列都有 `console_endpoint`。listener 只綁 `127.0.0.1`：**同機任何本機使用者都能連線**（OD-12 信任範圍），請部署在單人工作站。選配 com0com Serial console 於 `config.yaml` 的 `windows.serial_console`（`{<DUT COM>: {console_port, peer_port}}`）設定；對應 DUT bridge 與 TCP listener 建立後，daemon 開啟 `console_port`，外接終端連接 `peer_port`。兩端埠自動排除於裝置列舉，格式錯誤時整個鍵忽略並寫一筆 WARNING。
 

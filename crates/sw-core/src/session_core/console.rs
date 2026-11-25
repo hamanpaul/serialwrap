@@ -109,7 +109,7 @@ impl SessionCore {
 
     /// drain Phase 1 時記下的 human lease owner（05 §3.1 第 1 步）。
     pub fn retained_human_owner(&self) -> Option<&str> {
-        self.retained_human.as_ref().map(|(owner, _)| owner.as_str())
+        self.retained_human.as_ref().map(|(owner, _, _)| owner.as_str())
     }
 
     /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）與檔案傳輸（P8 Task 6，`kind="file"`）是前景
@@ -721,6 +721,7 @@ impl SessionCore {
             // 必關閉此 client；不登記、不授 owner，並要求 hub 關閉（hub 處理 close-all 時多半已關，重送為 no-op）。
             return vec![Effect::ConsoleClose { client_id }];
         }
+        self.clear_tcp_mirror_revocations_for_client(&client_id);
         self.human.next_lifetime = self.human.next_lifetime.max(lifetime);
         self.human.consoles.insert(
             client_id.clone(),
@@ -742,21 +743,26 @@ impl SessionCore {
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.on_stream_accept(&client_id);
         self.after_owner_change(before);
+        self.sync_tcp_console_lease(now);
         Vec::new()
     }
 
     /// `DataEvent::ConsoleDisconnected`（`_drop_console_client`，#136；與同 client 輸入同一條 data lane）。
     pub(super) fn console_disconnected(&mut self, client_id: &str, lifetime: u64) -> Vec<Effect> {
+        self.clear_tcp_mirror_revocation_for_client_lifetime(client_id, lifetime);
         if !self.human.is_live(client_id, lifetime) {
             return Vec::new();
         }
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.on_drop(client_id);
         self.after_owner_change(before);
+        self.forget_tcp_console_mirror_for_client(client_id, lifetime);
         self.human.deferred_mut().remove_client(client_id);
         let removed = self.human.lane.remove_client(client_id);
         self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
+        self.prune_tcp_mirror_revocations();
+        self.sync_tcp_console_lease(self.now_cache);
         Vec::new()
     }
 
@@ -823,6 +829,7 @@ impl SessionCore {
             let removed = self.human.lane.remove_client(&cid);
             self.settle_removed_replays(&removed);
             self.human.remove_console(&cid);
+            self.prune_tcp_mirror_revocations();
             self.human.peer_present.remove(&cid);
             fx.push(Effect::ConsoleClose { client_id: cid });
         }
@@ -992,7 +999,7 @@ impl SessionCore {
         // `uart_io.py:1113-1115`：bridge 停止時關閉 listener、端點清為 None（executor 於 BeginDrain 停 hub listener）。
         self.human.console_endpoint = None;
         if let Some(lease) = self.lease.as_ref().filter(|l| l.is_human()) {
-            self.retained_human = Some((lease.owner.clone(), lease.timeout_s));
+            self.retained_human = Some((lease.owner.clone(), lease.timeout_s, lease.mirror_client_lifetime));
         }
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.reset_for_stop();
@@ -1002,6 +1009,7 @@ impl SessionCore {
             fx.push(Effect::ConsoleCloseAll);
             self.human.close_gen += 1;
             self.human.consoles.clear();
+            self.prune_tcp_mirror_revocations();
             self.human.peer_present.clear();
             self.human.primary_client_id = None;
             self.retained_human = None;

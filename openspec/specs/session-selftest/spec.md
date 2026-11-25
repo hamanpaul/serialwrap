@@ -211,3 +211,39 @@ provenance 與唯讀偵測結果：
 - **WHEN** session 綁定的 profile `ready_probe` 非空
 - **THEN** result 含 `command_capable == True`
 
+### Requirement: Rust TCP raw ownership SHALL participate in self-test and reprobe through its lease mirror
+
+Rust 0.5.1（BC-23）中，存活的 TCP/Telnet raw owner SHALL 以 session-layer mirror lease 參與 `self-test` 的 `interactive_owner`、`human_attached` 與 `human_active` 計算。`human_active` 依最後一次真實 TCP raw input 的 60 秒視窗判定；鏡像 lifetime 為內部欄位，不改變 RPC schema。
+
+人類活動窗內，readiness reprobe SHALL 暫緩。self-test、lease refresh 或 agent command 在途期間不得因 raw owner 被 suspend 而拆除 mirror；agent 完成後 deferred input SHALL 只回放一次。
+
+上述 self-test 與 reprobe mirror 行為適用於 guard 開放期間。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease；既有 mirror 簿記會在同步路徑撤除。guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。此例外期間 raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由 SHALL 維持修前 Rust 基線；guard 開放時仍適用上述 mirror 驗收。
+
+#### Scenario: TCP raw owner appears in self-test context
+
+- **WHEN** READY 或 ATTACHED session 有存活 TCP/Telnet raw owner並已建立 mirror lease
+- **AND** mirror guard 開放
+- **AND** 呼叫 `session.self_test`
+- **THEN** result 回報該 human 的 `interactive_owner` 與 `human_attached == true`
+- **AND** 最後一次真實鍵入在 60 秒內時 `human_active == true`
+
+#### Scenario: guard closed removes mirror bookkeeping
+
+- **WHEN** guard 關閉期間的既有同步路徑處理存活 TCP raw owner
+- **THEN** 同步路徑撤除既有 mirror 簿記，guard 剛開放至下一次 sync 之間 TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行
+- **AND** raw ownership、suspend／resume、deferred input、回放及 raw／line 路由維持修前 Rust 基線
+
+#### Scenario: recent TCP input defers readiness reprobe
+
+- **WHEN** TCP raw owner 最近 60 秒內有真實輸入，session 處於允許 reprobe 的狀態
+- **THEN** 自動 reprobe 尊重 human activity window，不啟動 login probe
+- **AND** 超過活動窗後再依既有 reprobe 排程判定
+
+#### Scenario: self-test and refresh during an agent command preserve the mirror
+
+- **WHEN** agent command 已 suspend TCP raw owner，human bytes 正在 deferred buffer
+- **AND** 呼叫 `session.self_test` 或 interactive refresh
+- **AND** mirror guard 開放
+- **THEN** TCP mirror lease 不被拆除，agent command 的 TX 仲裁不變
+- **AND** command 結束後 deferred bytes 恰回放一次
+
