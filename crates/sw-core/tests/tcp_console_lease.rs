@@ -912,14 +912,33 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     assert_eq!(h.core.generations().owner_gen, owner_gen_before_open);
 
     h.fence.with(|fence| fence.flash_critical = true);
+    // guard 關閉期間由既有同步路徑撤除 A 的 mirror 簿記；probe suspend 不受影響。
+    let guarded_scan = h.scan(None);
+    assert!(guarded_scan.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })), "guard 關閉的同步不得送出或回放");
+    assert!(h.core.active_lease().is_none(), "guard 關閉期間同步撤除 A 的 mirror");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "撤除 mirror 不得結算 self-test suspend");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "self-test 尚在途時 raw owner 仍 suspended");
     assert!(h.input("a", b"nested").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
     assert_eq!(h.deferred_len("a"), b"nested".len());
 
     let owner_gen_before_sync = h.core.generations().owner_gen;
+    let a_lifetime = h.lifetime("a");
+    let lease_index_start = h.lease_index_ops().len();
     h.fence.with(|fence| fence.flash_critical = false);
     h.scan(None);
     let mirror = h.core.active_lease().expect("既有 sync 依仍存活的 A 建立 mirror");
     assert_eq!(mirror.owner, "human:a");
+    assert_eq!(mirror.mirror_client_lifetime, Some(a_lifetime), "重建的 mirror 綁定 A 目前的 lifetime");
+    let mirror_id = mirror.interactive_id.clone();
+    assert_ne!(Some(mirror_id.clone()), mirror_before.as_ref().map(|(id, _)| id.clone()), "guard 開放後是新建的 mirror，不是原 mirror");
+    assert_eq!(
+        h.lease_index_ops()[lease_index_start..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &mirror_id))
+            .count(),
+        1,
+        "guard 開放後只建立一次 mirror index",
+    );
     assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "同步不得結算 self-test suspend");
     assert_eq!(h.core.human_console().ownership.interactive_owner, None, "self-test 尚在途時 raw owner 仍 suspended");
     assert_eq!(h.core.generations().owner_gen, owner_gen_before_sync, "guard 後建鏡不因簿記改變 owner generation");
