@@ -1005,7 +1005,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let mut completion_timeout_snapshot: Option<RxSnapshot> = None;
     let mut completion_silence_expired = false;
     if let Some(evaluator) = echo_evaluator.as_ref() {
-        // 靜默 chunk 仍保留基線的提前救援行為；只有絕對 operation deadline 才走 R8 timeout 結算。
+        // 靜默 chunk 與絕對 operation deadline 使用相同的 human TX 救援分流。
         let silence_limit = timeout_s.min(30.0);
         'completion_wait: loop {
             let now = ctx.clock.mono_ns();
@@ -1059,13 +1059,17 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         || ctx.rx.tx_submit_pending();
                     let raw_half_line =
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open;
-                    if let CompletionEvaluation::Uncertain { stdout } =
-                        evaluator.evaluate(&snapshot.text, human_tx_seen, raw_half_line)
-                    {
-                        return OpOutcome::CompletionUncertain { stdout };
+                    if human_tx_seen {
+                        return OpOutcome::CompletionUncertain {
+                            stdout: evaluator.partial_stdout(
+                                &snapshot.text,
+                                human_tx_seen,
+                                raw_half_line,
+                            ),
+                        };
                     }
 
-                    // 尚未到 operation deadline 的靜默 chunk 沿用基線恢復結果與錯誤碼。
+                    // 無 human TX 時，靜默逾時沿用完整基線 recovery 結果。
                     completion_silence_expired = true;
                     break 'completion_wait;
                 }
@@ -1121,9 +1125,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 return OpOutcome::CompletionUncertain { stdout };
             }
 
-            // 沒有 human 交錯時沿用基線 recovery 的終態與錯誤碼。輸出只取 cutoff snapshot，
-            // 避免救援期間的 late RX 覆蓋 deadline 前已保留的 partial stdout。
-            return match recover_after_failure(
+            // 無 human TX 時直接採用基線 recovery 的完整結果與 stdout。
+            return recover_after_failure(
                 ctx,
                 grant,
                 timeout_s,
@@ -1133,11 +1136,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 passthrough,
                 Some((cmd_id, confirmed_of(&report))),
                 false,
-            ) {
-                OpOutcome::Recovered { key, .. } => OpOutcome::Recovered { key, stdout },
-                OpOutcome::PromptTimeout { .. } => OpOutcome::PromptTimeout { stdout },
-                other => other,
-            };
+            );
         }
         if q.req.is_trusted_human() {
             // `_recover_after_failure` human 分支（DF-02／OD-74）：不送救援鍵，actor 依前景快照升格 human lease。

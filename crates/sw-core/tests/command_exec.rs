@@ -685,9 +685,14 @@ fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
 
     let result = h.wait_done(&id);
     assert_eq!(result["status"], PyValue::from("done"), "期限後不得事後採用 RX 完成判定；只有 Ctrl-C 找回 prompt 才回成功：{result:?}");
-    assert!(
-        result["stdout"] == PyValue::from("DEADLINE_RX"),
-        "期限內可用輸出仍須保留"
+    let baseline_stdout = format!(
+        "{}^C",
+        "z".repeat(sw_core::resources::RX_WINDOW_MAX_CHARS - b"^C\r\nroot@t:/# ".len())
+    );
+    assert_eq!(
+        result["stdout"],
+        PyValue::from(baseline_stdout),
+        "無 human TX 時 timeout stdout 必須採用完整 recovery 結果，與 9af187ca 基線相同：{result:?}"
     );
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "無 human TX 時保留基線救援：{result:?}");
@@ -711,41 +716,70 @@ fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
 
 #[test]
 fn i294_r8_expired_before_first_wait_returns_timeout_partial() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
-    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
-    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
-    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
-    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
-        entered_tx.send(()).expect("test waits before first snapshot wait");
-        resume_rx.recv().expect("test releases first snapshot wait");
-    })));
+    for (human_state, echo_found) in [
+        ("none", true),
+        ("none", false),
+        ("registered", true),
+        ("registered", false),
+        ("pending", true),
+        ("pending", false),
+    ] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            entered_tx.send(()).expect("test waits before first snapshot wait");
+            resume_rx.recv().expect("test releases first snapshot wait");
+        })));
 
-    let tx_count = h.wal_tx_payloads().len();
-    let id = h.submit_with("echo FIRST_WAIT", |request| request.timeout_s = 0.2);
-    wait_tx(&h, b"echo FIRST_WAIT\n");
-    entered_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("已進入首次 snapshot wait 前的 barrier");
-    h.advance(Duration::from_millis(201));
-    h.inject_rx_reader_processed(b"echo FIRST_WAIT\r\nFIRST_WAIT\r\nroot@t:/# ");
-    resume_tx.send(()).expect("釋放首次 snapshot wait");
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("echo FIRST_WAIT", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"echo FIRST_WAIT\n");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("已進入首次 snapshot wait 前的 barrier");
+        match human_state {
+            "registered" => h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock),
+            "pending" => h.rx.set_tx_submit_pending_for_test(true),
+            "none" => {}
+            _ => unreachable!("unknown human state"),
+        }
+        let raw = if echo_found {
+            b"echo FIRST_WAIT\r\nFIRST_WAIT\r\nroot@t:/# ".as_slice()
+        } else {
+            b"partial output\r\nroot@t:/# ".as_slice()
+        };
+        h.inject_rx_reader_processed(raw);
+        h.advance(Duration::from_millis(201));
+        resume_tx.send(()).expect("釋放首次 snapshot wait");
 
-    let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("done"), "期限前尚未完成；期限後只有救援 prompt 才使命令成功：{result:?}");
-    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
-    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
-    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n\x03".to_vec());
-    let recovered = h.request(SessionRequest::ResultTail {
-        cmd_id: id,
-        from_chunk: 0,
-        limit: 10,
-    });
-    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
-    assert_eq!(
-        recovered["error_code"],
-        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
-        "逾期後由 recovery 找回 prompt：{recovered:?}"
-    );
+        let result = h.wait_done(&id);
+        if human_state == "pending" {
+            h.rx.set_tx_submit_pending_for_test(false);
+        }
+        assert_eq!(result["partial"], PyValue::Bool(true), "state={human_state}, echo={echo_found}: {result:?}");
+        if human_state == "none" {
+            assert_eq!(result["status"], PyValue::from("done"), "期限後只可由 recovery 找回 prompt：{result:?}");
+            assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+            assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n\x03".to_vec());
+            let recovered = h.request(SessionRequest::ResultTail {
+                cmd_id: id,
+                from_chunk: 0,
+                limit: 10,
+            });
+            assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+            assert_eq!(recovered["error_code"], PyValue::from("PROMPT_TIMEOUT_RECOVERED"), "{recovered:?}");
+        } else {
+            assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+            assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+            assert_eq!(result["stdout"], PyValue::from(if echo_found { "FIRST_WAIT" } else { "partial output" }), "{result:?}");
+            assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+            assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n".to_vec());
+        }
+    }
 }
 
 #[test]
@@ -840,6 +874,268 @@ fn i294_r8_tx_submit_pending_at_settlement_suppresses_recovery() {
             "結算時有在途 human submit 必須抑制所有救援 TX；pending_before_deadline={pending_before_deadline}"
         );
     }
+}
+
+fn i294_r9_run_silence_timeout_with_human(pending_submit: bool, echo_found: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+
+    let (first_wait_tx, first_wait_rx) = crossbeam_channel::bounded(1);
+    let (release_first_wait_tx, release_first_wait_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            first_wait_tx.send(()).expect("等待第一個靜默 chunk");
+            release_first_wait_rx.recv().expect("釋放第一個靜默 chunk");
+        })));
+    let (first_timeout_tx, first_timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_first_timeout_tx, release_first_timeout_rx) = crossbeam_channel::bounded(1);
+    let (second_timeout_tx, second_timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_second_timeout_tx, release_second_timeout_rx) = crossbeam_channel::bounded(1);
+    let timeout_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let timeout_count_hook = Arc::clone(&timeout_count);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            match timeout_count_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
+                0 => {
+                    first_timeout_tx.send(()).expect("等待第一個靜默 chunk 到期");
+                    release_first_timeout_rx
+                        .recv()
+                        .expect("釋放第一個靜默 chunk 到期點");
+                }
+                1 => {
+                    second_timeout_tx.send(()).expect("等待第二個靜默 chunk 到期");
+                    release_second_timeout_rx
+                        .recv()
+                        .expect("釋放第二個靜默 chunk 到期點");
+                }
+                _ => {}
+            }
+        })));
+
+    let command = "printf R9_SILENCE";
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    first_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("命令已到第一個 snapshot wait barrier");
+    wait_tx(&h, b"printf R9_SILENCE\n");
+
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+
+    let rx_before = h.rx.total_bytes();
+    let partial = if echo_found {
+        b"printf R9_SILENCE\r\npartial output\r\n".as_slice()
+    } else {
+        b"partial output\r\n".as_slice()
+    };
+    h.dev.push_rx(partial);
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        rx_before + partial.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_first_wait_tx
+        .send(())
+        .expect("釋放第一個 snapshot wait");
+
+    h.clock.advance(Duration::from_secs(30));
+    h.send_control(ControlEvent::Tick);
+    let _ = h.get_state();
+    first_timeout_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個靜默 chunk 已到期；operation deadline 仍在 90 秒後");
+    assert!(h.clock.mono_ns() < 120_000_000_000);
+
+    let (second_wait_tx, second_wait_rx) = crossbeam_channel::bounded(1);
+    let (release_second_wait_tx, release_second_wait_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            second_wait_tx.send(()).expect("等待第二個靜默 chunk");
+            release_second_wait_rx.recv().expect("釋放第二個靜默 chunk");
+        })));
+    release_first_timeout_tx
+        .send(())
+        .expect("釋放第一個靜默 chunk 結算");
+    second_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RX 改變後重新開始第二個靜默 chunk");
+    release_second_wait_tx
+        .send(())
+        .expect("釋放第二個靜默 chunk");
+    h.clock.advance(Duration::from_secs(30));
+    h.send_control(ControlEvent::Tick);
+    let _ = h.get_state();
+    second_timeout_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第二個靜默 chunk 已到期；operation deadline 尚未到期");
+    release_second_timeout_tx
+        .send(())
+        .expect("釋放第二個靜默 chunk 結算");
+
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    let expected_stdout = if echo_found {
+        "printf R9_SILENCE\npartial output"
+    } else {
+        "partial output\n"
+    };
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_SILENCE\n");
+}
+
+#[test]
+fn i294_r9_silence_timeout_full_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(false, true);
+}
+
+#[test]
+fn i294_r9_silence_timeout_full_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(true, true);
+}
+
+#[test]
+fn i294_r9_silence_timeout_without_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(false, false);
+}
+
+#[test]
+fn i294_r9_silence_timeout_without_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(true, false);
+}
+
+fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf R9_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R9_DEADLINE\n");
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+    let raw = b"printf R9_DEADLINE\r\npartial output\r\n";
+    if pending_submit {
+        let before = h.rx.total_bytes();
+        h.dev.push_rx(raw);
+        assert!(h.rx.wait_for_reader_bytes_for_test(
+            before + raw.len() as u64,
+            Duration::from_secs(5),
+        ));
+    } else {
+        h.inject_rx_processed(raw);
+    }
+    h.advance(Duration::from_millis(201));
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("printf R9_DEADLINE\npartial output"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_DEADLINE\n");
+}
+
+#[test]
+fn i294_r9_deadline_timeout_full_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_deadline_timeout_full_echo_with_human(false);
+}
+
+#[test]
+fn i294_r9_deadline_timeout_full_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_deadline_timeout_full_echo_with_human(true);
+}
+
+fn i294_r9_assert_stale_no_echo_completion_rechecked(pending_submit: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (enter_tx, enter_rx) = crossbeam_channel::bounded(1);
+    let (release_enter_tx, release_enter_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            enter_tx.send(()).expect("等待第一次 snapshot");
+            release_enter_rx.recv().expect("釋放第一次 snapshot");
+        })));
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (release_evaluated_tx, release_evaluated_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |snapshot| {
+            evaluated_tx
+                .send(snapshot.clone())
+                .expect("等待 evaluator 返回 Complete 的 snapshot");
+            release_evaluated_rx
+                .recv()
+                .expect("釋放成功判定線性化 barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let initial_rx = h.rx.total_bytes();
+    let id = h.submit_with("printf R9_STALE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R9_STALE\n");
+    enter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("等待器已進入 snapshot barrier");
+    let prompt = b"root@t:/# ";
+    h.dev.push_rx(prompt);
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        initial_rx + prompt.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_enter_tx.send(()).expect("釋放 snapshot 建立");
+    let stale = evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("舊 snapshot 已由無 echo 相容路徑判定 Complete");
+    assert_eq!(stale.text, "root@t:/# ");
+
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+    h.advance(Duration::from_millis(201));
+    release_evaluated_tx
+        .send(())
+        .expect("釋放 evaluator 與 RX 鎖之間的 barrier");
+
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(""), "逾時 stdout 必須取自重新結算的 snapshot：{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_STALE\n");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+}
+
+#[test]
+fn i294_r9_stale_no_echo_completion_rechecked_after_human_tx() {
+    i294_r9_assert_stale_no_echo_completion_rechecked(false);
+}
+
+#[test]
+fn i294_r9_stale_no_echo_completion_rechecked_after_pending_submit() {
+    i294_r9_assert_stale_no_echo_completion_rechecked(true);
 }
 
 fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {

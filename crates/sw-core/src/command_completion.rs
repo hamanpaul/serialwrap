@@ -193,17 +193,10 @@ fn find_command_echo(
                         .is_some_and(|matched| matched.start == 0 && matched.end == prefix_chars)
                 };
 
-            let mut direct_steps = 0usize;
             let direct_start = line_end.checked_sub(command_chars.len()).filter(|start| {
-                chars[*start..line_end]
-                    .iter()
-                    .zip(&command_chars)
-                    .all(|(actual, expected)| {
-                        direct_steps = direct_steps.saturating_add(1);
-                        actual == expected
-                    })
+                metrics.matcher_steps = metrics.matcher_steps.saturating_add(1);
+                prefix_lcp[*start] >= command_chars.len()
             });
-            metrics.matcher_steps = metrics.matcher_steps.saturating_add(direct_steps);
             if let Some(command_start) = direct_start.filter(|start| valid_start(*start, None)) {
                 return Some(EchoRange {
                     _command: command_start..line_end,
@@ -741,6 +734,51 @@ mod tests {
             wraps.index_slots()
         );
         assert!(metrics.lcp_index_slots <= 2 * input_chars);
+    }
+
+    #[test]
+    fn i294_r9_direct_echo_search_has_linear_work_bound() {
+        let prompt = r"(?m)^root@t:/# ";
+        for command_len in [40usize, 100, 200, 400, 800, 1_600] {
+            let command = "a".repeat(command_len);
+            let raw = format!("{}b{}", "a".repeat(command_len - 1), "\n".repeat(command_len));
+            let evaluator = evaluator(&command, prompt);
+            let (cleaned, source_ranges) = clean_text_with_source_ranges(&raw);
+            let wraps = WrapEvidence::from_raw(&raw, &cleaned, &source_ranges);
+            let mut metrics = EchoSearchMetrics::default();
+            let echo = find_command_echo(
+                &cleaned,
+                &command,
+                evaluator.prompt,
+                &wraps,
+                &mut metrics,
+            );
+            assert!(echo.is_none(), "不一致的直接比對輸入不得找到 echo：len={command_len}");
+
+            let input_chars = cleaned.chars().count();
+            let operation_count = metrics
+                .candidate_checks
+                .saturating_add(metrics.prompt_prefix_checks)
+                .saturating_add(metrics.prefix_scan_chars)
+                .saturating_add(metrics.preprocess_steps)
+                .saturating_add(metrics.matcher_steps)
+                .saturating_add(metrics.wrap_range_queries);
+            let linear_budget = 16 * (input_chars + command_len);
+            assert!(
+                operation_count <= linear_budget,
+                "直接 echo 候選比對須有線性操作上界：command_len={command_len}, input={input_chars}, budget={linear_budget}, operations={operation_count}, {metrics:?}"
+            );
+            assert!(
+                metrics.lcp_index_slots <= 2 * input_chars,
+                "直接比對索引空間須為輸入長度線性：command_len={command_len}, input={input_chars}, slots={}, {metrics:?}",
+                metrics.lcp_index_slots
+            );
+            assert!(
+                wraps.index_slots() <= 3 * (input_chars + 1),
+                "來源索引空間須為輸入長度線性：command_len={command_len}, input={input_chars}, slots={}, {metrics:?}",
+                wraps.index_slots()
+            );
+        }
     }
 
     #[test]

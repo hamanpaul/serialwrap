@@ -882,7 +882,6 @@ impl RxShared {
             drop(window);
 
             let value = matches(&snapshot);
-            let evaluated_at = clock.mono_ns();
             #[cfg(feature = "test-fakes")]
             {
                 if let Some(hook) = self
@@ -903,13 +902,18 @@ impl RxShared {
                 self.snapshot_wait_checks.fetch_add(1, Ordering::AcqRel);
                 self.changed.notify_all();
             }
-            // 以 evaluator 返回判定的時間結算：計算跨過 deadline 是 timeout；判定已在期限內完成，
-            // 後續 waiter 排程或 barrier 延遲不得把它改判成 timeout。
-            if evaluated_at >= deadline {
-                window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if clock.mono_ns() >= deadline {
                 break;
             }
+            let stale_snapshot = window.revision != revision
+                || human_tx_state(&window) != snapshot.human_tx_state
+                || window.tx_submit_pending != snapshot.tx_submit_pending;
+            if stale_snapshot {
+                continue;
+            }
             if let Some(value) = value {
+                drop(window);
                 #[cfg(feature = "test-fakes")]
                 if let Some(hook) = self
                     .snapshot_wait_match_hook
@@ -920,14 +924,6 @@ impl RxShared {
                     hook(&snapshot);
                 }
                 return SnapshotWaitResult::Matched { snapshot, value };
-            }
-
-            window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if clock.mono_ns() >= deadline {
-                break;
-            }
-            if window.revision != revision {
-                continue;
             }
             let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
             let wait_for = remaining.min(RX_WAIT_CLOCK_SLICE);
