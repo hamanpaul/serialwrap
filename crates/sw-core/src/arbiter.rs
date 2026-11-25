@@ -147,10 +147,24 @@ impl CommandRegistry {
         true
     }
 
-    /// 依 Python 基線的檢查順序執行 admission，建立命令紀錄與佇列項目。
+    /// 依 Python 基線的檢查順序執行 admission，建立命令紀錄與佇列項目（不套 console 單行上限）。
     pub fn admit(
         &self,
         req: SubmitReq,
+        queue_registered: bool,
+        cmd_id: String,
+        now_iso: &str,
+    ) -> Result<Admitted, PyDict> {
+        self.admit_with_line_limit(req, None, queue_registered, cmd_id, now_iso)
+    }
+
+    /// 同 [`CommandRegistry::admit`]，另依 session profile 的 `max_console_line_chars`（console 單行上限）檢查命令長度。
+    /// 依 OD-111，這是 Rust-only 行為：RPC `command.submit` 會帶入 profile 的值；human console 的整行輸入不套用。
+    /// `None`＝profile 未設，不檢查。
+    pub fn admit_with_line_limit(
+        &self,
+        req: SubmitReq,
+        max_console_line_chars: Option<&PyInt>,
         queue_registered: bool,
         cmd_id: String,
         now_iso: &str,
@@ -180,6 +194,27 @@ impl CommandRegistry {
                 "limit" => PyValue::from(CMD_REJECT_BYTES),
                 "hint" => "Command exceeds 16 KB hard limit. Use file-based injection or split into smaller commands.",
             });
+        }
+
+        // Python `arbiter.py`：profile 量測過的 console 單行上限，超過的命令送出後會被 target 截斷、等不到 prompt，
+        // 逾時又會送救援鍵，改在提交時拒絕（零 TX、不入列）。位置在 16 KB 檢查之後、換行檢查之前（rpc_schema 的錯誤
+        // 順序）；沿用 CMD_TOO_LONG（Stage 1B 凍結錯誤碼集合），`limit` 帶 profile 的值。計法與 file transfer 的單行預算
+        // 相同：完整命令的 UTF-8 bytes，不含結尾換行。
+        if let Some(limit) = max_console_line_chars {
+            let exceeded = match limit {
+                PyInt::Small(n) => (cmd_len as i128) > *n,
+                // 超出 i128 的正整數（config 已拒絕非正數）：命令長度不可能超過。
+                PyInt::Big(_) => false,
+            };
+            if exceeded {
+                return Err(pydict! {
+                    "ok" => false,
+                    "error_code" => "CMD_TOO_LONG",
+                    "cmd_length" => PyValue::from(cmd_len as i64),
+                    "limit" => PyValue::Int(limit.clone()),
+                    "hint" => "Command exceeds this console's line limit (profile max_console_line_chars) and would be truncated by the target. Shorten it, or push a script with file push and run that instead.",
+                });
+            }
         }
 
         let warning = (cmd_len > CMD_WARN_BYTES as usize).then(|| {

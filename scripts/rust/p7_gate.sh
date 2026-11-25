@@ -368,6 +368,15 @@ phase_row() {  # phase_row <列名> <階段目錄名>
 }
 phase_row "contract_blackbox p7 A" p7-a
 phase_row "contract_blackbox p7 B" p7-b
+# rust_only 行為以獨立必要集合在 Rust CLI／daemon 上執行；Python 全套只收集，不要求此節點通過。
+LINE_LIMIT_DIR="$RUN/rust-only-console-line-limit"
+mkdir -p "$LINE_LIMIT_DIR"
+run_row "Rust-only console line limit" rust-only-console-line-limit \
+  --l1 "$LINE_LIMIT_DIR/l1-results.json" --evidence "$LINE_LIMIT_DIR/junit.xml" -- \
+  env SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_AB_LABEL=rust-p7 \
+  SW_RESOURCE_REPORT="$LINE_LIMIT_DIR/l1-results.json" \
+  python3 -m pytest -q -p no:cacheprovider -m rust_only \
+  tests/contract_blackbox/test_bb_console_line_limit.py --junitxml="$LINE_LIMIT_DIR/junit.xml"
 phase_row "OD-59 control latency 500x3 A" od59-contract-a
 phase_row "OD-59 control latency 500x3 B" od59-contract-b
 phase_row "contract_blackbox slice21 B" slice21-b
