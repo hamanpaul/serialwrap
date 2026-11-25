@@ -9,6 +9,6 @@ scope: tests
 依擁有者 OD-115，DF-23 黑箱測試改為只在 Rust 執行，並記錄 Python 0.4.x 的時序相依終態與偶發一次自動重試。
 P7 coverage 在 Python A 輪的 rust-only 節點已由 selector 精確 deselect 時，仍要求 A JUnit 可解析；缺檔或 XML 損壞會回報明確的證據缺失 GAP，不再讓診斷程式中止。
 
-補強 update 黑箱證據：僅掛入拋棄式 daemon 的 `opendir/closedir` trace 以 PID、TID、monotonic 與 link 狀態將掃描歸因到受測 daemon，排空窗口改用 CLI 發出 handoff RPC 前的 monotonic 下界，並注入超過 50 ms 的回覆至 marker 延遲；舊版與新版 bundle 的 daemon 皆套用 build-time 版本，rig 同時核對版本與 executable。
+補強 update 黑箱證據：僅掛入拋棄式 daemon 的 `opendir/closedir` trace，記錄 `opendir` 入口時間、PID、watcher TID、同一目錄 handle 與 link 狀態；掃描必須在 bridge 控制呼叫完成後開始。排空窗口使用啟動 CLI 子行程前的 monotonic 下界，並在 pause marker 後加入 150 ms observer 延遲驗證截止時間不被推後。舊版與新版 bundle 以各自版本輸入建置，rig 核對 manifest、版本與實際 executable。
 
-console overflow 測試持續保留 16390-byte payload、2 秒零 RX 與 warning 斷言，並記錄 line-buffered ownership、DUT TX 與 WAL；hosted Windows bridge 測試容忍狀態檔原子替換瞬間的 `PermissionError` 後重試同一等待上限。
+console overflow 測試持續保留 16390-byte payload、2 秒零 RX 與 warning 斷言；ownership 異常先記錄，待 DUT TX、WAL、stderr 與 attach/detach 回應都擷取後才判 FAIL，並以受控 ownership 交錯鎖定診斷完整性。hosted Windows bridge 測試容忍狀態檔原子替換瞬間的 `PermissionError` 後重試同一等待上限。

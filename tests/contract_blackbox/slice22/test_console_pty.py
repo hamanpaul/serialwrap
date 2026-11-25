@@ -252,17 +252,23 @@ def test_line_overflow_warning(console_daemon) -> None:
             view = view[n:]
             read_until(fd2, b"\x00", 0.01)
             ownership_trace.append(_consoles(d))
-            assert not any(
-                row["interactive_owner"] for row in ownership_trace[-1]
-            ), ownership_trace
         sent = wait_rx_contains(target, b"aaaa", 2.0)
         tx_delta = target.written(0.2)[target_before:]
+        ownership_violation = any(
+            row["interactive_owner"]
+            for snapshot in ownership_trace
+            for row in snapshot
+        )
         diagnostic = {
+            "h1_attach": a1,
+            "h2_attach": a2,
             "h1_client_id": a1["client_id"],
             "h2_client_id": a2["client_id"],
+            "detach_response": detached,
             "detached_client_id": a1["client_id"],
             "initial_consoles": precondition,
             "ownership_trace": ownership_trace,
+            "ownership_violation": ownership_violation,
             "stderr": d._stderr_tail(),
             "tx_delta_len": len(tx_delta),
             "tx_delta_hex": tx_delta.hex(),
@@ -274,12 +280,98 @@ def test_line_overflow_warning(console_daemon) -> None:
         warning_seen = wait_for(lambda: a2["client_id"] in d._stderr_tail(20000), 3.0)
         diagnostic["warning_seen"] = warning_seen
         print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
+        assert not diagnostic["ownership_violation"], diagnostic
         assert not sent, diagnostic
         assert warning_seen, diagnostic
     finally:
         if fd2 is not None:
             os.close(fd2)
         os.close(fd1)
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_line_overflow_owner_change_keeps_full_diagnostics(monkeypatch, capsys) -> None:
+    class FakeDaemon:
+        def __init__(self) -> None:
+            self.attach_count = 0
+            self.stderr_reads = 0
+            self.wal_reads = 0
+
+        def rpc(self, method, _params):
+            if method == "session.console_attach":
+                self.attach_count += 1
+                client_id = f"client-{self.attach_count}"
+                return {"ok": True, "client_id": client_id, "vtty": f"/dev/pts/{self.attach_count}"}
+            return {"ok": True}
+
+        def _stderr_tail(self, _limit=None):
+            self.stderr_reads += 1
+            return "client-2 overflow warning"
+
+        def wal_records(self):
+            self.wal_reads += 1
+            return [{"dir": "TX", "source": "human:client-2", "payload_b64": "YWFhYQ=="}]
+
+    class FakeTarget:
+        def __init__(self) -> None:
+            self.written_reads = 0
+
+        def written(self, _wait_s=0.0):
+            self.written_reads += 1
+            return b""
+
+    import sys
+
+    module = sys.modules[__name__]
+    daemon = FakeDaemon()
+    target = FakeTarget()
+    writes: list[bytes] = []
+    console_snapshots = 0
+    opened_fds = iter((51, 52))
+    real_write = os.write
+    real_close = os.close
+
+    def fake_write(fd: int, payload) -> int:
+        if fd == 52:
+            chunk = bytes(payload)
+            writes.append(chunk)
+            return len(chunk)
+        return real_write(fd, payload)
+
+    def fake_close(fd: int) -> None:
+        if fd not in (51, 52):
+            real_close(fd)
+
+    def fake_consoles(_daemon) -> list[dict]:
+        nonlocal console_snapshots
+        console_snapshots += 1
+        return [{"client_id": "client-2", "interactive_owner": console_snapshots > 1}]
+
+    monkeypatch.setattr(module, "open_vtty", lambda _path: next(opened_fds))
+    monkeypatch.setattr(module, "read_until", lambda *_args, **_kwargs: b"")
+    monkeypatch.setattr(module, "_consoles", fake_consoles)
+    monkeypatch.setattr(module, "wait_rx_contains", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(module, "wait_for", lambda predicate, *_args, **_kwargs: predicate())
+    monkeypatch.setattr(module.os, "write", fake_write)
+    monkeypatch.setattr(module.os, "close", fake_close)
+
+    with pytest.raises(AssertionError) as failure:
+        test_line_overflow_warning((daemon, target))
+
+    assert target.written_reads >= 2, target.written_reads
+    assert daemon.wal_reads == 1, daemon.wal_reads
+    assert daemon.stderr_reads >= 1, daemon.stderr_reads
+    assert writes and sum(map(len, writes)) == 16391, sum(map(len, writes))
+    diagnostic = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert diagnostic["h1_client_id"] == "client-1", diagnostic
+    assert diagnostic["h2_client_id"] == "client-2", diagnostic
+    assert diagnostic["ownership_trace"][-1][0]["interactive_owner"] is True, diagnostic
+    assert diagnostic["ownership_violation"] is True, diagnostic
+    assert diagnostic["tx_delta_hex"] == "", diagnostic
+    assert diagnostic["wal_tx"], diagnostic
+    assert diagnostic["warning_seen"] is True, diagnostic
+    assert "assert not True" in str(failure.value), failure.value
 
 
 def test_last_line_before_disconnect_submitted(console_daemon) -> None:

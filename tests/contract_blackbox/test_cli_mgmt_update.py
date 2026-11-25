@@ -67,7 +67,10 @@ _BY_ID_SCAN_PRELOAD_C = r"""
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,27 +82,33 @@ _BY_ID_SCAN_PRELOAD_C = r"""
 
 static __thread DIR *tracked_dir;
 static __thread int tracked_link_present;
+static __thread uint64_t tracked_handle;
+static int marker_delay_applied;
 
-static void trace_event(const char *phase, int link_present) {
-    const char *path = getenv("SW_TEST_BY_ID_SCAN_TRACE");
-    if (!path) {
-        return;
-    }
+static uint64_t monotonic_ns(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static void trace_event(const char *phase, int link_present, uint64_t event_ns, uint64_t handle) {
+    const char *path = getenv("SW_TEST_BY_ID_SCAN_TRACE");
+    if (!path || event_ns == 0) {
         return;
     }
-    uint64_t mono_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-    char row[256];
+    char row[512];
     int length = snprintf(
         row,
         sizeof(row),
-        "%s\t%ld\t%ld\t%llu\t%d\n",
+        "%s\t%ld\t%ld\t%llu\t%d\t%llu\n",
         phase,
         (long)getpid(),
         (long)syscall(SYS_gettid),
-        (unsigned long long)mono_ns,
-        link_present
+        (unsigned long long)event_ns,
+        link_present,
+        (unsigned long long)handle
     );
     if (length <= 0 || length >= (int)sizeof(row)) {
         return;
@@ -111,19 +120,141 @@ static void trace_event(const char *phase, int link_present) {
     }
 }
 
+static void trace_handoff_request(const void *buffer, size_t length) {
+    static const char method[] = "daemon.handoff_stop";
+    if (buffer && memmem(buffer, length, method, sizeof(method) - 1)) {
+        trace_event("handoff_request", 0, monotonic_ns(), 0);
+    }
+}
+
+static int flags_need_mode(int flags) {
+    int needed = (flags & O_CREAT) != 0;
+#ifdef O_TMPFILE
+    needed = needed || (flags & O_TMPFILE) == O_TMPFILE;
+#endif
+    return needed;
+}
+
+static void delay_handoff_reached_marker(const char *pathname) {
+    const char *pause_dir = getenv("SW_TEST_UPDATE_PAUSE_DIR");
+    const char *delay_value = getenv("SW_TEST_MARKER_WRITE_DELAY_MS");
+    const char marker[] = "handoff_stop_replied.reached";
+    if (!pause_dir || !delay_value || !pathname || marker_delay_applied) {
+        return;
+    }
+    size_t pause_len = strlen(pause_dir);
+    if (strncmp(pathname, pause_dir, pause_len) != 0 || pathname[pause_len] != '/') {
+        return;
+    }
+    const char *base = strrchr(pathname, '/');
+    if (!base || strcmp(base + 1, marker) != 0) {
+        return;
+    }
+    char *end = NULL;
+    long delay_ms = strtol(delay_value, &end, 10);
+    if (!end || *end || delay_ms <= 0 || delay_ms > 10000) {
+        return;
+    }
+    if (__sync_lock_test_and_set(&marker_delay_applied, 1)) {
+        return;
+    }
+    struct timespec remaining = {
+        .tv_sec = delay_ms / 1000,
+        .tv_nsec = (delay_ms % 1000) * 1000000L,
+    };
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) {
+            break;
+        }
+    }
+    trace_event("marker_delay", 0, monotonic_ns(), 0);
+}
+
+int open(const char *pathname, int flags, ...) {
+    static int (*real_open)(const char *, int, ...);
+    if (!real_open) {
+        real_open = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
+    }
+    mode_t mode = 0;
+    int has_mode = flags_need_mode(flags);
+    if (has_mode) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+    delay_handoff_reached_marker(pathname);
+    return has_mode ? real_open(pathname, flags, mode) : real_open(pathname, flags);
+}
+
+int open64(const char *pathname, int flags, ...) {
+    static int (*real_open64)(const char *, int, ...);
+    if (!real_open64) {
+        real_open64 = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open64");
+    }
+    mode_t mode = 0;
+    int has_mode = flags_need_mode(flags);
+    if (has_mode) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+    delay_handoff_reached_marker(pathname);
+    return has_mode ? real_open64(pathname, flags, mode) : real_open64(pathname, flags);
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    static int (*real_openat)(int, const char *, int, ...);
+    if (!real_openat) {
+        real_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
+    }
+    mode_t mode = 0;
+    int has_mode = flags_need_mode(flags);
+    if (has_mode) {
+        va_list args;
+        va_start(args, flags);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+    delay_handoff_reached_marker(pathname);
+    return has_mode ? real_openat(dirfd, pathname, flags, mode) : real_openat(dirfd, pathname, flags);
+}
+
+ssize_t write(int fd, const void *buffer, size_t count) {
+    static ssize_t (*real_write)(int, const void *, size_t);
+    if (!real_write) {
+        real_write = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+    }
+    trace_handoff_request(buffer, count);
+    return real_write(fd, buffer, count);
+}
+
+ssize_t send(int fd, const void *buffer, size_t length, int flags) {
+    static ssize_t (*real_send)(int, const void *, size_t, int);
+    if (!real_send) {
+        real_send = (ssize_t (*)(int, const void *, size_t, int))dlsym(RTLD_NEXT, "send");
+    }
+    trace_handoff_request(buffer, length);
+    return real_send(fd, buffer, length, flags);
+}
+
 DIR *opendir(const char *name) {
     static DIR *(*real_opendir)(const char *);
     if (!real_opendir) {
         real_opendir = (DIR *(*)(const char *))dlsym(RTLD_NEXT, "opendir");
     }
-    DIR *result = real_opendir(name);
     const char *watched = getenv("SW_TEST_BY_ID_SCAN_DIR");
-    if (result && watched && strcmp(name, watched) == 0) {
+    int should_track = watched && strcmp(name, watched) == 0;
+    uint64_t open_started_ns = should_track ? monotonic_ns() : 0;
+    DIR *result = real_opendir(name);
+    if (result && should_track) {
         const char *link = getenv("SW_TEST_BY_ID_SCAN_LINK");
         struct stat stat_result;
         tracked_dir = result;
         tracked_link_present = link && lstat(link, &stat_result) == 0;
-        trace_event("open", tracked_link_present);
+        tracked_handle = (uint64_t)(uintptr_t)result;
+        trace_event("open", tracked_link_present, open_started_ns, tracked_handle);
     }
     return result;
 }
@@ -134,8 +265,9 @@ int closedir(DIR *directory) {
         real_closedir = (int (*)(DIR *))dlsym(RTLD_NEXT, "closedir");
     }
     if (tracked_dir == directory) {
-        trace_event("close", tracked_link_present);
+        trace_event("close", tracked_link_present, monotonic_ns(), tracked_handle);
         tracked_dir = NULL;
+        tracked_handle = 0;
     }
     return real_closedir(directory);
 }
@@ -315,19 +447,31 @@ class _ByIdScanObserver:
             self._trace_pending = b""
         for raw in lines:
             try:
-                phase, pid, tid, mono_ns, link_present = raw.decode(
+                phase, pid, tid, mono_ns, link_present, handle_id = raw.decode(
                     "ascii",
                 ).strip().split("\t")
                 pid_int = int(pid)
                 if phase not in {"open", "close"} or pid_int != self.process_pid:
                     continue
+                tid_int = int(tid)
+                thread_comm: str | None = None
+                if self.thread_name is not None:
+                    comm_path = Path(f"/proc/{pid_int}/task/{tid_int}/comm")
+                    try:
+                        thread_comm = comm_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        continue
+                    if thread_comm != self.thread_name[:15]:
+                        continue
                 event = {
                     "sequence": 0,
                     "mask": self._IN_OPEN if phase == "open" else self._IN_CLOSE_NOWRITE,
                     "name": "",
                     "observed_ns": int(mono_ns),
                     "process_pid": pid_int,
-                    "thread_id": int(tid),
+                    "thread_id": tid_int,
+                    "handle_id": int(handle_id),
+                    "thread_name": thread_comm,
                     "link_present": int(link_present) == 1,
                     "source": "scan_trace",
                 }
@@ -449,31 +593,40 @@ class _ByIdScanObserver:
         timeout_s: float,
         deadline_ns: int | None = None,
         link_present: bool | None = None,
+        started_after_ns: int | None = None,
     ) -> tuple[dict[str, int | str], dict[str, int | str]]:
         def find():
-            opened = None
+            opened_by_handle: dict[tuple[int, int | None, int | None], dict] = {}
             for event in self.events:
                 if event["sequence"] <= after_seq or event["name"]:
                     continue
                 source = event.get("source")
                 if source not in {"scan_trace", "proc_fd"}:
                     continue
-                if (
-                    link_present is not None
-                    and event.get("link_present") is not link_present
-                ):
+                pid = event.get("process_pid")
+                if pid != self.process_pid:
                     continue
-                if (
-                    int(event["mask"]) & self._IN_OPEN
-                    and event.get("process_pid") == self.process_pid
-                ):
-                    opened = event
-                elif (
-                    opened is not None
-                    and int(event["mask"]) & self._IN_CLOSE_NOWRITE
-                    and event.get("process_pid") == self.process_pid
-                ):
-                    return opened, event
+                thread_id = event.get("thread_id")
+                handle_id = event.get("handle_id")
+                if source == "scan_trace" and (thread_id is None or handle_id is None):
+                    continue
+                key = (int(pid), thread_id, handle_id)
+                if int(event["mask"]) & self._IN_OPEN:
+                    if (
+                        started_after_ns is not None
+                        and int(event["observed_ns"]) < started_after_ns
+                    ):
+                        continue
+                    if (
+                        link_present is not None
+                        and event.get("link_present") != link_present
+                    ):
+                        continue
+                    opened_by_handle[key] = event
+                elif int(event["mask"]) & self._IN_CLOSE_NOWRITE:
+                    opened = opened_by_handle.get(key)
+                    if opened is not None:
+                        return opened, event
             return None
 
         return self._wait_for(
@@ -486,6 +639,30 @@ def _scan_by_id_directory(directory: Path, *, hold_s: float = 0.05) -> None:
         next(entries, None)
         if hold_s:
             time.sleep(hold_s)
+
+
+def _append_scan_event(
+    observer: _ByIdScanObserver,
+    *,
+    phase: str,
+    thread_id: int,
+    handle_id: int,
+    observed_ns: int,
+    link_present: bool,
+) -> None:
+    with observer._condition:
+        observer.events.append({
+            "sequence": len(observer.events) + 1,
+            "mask": observer._IN_OPEN if phase == "open" else observer._IN_CLOSE_NOWRITE,
+            "name": "",
+            "observed_ns": observed_ns,
+            "process_pid": observer.process_pid,
+            "thread_id": thread_id,
+            "handle_id": handle_id,
+            "link_present": link_present,
+            "source": "scan_trace",
+        })
+        observer._condition.notify_all()
 
 
 def _prepare_by_id_scan_trace(tmp_path: Path, env: dict[str, str]) -> Path:
@@ -524,12 +701,40 @@ def _prepare_by_id_scan_trace(tmp_path: Path, env: dict[str, str]) -> Path:
     return trace
 
 
-def _pause_mono_ns(pause_dir: Path, point: str, phase: str) -> int:
-    name = point.replace("/", "_").replace(":", "_")
-    path = pause_dir / f"{name}.{phase}_mono_ns"
-    value = int(path.read_text(encoding="utf-8").strip())
-    assert value > 0, (path, value)
-    return value
+def _wait_scan_trace_event(
+    trace: Path,
+    phase: str,
+    *,
+    after_offset: int,
+    timeout_s: float,
+    process_pid: int | None = None,
+) -> dict[str, int | str]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            raw_lines = trace.read_bytes()[after_offset:].splitlines()
+        except FileNotFoundError:
+            raw_lines = []
+        for raw in raw_lines:
+            try:
+                event_phase, pid, tid, mono_ns, link_present, handle_id = raw.decode("ascii").split("\t")
+                event = {
+                    "phase": event_phase,
+                    "process_pid": int(pid),
+                    "thread_id": int(tid),
+                    "observed_ns": int(mono_ns),
+                    "link_present": int(link_present),
+                    "handle_id": int(handle_id),
+                }
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if event["phase"] != phase:
+                continue
+            if process_pid is not None and event["process_pid"] != process_pid:
+                continue
+            return event
+        time.sleep(0.01)
+    raise TimeoutError(f"等待 preload trace {phase} 逾時：{trace}")
 
 
 def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Path, Path]:
@@ -637,6 +842,155 @@ def test_by_id_scan_observer_requires_a_separate_scan_after_link_restore(tmp_pat
         assert restored["sequence"] < restore_scan[0]["sequence"]
         assert remove_scan[0]["sequence"] < remove_scan[1]["sequence"]
         assert restore_scan[0]["sequence"] < restore_scan[1]["sequence"]
+    finally:
+        observer.close()
+
+
+@pytest.mark.memory_only
+def test_by_id_scan_observer_rejects_open_started_before_link_action_completed(tmp_path: Path) -> None:
+    directory = tmp_path / "by-id"
+    directory.mkdir()
+    target = tmp_path / "device"
+    target.touch()
+    link = directory / "usb-FAKE_TARGET_0-if00"
+    link.symlink_to(target)
+    observer = _ByIdScanObserver(directory, link.name)
+    try:
+        before_remove = observer.mark()
+        link.unlink()
+        action_completed_ns = time.monotonic_ns()
+        removed = observer.wait_link_event(
+            after_seq=before_remove, action="remove", timeout_s=1.0,
+        )
+        _append_scan_event(
+            observer,
+            phase="open",
+            thread_id=101,
+            handle_id=1001,
+            observed_ns=action_completed_ns - 1,
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="close",
+            thread_id=101,
+            handle_id=1001,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        with pytest.raises(TimeoutError, match="等待 symlink 變更後的 by-id 目錄掃描 逾時"):
+            observer.wait_scan_after(
+                after_seq=int(removed["sequence"]),
+                timeout_s=0.05,
+                link_present=False,
+                started_after_ns=action_completed_ns,
+            )
+        _append_scan_event(
+            observer,
+            phase="open",
+            thread_id=101,
+            handle_id=1002,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="close",
+            thread_id=101,
+            handle_id=1002,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        accepted = observer.wait_scan_after(
+            after_seq=int(removed["sequence"]),
+            timeout_s=0.5,
+            link_present=False,
+            started_after_ns=action_completed_ns,
+        )
+        assert accepted[0]["handle_id"] == accepted[1]["handle_id"] == 1002, accepted
+    finally:
+        observer.close()
+
+
+@pytest.mark.memory_only
+def test_by_id_scan_observer_rejects_open_close_from_different_threads(tmp_path: Path) -> None:
+    directory = tmp_path / "by-id"
+    directory.mkdir()
+    target = tmp_path / "device"
+    target.touch()
+    link = directory / "usb-FAKE_TARGET_0-if00"
+    link.symlink_to(target)
+    observer = _ByIdScanObserver(directory, link.name)
+    try:
+        before_remove = observer.mark()
+        link.unlink()
+        action_completed_ns = time.monotonic_ns()
+        removed = observer.wait_link_event(
+            after_seq=before_remove, action="remove", timeout_s=1.0,
+        )
+        _append_scan_event(
+            observer,
+            phase="open",
+            thread_id=101,
+            handle_id=1001,
+            observed_ns=action_completed_ns + 1,
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="close",
+            thread_id=102,
+            handle_id=1001,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="open",
+            thread_id=101,
+            handle_id=1002,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="close",
+            thread_id=101,
+            handle_id=1003,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        with pytest.raises(TimeoutError, match="等待 symlink 變更後的 by-id 目錄掃描 逾時"):
+            observer.wait_scan_after(
+                after_seq=int(removed["sequence"]),
+                timeout_s=0.05,
+                link_present=False,
+                started_after_ns=action_completed_ns,
+            )
+        _append_scan_event(
+            observer,
+            phase="open",
+            thread_id=101,
+            handle_id=1002,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        _append_scan_event(
+            observer,
+            phase="close",
+            thread_id=101,
+            handle_id=1002,
+            observed_ns=time.monotonic_ns(),
+            link_present=False,
+        )
+        accepted = observer.wait_scan_after(
+            after_seq=int(removed["sequence"]),
+            timeout_s=0.5,
+            link_present=False,
+            started_after_ns=action_completed_ns,
+        )
+        assert accepted[0]["thread_id"] == accepted[1]["thread_id"] == 101, accepted
+        assert accepted[0]["handle_id"] == accepted[1]["handle_id"] == 1002, accepted
     finally:
         observer.close()
 
@@ -946,11 +1300,12 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     與 `test_update_push_after_freeze_zero_tx_l15`（只驗 file.push 路徑）不同：本案例窗口內不送任何 RPC，
     觸發全部來自背景引擎，依序為既有 console 輸入一行、DeviceWatcher 在 by-id 連結移除與復原後各自重探。
     inotify 以該私有 by-id 目錄的 symlink 事件分隔兩階段，再以 daemon PID 的 /proc fd 證據等待事件之後的
-    目錄 open/close；不使用 device.list 代替掃描完成訊號，其他行程單獨讀目錄不得滿足判準。
+    目錄 open/close；trace 以 daemon PID、`serialwrap-device-watcher` TID 和同一目錄 handle 配對，open 時間
+    取自 `opendir` 入口並須晚於 bridge 控制呼叫完成；不使用 device.list 代替掃描完成訊號，其他行程單獨讀目錄不得滿足判準。
 
-    時序與窗口邊界：CLI 在送出 `handoff_stop` 前記錄 monotonic 下界；該值不晚於 daemon 建立窗口的實際起點，
-    故加上 HANDOFF_DRAIN_GRACE_S 的截止點保守。回覆後另受控延遲 150 ms 才寫 reached marker，避免 marker 延遲
-    未量測。斷言分兩段：
+    時序與窗口邊界：preload 在 CLI 寫出 `daemon.handoff_stop` RPC 前記錄 monotonic 下界；該值不晚於
+    daemon 建立窗口的實際起點，故加上 HANDOFF_DRAIN_GRACE_S 的截止點保守。preload 另在 CLI 收到回覆、
+    建立 reached marker 前注入 150 ms 延遲，確認 marker 延遲不會把推算截止點往後移。斷言分兩段：
     1) 窗口仍開啟的證明：觸發後舊 daemon 尚未停止、`health.ping` 成功，且此時 TX 仍與凍結時一致；
     2) 整段零 TX：舊 daemon 停止（即窗口結束）後，以 bridge mark 作為擷取排空的屏障，TX 須與凍結時一致，
        且 console marker 不得出現於 TX（`assert_no_tx_after`）。
@@ -971,6 +1326,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         Path(env["SERIALWRAP_BY_ID_DIR"]),
         "usb-FAKE_TARGET_0-if00",
         process_pid=daemon.proc.pid,
+        thread_name="serialwrap-device-watcher",
         scan_trace=scan_trace,
     )
     old_daemon = root / "bin" / "serialwrapd"
@@ -985,9 +1341,10 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     env.update({
         "SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied",
         "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir),
-        "SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS": "150",
+        "SW_TEST_MARKER_WRITE_DELAY_MS": "150",
     })
     update_rows = []
+    trace_offset = scan_trace.stat().st_size if scan_trace.exists() else 0
     update_thread = RaisingThread(
         lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
     )
@@ -1000,33 +1357,31 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         marker = f"DRAIN_WINDOW_{time.time_ns()}"
         update_thread.start()
         wait_pause(pause_dir, "handoff_stop:replied")
-        request_started_ns = _pause_mono_ns(
-            pause_dir, "handoff_stop:replied", "request",
+        handoff_request = _wait_scan_trace_event(
+            scan_trace, "handoff_request", after_offset=trace_offset, timeout_s=2.0,
         )
-        reply_observed_ns = _pause_mono_ns(
-            pause_dir, "handoff_stop:replied", "reply",
+        marker_delay = _wait_scan_trace_event(
+            scan_trace,
+            "marker_delay",
+            after_offset=trace_offset,
+            timeout_s=2.0,
+            process_pid=handoff_request["process_pid"],
         )
-        marker_created_ns = _pause_mono_ns(
-            pause_dir, "handoff_stop:replied", "reached",
+        pause_marker_observed_ns = time.monotonic_ns()
+        window_started_lower_bound_ns = handoff_request["observed_ns"]
+        assert window_started_lower_bound_ns <= pause_marker_observed_ns, (
+            window_started_lower_bound_ns, pause_marker_observed_ns,
         )
-        assert reply_observed_ns >= request_started_ns, (
-            request_started_ns, reply_observed_ns,
+        marker_delay_ns = marker_delay["observed_ns"]
+        assert marker_delay_ns - handoff_request["observed_ns"] >= 150_000_000, (
+            handoff_request, marker_delay,
         )
-        assert marker_created_ns - reply_observed_ns >= 150_000_000, (
-            reply_observed_ns, marker_created_ns,
-        )
-        marker_based_start_ns = marker_created_ns - 50_000_000
-        # request_started_ns 取在 CLI 發出 daemon.handoff_stop 前；因此必不晚於 daemon 成立排空窗口，
-        # 以它加上固定窗口長度所得截止點只會比實際截止點更早，屬保守上界。
-        window_started_upper_bound_ns = request_started_ns
-        assert request_started_ns < marker_based_start_ns, (
-            request_started_ns, marker_based_start_ns, marker_created_ns,
-        )
-        assert window_started_upper_bound_ns <= request_started_ns < marker_based_start_ns, (
-            window_started_upper_bound_ns, request_started_ns, marker_based_start_ns,
-        )
-        window_deadline_ns = window_started_upper_bound_ns + int(
+        assert pause_marker_observed_ns >= marker_delay_ns, (pause_marker_observed_ns, marker_delay)
+        window_deadline_ns = window_started_lower_bound_ns + int(
             HANDOFF_DRAIN_GRACE_S * 1_000_000_000
+        )
+        assert pause_marker_observed_ns <= window_deadline_ns, (
+            pause_marker_observed_ns, window_deadline_ns,
         )
         bridge.mark("handoff-frozen", os.getpid())
         tx_at_freeze = tx_bytes(bridge.evidence_dir)
@@ -1053,6 +1408,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
                 timeout_s=HANDOFF_DRAIN_GRACE_S,
                 deadline_ns=window_deadline_ns,
                 link_present=change == "restore",
+                started_after_ns=action_completed_ns,
             )
             scan_trace.append({
                 "action": action,
@@ -1064,9 +1420,13 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
                 "scan_open_observed_ns": scan_open["observed_ns"],
                 "scan_process_pid": scan_open["process_pid"],
                 "scan_thread_id": scan_open["thread_id"],
+                "scan_thread_name": scan_open["thread_name"],
                 "scan_link_present": scan_open["link_present"],
+                "scan_open_handle_id": scan_open["handle_id"],
                 "scan_close_sequence": scan_close["sequence"],
                 "scan_close_observed_ns": scan_close["observed_ns"],
+                "scan_close_thread_id": scan_close["thread_id"],
+                "scan_close_handle_id": scan_close["handle_id"],
             })
 
         # 2) 每次都以連結變更事件為分界，且只接受其後新開始的目錄掃描。
@@ -1085,14 +1445,22 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         assert len(scan_trace) == 2, scan_trace
         assert scan_trace[0]["action"] == "by_id_link_remove"
         assert scan_trace[1]["action"] == "by_id_link_add"
+        for row in scan_trace:
+            assert row["action_completed_ns"] <= row["scan_open_observed_ns"], row
+            assert row["scan_process_pid"] == daemon.proc.pid, row
+            assert row["scan_thread_name"] == "serialwrap-device-watcher"[:15], row
+            assert row["scan_thread_id"] == row["scan_close_thread_id"], row
+            assert row["scan_open_handle_id"] == row["scan_close_handle_id"], row
         assert int(scan_trace[0]["scan_close_sequence"]) < int(scan_trace[1]["link_event_sequence"]), scan_trace
         assert int(scan_trace[1]["scan_close_observed_ns"]) <= ping_started_ns, scan_trace
         window_evidence = {
-            "window_started_upper_bound_ns": window_started_upper_bound_ns,
+            "window_started_lower_bound_ns": window_started_lower_bound_ns,
             "window_deadline_ns": window_deadline_ns,
             "daemon_pid": daemon.proc.pid,
-            "reply_observed_ns": reply_observed_ns,
-            "marker_created_ns": marker_created_ns,
+            "handoff_request": handoff_request,
+            "marker_delay": marker_delay,
+            "pause_marker_observed_ns": pause_marker_observed_ns,
+            "request_to_marker_delay_ns": pause_marker_observed_ns - handoff_request["observed_ns"],
             "scan_trace": scan_trace,
             "ping_started_ns": ping_started_ns,
             "ping_completed_ns": ping_completed_ns,
@@ -1126,7 +1494,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
             update_thread.join(15.0)
         env.pop("SW_TEST_UPDATE_PAUSE_AFTER", None)
         env.pop("SW_TEST_UPDATE_PAUSE_DIR", None)
-        env.pop("SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS", None)
+        env.pop("SW_TEST_MARKER_WRITE_DELAY_MS", None)
         _stop_rig(bridge, daemon, new_cli, env)
 
 
