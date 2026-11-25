@@ -353,6 +353,23 @@ mod tests {
     }
 
     #[test]
+    fn wrap_evidence_uses_the_surviving_source_after_backspace() {
+        let raw = "A \r \x08";
+        let (cleaned, sources) = clean_text_with_source_ranges(raw);
+        assert_eq!(cleaned, "A ");
+        assert_eq!(sources, vec![0..1, 1..2]);
+        let evidence = WrapEvidence::from_raw(raw, &cleaned, &sources);
+        assert!(evidence.is_wrap_at(1, ' '));
+
+        let raw = "A \r\x08 ";
+        let (cleaned, sources) = clean_text_with_source_ranges(raw);
+        assert_eq!(cleaned, "A ");
+        assert_eq!(sources, vec![0..1, 4..5]);
+        let evidence = WrapEvidence::from_raw(raw, &cleaned, &sources);
+        assert!(!evidence.is_wrap_at(1, ' '));
+    }
+
+    #[test]
     fn no_echo_human_tx_is_uncertain_but_clean_no_echo_tail_prompt_completes() {
         let evaluator = evaluator("printf x", r"(?m)^root@prplOS:.*# ");
         assert_eq!(

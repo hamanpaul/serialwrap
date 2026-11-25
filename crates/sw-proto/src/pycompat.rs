@@ -876,6 +876,8 @@ mod tests {
             ("A\x07é", "Aé", &[0..1, 2..4]),
             ("ab\x08c", "ac", &[0..1, 3..4]),
             ("ab\x7fc", "ac", &[0..1, 3..4]),
+            ("A \r \x08", "A ", &[0..1, 1..2]),
+            ("A \r\x08 ", "A ", &[0..1, 4..5]),
             ("a\rb", "ab", &[0..1, 2..3]),
             ("a\r\nb", "a\nb", &[0..1, 1..3, 3..4]),
             ("é😀z", "é😀z", &[0..2, 2..6, 6..7]),
@@ -887,9 +889,106 @@ mod tests {
             ("x\x1b]0;title\x07y", "xy", &[0..1, 11..12]),
         ];
 
+        #[derive(Clone)]
+        struct ExpectedChar {
+            ch: char,
+            source: std::ops::Range<usize>,
+        }
+
+        // 獨立依 raw char_indices 建立正規化來源，再逐字元套用清理規則；不讀取 API 回傳值，
+        // 因而可辨識重複字元被移除後仍映射到錯誤來源位置的情形。
+        fn expected_model(raw: &str) -> (String, Vec<std::ops::Range<usize>>) {
+            fn ansi_end(text: &str, start: usize) -> Option<usize> {
+                let bytes = text.as_bytes();
+                if bytes.get(start) != Some(&0x1b) {
+                    return None;
+                }
+                match *bytes.get(start + 1)? {
+                    b'[' => {
+                        let mut i = start + 2;
+                        while bytes.get(i).is_some_and(|b| {
+                            b.is_ascii_digit() || matches!(b, b';' | b'?')
+                        }) {
+                            i += 1;
+                        }
+                        bytes
+                            .get(i)
+                            .is_some_and(u8::is_ascii_alphabetic)
+                            .then_some(i + 1)
+                    }
+                    b']' => {
+                        let mut i = start + 2;
+                        let mut last_st = None;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                return Some(i + 1);
+                            }
+                            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                                last_st = Some(i + 2);
+                            }
+                            i += 1;
+                        }
+                        last_st
+                    }
+                    _ => None,
+                }
+            }
+
+            let mut normalized = Vec::<ExpectedChar>::new();
+            let mut input = raw.char_indices().peekable();
+            while let Some((start, ch)) = input.next() {
+                let end = start + ch.len_utf8();
+                if ch == '\r' {
+                    if let Some(&(next_start, '\n')) = input.peek() {
+                        input.next();
+                        normalized.push(ExpectedChar {
+                            ch: '\n',
+                            source: start..next_start + 1,
+                        });
+                    }
+                    continue;
+                }
+                normalized.push(ExpectedChar {
+                    ch,
+                    source: start..end,
+                });
+            }
+            let normalized_text: String = normalized.iter().map(|item| item.ch).collect();
+            let mut output = Vec::<char>::new();
+            let mut sources = Vec::<std::ops::Range<usize>>::new();
+            let mut unit = 0usize;
+            let mut byte = 0usize;
+            while byte < normalized_text.len() {
+                if let Some(end) = ansi_end(&normalized_text, byte) {
+                    let skipped = normalized_text[byte..end].chars().count();
+                    unit += skipped;
+                    byte = end;
+                    continue;
+                }
+                let item = &normalized[unit];
+                unit += 1;
+                byte += item.ch.len_utf8();
+                match item.ch {
+                    '\u{08}' | '\u{7f}' => {
+                        output.pop();
+                        sources.pop();
+                    }
+                    '\u{07}' => {}
+                    ch => {
+                        output.push(ch);
+                        sources.push(item.source.clone());
+                    }
+                }
+            }
+            (output.into_iter().collect(), sources)
+        }
+
         fn verify(raw: &str) {
             let (actual, sources) = clean_text_with_source_ranges(raw);
             assert_eq!(actual, clean_text(raw), "cleaned text differs for {raw:?}");
+            let (expected_text, expected_sources) = expected_model(raw);
+            assert_eq!(actual, expected_text, "independent model text for {raw:?}");
+            assert_eq!(sources, expected_sources, "independent source model for {raw:?}");
             let chars: Vec<char> = actual.chars().collect();
             assert_eq!(chars.len(), sources.len(), "range count for {raw:?}");
             let mut previous_end = 0;
@@ -928,7 +1027,7 @@ mod tests {
             }
         }
         let atoms = [
-            "A", "é", "😀", "\x07", "\x08", "\x7f", "\r", "\n", "\r\n", "\x1b[31m",
+            "A", " ", "é", "😀", "\x07", "\x08", "\x7f", "\r", "\n", "\r\n", "\x1b[31m",
             "\x1b]0;t\x07",
         ];
         enumerate(&atoms, 3, &mut String::new());

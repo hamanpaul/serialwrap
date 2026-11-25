@@ -16,7 +16,7 @@ use crossbeam_channel::{Receiver, Sender};
 use sw_pal::traits::{Clock, TxOutcome};
 use sw_proto::config_types::{ProfileTemplate, SessionProfile};
 use sw_proto::pycompat::{
-    a2b_base64_lenient, clean_text, clean_text_with_source_ranges, py_strip, splitlines, PyErr,
+    a2b_base64_lenient, clean_text, py_strip, splitlines, PyErr,
 };
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -197,74 +197,40 @@ pub fn extract_command_stdout(
     prompt_regex: &PyRegex,
     completion: Option<&PyRegex>,
 ) -> String {
-    let mut cut = prompt_cut_lines(raw, prompt_regex, completion);
-    strip_command_echo_lines(
-        raw,
-        &mut cut.lines,
-        command,
-        &cut.echo_text,
-        cut.cleaned_start,
-        cut.preserve_leading_wrap,
-    );
-    cut.lines.join("\n").trim_matches('\n').to_string()
-}
-
-fn strip_command_echo_lines(
-    raw: &str,
-    lines: &mut Vec<String>,
-    command: &str,
-    echo_text: &str,
-    cleaned_start: usize,
-    preserve_leading_wrap: bool,
-) {
+    let mut lines = prompt_cut_lines(raw, prompt_regex, completion);
     if !command.is_empty() {
         let stripped = py_strip(command);
-        let (cleaned, source_ranges) = clean_text_with_source_ranges(raw);
-        let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
         let mut removed = false;
-        // 保留舊的 prompt 前綴／整行 echo 擷取；有折行證據時改走位置感知 matcher，
-        // 避免 py_strip 把命令首尾的 readline 插入空白吞掉，或固定解讀同一空白的用途。
-        if wraps.is_empty() && !preserve_leading_wrap {
-            while lines
-                .first()
-                .is_some_and(|line| py_strip(line).ends_with(stripped))
-            {
-                lines.remove(0);
-                removed = true;
-            }
+        while lines
+            .first()
+            .is_some_and(|line| py_strip(line).ends_with(stripped))
+        {
+            lines.remove(0);
+            removed = true;
         }
         if !removed {
-            // 插入字元須在候選位置對應原始 BusyBox `\r\r\n` 或 readline ` \r`；其他位置的標記不得授權拼接。
-            // 一般 CRLF／空白 stdout 不得拼接（rulings/p5.md P5-70f6ce7-1）。
-            if let Some(n) = strip_wrapped_command_echo(
-                echo_text,
-                stripped,
-                &wraps,
-                cleaned_start,
-            ) {
-                lines.drain(..n);
+            // Producer 路徑保留 9af187ca 的演算法與結果；i294 的局部來源判斷只屬 evaluator。
+            let wraps = ProducerWrapEvidence {
+                newline: raw.contains("\r\r\n"),
+                space: raw.contains(" \r"),
+            };
+            if wraps.newline || wraps.space {
+                if let Some(n) = strip_wrapped_command_echo_producer(&lines, stripped, wraps) {
+                    lines.drain(..n);
+                }
             }
         }
     }
+    lines.join("\n").trim_matches('\n').to_string()
 }
 
 /// `clean_text` 後依最後一個 prompt（completion 模式下只裁完成標記之後的尾 prompt）截斷並切行。
-struct PromptCut {
-    lines: Vec<String>,
-    echo_text: String,
-    /// `echo_text[0]` 在完整清理後 snapshot 中的字元位置。
-    cleaned_start: usize,
-    /// 開頭空行含 BusyBox 折行標記時保留，讓 matcher 看見插入位於命令之前。
-    preserve_leading_wrap: bool,
-}
-
 fn prompt_cut_lines(
     raw: &str,
     prompt_regex: &PyRegex,
     completion: Option<&PyRegex>,
-) -> PromptCut {
-    let (cleaned, source_ranges) = clean_text_with_source_ranges(raw);
-    let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
+) -> Vec<String> {
+    let cleaned = clean_text(raw);
     let prompt_start = last_match_start(prompt_regex, &cleaned);
     let completion_end = completion
         .and_then(|re| re.search(raw))
@@ -279,24 +245,10 @@ fn prompt_cut_lines(
             text = char_prefix(&cleaned, start);
         }
     }
-    let leading_newlines = text.chars().take_while(|ch| *ch == '\n').count();
-    let preserve_leading_wrap =
-        (0..leading_newlines).any(|position| wraps.is_wrap_at(position, '\n'));
-    let trimmed = if preserve_leading_wrap {
-        text.as_str()
-    } else {
-        text.trim_start_matches('\n')
-    };
-    let cleaned_start = text.chars().count().saturating_sub(trimmed.chars().count());
-    PromptCut {
-        lines: splitlines(trimmed)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        echo_text: trimmed.to_string(),
-        cleaned_start,
-        preserve_leading_wrap,
-    }
+    splitlines(text.trim_start_matches('\n'))
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt；修正 PR `_WRAP_MIN_SEGMENT`），也以此保守估計回顯最多佔幾行。
@@ -334,10 +286,6 @@ impl WrapEvidence {
         evidence
     }
 
-    fn is_empty(&self) -> bool {
-        self.newline_positions.is_empty() && self.space_positions.is_empty()
-    }
-
     pub(crate) fn is_wrap_at(&self, position: usize, ch: char) -> bool {
         match ch {
             '\n' => self.newline_positions.contains(&position),
@@ -345,6 +293,63 @@ impl WrapEvidence {
             _ => false,
         }
     }
+}
+
+/// Producer 的基線折行證據（9af187ca）；不可與 evaluator 的來源位置證據共用。
+#[derive(Clone, Copy)]
+struct ProducerWrapEvidence {
+    newline: bool,
+    space: bool,
+}
+
+fn match_wrapped_echo_producer(
+    text: &[char],
+    start: usize,
+    command: &[char],
+    wraps: ProducerWrapEvidence,
+) -> Option<usize> {
+    let (mut i, mut j) = (start, 0usize);
+    let mut last_wrap: Option<usize> = None;
+    while j < command.len() {
+        let ch = *text.get(i)?;
+        if ch == command[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let allowed = (ch == '\n' && wraps.newline) || (ch == ' ' && wraps.space);
+        if j == 0 || !allowed {
+            return None;
+        }
+        let column = last_wrap.map_or(start + j, |w| j - w);
+        if column < WRAP_MIN_SEGMENT {
+            return None;
+        }
+        last_wrap = Some(j);
+        i += 1;
+    }
+    Some(i)
+}
+
+fn strip_wrapped_command_echo_producer(
+    lines: &[String],
+    command: &str,
+    wraps: ProducerWrapEvidence,
+) -> Option<usize> {
+    if command.is_empty() || lines.is_empty() {
+        return None;
+    }
+    let cmd: Vec<char> = command.chars().collect();
+    let window = &lines[..lines.len().min(cmd.len() / WRAP_MIN_SEGMENT + 2)];
+    let text: Vec<char> = window.join("\n").chars().collect();
+    for start in 0..lines[0].chars().count() {
+        if let Some(end) = match_wrapped_echo_producer(&text, start, &cmd, wraps) {
+            if end == text.len() || text[end] == '\n' {
+                return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
+            }
+        }
+    }
+    None
 }
 
 /// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
@@ -388,48 +393,6 @@ pub(crate) fn match_wrapped_echo(
         }
     }
     None
-}
-
-/// 修正 PR `_strip_wrapped_command_echo`：命令須從裁切區第一行開始（容許殘留 prompt），並完整結束於某行行尾。
-/// 回傳要移除的行數；候選插入點只查詢其原始來源位置的折行證據。
-fn strip_wrapped_command_echo(
-    text: &str,
-    command: &str,
-    wraps: &WrapEvidence,
-    text_base: usize,
-) -> Option<usize> {
-    if command.is_empty() || text.is_empty() {
-        return None;
-    }
-    let cmd: Vec<char> = command.chars().collect();
-    let chars: Vec<char> = text.chars().collect();
-    let first_line_len = chars
-        .iter()
-        .position(|ch| is_splitline(*ch))
-        .unwrap_or(chars.len());
-    for start in 0..first_line_len {
-        if start > 0 && wraps.is_wrap_at(text_base + start - 1, ' ') {
-            continue;
-        }
-        if let Some(end) = match_wrapped_echo(&chars, start, &cmd, wraps, text_base, |end| {
-            end == chars.len() || chars.get(end).is_some_and(|ch| is_splitline(*ch))
-        }) {
-            let line_count = chars[..end]
-                .iter()
-                .filter(|ch| is_splitline(**ch))
-                .count()
-                .saturating_add(1);
-            return Some(line_count.min(splitlines(text).len()));
-        }
-    }
-    None
-}
-
-fn is_splitline(ch: char) -> bool {
-    matches!(
-        ch,
-        '\n' | '\r' | '\x0b' | '\x0c' | '\x1c'..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
-    )
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），

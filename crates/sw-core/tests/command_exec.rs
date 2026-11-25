@@ -22,7 +22,7 @@ use sw_core::session_core::{Effect, SessionRequest};
 use sw_core::tx_writer::OpId;
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::PalError;
-use sw_proto::pycompat::{PyErr, clean_text};
+use sw_proto::pycompat::{PyErr, clean_text, py_strip, splitlines};
 use sw_proto::pyjson::{PyDict, PyValue};
 use sw_proto::pyre::{PyFlags, compile};
 
@@ -1294,6 +1294,211 @@ fn echo_line_removed_repeatedly() {
     h.dev.on_tx_reply(b"ls\n", b"ls\r\nls\r\na b\r\nroot@t:/# ");
     let id = h.submit_ok("ls");
     assert_eq!(h.wait_done(&id)["stdout"], PyValue::from("a b"));
+}
+
+/// 9af187ca 的 producer 擷取器原樣保存在測試內，供 producer 路徑差分使用。
+/// 此 oracle 刻意保留整份 raw 的 BusyBox/readline 標記判斷；i294 evaluator 不得改變 producer 語意。
+fn producer_oracle_9af187ca(
+    raw: &str,
+    command: &str,
+    prompt_regex: &sw_proto::pyre::PyRegex,
+    completion: Option<&sw_proto::pyre::PyRegex>,
+) -> String {
+    #[derive(Clone, Copy)]
+    struct WrapEvidence {
+        newline: bool,
+        space: bool,
+    }
+
+    fn char_prefix(text: &str, chars: usize) -> String {
+        text.chars().take(chars).collect()
+    }
+
+    fn last_match_start(re: &sw_proto::pyre::PyRegex, text: &str) -> Option<usize> {
+        let total = text.chars().count();
+        let mut pos = 0;
+        let mut last = None;
+        while pos <= total {
+            let Some(m) = re.search_from(text, pos) else {
+                break;
+            };
+            last = Some(m.start);
+            pos = if m.end > m.start { m.end } else { m.end + 1 };
+        }
+        last
+    }
+
+    fn match_wrapped_echo(
+        text: &[char],
+        start: usize,
+        command: &[char],
+        wraps: WrapEvidence,
+    ) -> Option<usize> {
+        let (mut i, mut j) = (start, 0usize);
+        let mut last_wrap: Option<usize> = None;
+        while j < command.len() {
+            let ch = *text.get(i)?;
+            if ch == command[j] {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            let allowed = (ch == '\n' && wraps.newline) || (ch == ' ' && wraps.space);
+            if j == 0 || !allowed {
+                return None;
+            }
+            let column = last_wrap.map_or(start + j, |w| j - w);
+            if column < 20 {
+                return None;
+            }
+            last_wrap = Some(j);
+            i += 1;
+        }
+        Some(i)
+    }
+
+    fn strip_wrapped_command_echo(
+        lines: &[String],
+        command: &str,
+        wraps: WrapEvidence,
+    ) -> Option<usize> {
+        if command.is_empty() || lines.is_empty() {
+            return None;
+        }
+        let cmd: Vec<char> = command.chars().collect();
+        let window = &lines[..lines.len().min(cmd.len() / 20 + 2)];
+        let text: Vec<char> = window.join("\n").chars().collect();
+        for start in 0..lines[0].chars().count() {
+            if let Some(end) = match_wrapped_echo(&text, start, &cmd, wraps) {
+                if end == text.len() || text[end] == '\n' {
+                    return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
+                }
+            }
+        }
+        None
+    }
+
+    let cleaned = clean_text(raw);
+    let prompt_start = last_match_start(prompt_regex, &cleaned);
+    let completion_end = completion
+        .and_then(|re| re.search(raw))
+        .map(|m| clean_text(&char_prefix(raw, m.end)).chars().count());
+    let mut text = cleaned;
+    if let Some(start) = prompt_start {
+        let cut = match completion {
+            None => true,
+            Some(_) => completion_end.is_some_and(|end| start >= end),
+        };
+        if cut {
+            text = char_prefix(&text, start);
+        }
+    }
+    let mut lines: Vec<String> = splitlines(text.trim_start_matches('\n'))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if !command.is_empty() {
+        let stripped = py_strip(command);
+        let mut removed = false;
+        while lines
+            .first()
+            .is_some_and(|line| py_strip(line).ends_with(stripped))
+        {
+            lines.remove(0);
+            removed = true;
+        }
+        if !removed {
+            let wraps = WrapEvidence {
+                newline: raw.contains("\r\r\n"),
+                space: raw.contains(" \r"),
+            };
+            if wraps.newline || wraps.space {
+                if let Some(n) = strip_wrapped_command_echo(&lines, stripped, wraps) {
+                    lines.drain(..n);
+                }
+            }
+        }
+    }
+    lines.join("\n").trim_matches('\n').to_string()
+}
+
+#[test]
+fn i294_producer_stdout_matches_base_9af187ca_oracle() {
+    let prompt = compile("(?m)^root@t:.*# ", PyFlags(0)).expect("prompt regex");
+    let marker = compile("(?m)^DONE\\r?$", PyFlags(0)).expect("completion marker regex");
+
+    // R5-01 固定反例：輸出行的 ` \\r\\n` 不得切換 producer 的重複 echo 剝除策略。
+    let raw = "ls\r\nls\r\na b \r\nDONE\r\n";
+    assert_eq!(
+        producer_oracle_9af187ca(raw, "ls", &prompt, Some(&marker)),
+        "a b \nDONE"
+    );
+    assert_eq!(
+        extract_command_stdout(raw, "ls", &prompt, Some(&marker)),
+        "a b \nDONE"
+    );
+
+    // 有界 producer 輸入空間：重複 echo、兩種終端折行、無關行尾空白、ANSI／backspace、
+    // completion marker 與 prompt 的相對位置都逐一對照 9af187ca oracle。
+    let long = wrap_cmd96();
+    let mut cases = Vec::<(String, String)>::new();
+    for command in ["ls".to_string(), long.clone()] {
+        for repeats in [1usize, 2] {
+            for output in [
+                "OUT\r\n",
+                "a b \r\n",
+                "\x1b[31mA\x08B\x07\x1b[0m\r\n",
+            ] {
+                for tail in [
+                    "DONE\r\nroot@t:/# ",
+                    "root@t:/# \r\nDONE\r\n",
+                    "DONE\r\n",
+                ] {
+                    let echo = format!("{command}\r\n").repeat(repeats);
+                    cases.push((format!("{echo}{output}{tail}"), command.clone()));
+                }
+            }
+        }
+    }
+    let mixed_command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
+    let mixed_echo = format!(
+        "{}\r\r\n{} \r{}\r\n",
+        &mixed_command[..25],
+        &mixed_command[25..60],
+        &mixed_command[60..]
+    );
+    cases.push((
+        format!("{mixed_echo}\x1b[32mOUT\x1b[0m\r\nDONE\r\nroot@t:/# "),
+        mixed_command,
+    ));
+    let mut prefixed_prompt_case = format!(
+        "root@t:/# old\r\n\x1b[33m{long}\x1b[0mX\x08\r\nOUT\r\nDONE\r\nroot@t:/# "
+    );
+    cases.push((prefixed_prompt_case.clone(), long.clone()));
+    prefixed_prompt_case.push_str("AFTER-MARKER\r\n");
+    cases.push((prefixed_prompt_case, long));
+
+    for (raw, command) in cases {
+        let completion = Some(&marker);
+        assert_eq!(
+            extract_command_stdout(&raw, &command, &prompt, completion),
+            producer_oracle_9af187ca(&raw, &command, &prompt, completion),
+            "producer output differs from 9af187ca for command={command:?}, raw={raw:?}"
+        );
+    }
+
+    // 確認完成標記實際經一般 producer 呼叫路徑時也維持基線結果。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"ls\n", b"ls\r\nls\r\na b \r\nDONE\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("ls", |request| {
+        request.completion_regex = Some("(?m)^DONE\\r?$".into())
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("a b \nDONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"ls\n");
 }
 
 #[test]
@@ -5020,7 +5225,20 @@ fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
 fn wrapped_echo_whitespace_boundary_matrix() {
     let prompt = WRAP_PROMPT;
     let check = |raw: String, command: &str, expected: String| {
-        assert_eq!(wrap_extract(&raw, command), expected, "command={command:?} raw={raw:?}");
+        let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", WRAP_PROMPT_RE);
+        let h = ActorRig::new_with_hub(&profile).ready_with_prompt(prompt.as_bytes());
+        let tx = format!("{command}\n");
+        h.dev.on_tx_reply(tx.as_bytes(), raw.as_bytes());
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_ok(command);
+        let record = h.wait_done(&id);
+        assert_eq!(record["status"], PyValue::from("done"));
+        assert_eq!(
+            record["stdout"],
+            PyValue::from(expected),
+            "command={command:?} raw={raw:?}"
+        );
+        assert_eq!(wal_tx_bytes_since(&h, tx_count), tx.as_bytes());
     };
 
     // R4-01：命令原有空白緊接 BusyBox 折行；該空白既像 readline 標記，也必須保留為命令字元。
