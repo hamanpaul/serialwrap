@@ -1790,7 +1790,7 @@ fn setup_force_preserves_each_user_timeout_recovery_value_byte_for_byte() {
 #[test]
 fn setup_entry_backfills_and_reports_without_changing_json_shape() {
     let t = TestEnv::posix().with_real_service();
-    let profile = t.config_dir().join("profiles/default.yaml");
+    let profile = t.config_dir().join("profiles").join("default.yaml");
     std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
     std::fs::write(
         &profile,
