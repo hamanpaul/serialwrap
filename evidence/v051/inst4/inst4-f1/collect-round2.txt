@@ -1,0 +1,17 @@
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+TEST_SHA256: 922a2bd51fca7c49883edf032e8051c6a7d07c10752864334dc81f9a858bdd75  crates/sw-cli/tests/mgmt_setup.rs
+SOURCE_SHA256: 839b5f726ec42eb940d8a5efbd2cb159ca91a7f516829cd5086a8550eca1bb3a  crates/sw-cli/src/rollback.rs
+CARGO_TARGET_DIR: /srv/thala-e/serialwrap-cargo/v051-inst4
+CARGO_INCREMENTAL: 0
+CARGO_BUILD_JOBS: 6
+TMPDIR: /tmp/sw.UjvtHn
+
+command: heavy-slot serialwrap-v051-inst4 nice -n 10 python3 scripts/rust/cargo_l1_results.py --list-only --out /tmp/sw.UjvtHn/inst4-round2-p7.collect.json -- --workspace --features test-fakes
+p7_collector_exit_code: 0
+p7 collect sha256: 4b1ab3e58a0aa1b369c8822f61ec9a213e35593af0be108d7a77863b9366b915  evidence/v051/inst4/inst4-f1/collect-workspace-round2.json
+p7 collected: 3764 ignored: 53
+
+command: heavy-slot serialwrap-v051-inst4 nice -n 10 python3 scripts/rust/cargo_l1_results.py --list-only --out /tmp/sw.UjvtHn/inst4-round2-s21.collect.json -- --workspace --features test-fakes -- --skip cap_
+s21/s22_collector_exit_code: 0
+s21/s22 collect sha256: f50b211eb569be52894ad2db2ff63092a53220a3287b3676dcb9c0a07ef22536  evidence/v051/inst4/inst4-f1/collect-workspace-skipcap-round2.json
+s21/s22 collected: 3764 ignored: 53

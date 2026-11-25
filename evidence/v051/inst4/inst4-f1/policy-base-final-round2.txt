@@ -1,0 +1,182 @@
+COMMAND: nice -n 10 python3 -m policy_check --repo . --pr-base-ref origin/main
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+# Policy Check Report
+
+Engine: policy-check 1.0.19 (installed package)
+
+- pass: 24
+- fail: 1
+- warn: 2
+- skip (exempt): 0
+
+### README
+
+## :white_check_mark: R-01 — pass
+README.md exists and satisfies minimum length.
+
+## :white_check_mark: R-02 — pass
+README has all required sections: ['Install', 'Usage', 'Version']
+
+### CHANGELOG
+
+## :white_check_mark: R-03 — pass
+CHANGELOG.md exists at repository root.
+
+## :white_check_mark: R-04 — pass
+CHANGELOG.md includes the # Changelog header.
+
+## :white_check_mark: R-09 — pass
+No code path files changed.
+
+### VERSION
+
+## :white_check_mark: R-05 — pass
+VERSION exists at repository root.
+
+## :white_check_mark: R-06 — pass
+VERSION format is valid: 0.5.0
+
+## :white_check_mark: R-07 — pass
+VERSION (0.5.0) matches latest tag (v0.5.0).
+
+### CONFIG
+
+## :white_check_mark: R-08 — pass
+.project-policy.yml schema is valid for R-08.
+
+### PR
+
+## :white_check_mark: R-10 — pass
+No PR title provided; treat as non-PR context.
+
+## :white_check_mark: R-11 — pass
+No PR body provided; treat as non-PR context.
+
+## :white_check_mark: R-12 — pass
+Missing PR base/head ref; treat as non-PR context.
+
+## :white_check_mark: R-17 — pass
+No PR body provided; treat as non-PR context.
+
+### AGENT
+
+## :white_check_mark: R-13 — pass
+all agent convention files present
+
+## :white_check_mark: R-14 — pass
+agent files aligned to policy_version 1.0.19
+
+### WORKFLOW
+
+## :white_check_mark: R-15 — pass
+All workflow uses refs are pinned with tag or SHA.
+
+## :white_check_mark: R-20 — pass
+All workflow policy_version declarations match 1.0.19.
+
+## :white_check_mark: R-23 — pass
+engine pin aligned to policy_version 1.0.19
+
+### MARKER-SYNC
+
+## :white_check_mark: R-16 — pass
+All 5 CLI help markers are in sync.
+
+## :white_check_mark: R-26 — pass
+All 4 generated-fact marker(s) are in sync.
+
+### CI
+
+## :warning: R-19 — warn
+R-19 detected a test gate that may be bypassed or was not parsed reliably.
+
+<details><summary>detail</summary>
+
+```
+- architecture-html.yml:native-html/step[3] 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- release.yml:publish/Install test + build dependencies 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- rust.yml:rust-linux/安裝 Python 相依（PyYAML、pytest、jsonschema、policy_check） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- rust.yml:rust-linux/cargo test（Linux，全部 feature） 的測試 step 帶 if 條件，gate 可能為條件式。
+- rust.yml:rust-linux/Rust 相關 pytest（SW_REQUIRE_CARGO=1：缺 cargo 即 FAIL，不得 SKIP） 的測試 step 帶 if 條件，gate 可能為條件式。
+- rust.yml:rust-linux/Stage 1A CLI 委派路徑回歸（Rust CLI） 的測試 step 帶 if 條件，gate 可能為條件式。
+- rust.yml:rust-linux/黑箱契約 harness（Stage 2 Rust CLI＋Rust daemon，tests/contract_blackbox） 的測試 step 帶 if 條件，gate 可能為條件式。
+- tests.yml:pytest/安裝測試相依（預設安裝，不含 [redos] extra） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:pytest/執行測試套件（含 re2 線性引擎） 的測試 step 帶 if 條件，gate 可能為條件式。
+- tests.yml:bridge-tools/安裝 bridge 測試相依與 socat 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:bridge-tools-windows/安裝 bridge 測試相依（含 Windows pyserial） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:pytest-windows/安裝免驅動 Windows L1 相依 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:windows-com-selfhosted/安裝相依與 bridge 工具 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+```
+
+</details>
+
+### SECRET
+
+## :x: R-21 — fail
+R-21 findings with tier='shareable', visibility='unknown': structural:15, credential:0, marker:0.
+
+<details><summary>detail</summary>
+
+```
+evidence/v051/inst4/inst4-f1/collect-sw-cli.txt:7 structural
+evidence/v051/inst4/inst4-f1/gate-cargo-check-windows.txt:277 structural
+evidence/v051/inst4/inst4-f1/gate-cargo-clippy.txt:2382 structural
+evidence/v051/inst4/inst4-f1/green-auto-select.txt:5 structural
+evidence/v051/inst4/inst4-f1/green-endpoint-resolve.txt:5 structural
+evidence/v051/inst4/inst4-f1/green-root-flow.txt:5 structural
+evidence/v051/inst4/inst4-f1/green-yaml-nested.txt:5 structural
+evidence/v051/inst4/inst4-f1/red-bundle-preserve.txt:5 structural
+evidence/v051/inst4/inst4-f1/red-first-install-health.txt:5 structural
+evidence/v051/inst4/inst4-f1/red-logical-held-lock.txt:7 structural
+evidence/v051/inst4/inst4-f1/red-logical-port.txt:7 structural
+evidence/v051/inst4/inst4-f1/red-logical-released-lock.txt:7 structural
+evidence/v051/inst4/inst4-f1/red-yaml-nested.txt:31 structural
+evidence/v051/inst4/inst4-f1/red-yaml-nested.txt:41 structural
+evidence/v051/inst4/inst4-f1/red-yaml-nested.txt:42 structural
+```
+
+</details>
+
+### DOC-ALIGN
+
+## :white_check_mark: R-18 — pass
+No code path files changed.
+
+## :warning: R-22 — warn
+docs contain 3462 pre-existing dangling reference(s) (advisory).
+
+<details><summary>detail</summary>
+
+```
+README.md -> ~/.config/serialwrap/config.yaml
+README.md -> config.yaml
+README.md -> state.json
+README.md -> ~/.local/state/serialwrap/state.json
+README.md -> config.yaml
+README.md -> release-manifest.json
+README.md -> config.yaml
+README.md -> config.yml
+README.md -> ~/.config/serialwrap/config.yaml
+README.md -> benches.yaml
+README.md -> ~/.config/serialwrap/benches.yaml
+README.md -> config.yaml
+README.md -> config.yaml
+README.md -> bench-issue.sh
+README.md -> config.yml
+README.md -> bench-enroll.sh
+README.md -> benches.yaml
+README.md -> autostart-hold.json
+README.md -> install-journal.json
+README.md -> config.yaml
+```
+
+</details>
+
+## :white_check_mark: R-24 — pass
+No moc declared; R-24 not applicable.
+
+## :white_check_mark: R-25 — pass
+No doc_coverage declared (not applicable).
+
+## :white_check_mark: R-27 — pass
+133 code(s) across 2 namespace(s) documented.

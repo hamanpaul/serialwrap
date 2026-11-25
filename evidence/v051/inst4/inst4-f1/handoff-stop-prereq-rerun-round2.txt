@@ -1,0 +1,33 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo test -p sw-daemon --test handoff_stop --features test-fakes --no-fail-fast
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+handoff_stop.rs SHA256: 9acf0df5b8cb08acaa234ea15982a3d170c77a372f0888f2be38e1728c99ad60
+handoff_cli.rs SHA256: d637beec401d1b459cc91885d34c1f447c9f090d7b02d6bca503dd419e4146c5
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running tests/handoff_stop.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/handoff_stop-c11190ddf88ce066)
+
+running 23 tests
+test handoff_frozen_response_carries_startup_fingerprint ... ok
+test handoff_stop_freezes_custody_deliverer_gate ... ok
+test handoff_service_push_ticket_blocks_until_done ... ok
+test handoff_frozen_rejects_mutating_methods ... ok
+test handoff_file_push_ticket_survives_rpc_timeout ... ok
+test handoff_flash_races_prepare_probe_first ... ok
+test handoff_busy_while_rpc_command_outstanding ... ok
+test handoff_flash_races_prepare_handoff_first ... ok
+test handoff_session_query_timeout_preserves_lease_ticket ... ok
+test handoff_rollback_preserves_shutdown_freeze ... ok
+test handoff_busy_lease_and_recovering ... ok
+test frozen_submit_validation_errors_precede_admission ... ok
+test handoff_file_push_ticket_survives_human_replay ... ok
+test handoff_tx_fence_timeout_thaws_without_stop ... ok
+test auto_reprobe_ready_result_survives_failed_handoff_tx_fence ... ok
+test handoff_reason_supervision_set_same_semantics ... ok
+test handoff_ok_then_sc11_stop_order ... ok
+test default_cli_update_scope_cannot_bypass_foreign_daemon ... ok
+test handoff_file_push_after_last_probe ... ok
+test handoff_drain_window_background_triggers_zero_tx ... ok
+test handoff_then_successor_never_double_held ... ok
+test shutdown_during_force_recover_poll_finishes_handler_and_exits_zero ... ok
+test handoff_flash_races_prepare ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.17s

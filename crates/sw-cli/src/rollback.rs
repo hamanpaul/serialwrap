@@ -3666,12 +3666,26 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
     let source = backup.unwrap_or(&snapshot);
     // state.json 與 benches.state.json 可能在新版運作期間更新（例如 RELEASED）；
     // 回退只還原設定，不可用舊備份覆蓋目前的持久化狀態。
-    for (name, target) in [("config.yaml", crate::endpoint_resolve::config_write_path(ctx))] {
-        let from = source.join(name);
-        if ctx.p.fs.exists(&from) {
-            copy_replace(ctx, &from, &target).map_err(|error| error.to_string())?;
-        } else if name == "config.yaml" && ctx.p.fs.exists(&snapshot.join(name)) {
-            copy_replace(ctx, &snapshot.join(name), &target).map_err(|error| error.to_string())?;
+    let config_path = crate::endpoint_resolve::config_write_path(ctx);
+    match original.config_sha256.as_deref() {
+        Some(expected) => {
+            let original_config = snapshot.join("config.yaml");
+            if !ctx.p.fs.exists(&original_config) {
+                return Err("原始 config.yaml 快照不存在".into());
+            }
+            copy_replace(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
+            let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
+            if sha256_hex(&restored) != expected {
+                return Err("還原後的 config.yaml 與原始快照不一致".into());
+            }
+        }
+        None => {
+            if ctx.p.fs.exists(&config_path) {
+                ctx.p.fs.remove_file(&config_path).map_err(|error| error.py_message)?;
+                if let Some(parent) = config_path.parent() {
+                    ctx.p.fs.sync_dir(parent).map_err(|error| error.py_message)?;
+                }
+            }
         }
     }
     for name in ["profiles", "supervisor"] {
@@ -3864,6 +3878,7 @@ fn verify_restored(
     should_start: bool,
     start_if_needed: bool,
 ) -> Result<PyDict, String> {
+    verify_original_config(ctx, original)?;
     let mut restored = restored_value(original);
     let Some(current) = original.current.as_ref() else {
         if !matches!(endpoint_presence(ctx, &original.supervisor.endpoint), EndpointPresence::Absent) {
@@ -3892,6 +3907,23 @@ fn verify_restored(
     }
     restored.insert("started", measured.get("started").cloned().unwrap_or(PyValue::Bool(false)));
     Ok(restored)
+}
+
+fn verify_original_config(ctx: &CliCtx<'_>, original: &OriginalSnapshot) -> Result<(), String> {
+    let config_path = crate::endpoint_resolve::config_write_path(ctx);
+    match (original.config_sha256.as_deref(), ctx.p.fs.exists(&config_path)) {
+        (None, false) => Ok(()),
+        (None, true) => Err("原始安裝沒有 config.yaml，但回復後檔案仍存在".into()),
+        (Some(_), false) => Err("原始安裝的 config.yaml 在回復後遺失".into()),
+        (Some(expected), true) => {
+            let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
+            if sha256_hex(&restored) == expected {
+                Ok(())
+            } else {
+                Err("還原後的 config.yaml 與原始 SHA-256 不一致".into())
+            }
+        }
+    }
 }
 
 fn recovery_deferred(from_step: &str, error: HandoffError, _ctx: &CliCtx<'_>, _endpoint: &str, phase: &str) -> RecoveryReport {

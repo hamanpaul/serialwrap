@@ -3237,6 +3237,77 @@ fn bundle_setup_auto_port_health_failure_keeps_original_config() {
 }
 
 #[test]
+fn bundle_setup_auto_port_switch_failure_without_config_restores_absence() {
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_bundle("0.5.1")
+        .with_rpc_listen(mock_listen)
+        .with_fs_fault_replace_suffix("serialwrap.exe.new");
+
+    assert!(!t.config_path().exists(), "首次安裝前 config.yaml 應不存在");
+    let (rc, _out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_ne!(rc, 0, "穩定入口切換失敗時 setup 必須回報失敗");
+    assert!(err.contains("selected port 48716"), "測試必須走自動選埠路徑：{err}");
+    assert!(
+        !t.config_path().exists(),
+        "原本沒有 config.yaml 時，入口切換失敗的交易回復不得留下自動選埠建立的檔案"
+    );
+}
+
+#[test]
+fn bundle_setup_auto_port_health_failure_without_config_restores_absence() {
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_listen(mock_listen);
+
+    assert!(!t.config_path().exists(), "首次安裝前 config.yaml 應不存在");
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_ne!(rc, 0, "daemon 健康檢查逾時時 setup 必須回報失敗");
+    assert_eq!(str_field(&json(&out), "error_code"), "TIMEOUT");
+    assert!(err.contains("selected port 48716"), "測試必須走自動選埠路徑：{err}");
+    assert!(
+        !t.config_path().exists(),
+        "原本沒有 config.yaml 時，健康檢查失敗的交易回復不得留下自動選埠建立的檔案"
+    );
+}
+
+#[test]
+fn bundle_setup_auto_port_interrupted_recovery_without_config_reselects_port() {
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_bundle("0.5.1")
+        .with_process()
+        .with_rpc_listen(mock_listen)
+        .with_crash_at("entries_switching:after_effect");
+
+    assert!(!t.config_path().exists(), "首次安裝前 config.yaml 應不存在");
+    let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    assert!(t.config_path().exists(), "中斷點應位於自動選埠 config 寫入之後");
+    assert!(t.journal_json().is_some(), "中斷後應保留交易 journal");
+
+    let mut t = t;
+    t.clear_crash();
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert!(
+        err.contains("selected port 48716"),
+        "journal 復原後重試必須再次自動選埠：{err}"
+    );
+    assert_ne!(rc, 0, "自動選埠後沒有健康回應時重試安裝必須失敗");
+    assert_eq!(str_field(&json(&out), "error_code"), "TIMEOUT");
+    assert!(
+        !t.config_path().exists(),
+        "journal 復原與重試失敗後，原本不存在的 config.yaml 必須維持不存在"
+    );
+    assert!(t.journal_json().is_none(), "交易回復成功後應清除 journal");
+}
+
+#[test]
 fn bundle_setup_ping_timeout_with_held_instance_lock_refuses_second_daemon() {
     let endpoint = TestEnv::win_endpoint();
     let t = TestEnv::windows()

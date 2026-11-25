@@ -1,0 +1,85 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 python3 -m pytest --noconftest -q tests/test_slice21_case_freeze.py tests/test_slice24_cases.py
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+test_slice21_case_freeze.py SHA256: 3bd6c204bff21aa2023c3f7d76300abd73b0f92c9b6d8aa5884003db1306fe91
+test_slice24_cases.py SHA256: 2ab08f667e2d9823175a9f3b087b9a586356e7e5ae3043f78aed6915704388f1
+........................................................................ [ 83%]
+..............                                                           [100%]
+=============================== warnings summary ===============================
+tests/test_slice21_case_freeze.py:20
+  <worktree>/tests/test_slice21_case_freeze.py:20: PytestUnknownMarkWarning: Unknown pytest.mark.core_portable - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+tests/test_slice21_case_freeze.py:20
+  <worktree>/tests/test_slice21_case_freeze.py:20: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+tests/test_slice24_cases.py:26
+  <worktree>/tests/test_slice24_cases.py:26: PytestUnknownMarkWarning: Unknown pytest.mark.core_portable - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = [pytest.mark.core_portable]
+
+tests/test_slice24_cases.py:131
+  <worktree>/tests/test_slice24_cases.py:131: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:139
+  <worktree>/tests/test_slice24_cases.py:139: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:154
+  <worktree>/tests/test_slice24_cases.py:154: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:164
+  <worktree>/tests/test_slice24_cases.py:164: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:180
+  <worktree>/tests/test_slice24_cases.py:180: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:200
+  <worktree>/tests/test_slice24_cases.py:200: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:214
+  <worktree>/tests/test_slice24_cases.py:214: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:227
+  <worktree>/tests/test_slice24_cases.py:227: PytestUnknownMarkWarning: Unknown pytest.mark.process_rpc - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.process_rpc
+
+tests/test_slice24_cases.py:240
+  <worktree>/tests/test_slice24_cases.py:240: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:264
+  <worktree>/tests/test_slice24_cases.py:264: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:285
+  <worktree>/tests/test_slice24_cases.py:285: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:336
+  <worktree>/tests/test_slice24_cases.py:336: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:355
+  <worktree>/tests/test_slice24_cases.py:355: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:375
+  <worktree>/tests/test_slice24_cases.py:375: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+tests/test_slice24_cases.py:393
+  <worktree>/tests/test_slice24_cases.py:393: PytestUnknownMarkWarning: Unknown pytest.mark.process_rpc - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.process_rpc
+
+tests/test_slice24_cases.py:405
+  <worktree>/tests/test_slice24_cases.py:405: PytestUnknownMarkWarning: Unknown pytest.mark.memory_only - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.memory_only
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+86 passed, 19 warnings in 6.26s

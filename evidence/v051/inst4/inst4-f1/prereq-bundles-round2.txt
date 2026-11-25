@@ -1,0 +1,6 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 scripts/rust/mkbundle.sh --dev --stage 2 --profile debug --version-override 0.0.1 --out /srv/thala-e/serialwrap-cargo/v051-inst4/prereqs/base-bundle
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+/srv/thala-e/serialwrap-cargo/v051-inst4/prereqs/base-bundle
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 scripts/rust/mkbundle.sh --dev --stage 2 --profile debug --out /srv/thala-e/serialwrap-cargo/v051-inst4/prereqs/bundle
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+/srv/thala-e/serialwrap-cargo/v051-inst4/prereqs/bundle

@@ -1,0 +1,29 @@
+command: nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_auto_port_switch_failure_without_config_restores_absence -- --exact --nocapture
+git rev-parse HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+test sha256: 922a2bd51fca7c49883edf032e8051c6a7d07c10752864334dc81f9a858bdd75  crates/sw-cli/tests/mgmt_setup.rs
+program sha256: d16a4708a6522d0eb0f3540b5fee2ee73ee04bfa58d616fe5cd955c3aa794138  crates/sw-cli/src/rollback.rs
+CARGO_TARGET_DIR: /srv/thala-e/serialwrap-cargo/v051-inst4
+CARGO_INCREMENTAL: 0
+CARGO_BUILD_JOBS: 6
+TMPDIR: /tmp/sw.OjSWwU
+
+   Compiling sw-cli v0.5.0 (<worktree>/crates/sw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.26s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+
+thread 'bundle_setup_auto_port_switch_failure_without_config_restores_absence' (1918124) panicked at crates/sw-cli/tests/mgmt_setup.rs:3252:5:
+原本沒有 config.yaml 時，入口切換失敗的交易回復不得留下自動選埠建立的檔案
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test bundle_setup_auto_port_switch_failure_without_config_restores_absence ... FAILED
+
+failures:
+
+failures:
+    bundle_setup_auto_port_switch_failure_without_config_restores_absence
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 86 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p sw-cli --test mgmt_setup`
+test_exit_code: 101

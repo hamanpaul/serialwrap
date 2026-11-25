@@ -1,0 +1,18 @@
+command: nice -n 10 cargo test -p sw-cli --features test-fakes --test mgmt_setup bundle_setup_auto_port_health_failure_without_config_restores_absence -- --exact --nocapture
+git rev-parse HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+test sha256: 922a2bd51fca7c49883edf032e8051c6a7d07c10752864334dc81f9a858bdd75  crates/sw-cli/tests/mgmt_setup.rs
+program sha256: 839b5f726ec42eb940d8a5efbd2cb159ca91a7f516829cd5086a8550eca1bb3a  crates/sw-cli/src/rollback.rs
+CARGO_TARGET_DIR: /srv/thala-e/serialwrap-cargo/v051-inst4
+CARGO_INCREMENTAL: 0
+CARGO_BUILD_JOBS: 6
+TMPDIR: /tmp/sw.MTy4Xs
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/mgmt_setup.rs (/srv/thala-e/serialwrap-cargo/v051-inst4/debug/deps/mgmt_setup-dd7a029c07b21a39)
+
+running 1 test
+test bundle_setup_auto_port_health_failure_without_config_restores_absence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 0.07s
+
+test_exit_code: 0

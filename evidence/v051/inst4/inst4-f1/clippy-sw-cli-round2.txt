@@ -1,0 +1,2398 @@
+COMMAND: heavy-slot serialwrap-v051-inst4 nice -n 10 cargo clippy -p sw-cli --tests --features test-fakes -- --cap-lints warn
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+rollback.rs SHA256: 839b5f726ec42eb940d8a5efbd2cb159ca91a7f516829cd5086a8550eca1bb3a
+mgmt_setup.rs SHA256: 922a2bd51fca7c49883edf032e8051c6a7d07c10752864334dc81f9a858bdd75
+warning: unneeded `return` statement
+  --> crates/sw-pal/src/console_pty/posix.rs:48:13
+   |
+48 | /             return Ok(Self {
+49 | |                 read_fd: fd,
+50 | |                 write_fd: fd,
+51 | |                 eventfd: true,
+52 | |             });
+   | |______________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_return
+   = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+   |
+48 ~             Ok(Self {
+49 +                 read_fd: fd,
+50 +                 write_fd: fd,
+51 +                 eventfd: true,
+52 ~             })
+   |
+
+warning: casting to the same type is unnecessary (`u32` -> `u32`)
+   --> crates/sw-pal/src/console_pty/posix.rs:429:17
+    |
+429 |         ispeed: i as u32,
+    |                 ^^^^^^^^ help: try: `i`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+    = note: `#[warn(clippy::unnecessary_cast)]` on by default
+
+warning: casting to the same type is unnecessary (`u32` -> `u32`)
+   --> crates/sw-pal/src/console_pty/posix.rs:430:17
+    |
+430 |         ospeed: o as u32,
+    |                 ^^^^^^^^ help: try: `o`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: this `map_or` can be simplified
+   --> crates/sw-pal/src/console_pty/posix.rs:526:5
+    |
+526 |     held.map_or(true, |paths| paths.contains(slave_path))
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+526 -     held.map_or(true, |paths| paths.contains(slave_path))
+526 +     held.is_none_or(|paths| paths.contains(slave_path))
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+   --> crates/sw-pal/src/console_pty/posix.rs:582:14
+    |
+582 |         + if remaining.subsec_nanos() % 1_000_000 != 0 {
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!remaining.subsec_nanos().is_multiple_of(1_000_000)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/device.rs:14:12
+   |
+14 |     state: Arc<Mutex<(VecDeque<Scripted>, Option<Vec<(String, DeviceInfo)>>)>>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+   = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/device.rs:19:12
+   |
+19 |     state: Arc<Mutex<(VecDeque<Scripted>, Option<Vec<(String, DeviceInfo)>>)>>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/fs.rs:89:17
+   |
+89 |       lock_block: Mutex<
+   |  _________________^
+90 | |         Option<(
+91 | |             PathBuf,
+92 | |             std::sync::Arc<super::clock::FakeClock>,
+...  |
+96 | |         )>,
+97 | |     >,
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/fakes/proc.rs:173:18
+    |
+173 |     replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/process.rs:11:16
+   |
+11 |     pub calls: Mutex<Vec<(Vec<OsString>, Vec<(String, String)>)>>,
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/process.rs:30:13
+   |
+30 |     spawns: Mutex<Vec<(Vec<String>, Vec<(OsString, OsString)>, bool)>>,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/process.rs:65:29
+   |
+65 |     pub fn spawns(&self) -> Vec<(Vec<String>, Vec<(OsString, OsString)>, bool)> {
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/fakes/process.rs:220:11
+    |
+220 |     hook: Mutex<Option<Arc<dyn Fn(&crate::traits::HandlerSpec) + Send + Sync>>>,
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: file opened with `create`, but `truncate` behavior not defined
+   --> crates/sw-pal/src/fakes/realfs.rs:232:18
+    |
+232 |                 .create(true)
+    |                  ^^^^^^^^^^^^- help: add: `.truncate(true)`
+    |
+    = help: if you intend to overwrite an existing file entirely, call `.truncate(true)`
+    = help: if you instead know that you may want to keep some parts of the old file, call `.truncate(false)`
+    = help: alternatively, use `.append(true)` to append to the file instead of overwriting it
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#suspicious_open_options
+    = note: `#[warn(clippy::suspicious_open_options)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/fakes/serial.rs:335:17
+    |
+335 |     tx_replies: Mutex<Vec<(Vec<u8>, Vec<u8>, bool)>>,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/fakes/serial.rs:336:17
+    |
+336 |     tx_matches: Mutex<Vec<(SimpleRegex, Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>)>>,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: this `if` statement can be collapsed
+   --> crates/sw-pal/src/fakes/serial.rs:388:13
+    |
+388 | /             if !*pushed && trigger.len() <= tx.len() {
+389 | |                 if tx.windows(trigger.len()).any(|w| w == trigger.as_slice()) {
+390 | |                     *pushed = true;
+391 | |                     to_push.extend_from_slice(reply);
+392 | |                 }
+393 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+388 ~             if !*pushed && trigger.len() <= tx.len()
+389 ~                 && tx.windows(trigger.len()).any(|w| w == trigger.as_slice()) {
+390 |                     *pushed = true;
+391 |                     to_push.extend_from_slice(reply);
+392 ~                 }
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/fakes/serial.rs:807:53
+    |
+807 |     pub fn on_tx_match(&self, pattern: &str, reply: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>) {
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: useless conversion to the same type: `&str`
+   --> crates/sw-pal/src/fakes/service.rs:310:38
+    |
+310 |             result.error_code = Some("INTERNAL_ERROR".into());
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"INTERNAL_ERROR"`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+    = note: `#[warn(clippy::useless_conversion)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-pal/src/fakes/sysenv.rs:56:16
+   |
+56 |     call_envs: Mutex<Vec<Option<Vec<(OsString, OsString)>>>>,
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: this manual char comparison can be written more succinctly
+  --> crates/sw-pal/src/fakes/sysenv.rs:92:28
+   |
+92 |     let parts = path.split(|ch| ch == '/' || ch == '\\').collect::<Vec<_>>();
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['/', '\\']`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+   = note: `#[warn(clippy::manual_pattern_char_comparison)]` on by default
+
+warning: useless conversion to the same type: `std::collections::VecDeque<fakes::sysenv::Scripted>`
+   --> crates/sw-pal/src/fakes/sysenv.rs:318:39
+    |
+318 |                     .map(|(k, v)| (k, v.into()))
+    |                                       ^^^^^^^^ help: consider removing `.into()`: `v`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: this manual char comparison can be written more succinctly
+   --> crates/sw-pal/src/proc_scan/mod.rs:460:17
+    |
+460 |     path.rsplit(|ch| ch == '/' || ch == '\\')
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['/', '\\']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+
+warning: this manual char comparison can be written more succinctly
+   --> crates/sw-pal/src/proc_scan/mod.rs:575:28
+    |
+575 |     let base = path.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or(path);
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['/', '\\']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+
+warning: called `skip(..).next()` on an iterator
+   --> crates/sw-pal/src/proc_holders/posix.rs:265:11
+    |
+265 |     fields.skip(1).next()?.parse().ok()
+    |           ^^^^^^^^^^^^^^^ help: use `nth` instead: `.nth(1)`
+    |
+help: for this change `fields` has to be mutable
+   --> crates/sw-pal/src/proc_holders/posix.rs:264:9
+    |
+264 |     let fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    |         ^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_skip_next
+    = note: `#[warn(clippy::iter_skip_next)]` on by default
+
+warning: this `map_or` can be simplified
+   --> crates/sw-pal/src/rpc_transport/posix.rs:443:5
+    |
+443 |     deadline.map_or(true, |limit| now >= limit)
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_none_or` instead
+    |
+443 -     deadline.map_or(true, |limit| now >= limit)
+443 +     deadline.is_none_or(|limit| now >= limit)
+    |
+
+warning: you should consider adding a `Default` implementation for `PosixSerialBackend`
+  --> crates/sw-pal/src/serial/posix.rs:27:5
+   |
+27 | /     pub fn new() -> Self {
+28 | |         Self {
+29 | |             excl: Arc::new(PosixUartExclusive),
+30 | |             post_excl_fault: None,
+31 | |         }
+32 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#new_without_default
+   = note: `#[warn(clippy::new_without_default)]` on by default
+help: try adding this
+   |
+25 + impl Default for PosixSerialBackend {
+26 +     fn default() -> Self {
+27 +         Self::new()
+28 +     }
+29 + }
+   |
+
+warning: unneeded `return` statement
+   --> crates/sw-pal/src/serial/posix.rs:664:13
+    |
+664 | /             return Ok(Self {
+665 | |                 read_fd: fd,
+666 | |                 write_fd: fd,
+667 | |                 eventfd: true,
+668 | |             });
+    | |______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_return
+help: remove `return`
+    |
+664 ~             Ok(Self {
+665 +                 read_fd: fd,
+666 +                 write_fd: fd,
+667 +                 eventfd: true,
+668 ~             })
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+    --> crates/sw-pal/src/serial/posix.rs:1247:39
+     |
+1247 |     let rounded = millis + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+     |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!remaining.subsec_nanos().is_multiple_of(1_000_000)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+warning: unneeded `return` statement
+    --> crates/sw-pal/src/serial/posix.rs:1292:9
+     |
+1292 |         return (136..=143).contains(&libc::major(stat.st_rdev));
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_return
+help: remove `return`
+     |
+1292 -         return (136..=143).contains(&libc::major(stat.st_rdev));
+1292 +         (136..=143).contains(&libc::major(stat.st_rdev))
+     |
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl/systemd.rs:216:10
+    |
+216 |     ) -> Result<AutostartHoldRecord, ServiceResult> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+    = note: `#[warn(clippy::result_large_err)]` on by default
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl/systemd.rs:387:10
+    |
+387 |     ) -> Result<Vec<CmdRecord>, ServiceResult> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl/windows_service.rs:117:10
+    |
+117 |     ) -> Result<AutostartHoldRecord, crate::service_ctl::ServiceResult> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this boolean expression can be simplified
+   --> crates/sw-pal/src/service_ctl/windows_service.rs:399:12
+    |
+399 |         if !start_type.as_ref().is_some_and(|(code, _)| *code == 2) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `start_type.as_ref().is_none_or(|(code, _)| *code != 2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+    = note: `#[warn(clippy::nonminimal_bool)]` on by default
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl/windows_task.rs:130:10
+    |
+130 |     ) -> Result<AutostartHoldRecord, ServiceResult> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl.rs:603:10
+    |
+603 |     ) -> Result<AutostartHoldRecord, ServiceResult>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl.rs:610:10
+    |
+610 |     ) -> Result<Vec<CmdRecord>, ServiceResult>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-pal/src/service_ctl.rs:618:10
+    |
+618 |     ) -> Result<AutostartHoldRecord, ServiceResult>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+    |
+    = help: try reducing the size of `service_ctl::ServiceResult`, for example by boxing large elements or replacing it with `Box<service_ctl::ServiceResult>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-pal/src/traits.rs:857:10
+    |
+857 |       ) -> (
+    |  __________^
+858 | |         Box<dyn SerialReader>,
+859 | |         Box<dyn SerialWriter>,
+860 | |         std::sync::Arc<dyn IoWaker>,
+861 | |         CloseToken,
+862 | |     );
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: unneeded `return` statement
+   --> crates/sw-pal/src/wal_fs/posix.rs:261:13
+    |
+261 |             return Err(io::Error::last_os_error());
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_return
+help: remove `return`
+    |
+261 -             return Err(io::Error::last_os_error());
+261 +             Err(io::Error::last_os_error())
+    |
+
+warning: `sw-pal` (lib) generated 40 warnings (run `cargo clippy --fix --lib -p sw-pal -- --cap-lints warn` to apply 17 suggestions)
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-proto/src/config_types.rs:529:6
+    |
+529 |   ) -> Result<
+    |  ______^
+530 | |     (
+531 | |         BTreeMap<String, ProfileTemplate>,
+532 | |         Vec<ProfileTemplate>,
+...   |
+535 | |     ConfigError,
+536 | | > {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this function has too many arguments (9/7)
+   --> crates/sw-proto/src/config_types.rs:596:1
+    |
+596 | / fn merge_session(
+597 | |     template: &ProfileTemplate,
+598 | |     target: &YMap,
+599 | |     act_no: PyInt,
+...   |
+605 | |     fs: &dyn ProfileFs,
+606 | | ) -> Result<SessionProfile, ConfigError> {
+    | |________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: this returns a `Result<_, ()>`
+   --> crates/sw-proto/src/config_types.rs:990:5
+    |
+990 |     pub fn windows_test_device_allowlist(&self) -> Result<Option<Vec<String>>, ()> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: use a custom `Error` type instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_unit_err
+    = note: `#[warn(clippy::result_unit_err)]` on by default
+
+warning: this `if` has identical blocks
+   --> crates/sw-proto/src/pycompat.rs:989:42
+    |
+989 |           if (0x20..=0x7e).contains(&byte) {
+    |  __________________________________________^
+990 | |             out.push(byte as char);
+991 | |         } else if matches!(byte, b'\t' | b'\n' | b'\r') {
+    | |_________^
+    |
+note: same as this
+   --> crates/sw-proto/src/pycompat.rs:991:57
+    |
+991 |           } else if matches!(byte, b'\t' | b'\n' | b'\r') {
+    |  _________________________________________________________^
+992 | |             out.push(byte as char);
+993 | |         } else {
+    | |_________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#if_same_then_else
+    = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: the variable `char_count` is used as a loop counter
+   --> crates/sw-proto/src/pyjson.rs:661:5
+    |
+661 |     for c in s.chars() {
+    |     ^^^^^^^^^^^^^^^^^^ help: consider using: `for (char_count, c) in s.chars().enumerate()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#explicit_counter_loop
+    = note: `#[warn(clippy::explicit_counter_loop)]` on by default
+
+warning: this `map_or` can be simplified
+    --> crates/sw-proto/src/yaml11/resolve.rs:1141:16
+     |
+1141 |             if prev.map_or(true, |p| matches!(p, ' ' | '\t' | '\n' | '\r')) {
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+     = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+     |
+1141 -             if prev.map_or(true, |p| matches!(p, ' ' | '\t' | '\n' | '\r')) {
+1141 +             if prev.is_none_or(|p| matches!(p, ' ' | '\t' | '\n' | '\r')) {
+     |
+
+warning: this loop could be written as a `for` loop
+    --> crates/sw-proto/src/yaml11/resolve.rs:1183:5
+     |
+1183 |     while let Some(Token(m, t)) = sc.next() {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `for Token(m, t) in sc`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#while_let_on_iterator
+     = note: `#[warn(clippy::while_let_on_iterator)]` on by default
+
+warning: this `if` can be collapsed into the outer `match`
+    --> crates/sw-proto/src/yaml11/resolve.rs:1264:17
+     |
+1264 | /                 if v.contains('?') || v.starts_with(':') || v.starts_with('|') || v.starts_with('>') {
+1265 | |                     return Err(err("found a character that cannot appear in a flow plain scalar"));
+1266 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_match
+     = note: `#[warn(clippy::collapsible_match)]` on by default
+help: collapse nested if block
+     |
+1263 ~             TokenType::Scalar(TScalarStyle::Plain, v) if stack.last().map_or(false, |t| t.1)
+1264 ~                 && (v.contains('?') || v.starts_with(':') || v.starts_with('|') || v.starts_with('>')) => {
+1265 |                     return Err(err("found a character that cannot appear in a flow plain scalar"));
+1266 ~                 }
+     |
+
+warning: this `map_or` can be simplified
+    --> crates/sw-proto/src/yaml11/resolve.rs:1263:58
+     |
+1263 |             TokenType::Scalar(TScalarStyle::Plain, v) if stack.last().map_or(false, |t| t.1) => {
+     |                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_some_and` instead
+     |
+1263 -             TokenType::Scalar(TScalarStyle::Plain, v) if stack.last().map_or(false, |t| t.1) => {
+1263 +             TokenType::Scalar(TScalarStyle::Plain, v) if stack.last().is_some_and(|t| t.1) => {
+     |
+
+warning: this loop could be written as a `for` loop
+    --> crates/sw-proto/src/yaml11/resolve.rs:1322:9
+     |
+1322 |         while let Some(Token(m, t)) = sc.next() {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `for Token(m, t) in sc.by_ref()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#while_let_on_iterator
+
+warning: this boolean expression can be simplified
+   --> crates/sw-proto/src/yaml11/emit.rs:613:12
+    |
+613 |         if !printable_ascii && !(allow_unicode && unicode_character && ch != '\u{feff}') {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `!(printable_ascii || allow_unicode && unicode_character && ch != '\u{feff}')`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+    = note: `#[warn(clippy::nonminimal_bool)]` on by default
+
+warning: `sw-proto` (lib) generated 11 warnings (run `cargo clippy --fix --lib -p sw-proto -- --cap-lints warn` to apply 5 suggestions)
+    Checking sw-cli v0.5.0 (<worktree>/crates/sw-cli)
+warning: this boolean expression can be simplified
+   --> crates/sw-cli/src/argparse/help.rs:176:20
+    |
+176 |                   if index + 1 < chars.len()
+    |  ____________________^
+177 | |                     && index > start
+178 | |                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+    | |___________________________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+    = note: `#[warn(clippy::nonminimal_bool)]` on by default
+help: try
+    |
+176 -                 if index + 1 < chars.len()
+177 -                     && index > start
+178 -                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+176 +                 if !(index + 1 >= chars.len() || index <= start || !after_ok || !before_ok && !doubled_before_ok)
+    |
+176 -                 if index + 1 < chars.len()
+177 -                     && index > start
+178 -                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+176 +                 if (doubled_before_ok || before_ok) && after_ok && index > start && index + 1 < chars.len()
+    |
+
+warning: this boolean expression can be simplified
+   --> crates/sw-cli/src/argparse/help.rs:178:24
+    |
+178 |                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+help: try
+    |
+178 -                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+178 +                     && !(!after_ok || !before_ok && !doubled_before_ok)
+    |
+178 -                     && ((before_ok && after_ok) || (doubled_before_ok && after_ok))
+178 +                     && (doubled_before_ok || before_ok) && after_ok
+    |
+
+warning: useless use of `format!`
+   --> crates/sw-cli/src/argparse/help.rs:271:25
+    |
+271 |             .map(|line| format!("{}", line))
+    |                         ^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `line.to_string()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_format
+    = note: `#[warn(clippy::useless_format)]` on by default
+
+warning: clamp-like pattern without using clamp function
+   --> crates/sw-cli/src/argparse/help.rs:352:29
+    |
+352 |     let max_help_position = width.saturating_sub(20).max(4).min(24);
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with clamp: `width.saturating_sub(20).clamp(4, 24)`
+    |
+    = note: clamp will panic if max < min
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_clamp
+    = note: `#[warn(clippy::manual_clamp)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+   --> crates/sw-cli/src/argparse/parser.rs:137:29
+    |
+137 |         .find(|(_, action)| action.option_strings.iter().any(|option| *option == token))
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `action.option_strings.contains(&token)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_contains
+    = note: `#[warn(clippy::manual_contains)]` on by default
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+   --> crates/sw-cli/src/argparse/parser.rs:152:13
+    |
+152 | /             action
+153 | |                 .option_strings
+154 | |                 .iter()
+155 | |                 .any(|candidate| *candidate == option)
+    | |______________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_contains
+help: try
+    |
+152 ~             action
+153 +                 .option_strings.contains(&option)
+    |
+
+warning: this function has too many arguments (10/7)
+   --> crates/sw-cli/src/argparse/parser.rs:275:1
+    |
+275 | / fn record_action(
+276 | |     action: &ActionSpec,
+277 | |     index: usize,
+278 | |     value: ArgValue,
+...   |
+285 | |     width: usize,
+286 | | ) -> Result<(), ParseFailure> {
+    | |_____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: this function has too many arguments (10/7)
+   --> crates/sw-cli/src/argparse/parser.rs:315:1
+    |
+315 | / fn apply_action(
+316 | |     index: usize,
+317 | |     action: &ActionSpec,
+318 | |     raw_values: &[String],
+...   |
+325 | |     width: usize,
+326 | | ) -> Result<(), ParseFailure> {
+    | |_____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (11/7)
+   --> crates/sw-cli/src/argparse/parser.rs:457:1
+    |
+457 | / fn consume_optional(
+458 | |     start: usize,
+459 | |     args: &[String],
+460 | |     pattern: &[char],
+...   |
+468 | |     width: usize,
+469 | | ) -> Result<usize, ParseFailure> {
+    | |________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (10/7)
+   --> crates/sw-cli/src/argparse/parser.rs:661:1
+    |
+661 | / fn consume_positionals(
+662 | |     start: usize,
+663 | |     args: &[String],
+664 | |     pattern: &[char],
+...   |
+671 | |     width: usize,
+672 | | ) -> Result<ConsumePositionals, ParseFailure> {
+    | |_____________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this boolean expression can be simplified
+  --> crates/sw-cli/src/argparse/usage.rs:69:26
+   |
+69 |         .filter(|action| !action.option_strings.is_empty() == optionals)
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `action.option_strings.is_empty() != optionals`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+
+warning: using `contains()` instead of `iter().any()` is more efficient
+  --> crates/sw-cli/src/argparse/usage.rs:80:27
+   |
+80 |             .find(|group| group.dests.iter().any(|dest| *dest == action.dest))
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `group.dests.contains(&action.dest)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_contains
+
+warning: the use of negated comparison operators on partially ordered types produces code that is hard to read and refactor, please consider using the `partial_cmp` method instead, to make it clear that the two values could be incomparable
+  --> crates/sw-cli/src/client.rs:46:49
+   |
+46 |     if timeout_s.is_nan() || timeout_s < 0.0 || !(timeout_ns < PYTIME_NS_LIMIT) {
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#neg_cmp_op_on_partial_ord
+   = note: `#[warn(clippy::neg_cmp_op_on_partial_ord)]` on by default
+
+warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+   --> crates/sw-cli/src/client.rs:141:13
+    |
+141 | /             match status.get(key) {
+142 | |                 // Python 的 bool 是 int 子類，故也保留布林計數。
+143 | |                 Some(value @ (PyValue::Int(_) | PyValue::Bool(_))) => {
+144 | |                     busy.insert(key, value.clone());
+145 | |                 }
+146 | |                 _ => {}
+147 | |             }
+    | |_____________^
+    |
+    = note: you might want to preserve the comments from inside the `match`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_match
+    = note: `#[warn(clippy::single_match)]` on by default
+help: try
+    |
+141 ~             if let Some(value @ (PyValue::Int(_) | PyValue::Bool(_))) = status.get(key) {
+142 +                 busy.insert(key, value.clone());
+143 +             }
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/sw-cli/src/commands/daemon_cmd.rs:952:6
+    |
+952 | ) -> Result<(Vec<(OsString, OsString)>, Vec<String>), EnvFileSourceError> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this manual char comparison can be written more succinctly
+    --> crates/sw-cli/src/commands/daemon_cmd.rs:1425:47
+     |
+1425 |     let suffix = remainder.trim_start_matches(|c| c == '/' || c == '\\');
+     |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['/', '\\']`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+     = note: `#[warn(clippy::manual_pattern_char_comparison)]` on by default
+
+warning: this boolean expression can be simplified
+   --> crates/sw-cli/src/commands/supervision_cmd.rs:108:12
+    |
+108 |           || (!matches!(target, sw_pal::service_ctl::SupervisionMode::OnDemand)
+    |  ____________^
+109 | |             && !(matches!(target, sw_pal::service_ctl::SupervisionMode::WindowsService)
+110 | |                 && ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows)
+111 | |             && !supported.contains(&target))
+    | |____________________________________________^ help: try: `!(matches!(target, sw_pal::service_ctl::SupervisionMode::OnDemand) || supported.contains(&target) || matches!(target, sw_pal::service_ctl::SupervisionMode::WindowsService) && ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+
+warning: this boolean expression can be simplified
+   --> crates/sw-cli/src/commands/supervision_cmd.rs:108:13
+    |
+108 |           || (!matches!(target, sw_pal::service_ctl::SupervisionMode::OnDemand)
+    |  _____________^
+109 | |             && !(matches!(target, sw_pal::service_ctl::SupervisionMode::WindowsService)
+110 | |                 && ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows)
+    | |____________________________________________________________________________^ help: try: `!(matches!(target, sw_pal::service_ctl::SupervisionMode::OnDemand) || matches!(target, sw_pal::service_ctl::SupervisionMode::WindowsService) && ctx.p.caps.path_flavor == sw_pal::PalPathFlavor::Windows)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+
+warning: this block may be rewritten with the `?` operator
+   --> crates/sw-cli/src/remote_tunnel.rs:499:17
+    |
+499 | /                 if let Err(cleanup_error) =
+500 | |                     cleanup_spawn(ctx, &registry, i64::from(listen_port), tunnel, state)
+501 | |                 {
+502 | |                     return Err(cleanup_error);
+503 | |                 }
+    | |_________________^ help: replace it with: `cleanup_spawn(ctx, &registry, i64::from(listen_port), tunnel, state)?;`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#question_mark
+    = note: `#[warn(clippy::question_mark)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> crates/sw-cli/src/remote_tunnel.rs:655:9
+    |
+655 | /         if pid > 0 && ctx.p.tunnel.alive(&proc) {
+656 | |             if ctx
+657 | |                 .p
+658 | |                 .tunnel
+...   |
+672 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+655 ~         if pid > 0 && ctx.p.tunnel.alive(&proc)
+656 ~             && ctx
+657 |                 .p
+...
+670 |                 continue;
+671 ~             }
+    |
+
+warning: large size difference between variants
+   --> crates/sw-cli/src/doctor_cmd.rs:211:1
+    |
+211 | /  enum ManifestState {
+212 | |      /// 找不到 manifest：不附加 `version_pairing`。
+213 | |      Missing,
+214 | |      /// 找到但驗證失敗：`key` 為 Python `invalid release manifest: <key>` 的 key。
+215 | |      Invalid { key: String },
+    | |      ----------------------- the second-largest variant contains at least 24 bytes
+216 | |      /// 驗證通過。
+217 | |/     Valid {
+218 | ||         dir: PathBuf,
+219 | ||         manifest: ReleaseManifest,
+220 | ||     },
+    | ||_____- the largest variant contains at least 296 bytes
+221 | |  }
+    | |__^ the entire enum is at least 296 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+219 -         manifest: ReleaseManifest,
+219 +         manifest: Box<ReleaseManifest>,
+    |
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:118:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+118 |   ) -> Result<StopReport, StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+    = note: `#[warn(clippy::result_large_err)]` on by default
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:138:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+138 |   ) -> Result<StopReport, StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:152:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+152 |   ) -> Result<StopReport, StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this function has too many arguments (8/7)
+   --> crates/sw-cli/src/graceful_stop.rs:143:1
+    |
+143 | / pub fn graceful_stop_with_existing_hold(
+144 | |     ctx: &mut CliCtx<'_>,
+145 | |     mode: &SupervisionMode,
+146 | |     endpoint: &str,
+...   |
+151 | |     existing_hold: Option<AutostartHoldRecord>,
+152 | | ) -> Result<StopReport, StopFailure> {
+    | |____________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:612:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+612 |   ) -> Result<(), StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:625:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+625 |   ) -> Result<bool, StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:718:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+718 |   ) -> Result<Option<DaemonIdentity>, StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/graceful_stop.rs:969:6
+    |
+ 30 |       Service(ServiceResult),
+    |       ---------------------- the largest variant contains at least 168 bytes
+...
+ 36 |       Hold(ServiceResult),
+    |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+ 40 | /     HandoffContext {
+ 41 | |         cause: Box<StopFailure>,
+ 42 | |         hold: Option<AutostartHoldRecord>,
+ 43 | |         chain: Vec<HandoffLink>,
+ 44 | |     },
+    | |_____- the variant `HandoffContext` contains at least 160 bytes
+...
+969 |   ) -> Result<(), StopFailure> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this `if` statement can be collapsed
+   --> crates/sw-cli/src/install_layout.rs:525:9
+    |
+525 | /         if pieces.len() >= 3 && pieces[1].eq_ignore_ascii_case("bin") {
+526 | |             if root
+527 | |                 .entry_names
+528 | |                 .iter()
+...   |
+533 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+525 ~         if pieces.len() >= 3 && pieces[1].eq_ignore_ascii_case("bin")
+526 ~             && root
+527 |                 .entry_names
+...
+531 |                 return ExeLocation::InstalledVersion(pieces[0].to_string());
+532 ~             }
+    |
+
+warning: this function has too many arguments (8/7)
+   --> crates/sw-cli/src/install_layout.rs:595:1
+    |
+595 | / fn check_file_digest(
+596 | |     ctx: &Ctx<'_>,
+597 | |     base: &Path,
+598 | |     m: &ReleaseManifest,
+...   |
+603 | |     diffs: &mut Vec<PairingDiff>,
+604 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this can be `std::io::Error::other(_)`
+    --> crates/sw-cli/src/install_layout.rs:1302:61
+     |
+1302 |     tree_sha256_with_prefix(ctx, py_root, "").map_err(|err| IoError::new(ErrorKind::Other, err))
+     |                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#io_other_error
+     = note: `#[warn(clippy::io_other_error)]` on by default
+help: use `std::io::Error::other`
+     |
+1302 -     tree_sha256_with_prefix(ctx, py_root, "").map_err(|err| IoError::new(ErrorKind::Other, err))
+1302 +     tree_sha256_with_prefix(ctx, py_root, "").map_err(|err| IoError::other(err))
+     |
+
+warning: this manual char comparison can be written more succinctly
+   --> crates/sw-cli/src/legacy_handoff.rs:152:42
+    |
+152 |     let mut parts = version.trim().split(|ch: char| ch == '.' || ch == '-' || ch == '+');
+    |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['.', '-', '+']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+
+warning: this manual char comparison can be written more succinctly
+   --> crates/sw-cli/src/legacy_handoff.rs:182:28
+    |
+182 |     let base = path.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or(path).to_ascii_lowercase();
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['/', '\\']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/legacy_handoff.rs:325:6
+    |
+101 |     Refused { code: &'static str, reason: &'static str, message: String, detail: PyDict },
+    |     ------------------------------------------------------------------------------------- the variant `Refused` contains at least 128 bytes
+102 |     /// 已送出 stop 後失敗：`pending=true` 為 D5 逾時（hold 與 journal 保留）。
+103 |     AfterStop { code: &'static str, reason: &'static str, message: String, detail: PyDict, pending: bool, stopped: bool },
+    |     --------------------------------------------------------------------------------------------------------------------- the largest variant contains at least 130 bytes
+...
+325 | ) -> Result<LegacyPlan, LegacyFailure> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `legacy_handoff::LegacyFailure`, for example by boxing large elements or replacing it with `Box<legacy_handoff::LegacyFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/legacy_handoff.rs:470:6
+    |
+101 |     Refused { code: &'static str, reason: &'static str, message: String, detail: PyDict },
+    |     ------------------------------------------------------------------------------------- the variant `Refused` contains at least 128 bytes
+102 |     /// 已送出 stop 後失敗：`pending=true` 為 D5 逾時（hold 與 journal 保留）。
+103 |     AfterStop { code: &'static str, reason: &'static str, message: String, detail: PyDict, pending: bool, stopped: bool },
+    |     --------------------------------------------------------------------------------------------------------------------- the largest variant contains at least 130 bytes
+...
+470 | ) -> Result<LegacyStopped, LegacyFailure> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `legacy_handoff::LegacyFailure`, for example by boxing large elements or replacing it with `Box<legacy_handoff::LegacyFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/legacy_handoff.rs:575:6
+    |
+101 |     Refused { code: &'static str, reason: &'static str, message: String, detail: PyDict },
+    |     ------------------------------------------------------------------------------------- the variant `Refused` contains at least 128 bytes
+102 |     /// 已送出 stop 後失敗：`pending=true` 為 D5 逾時（hold 與 journal 保留）。
+103 |     AfterStop { code: &'static str, reason: &'static str, message: String, detail: PyDict, pending: bool, stopped: bool },
+    |     --------------------------------------------------------------------------------------------------------------------- the largest variant contains at least 130 bytes
+...
+575 | ) -> Result<Waited, LegacyFailure> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `legacy_handoff::LegacyFailure`, for example by boxing large elements or replacing it with `Box<legacy_handoff::LegacyFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+   --> crates/sw-cli/src/legacy_handoff.rs:731:6
+    |
+101 |     Refused { code: &'static str, reason: &'static str, message: String, detail: PyDict },
+    |     ------------------------------------------------------------------------------------- the variant `Refused` contains at least 128 bytes
+102 |     /// 已送出 stop 後失敗：`pending=true` 為 D5 逾時（hold 與 journal 保留）。
+103 |     AfterStop { code: &'static str, reason: &'static str, message: String, detail: PyDict, pending: bool, stopped: bool },
+    |     --------------------------------------------------------------------------------------------------------------------- the largest variant contains at least 130 bytes
+...
+731 | ) -> Result<Option<LegacyPlan>, LegacyFailure> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try reducing the size of `legacy_handoff::LegacyFailure`, for example by boxing large elements or replacing it with `Box<legacy_handoff::LegacyFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this can be `std::io::Error::other(_)`
+   --> crates/sw-cli/src/pairing.rs:200:24
+    |
+200 |     .map_err(|message| IoError::new(ErrorKind::Other, message))
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#io_other_error
+help: use `std::io::Error::other`
+    |
+200 -     .map_err(|message| IoError::new(ErrorKind::Other, message))
+200 +     .map_err(|message| IoError::other(message))
+    |
+
+warning: manual implementation of `Option::zip`
+   --> crates/sw-cli/src/pairing.rs:324:23
+    |
+324 |           let matches = string(m, key)
+    |  _______________________^
+325 | |             .and_then(|expected| {
+326 | |                 fs::read(manifest_dir.join(relative))
+327 | |                     .ok()
+328 | |                     .map(|b| (expected, b))
+329 | |             })
+    | |______________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_option_zip
+    = note: `#[warn(clippy::manual_option_zip)]` on by default
+help: use
+    |
+324 ~         let matches = string(m, key).zip(fs::read(manifest_dir.join(relative))
+325 +                     .ok())
+    |
+
+warning: initializer for `thread_local` value can be made `const`
+  --> crates/sw-cli/src/rollback.rs:28:56
+   |
+28 |     static TEST_CRASH_POINT: RefCell<Option<String>> = RefCell::new(None);
+   |                                                        ^^^^^^^^^^^^^^^^^^ help: replace with: `const { RefCell::new(None) }`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#missing_const_for_thread_local
+   = note: `#[warn(clippy::missing_const_for_thread_local)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/sw-cli/src/rollback.rs:29:23
+   |
+29 |     static TEST_HOOK: RefCell<Option<(String, Box<dyn FnOnce()>)>> = RefCell::new(None);
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
+
+warning: used consecutive `str::replace` call
+  --> crates/sw-cli/src/rollback.rs:68:22
+   |
+68 |     let name = point.replace('/', "_").replace(':', "_");
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `replace(['/', ':'], "_")`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+   = note: `#[warn(clippy::collapsible_str_replace)]` on by default
+
+warning: the `Err`-variant returned from this function is very large
+  --> crates/sw-cli/src/rollback.rs:89:6
+   |
+89 | ) -> Result<PyDict, OpFailure> {
+   |      ^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+   |
+   = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this `map_or` can be simplified
+   --> crates/sw-cli/src/rollback.rs:382:36
+    |
+382 |     daemons.iter().filter(|daemon| daemon.socket.as_deref().map_or(true, |socket| socket == endpoint)).cloned().collect()
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+382 -     daemons.iter().filter(|daemon| daemon.socket.as_deref().map_or(true, |socket| socket == endpoint)).cloned().collect()
+382 +     daemons.iter().filter(|daemon| daemon.socket.as_deref().is_none_or(|socket| socket == endpoint)).cloned().collect()
+    |
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:1131:6
+     |
+1131 |   ) -> Result<RevertStop, StopFailure> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/sw-cli/src/graceful_stop.rs:30:5
+     |
+  30 |       Service(ServiceResult),
+     |       ---------------------- the largest variant contains at least 168 bytes
+...
+  36 |       Hold(ServiceResult),
+     |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+  40 | /     HandoffContext {
+  41 | |         cause: Box<StopFailure>,
+  42 | |         hold: Option<AutostartHoldRecord>,
+  43 | |         chain: Vec<HandoffLink>,
+  44 | |     },
+     | |_____- the variant `HandoffContext` contains at least 160 bytes
+     |
+     = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:1143:6
+     |
+1143 |   ) -> Result<RevertStop, StopFailure> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/sw-cli/src/graceful_stop.rs:30:5
+     |
+  30 |       Service(ServiceResult),
+     |       ---------------------- the largest variant contains at least 168 bytes
+...
+  36 |       Hold(ServiceResult),
+     |       ------------------- the variant `Hold` contains at least 168 bytes
+...
+  40 | /     HandoffContext {
+  41 | |         cause: Box<StopFailure>,
+  42 | |         hold: Option<AutostartHoldRecord>,
+  43 | |         chain: Vec<HandoffLink>,
+  44 | |     },
+     | |_____- the variant `HandoffContext` contains at least 160 bytes
+     |
+     = help: try reducing the size of `graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<graceful_stop::StopFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:1149:39
+     |
+1149 |             failure.error_code = Some(code.as_str().into());
+     |                                       ^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `code.as_str()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+     = note: `#[warn(clippy::useless_conversion)]` on by default
+
+warning: this function has too many arguments (8/7)
+    --> crates/sw-cli/src/rollback.rs:1494:1
+     |
+1494 | / fn execute_change(
+1495 | |     ctx: &mut CliCtx<'_>,
+1496 | |     bundle_dir: &Path,
+1497 | |     target_mode: &SupervisionMode,
+...    |
+1502 | |     lock: FileLockGuard,
+1503 | | ) -> UpdateReport {
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (9/7)
+    --> crates/sw-cli/src/rollback.rs:1507:1
+     |
+1507 | / fn execute_change_with_restore(
+1508 | |     ctx: &mut CliCtx<'_>,
+1509 | |     bundle_dir: &Path,
+1510 | |     target_mode: &SupervisionMode,
+...    |
+1516 | |     lock: FileLockGuard,
+1517 | | ) -> UpdateReport {
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: derefed type is same as origin
+    --> crates/sw-cli/src/rollback.rs:2153:16
+     |
+2153 |       let code = error
+     |  ________________^
+2154 | |         .error_code
+2155 | |         .as_deref()
+     | |___________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_option_as_deref
+     = note: `#[warn(clippy::needless_option_as_deref)]` on by default
+help: try
+     |
+2153 ~     let code = error
+2154 +         .error_code
+     |
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2171:26
+     |
+2171 |         error_code: Some(ErrorCode::InternalError.as_str().into()),
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `ErrorCode::InternalError.as_str()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2173:21
+     |
+2173 |         phase: Some("supervisor_install".into()),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"supervisor_install"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:2189:6
+     |
+2189 | ) -> Result<(), OpFailure> {
+     |      ^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+     |
+     = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:2212:6
+     |
+2212 | ) -> Result<StopSupervisorOk, (OpFailure, bool)> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 152 bytes
+     |
+     = help: try reducing the size of `(rollback::OpFailure, bool)`, for example by boxing large elements or replacing it with `Box<(rollback::OpFailure, bool)>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this function has too many arguments (8/7)
+    --> crates/sw-cli/src/rollback.rs:2209:1
+     |
+2209 | / fn stop_supervisor(
+2210 | |     ctx: &mut CliCtx<'_>, mode: &SupervisionMode, endpoint: &str, with_sudo: bool,
+2211 | |     daemon: Option<&DaemonSnapshot>, enabled: Option<bool>, journal: &mut Journal, root: &InstallRoot,
+2212 | | ) -> Result<StopSupervisorOk, (OpFailure, bool)> {
+     | |________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:2345:6
+     |
+2345 | ) -> Result<StopSupervisorOk, (OpFailure, bool)> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 152 bytes
+     |
+     = help: try reducing the size of `(rollback::OpFailure, bool)`, for example by boxing large elements or replacing it with `Box<(rollback::OpFailure, bool)>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:2391:6
+     |
+2391 | ) -> Result<(), sw_pal::service_ctl::ServiceResult> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+     |
+     = help: try reducing the size of `sw_pal::ServiceResult`, for example by boxing large elements or replacing it with `Box<sw_pal::ServiceResult>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2396:30
+     |
+2396 | ...   error_code: Some(ErrorCode::NeedsSudo.as_str().into()), hint: Some("systemd-system 更新須加 --with-sudo".into()), phase: Som...
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `ErrorCode::NeedsSudo.as_str()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2466:30
+     |
+2466 |             error_code: Some(ErrorCode::InternalError.as_str().into()),
+     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `ErrorCode::InternalError.as_str()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2468:25
+     |
+2468 |             phase: Some("supervisor_install".into()),
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"supervisor_install"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2478:34
+     |
+2478 | ...e: Some(ErrorCode::InternalError.as_str().into()), hint: Some("systemd daemon-reload 失敗".into()), phase: Some("supervisor_ins...
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `ErrorCode::InternalError.as_str()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/src/rollback.rs:2478:136
+     |
+2478 | ...nto()), phase: Some("supervisor_install".into()),
+     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"supervisor_install"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:2501:6
+     |
+2501 | ) -> Result<PyDict, OpFailure> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+     |
+     = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this function has too many arguments (9/7)
+    --> crates/sw-cli/src/rollback.rs:2491:1
+     |
+2491 | / fn start_and_verify(
+2492 | |     ctx: &mut CliCtx<'_>,
+2493 | |     root: &InstallRoot,
+2494 | |     mode: &SupervisionMode,
+...    |
+2500 | |     daemon_snapshot: Option<&DaemonSnapshot>,
+2501 | | ) -> Result<PyDict, OpFailure> {
+     | |______________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this `if` statement can be collapsed
+    --> crates/sw-cli/src/rollback.rs:2570:5
+     |
+2570 | /     if !status.get_truthy("ok") {
+2571 | |         if should_start { return Err(OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_start_and_verify", reas...
+2572 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+2570 ~     if !status.get_truthy("ok")
+2571 ~         && should_start { return Err(OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_start_and_verify", reason: Some("health_failed"), message: Some("新版 daemon health.status 未回報成功".into()), detail: status }); }
+     |
+
+warning: this function has too many arguments (11/7)
+    --> crates/sw-cli/src/rollback.rs:2644:1
+     |
+2644 | / fn revert_after_failure(
+2645 | |     ctx: &mut CliCtx<'_>,
+2646 | |     root: InstallRoot,
+2647 | |     mut journal: Journal,
+...    |
+2655 | |     target_mode: &SupervisionMode,
+2656 | | ) -> UpdateReport {
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: called `unwrap_err` on `restore_result` after checking its variant with `is_ok`
+    --> crates/sw-cli/src/rollback.rs:2788:79
+     |
+2764 |     if restore_result.is_ok() {
+     |     ------------------------- help: try: `if let Err(<item>) = restore_result`
+...
+2788 |         let mut detail = PyDict::from_pairs(vec![("message".into(), str_value(restore_result.unwrap_err()))]);
+     |                                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_unwrap
+     = note: `#[warn(clippy::unnecessary_unwrap)]` on by default
+
+warning: the `Err`-variant returned from this closure is very large
+    --> crates/sw-cli/src/rollback.rs:2739:23
+     |
+2739 |             .and_then(|_| confirm_released(ctx, &original.supervisor.endpoint, original.daemon.as_ref()))
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+     |
+     = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this `if` has identical blocks
+    --> crates/sw-cli/src/rollback.rs:2995:116
+     |
+2995 |       if path.is_absolute() { path } else if recorded.starts_with("versions/") || recorded.starts_with("versions\\") {
+     |  ____________________________________________________________________________________________________________________^
+2996 | |         root.versions.join(version)
+2997 | |     } else {
+     | |_____^
+     |
+note: same as this
+    --> crates/sw-cli/src/rollback.rs:2997:12
+     |
+2997 |       } else {
+     |  ____________^
+2998 | |         root.versions.join(version)
+2999 | |     }
+     | |_____^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#if_same_then_else
+     = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:3106:104
+     |
+3106 | ...daemon_running: bool) -> Result<SupervisorSnapshot, OpFailure> {
+     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+     |
+     = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:3146:91
+     |
+3146 | fn confirm_released(ctx: &CliCtx<'_>, endpoint: &str, daemon: Option<&DaemonSnapshot>) -> Result<Option<&'static str>, OpFailure> {
+     |                                                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 144 bytes
+     |
+     = help: try reducing the size of `rollback::OpFailure`, for example by boxing large elements or replacing it with `Box<rollback::OpFailure>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: this function has too many arguments (9/7)
+    --> crates/sw-cli/src/rollback.rs:3733:1
+     |
+3733 | / fn restore_supervisor_and_daemon(
+3734 | |     ctx: &mut CliCtx<'_>,
+3735 | |     root: &InstallRoot,
+3736 | |     original: &OriginalSnapshot,
+...    |
+3742 | |     progress: &mut RestoreProgress,
+3743 | | ) -> Result<PyDict, String> {
+     | |___________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+warning: this `map_or` can be simplified
+    --> crates/sw-cli/src/rollback.rs:3775:8
+     |
+3775 |     if target_hold.map_or(true, |hold| hold.mode != *mode) && *mode != SupervisionMode::OnDemand {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_none_or` instead
+     |
+3775 -     if target_hold.map_or(true, |hold| hold.mode != *mode) && *mode != SupervisionMode::OnDemand {
+3775 +     if target_hold.is_none_or(|hold| hold.mode != *mode) && *mode != SupervisionMode::OnDemand {
+     |
+
+warning: redundant closure
+    --> crates/sw-cli/src/rollback.rs:4293:60
+     |
+4293 |     value.insert("original", journal.original.as_ref().map(|original| original_value(original)).unwrap_or(PyValue::Null));
+     |                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `original_value`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#redundant_closure
+     = note: `#[warn(clippy::redundant_closure)]` on by default
+
+warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+    --> crates/sw-cli/src/rollback.rs:4624:5
+     |
+4624 | /     match &result {
+4625 | |         Err(crate::setup_cmd::ReconcileError::WaitOldExitTimeout { .. }) => {
+4626 | |             let mut response = output_error(ErrorCode::Timeout, "舊 daemon 在等待期間仍未結束；自動啟動 hold 保留，請確認狀態後...
+4627 | |             response.insert("phase", PyValue::Str("reconcile_wait_old_exit".into()));
+...    |
+4632 | |         _ => {}
+4633 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_match
+help: try
+     |
+4624 ~     if let Err(crate::setup_cmd::ReconcileError::WaitOldExitTimeout { .. }) = &result {
+4625 ~         let mut response = output_error(ErrorCode::Timeout, "舊 daemon 在等待期間仍未結束；自動啟動 hold 保留，請確認狀態後重跑 supervision-mode set");
+4626 +         response.insert("phase", PyValue::Str("reconcile_wait_old_exit".into()));
+4627 +         response.insert("previous_mode", PyValue::Str(old.as_str().into()));
+4628 +         if force_requested { response.insert("force_ignored", PyValue::Bool(true)); }
+4629 +         return emit(ctx, response, "supervision-mode", 1);
+4630 +     }
+     |
+
+warning: the `Err`-variant returned from this function is very large
+    --> crates/sw-cli/src/rollback.rs:4923:6
+     |
+4923 | ) -> Result<(), sw_pal::service_ctl::ServiceResult> {
+     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 168 bytes
+     |
+     = help: try reducing the size of `sw_pal::ServiceResult`, for example by boxing large elements or replacing it with `Box<sw_pal::ServiceResult>`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: derefed type is same as origin
+    --> crates/sw-cli/src/rollback.rs:4932:43
+     |
+4932 |     detail.insert("error_code", str_value(error.error_code.as_deref().unwrap_or(ErrorCode::InternalError.as_str())));
+     |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `error.error_code`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_option_as_deref
+
+warning: derefed type is same as origin
+    --> crates/sw-cli/src/rollback.rs:4933:38
+     |
+4933 |     detail.insert("phase", str_value(error.phase.as_deref().unwrap_or("autostart_release")));
+     |                                      ^^^^^^^^^^^^^^^^^^^^^^ help: try: `error.phase`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_option_as_deref
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> crates/sw-cli/src/setup_cmd.rs:2430:45
+     |
+2430 |             match default_com0com_pair(ctx, &bundle) {
+     |                                             ^^^^^^^ help: change this to: `bundle`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+     = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: stripping a prefix manually
+  --> crates/sw-cli/src/wslconf.rs:25:31
+   |
+25 |             let Some(close) = trimmed[1..].find(']').map(|position| position + 1) else {
+   |                               ^^^^^^^^^^^^
+   |
+note: the prefix was tested here
+  --> crates/sw-cli/src/wslconf.rs:24:9
+   |
+24 |         if trimmed.starts_with('[') {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_strip
+   = note: `#[warn(clippy::manual_strip)]` on by default
+help: try using the `strip_prefix` method
+   |
+24 ~         if let Some(<stripped>) = trimmed.strip_prefix('[') {
+25 ~             let Some(close) = <stripped>.find(']').map(|position| position + 1) else {
+   |
+
+warning: `sw-cli` (lib test) generated 81 warnings (61 duplicates) (run `cargo clippy --fix --lib -p sw-cli --tests -- --cap-lints warn` to apply 8 suggestions)
+warning: `sw-cli` (lib) generated 81 warnings (20 duplicates) (run `cargo clippy --fix --lib -p sw-cli -- --cap-lints warn` to apply 25 suggestions)
+warning: this `map_or` can be simplified
+   --> crates/sw-cli/tests/emitted_codes.rs:230:27
+    |
+230 |                 } else if p.extension().map_or(false, |ext| ext == "rs") {
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_some_and` instead
+    |
+230 -                 } else if p.extension().map_or(false, |ext| ext == "rs") {
+230 +                 } else if p.extension().is_some_and(|ext| ext == "rs") {
+    |
+
+warning: `sw-cli` (test "emitted_codes") generated 1 warning (run `cargo clippy --fix --test "emitted_codes" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: the borrowed expression implements the required traits
+   --> crates/sw-cli/tests/support/mod.rs:973:33
+    |
+973 |         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+    |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{pid}")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+    = note: `#[warn(clippy::needless_borrows_for_generic_args)]` on by default
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:1002:33
+     |
+1002 |         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+     |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: explicit call to `.into_iter()` in function argument accepting `IntoIterator`
+    --> crates/sw-cli/tests/support/mod.rs:1388:49
+     |
+1388 |         for version in std::iter::once(v).chain(prev.into_iter()) {
+     |                                                 ^^^^^^^^^^^^^^^^
+     |
+note: this parameter accepts any `IntoIterator`, so you don't need to call `.into_iter()`
+    --> /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/iter/traits/iterator.rs:515:11
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+     = note: `#[warn(clippy::useless_conversion)]` on by default
+help: consider removing the `.into_iter()`
+     |
+1388 -         for version in std::iter::once(v).chain(prev.into_iter()) {
+1388 +         for version in std::iter::once(v).chain(prev) {
+     |
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:2015:33
+     |
+2015 |         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+     |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: this boolean expression can be simplified
+    --> crates/sw-cli/tests/support/mod.rs:2060:40
+     |
+2060 |         if !self.restart_on_failure || !self.daemon_exit_code_after_handoff.is_some_and(|rc| rc != 0) {
+     |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `self.daemon_exit_code_after_handoff.is_none_or(|rc| rc == 0)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#nonminimal_bool
+     = note: `#[warn(clippy::nonminimal_bool)]` on by default
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:2053:37
+     |
+2053 |             let token = &sha256_hex(&format!("handoff-{old_pid}"))[..32];
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{old_pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:2072:41
+     |
+2072 |                 let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+     |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:2357:45
+     |
+2357 |                     let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
+     |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("handoff-{pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: type parameter `T` goes unused in function definition
+    --> crates/sw-cli/tests/support/mod.rs:2708:22
+     |
+2708 |     pub fn from_slice<T>(_bytes: &[u8]) -> Result<Value, String> {
+     |                      ^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#extra_unused_type_parameters
+     = note: `#[warn(clippy::extra_unused_type_parameters)]` on by default
+help: consider removing the parameter
+     |
+2708 -     pub fn from_slice<T>(_bytes: &[u8]) -> Result<Value, String> {
+2708 +     pub fn from_slice(_bytes: &[u8]) -> Result<Value, String> {
+     |
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/support/mod.rs:2930:54
+     |
+2930 |     alive_state_with_identity(role, pid, &sha256_hex(&format!("{role}|{pid}")))
+     |                                                      ^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("{role}|{pid}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: this `map_or` can be simplified
+  --> crates/sw-cli/tests/mgmt_graceful_stop.rs:92:13
+   |
+92 |             exit.map_or(true, |exit| now < at + drain + exit)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+   = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+   |
+92 -             exit.map_or(true, |exit| now < at + drain + exit)
+92 +             exit.is_none_or(|exit| now < at + drain + exit)
+   |
+
+warning: the `Err`-variant returned from this function is very large
+  --> crates/sw-cli/tests/mgmt_graceful_stop.rs:97:45
+   |
+97 | fn on_demand_revert_handoff(t: &TestEnv) -> Result<sw_cli::graceful_stop::StopReport, StopFailure> {
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `Err`-variant is at least 176 bytes
+   |
+   = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+   = note: `#[warn(clippy::result_large_err)]` on by default
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:98:20
+    |
+ 98 |       t.with_cli_ctx(|ctx| {
+    |  ____________________^
+ 99 | |         graceful_stop_with(
+100 | |             ctx,
+101 | |             &SupervisionMode::OnDemand,
+...   |
+108 | |     })
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:249:27
+    |
+249 |               .with_cli_ctx(|ctx| {
+    |  ___________________________^
+250 | |                 graceful_stop_with(
+251 | |                     ctx,
+252 | |                     &mode,
+...   |
+259 | |             })
+    | |_____________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:302:23
+    |
+302 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+303 | |             graceful_stop_with(
+304 | |                 ctx,
+305 | |                 &SupervisionMode::SystemdUser,
+...   |
+312 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:329:23
+    |
+329 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+330 | |             graceful_stop_with(
+331 | |                 ctx,
+332 | |                 &SupervisionMode::SystemdUser,
+...   |
+339 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:363:23
+    |
+363 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+364 | |             graceful_stop_with(
+365 | |                 ctx,
+366 | |                 &SupervisionMode::WindowsService,
+...   |
+373 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:403:28
+    |
+403 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+404 | |         graceful_stop_with(
+405 | |             ctx,
+406 | |             &SupervisionMode::SystemdUser,
+...   |
+413 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:430:23
+    |
+430 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+431 | |             graceful_stop_with(
+432 | |                 ctx,
+433 | |                 &SupervisionMode::OnDemand,
+...   |
+440 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:466:27
+    |
+466 |               .with_cli_ctx(|ctx| {
+    |  ___________________________^
+467 | |                 graceful_stop_with(
+468 | |                     ctx,
+469 | |                     &SupervisionMode::SystemdUser,
+...   |
+476 | |             })
+    | |_____________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:498:33
+    |
+498 |       let result = t.with_cli_ctx(|ctx| {
+    |  _________________________________^
+499 | |         graceful_stop_with(
+500 | |             ctx,
+501 | |             &SupervisionMode::SystemdUser,
+...   |
+508 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:519:33
+    |
+519 |       let result = t.with_cli_ctx(|ctx| {
+    |  _________________________________^
+520 | |         graceful_stop_with(
+521 | |             ctx,
+522 | |             &SupervisionMode::SystemdUser,
+...   |
+529 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:554:23
+    |
+554 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+555 | |             graceful_stop_with(
+556 | |                 ctx,
+557 | |                 &SupervisionMode::SystemdUser,
+...   |
+564 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:588:28
+    |
+588 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+589 | |         graceful_stop_with(
+590 | |             ctx,
+591 | |             &SupervisionMode::SystemdUser,
+...   |
+598 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:815:23
+    |
+815 |           .with_cli_ctx(|ctx| {
+    |  _______________________^
+816 | |             graceful_stop_with(
+817 | |                 ctx,
+818 | |                 &SupervisionMode::SystemdUser,
+...   |
+825 | |         })
+    | |_________^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:845:28
+    |
+845 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+846 | |         graceful_stop_with(
+847 | |             ctx,
+848 | |             &SupervisionMode::SystemdUser,
+...   |
+855 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:870:28
+    |
+870 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+871 | |         graceful_stop_with(
+872 | |             ctx,
+873 | |             &SupervisionMode::SystemdUser,
+...   |
+880 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:903:28
+    |
+903 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+904 | |         graceful_stop_with(
+905 | |             ctx,
+906 | |             &SupervisionMode::SystemdUser,
+...   |
+913 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: the `Err`-variant returned from this closure is very large
+   --> crates/sw-cli/tests/mgmt_graceful_stop.rs:943:28
+    |
+943 |       let r = t.with_cli_ctx(|ctx| {
+    |  ____________________________^
+944 | |         graceful_stop_with(
+945 | |             ctx,
+946 | |             &SupervisionMode::SystemdUser,
+...   |
+953 | |     });
+    | |_____^ the `Err`-variant is at least 176 bytes
+    |
+    = help: try reducing the size of `sw_cli::graceful_stop::StopFailure`, for example by boxing large elements or replacing it with `Box<sw_cli::graceful_stop::StopFailure>`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#result_large_err
+
+warning: `sw-cli` (test "wintask_scoped_stop") generated 10 warnings (10 duplicates)
+warning: used `assert_eq!` with a literal bool
+   --> crates/sw-cli/tests/mgmt_doctor.rs:780:5
+    |
+780 |     assert_eq!(b(check, "advisory"), false);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+    = note: `#[warn(clippy::bool_assert_comparison)]` on by default
+help: replace it with `assert!(..)`
+    |
+780 -     assert_eq!(b(check, "advisory"), false);
+780 +     assert!(!b(check, "advisory"));
+    |
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/sw-cli/tests/mgmt_doctor.rs:783:5
+    |
+783 |     assert_eq!(b(check, "ok"), false);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+    |
+783 -     assert_eq!(b(check, "ok"), false);
+783 +     assert!(!b(check, "ok"));
+    |
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/sw-cli/tests/mgmt_doctor.rs:804:5
+    |
+804 |     assert_eq!(b(check, "ok"), false);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+    |
+804 -     assert_eq!(b(check, "ok"), false);
+804 +     assert!(!b(check, "ok"));
+    |
+
+warning: used `assert_eq!` with a literal bool
+   --> crates/sw-cli/tests/mgmt_doctor.rs:835:5
+    |
+835 |     assert_eq!(b(check, "ok"), false);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+    |
+835 -     assert_eq!(b(check, "ok"), false);
+835 +     assert!(!b(check, "ok"));
+    |
+
+warning: `sw-cli` (test "mgmt_graceful_stop") generated 29 warnings (run `cargo clippy --fix --test "mgmt_graceful_stop" -p sw-cli -- --cap-lints warn` to apply 11 suggestions)
+warning: `sw-cli` (test "mgmt_doctor") generated 14 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_doctor" -p sw-cli -- --cap-lints warn` to apply 4 suggestions)
+warning: `sw-cli` (test "mgmt_remote") generated 10 warnings (10 duplicates)
+warning: the following explicit lifetimes could be elided: 'a
+   --> crates/sw-cli/tests/mgmt_legacy_handoff.rs:190:9
+    |
+190 | fn step<'a>(j: &'a PyValue, op: &str, name: &str) -> PyValue {
+    |         ^^      ^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_lifetimes
+    = note: `#[warn(clippy::needless_lifetimes)]` on by default
+help: elide the lifetimes
+    |
+190 - fn step<'a>(j: &'a PyValue, op: &str, name: &str) -> PyValue {
+190 + fn step(j: &PyValue, op: &str, name: &str) -> PyValue {
+    |
+
+warning: `sw-cli` (test "mgmt_legacy_handoff") generated 11 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_legacy_handoff" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: `sw-cli` (test "rollback_holders_p7") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "rollback_entry_symlink") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "mgmt_connect") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "mgmt_service") generated 10 warnings (10 duplicates)
+warning: this `if let` can be collapsed into the outer `if let`
+   --> crates/sw-cli/tests/cli_spec_schema.rs:120:13
+    |
+120 | /             if let PyValue::Str(expected) = expected {
+121 | |                 assert_eq!(
+122 | |                     action.dest, expected,
+123 | |                     "{context} flags={expected_flags:?} dest"
+124 | |                 );
+125 | |             }
+    | |_____________^
+    |
+help: the outer pattern can be modified to include the inner pattern
+   --> crates/sw-cli/tests/cli_spec_schema.rs:119:21
+    |
+119 |         if let Some(expected) = expected.0.get("dest") {
+    |                     ^^^^^^^^ replace this binding
+120 |             if let PyValue::Str(expected) = expected {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^ with this pattern
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_match
+    = note: `#[warn(clippy::collapsible_match)]` on by default
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> crates/sw-cli/tests/cli_spec_schema.rs:151:37
+    |
+151 |                 .map(|values| values.iter().copied().collect::<Vec<_>>())
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+    = note: `#[warn(clippy::iter_cloned_collect)]` on by default
+
+warning: useless use of `format!`
+   --> crates/sw-cli/tests/mgmt_layout.rs:774:28
+    |
+774 |     t.write_file(&outside, format!("cli-0.4.0\n").as_bytes());
+    |                            ^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `"cli-0.4.0\n".to_string()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_format
+    = note: `#[warn(clippy::useless_format)]` on by default
+
+warning: this can be `std::io::Error::other(_)`
+  --> crates/sw-cli/tests/run_process.rs:47:13
+   |
+47 |         Err(io::Error::new(io::ErrorKind::Other, "flush failed"))
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#io_other_error
+   = note: `#[warn(clippy::io_other_error)]` on by default
+help: use `std::io::Error::other`
+   |
+47 -         Err(io::Error::new(io::ErrorKind::Other, "flush failed"))
+47 +         Err(io::Error::other("flush failed"))
+   |
+
+warning: `sw-cli` (test "cli_spec_schema") generated 2 warnings (run `cargo clippy --fix --test "cli_spec_schema" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: spawned process is never `wait()`ed on
+    --> crates/sw-cli/tests/mgmt_layout.rs:1341:23
+     |
+1341 |       let mut running = std::process::Command::new(root.bin.join("serialwrap.exe"))
+     |  _______________________^
+1342 | |         .args(["-n", "30", "127.0.0.1"])
+1343 | |         .stdout(std::process::Stdio::null())
+1344 | |         .spawn()
+1345 | |         .expect("啟動舊 CLI 失敗");
+     | |__________________________________^
+     |
+     = help: consider calling `.wait()`
+     = note: not doing so might leave behind zombie processes
+     = note: see https://doc.rust-lang.org/stable/std/process/struct.Child.html#warning
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#zombie_processes
+     = note: `#[warn(clippy::zombie_processes)]` on by default
+
+warning: `sw-cli` (test "run_process") generated 11 warnings (10 duplicates) (run `cargo clippy --fix --test "run_process" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: `sw-cli` (test "mgmt_layout") generated 12 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_layout" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: `sw-cli` (test "service_wintask") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "update_guard") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "mgmt_com0com") generated 10 warnings (10 duplicates)
+warning: `sw-cli` (test "mgmt_terminal") generated 10 warnings (10 duplicates)
+warning: equality checks against false can be replaced by a negation
+   --> crates/sw-cli/tests/mgmt_daemon.rs:727:13
+    |
+727 |     assert!(fbool(&j, "ok") == false);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `!fbool(&j, "ok")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_comparison
+    = note: `#[warn(clippy::bool_comparison)]` on by default
+
+warning: `sw-cli` (test "mgmt_daemon") generated 11 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_daemon" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: the borrowed expression implements the required traits
+   --> crates/sw-cli/tests/mgmt_update.rs:533:20
+    |
+533 |         sha256_hex(&t.version_bytes("0.4.0", "bin/serialwrap.exe"))
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `t.version_bytes("0.4.0", "bin/serialwrap.exe")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: the borrowed expression implements the required traits
+    --> crates/sw-cli/tests/mgmt_setup.rs:1715:20
+     |
+1715 |         sha256_hex(&std::fs::read_to_string(&skill_path).unwrap()),
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `std::fs::read_to_string(&skill_path).unwrap()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+warning: `sw-cli` (test "support_selftest") generated 10 warnings (10 duplicates)
+warning: used `assert_eq!` with a literal bool
+    --> crates/sw-cli/tests/mgmt_update.rs:1244:5
+     |
+1244 | /     assert_eq!(
+1245 | |         t.service()
+1246 | |             .action(&SupervisionMode::SystemdUser, ServiceAction::Start, false)
+1247 | |             .ok,
+1248 | |         false,
+1249 | |         "RefuseManualStart：外部 start 被拒"
+1250 | |     );
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+     = note: `#[warn(clippy::bool_assert_comparison)]` on by default
+help: replace it with `assert!(..)`
+     |
+1244 ~     assert!(
+1245 ~         !t.service()
+1246 |             .action(&SupervisionMode::SystemdUser, ServiceAction::Start, false)
+1247 ~             .ok,
+     |
+
+warning: used `assert_eq!` with a literal bool
+    --> crates/sw-cli/tests/mgmt_update.rs:2178:5
+     |
+2178 |     assert_eq!(b(update, "reverted"), false, "{out}");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+     |
+2178 -     assert_eq!(b(update, "reverted"), false, "{out}");
+2178 +     assert!(!b(update, "reverted"), "{out}");
+     |
+
+warning: used `assert_eq!` with a literal bool
+    --> crates/sw-cli/tests/mgmt_update.rs:2179:5
+     |
+2179 |     assert_eq!(b(update, "revert_pending"), true, "{out}");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+     |
+2179 -     assert_eq!(b(update, "revert_pending"), true, "{out}");
+2179 +     assert!(b(update, "revert_pending"), "{out}");
+     |
+
+warning: `sw-cli` (test "mgmt_setup") generated 11 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_setup" -p sw-cli -- --cap-lints warn` to apply 1 suggestion)
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:2801:26
+     |
+2801 |         error_code: Some("NEEDS_SUDO".into()),
+     |                          ^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"NEEDS_SUDO"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:2803:21
+     |
+2803 |         phase: Some("autostart_hold".into()),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"autostart_hold"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:2834:26
+     |
+2834 |         error_code: Some("INTERNAL_ERROR".into()),
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"INTERNAL_ERROR"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:2836:21
+     |
+2836 |         phase: Some("autostart_hold".into()),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"autostart_hold"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:3179:26
+     |
+3179 |         error_code: Some("INTERNAL_ERROR".into()),
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"INTERNAL_ERROR"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:3181:21
+     |
+3181 |         phase: Some("autostart_release".into()),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"autostart_release"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: used `assert_eq!` with a literal bool
+    --> crates/sw-cli/tests/mgmt_update.rs:3184:5
+     |
+3184 |     assert_eq!(rec.ok, false);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+     |
+3184 -     assert_eq!(rec.ok, false);
+3184 +     assert!(!rec.ok);
+     |
+
+warning: used `assert_eq!` with a literal bool
+    --> crates/sw-cli/tests/mgmt_update.rs:3185:5
+     |
+3185 |     assert_eq!(rec.journal_kept, true);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+help: replace it with `assert!(..)`
+     |
+3185 -     assert_eq!(rec.journal_kept, true);
+3185 +     assert!(rec.journal_kept);
+     |
+
+warning: useless conversion to the same type: `&str`
+    --> crates/sw-cli/tests/mgmt_update.rs:3198:21
+     |
+3198 |         phase: Some("autostart_release".into()),
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"autostart_release"`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: `sw-cli` (test "mgmt_update") generated 23 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_update" -p sw-cli -- --cap-lints warn` to apply 13 suggestions)
+warning: useless conversion to the same type: `&str`
+   --> crates/sw-cli/tests/mgmt_supervision_switch.rs:944:26
+    |
+944 |         error_code: Some("INTERNAL_ERROR".into()),
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"INTERNAL_ERROR"`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: useless conversion to the same type: `&str`
+   --> crates/sw-cli/tests/mgmt_supervision_switch.rs:946:21
+    |
+946 |         phase: Some("autostart_release".into()),
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `"autostart_release"`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+warning: `sw-cli` (test "mgmt_supervision_switch") generated 12 warnings (10 duplicates) (run `cargo clippy --fix --test "mgmt_supervision_switch" -p sw-cli -- --cap-lints warn` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.68s

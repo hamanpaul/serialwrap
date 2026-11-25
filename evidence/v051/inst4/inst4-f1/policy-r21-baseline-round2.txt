@@ -1,0 +1,5 @@
+COMMAND: python3 R-21 baseline check over policy-base-final-round2.txt and policy-plain-final-round2.txt
+HEAD: f3932f2b7df5b11f6717a189593cb44b771366b0
+R21 structural paths parsed: 13
+Paths tracked at start HEAD and byte-identical: 13
+Changed since start HEAD: 0
