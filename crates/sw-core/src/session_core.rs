@@ -8680,6 +8680,16 @@ impl SessionCore {
                 }
                 CmdOutcome::Result(prompt_timeout_none())
             }
+            OpOutcome::CompletionUncertain { stdout } => {
+                self.set_terminal_capture(cmd_id, Some(stdout.clone()), Some("PROMPT_TIMEOUT"), now);
+                CmdOutcome::Result(pydict! {
+                    "ok" => false,
+                    "error_code" => "PROMPT_TIMEOUT",
+                    "stdout" => stdout,
+                    "partial" => true,
+                    "recovery_action" => "NONE",
+                })
+            }
             // P6 Task 7（D-10）／OD-74：可信 human 的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner`
             // human 分支，`session_manager.py:6476-6504`）；可信判定同上，不看 source 字首。
             OpOutcome::RebootExpected if self.fg_origin_is_human() => {

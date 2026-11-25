@@ -40,7 +40,7 @@ use sw_core::session_core::{
     CoreDeps, Effect, PublicCtx, SessionCore, SessionRequest, SessionState,
 };
 use sw_core::state_store::StateDelta;
-use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterHandle};
+use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterContext, TxWriterHandle};
 use sw_core::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use sw_core::wal::{WalAppendReq, WalConfig, WalHealthFanout, WalWriter};
 use sw_core::Mono;
@@ -3417,8 +3417,11 @@ impl TxRig {
             cancel,
             fence.clone(),
             wal,
-            TXRIG_EPOCH,
-            ctl_tx,
+            TxWriterContext {
+                rx: sw_core::uart_bridge::RxShared::new(65_536, 0),
+                epoch: TXRIG_EPOCH,
+                control: ctl_tx,
+            },
         );
         std::mem::forget(_stop);
         TxRig {

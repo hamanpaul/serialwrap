@@ -277,6 +277,113 @@ mod shutdown_publication_tests {
     }
 }
 
+#[cfg(test)]
+mod observed_tx_submit_tests {
+    use super::*;
+    use crate::uart_bridge::RxShared;
+
+    fn permit(op_id: u64, class: TxClass) -> TxPermit {
+        TxPermit {
+            op_id: OpId(op_id),
+            epoch: 7,
+            owner_gen: 0,
+            fsm_gen: 0,
+            class,
+            source: "test".into(),
+            cmd_id: Some("cmd".into()),
+            log: false,
+            input_epoch: None,
+            replay_hold: None,
+            probe_id: None,
+        }
+    }
+
+    #[test]
+    fn command_boundary_retries_after_would_block() {
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(3, TxClass::Command);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            human_payload: None,
+            human_raw_input: false,
+            command_op_id: Some(3),
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::WouldBlock),
+            Ok(SubmitStep::WouldBlock)
+        ));
+        rx.append(b"stale prompt", 1, 7, 1);
+        let expected_offset = rx.snapshot_len();
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+
+        assert_eq!(
+            rx.command_tx_boundary(3).map(|boundary| boundary.rx_offset),
+            Some(expected_offset),
+            "command RX 起點應取實際接受寫入前的 watermark"
+        );
+    }
+
+    #[test]
+    fn human_tx_observation_tracks_only_accepted_segments() {
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(4, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            human_payload: Some(b"abc\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::WouldBlock),
+            Ok(SubmitStep::WouldBlock)
+        ));
+        assert_eq!(rx.human_tx_state(), crate::uart_bridge::HumanTxState::default());
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(3)),
+            Ok(SubmitStep::Accepted(3))
+        ));
+        let partial = rx.human_tx_state();
+        assert_eq!(partial.generation, 1);
+        assert!(partial.raw_line_open, "尚未接受換行時 raw line 仍在途");
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+        let complete = rx.human_tx_state();
+        assert_eq!(complete.generation, 2);
+        assert!(!complete.raw_line_open, "接受換行後 raw line 才結束");
+    }
+}
+
 impl Fence {
     pub fn new() -> Arc<Fence> {
         Arc::new(Fence(
@@ -654,6 +761,62 @@ impl SubmitGate for FenceSubmitGate<'_> {
     }
 }
 
+/// fence 已准許後、OS submit 前記錄可信 human TX 或 agent command RX 邊界。
+struct ObservedTxSubmitGate<'a, 'b> {
+    inner: &'b FenceSubmitGate<'a>,
+    rx: &'b crate::uart_bridge::RxShared,
+    human_payload: Option<&'b [u8]>,
+    human_raw_input: bool,
+    command_op_id: Option<u64>,
+    command_boundary_recorded: Cell<bool>,
+    accepted_human_bytes: Cell<usize>,
+    human_observation_unknown: Cell<bool>,
+}
+
+impl SubmitGate for ObservedTxSubmitGate<'_, '_> {
+    fn submit(
+        &self,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked> {
+        self.inner.submit(&mut || {
+            let human_payload = (!self.human_observation_unknown.get())
+                .then(|| {
+                    self.human_payload.map(|payload| {
+                        (
+                            payload,
+                            self.human_raw_input,
+                            self.accepted_human_bytes.get(),
+                        )
+                    })
+                })
+                .flatten();
+            let (step, command_boundary_recorded) = self.rx.observe_tx_submit(
+                self.command_op_id,
+                self.command_boundary_recorded.get(),
+                human_payload,
+                os_submit,
+            );
+            self.command_boundary_recorded
+                .set(command_boundary_recorded);
+            match &step {
+                SubmitStep::Accepted(count) if *count > 0 && human_payload.is_some() => {
+                    let accepted = self
+                        .accepted_human_bytes
+                        .get()
+                        .saturating_add(*count)
+                        .min(self.human_payload.map_or(0, <[u8]>::len));
+                    self.accepted_human_bytes.set(accepted);
+                }
+                SubmitStep::Pending if human_payload.is_some() => {
+                    self.human_observation_unknown.set(true);
+                }
+                _ => {}
+            }
+            step
+        })
+    }
+}
+
 /// 同一時間可未結的聚合緩衝上限（P8 Task 5）。每個 epoch 只有一個前景傳輸，超過即為程式錯誤，
 /// 新開的 `Append` 一律不提交（零 TX）。
 pub const TX_AGGREGATE_OPEN_MAX: usize = 8;
@@ -882,6 +1045,7 @@ struct TxWriter {
     settle: Receiver<OpId>,
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
+    rx: Arc<crate::uart_bridge::RxShared>,
     /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
     aggregates: IndexMap<AggregateKey, Vec<u8>>,
 }
@@ -1109,7 +1273,35 @@ impl TxWriter {
                         permit: &job.permit,
                         last_reject: Cell::new(None),
                     };
-                    let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
+                    let human_tx = !job.payload.is_empty()
+                        && is_trusted_human_tx(job.permit.class);
+                    let command_tx = !job.payload.is_empty()
+                        && job.permit.class == TxClass::Command;
+                    let result = if human_tx || command_tx {
+                        let observed_gate = ObservedTxSubmitGate {
+                            inner: &gate,
+                            rx: &self.rx,
+                            human_payload: human_tx.then_some(job.payload.as_slice()),
+                            human_raw_input: is_raw_human_input(job.permit.class),
+                            command_op_id: command_tx.then_some(job.permit.op_id.0),
+                            command_boundary_recorded: Cell::new(false),
+                            accepted_human_bytes: Cell::new(0),
+                            human_observation_unknown: Cell::new(false),
+                        };
+                        self.writer
+                            .write_gated(&job.payload, &self.cancel, &observed_gate)
+                    } else {
+                        self.writer.write_gated(&job.payload, &self.cancel, &gate)
+                    };
+                    let confirmed = confirmed_bytes(&result.outcome);
+                    let unknown = matches!(&result.outcome, TxOutcome::Unknown { .. });
+                    if human_tx && is_raw_human_input(job.permit.class) {
+                        self.rx
+                            .finish_human_raw_tx(&job.payload, confirmed, unknown);
+                    }
+                    if command_tx {
+                        self.rx.finish_command_tx(&job.payload, confirmed);
+                    }
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
                     let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
                     let (result, reject) =
@@ -1396,15 +1588,31 @@ fn confirmed_bytes(outcome: &TxOutcome) -> usize {
     }
 }
 
+fn is_trusted_human_tx(class: TxClass) -> bool {
+    matches!(
+        class,
+        TxClass::HumanRaw | TxClass::HumanReplay | TxClass::HumanLine
+    )
+}
+
+fn is_raw_human_input(class: TxClass) -> bool {
+    matches!(class, TxClass::HumanRaw | TxClass::HumanReplay | TxClass::LeaseOwner)
+}
+
 /// 啟動 TX writer thread（唯一呼叫 `SerialWriter::write_gated` 的地方）。
+pub struct TxWriterContext {
+    pub rx: Arc<crate::uart_bridge::RxShared>,
+    pub epoch: u64,
+    pub control: Sender<ControlEvent>,
+}
+
 pub fn spawn_tx_writer(
     com: String,
     writer: Box<dyn SerialWriter>,
     cancel: CancelToken,
     fence: Arc<Fence>,
     wal: Arc<WalWriter>,
-    epoch: u64,
-    control: Sender<ControlEvent>,
+    context: TxWriterContext,
 ) -> (
     TxWriterHandle,
     TxWriterStop,
@@ -1414,6 +1622,7 @@ pub fn spawn_tx_writer(
     let (settle_tx, settle_rx) = crossbeam_channel::bounded(TX_SETTLE_QUEUE_MAX);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let gauge = Arc::new(LedgerGaugeCells::default());
+    let TxWriterContext { rx, epoch, control } = context;
     let handle = TxWriterHandle {
         jobs: job_tx,
         settle: settle_tx,
@@ -1433,6 +1642,7 @@ pub fn spawn_tx_writer(
         settle: settle_rx,
         stop: stop_rx,
         gauge,
+        rx,
         aggregates: IndexMap::new(),
     };
     let join = std::thread::spawn(move || worker.run());

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Sender};
 use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
-    SerialReader, SerialWriter,
+    SerialReader, SerialWriter, SubmitStep,
 };
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
@@ -19,7 +19,7 @@ use sw_proto::pyre::PyRegex;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
 use crate::tx_writer::{
-    spawn_tx_writer, EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop,
+    spawn_tx_writer, EvidenceGap, Fence, TxLedger, TxWriterContext, TxWriterHandle, TxWriterStop,
 };
 use crate::wal::{WalAppendReq, WalWriter};
 use crate::Mono;
@@ -43,6 +43,11 @@ struct RxWindow {
     watermark: (u64, u64),
     revision: u64,
     rate: VecDeque<(Mono, u64)>,
+    human_tx_generation: u64,
+    last_human_tx_rx_offset: u64,
+    human_raw_line_open: bool,
+    command_tx_boundary: Option<(u64, CommandTxBoundary)>,
+    tx_submit_pending: bool,
 }
 
 impl RxWindow {
@@ -269,6 +274,109 @@ impl RxShared {
             .to_string()
     }
 
+    /// 取得同一個 RX watermark 下的 snapshot；若窗口已修剪會把 `base` 推進到保留資料起點。
+    pub fn snapshot_from(&self, from: u64) -> RxSnapshot {
+        let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        snapshot_from_window(&window, from)
+    }
+
+    /// 回傳最近可信 human TX 世代、其 TX 前 RX offset 與目前 raw 輸入是否仍是半行。
+    pub fn human_tx_state(&self) -> HumanTxState {
+        let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        human_tx_state(&window)
+    }
+
+    /// 持有 RX watermark 鎖跨越單次 OS submit；只有已接受的 TX 才提交觀察狀態。
+    /// WouldBlock 不留下 human TX，也不固定 command 起點，下一次實際提交會重新取 watermark。
+    pub(crate) fn observe_tx_submit(
+        &self,
+        command_op_id: Option<u64>,
+        command_boundary_recorded: bool,
+        human_payload: Option<(&[u8], bool, usize)>,
+        submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> (SubmitStep, bool) {
+        let candidate_boundary = {
+            let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let boundary = command_op_id
+                .filter(|_| !command_boundary_recorded)
+                .map(|_| command_boundary(&window));
+            window.tx_submit_pending = true;
+            boundary
+        };
+        let pending_guard = TxSubmitPendingGuard { rx: self };
+        let step = submit();
+        let accepted = matches!(&step, SubmitStep::Accepted(count) if *count > 0);
+        let submitted = accepted || matches!(&step, SubmitStep::Pending);
+        let mut boundary_recorded = command_boundary_recorded;
+
+        if submitted {
+            let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
+                if !command_boundary_recorded {
+                    window.command_tx_boundary = Some((op_id, boundary));
+                    boundary_recorded = true;
+                }
+            }
+            match (human_payload, &step) {
+                (Some((payload, raw_input, offset)), SubmitStep::Accepted(count)) if *count > 0 => {
+                    let start = offset.min(payload.len());
+                    let end = start.saturating_add(*count).min(payload.len());
+                    if end > start {
+                        record_human_tx_locked(&mut window, &payload[start..end], raw_input);
+                    }
+                }
+                (Some((_, raw_input, _)), SubmitStep::Pending) => {
+                    record_human_tx_unknown_locked(&mut window, raw_input);
+                }
+                _ => {}
+            }
+        }
+
+        drop(pending_guard);
+        (step, boundary_recorded)
+    }
+
+    /// TX writer 完成後以確認的 human raw bytes 校正半行；結果不明時保持保守開啟。
+    pub(crate) fn finish_human_raw_tx(&self, payload: &[u8], confirmed: usize, unknown: bool) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if unknown {
+            window.human_raw_line_open = true;
+        } else {
+            let accepted = confirmed.min(payload.len());
+            if accepted > 0 {
+                update_raw_line_state(&mut window, &payload[..accepted]);
+            }
+        }
+    }
+
+    /// agent 命令確實送到換行時，該換行已結束由 human 開啟的板端半行。
+    pub(crate) fn finish_command_tx(&self, payload: &[u8], confirmed: usize) {
+        let Some(line_end) = payload
+            .iter()
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
+            .map(|index| index + 1)
+        else {
+            return;
+        };
+        if confirmed < line_end {
+            return;
+        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_raw_line_open = false;
+    }
+
+    /// 讀取指定 op 的 command TX 邊界；下一筆 agent command 會覆寫此單一在途記錄。
+    pub fn command_tx_boundary(&self, op_id: u64) -> Option<CommandTxBoundary> {
+        let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window
+            .command_tx_boundary
+            .as_ref()
+            .filter(|(recorded_op, _)| *recorded_op == op_id)
+            .map(|(_, boundary)| boundary.clone())
+    }
+
     pub fn tail(&self, max_chars: usize) -> String {
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if max_chars == 0 {
@@ -358,6 +466,55 @@ impl RxShared {
         self.wait_for_match_from(from, timeout, clock, |text| re.search(text).is_some())
     }
 
+    /// 等待 predicate 成功並回傳命中時使用的同一份 snapshot；超時回 `None`。
+    pub fn wait_for_snapshot_from<T>(
+        &self,
+        from: u64,
+        timeout: Duration,
+        clock: &dyn Clock,
+        mut matches: impl FnMut(&RxSnapshot) -> Option<T>,
+    ) -> Option<(RxSnapshot, T)> {
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let deadline = clock.mono_ns().saturating_add(timeout_ns);
+        if clock.mono_ns() >= deadline {
+            return None;
+        }
+
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        while clock.mono_ns() < deadline {
+            if window.tx_submit_pending {
+                let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
+                let wait_for = remaining.min(RX_WAIT_CLOCK_SLICE);
+                let (next, _) = self
+                    .changed
+                    .wait_timeout(window, wait_for)
+                    .unwrap_or_else(|error| error.into_inner());
+                window = next;
+                continue;
+            }
+            let snapshot = snapshot_from_window(&window, from);
+            let revision = window.revision;
+            drop(window);
+
+            if let Some(value) = matches(&snapshot) {
+                return Some((snapshot, value));
+            }
+
+            window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if window.revision != revision {
+                continue;
+            }
+            let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
+            let wait_for = remaining.min(RX_WAIT_CLOCK_SLICE);
+            let (next, _) = self
+                .changed
+                .wait_timeout(window, wait_for)
+                .unwrap_or_else(|error| error.into_inner());
+            window = next;
+        }
+        None
+    }
+
     #[cfg(feature = "test-fakes")]
     pub fn wait_for_regex_from_with<F>(
         &self,
@@ -434,6 +591,117 @@ impl RxShared {
 pub struct RxMatch {
     pub epoch: u64,
     pub rx_seq: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RxSnapshot {
+    /// 此 snapshot 實際保留文字的絕對起點。
+    pub base: u64,
+    /// 已解碼的 RX 文字。
+    pub text: String,
+    /// 同一把鎖下讀取的 `(epoch, rx_seq)`。
+    pub watermark: (u64, u64),
+    /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
+    pub trimmed_before_from: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HumanTxState {
+    pub generation: u64,
+    pub rx_offset: u64,
+    pub raw_line_open: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandTxBoundary {
+    /// OS submit 之前的絕對 RX 字元偏移。
+    pub rx_offset: u64,
+    /// 同一 RX watermark 下的可信 human TX 狀態。
+    pub human_tx_state: HumanTxState,
+    /// TX 邊界當時，自最近 human TX 起累積的 RX 輸出。
+    pub human_snapshot: RxSnapshot,
+}
+
+struct TxSubmitPendingGuard<'a> {
+    rx: &'a RxShared,
+}
+
+impl Drop for TxSubmitPendingGuard<'_> {
+    fn drop(&mut self) {
+        self.rx
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .tx_submit_pending = false;
+        self.rx.wake_all();
+    }
+}
+
+fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
+    let base = from.max(window.trimmed);
+    RxSnapshot {
+        base,
+        text: window.text_from(base).to_string(),
+        watermark: window.watermark,
+        trimmed_before_from: base > from,
+    }
+}
+
+fn human_tx_state(window: &RxWindow) -> HumanTxState {
+    HumanTxState {
+        generation: window.human_tx_generation,
+        rx_offset: window.last_human_tx_rx_offset,
+        raw_line_open: window.human_raw_line_open,
+    }
+}
+
+fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
+    let human_tx_state = human_tx_state(window);
+    let human_snapshot = if human_tx_state.generation == 0 {
+        RxSnapshot {
+            base: window.trimmed,
+            text: String::new(),
+            watermark: window.watermark,
+            trimmed_before_from: false,
+        }
+    } else {
+        snapshot_from_window(window, human_tx_state.rx_offset)
+    };
+    CommandTxBoundary {
+        rx_offset: window
+            .trimmed
+            .saturating_add(window.text.chars().count() as u64),
+        human_tx_state,
+        human_snapshot,
+    }
+}
+
+fn record_human_tx_locked(window: &mut RxWindow, payload: &[u8], raw_input: bool) {
+    window.human_tx_generation = window.human_tx_generation.saturating_add(1);
+    window.last_human_tx_rx_offset = window
+        .trimmed
+        .saturating_add(window.text.chars().count() as u64);
+    if raw_input && !payload.is_empty() {
+        update_raw_line_state(window, payload);
+    }
+}
+
+fn record_human_tx_unknown_locked(window: &mut RxWindow, raw_input: bool) {
+    window.human_tx_generation = window.human_tx_generation.saturating_add(1);
+    window.last_human_tx_rx_offset = window
+        .trimmed
+        .saturating_add(window.text.chars().count() as u64);
+    if raw_input {
+        window.human_raw_line_open = true;
+    }
+}
+
+fn update_raw_line_state(window: &mut RxWindow, payload: &[u8]) {
+    if let Some(last_line_break) = payload.iter().rposition(|byte| matches!(*byte, b'\r' | b'\n')) {
+        window.human_raw_line_open = last_line_break + 1 < payload.len();
+    } else if !payload.is_empty() {
+        window.human_raw_line_open = true;
+    }
 }
 
 /// reader thread 的依賴（Task 10 Produces）。
@@ -759,8 +1027,11 @@ impl IoWorker {
             cancel.clone(),
             args.fence,
             args.wal,
-            args.epoch,
-            args.control,
+            TxWriterContext {
+                rx: args.rx,
+                epoch: args.epoch,
+                control: args.control,
+            },
         );
         IoWorker {
             tx,

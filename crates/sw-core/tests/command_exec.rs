@@ -116,6 +116,14 @@ fn wal_tx_has(h: &ActorRig, payload: &[u8]) -> bool {
     h.wal_tx_payloads().iter().any(|p| p == payload)
 }
 
+fn wal_tx_bytes_since(h: &ActorRig, count: usize) -> Vec<u8> {
+    h.wal_tx_payloads()
+        .into_iter()
+        .skip(count)
+        .flatten()
+        .collect()
+}
+
 /// 等 WAL 出現指定 TX（OpRunner 已送出）。
 fn wait_tx(h: &ActorRig, payload: &[u8]) {
     h.wait_for("TX 寫出", |h| wal_tx_has(h, payload));
@@ -161,6 +169,269 @@ fn line_command_stdout_extraction_and_done() {
         )
     );
     assert_eq!(rec["execution_mode"], PyValue::from("line"));
+}
+
+#[test]
+fn i294_human_prompt_before_agent_echo_does_not_complete() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let id = h.submit_ok("echo AGENT");
+    wait_tx(&h, b"echo AGENT\n");
+    h.inject_rx(b"root@t:/# ");
+    let before_agent_echo = h.command_get(&id);
+    assert_eq!(
+        before_agent_echo["status"],
+        PyValue::from("running"),
+        "human 的舊 prompt 不得完成 agent 命令：{before_agent_echo:?}"
+    );
+
+    h.inject_rx(b"echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("AGENT"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "完成判定不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho AGENT\n".to_vec(),
+        "只送原本的人類行與 agent 命令"
+    );
+}
+
+#[test]
+fn i294_deferred_human_prompt_between_queued_commands_does_not_complete_next() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-deferred-order");
+    let tx_count = h.wal_tx_payloads().len();
+
+    let first = h.submit_ok("echo FIRST");
+    wait_tx(&h, b"echo FIRST\n");
+    let second = h.submit_ok("echo SECOND");
+    console.push_input(b"echo HUMAN\n");
+    assert_eq!(h.command_get(&first)["status"], PyValue::from("running"));
+
+    h.inject_rx(b"echo FIRST\r\nFIRST\r\nroot@t:/# ");
+    let first_result = h.wait_done(&first);
+    assert_eq!(first_result["stdout"], PyValue::from("FIRST"));
+    wait_tx(&h, b"echo HUMAN\n");
+
+    h.inject_rx(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
+    wait_tx(&h, b"echo SECOND\n");
+    h.inject_rx(b"root@t:/# ");
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "deferred human 的 prompt 在第二筆 command echo 前不得完成"
+    );
+
+    h.inject_rx(b"echo SECOND\r\nSECOND\r\nroot@t:/# ");
+    let second_result = h.wait_done(&second);
+    assert_eq!(second_result["status"], PyValue::from("done"));
+    assert_eq!(second_result["stdout"], PyValue::from("SECOND"));
+    assert_eq!(second_result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo FIRST\necho HUMAN\necho SECOND\n".to_vec(),
+        "deferred 回放與兩筆 agent 命令依既有仲裁送出，不增加 TX"
+    );
+}
+
+#[test]
+fn i294_background_uses_command_echo_boundary() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-background-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let id = h.submit_with("echo BACKGROUND", |r| r.mode = "background".into());
+    wait_tx(&h, b"echo BACKGROUND\n");
+    h.inject_rx(b"root@t:/# ");
+    let before_echo = h.command_get(&id);
+    assert_eq!(
+        before_echo["status"],
+        PyValue::from("running"),
+        "背景命令同樣不得由命令前的 prompt 完成：{before_echo:?}"
+    );
+
+    h.inject_rx(b"echo BACKGROUND\r\nBACKGROUND\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["execution_mode"], PyValue::from("background"));
+    let tail = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 200,
+    });
+    assert_eq!(tail["status"], PyValue::from("active"));
+    let PyValue::List(chunks) = tail["chunks"].clone() else {
+        panic!("capture 應為 list")
+    };
+    let joined: String = chunks.iter().filter_map(PyValue::as_str).collect();
+    assert!(joined.contains("BACKGROUND"), "背景輸出應擷取：{joined:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho BACKGROUND\n".to_vec(),
+        "背景完成判定不增加 TX"
+    );
+}
+
+#[test]
+fn i294_no_echo_without_pending_human_tx_uses_tail_prompt() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"printf x\n");
+    h.inject_rx(b"x\r\nroot@t:/# ");
+
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("x"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf x\n".to_vec());
+}
+
+#[test]
+fn i294_prompt_before_command_tx_is_outside_no_echo_window() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    assert!(h.dev.wait_paused(Duration::from_secs(2)), "命令應停在 OS submit 前");
+    h.inject_rx(b"root@t:/# ");
+    h.dev.release_pause();
+    wait_tx(&h, b"printf x\n");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "command TX 前到達的舊 prompt 不得觸發無 echo 降階"
+    );
+
+    h.inject_rx(b"x\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("x"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf x\n".to_vec());
+}
+
+#[test]
+fn i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-no-echo-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"printf x\n");
+    h.inject_rx(b"root@t:/# ");
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    h.advance(Duration::from_millis(200));
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["partial"], PyValue::Bool(true));
+    assert_eq!(rec["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "歧義結算不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\nprintf x\n".to_vec(),
+        "無 echo 歧義不額外送救援鍵或重送"
+    );
+}
+
+#[test]
+fn i294_raw_half_line_does_not_anchor_agent_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-half-line");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"e");
+    wait_tx(&h, b"e");
+
+    let id = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"cho AGENT\n");
+    h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    h.advance(Duration::from_millis(200));
+
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["partial"], PyValue::Bool(true));
+    assert!(rec["stdout"].as_str().is_some_and(|stdout| stdout.contains("AGENT")));
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "歧義結算不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo AGENT\n".to_vec(),
+        "half-line 歧義不額外送救援鍵或重送"
+    );
+}
+
+#[test]
+fn i294_raw_half_line_does_not_poison_next_agent_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-half-line-next");
+    console.push_input(b"e");
+    wait_tx(&h, b"e");
+
+    let first = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"cho AGENT\n");
+    h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    h.advance(Duration::from_millis(200));
+    let first_result = h.wait_done(&first);
+    assert_eq!(first_result["partial"], PyValue::Bool(true));
+
+    let second = h.submit_ok("echo NEXT");
+    wait_tx(&h, b"echo NEXT\n");
+    h.inject_rx(b"echo NEXT\r\nNEXT\r\nroot@t:/# ");
+    let second_result = h.wait_done(&second);
+    assert_eq!(second_result["status"], PyValue::from("done"));
+    assert_eq!(second_result["stdout"], PyValue::from("NEXT"));
+    assert_eq!(second_result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let command = format!("echo {} {}", "x".repeat(50), "y".repeat(40));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    let first = format!("root@t:/# {}\r\r\n", &command[..65]);
+    h.inject_rx(first.as_bytes());
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    let tail = format!("{}\r\nWRAPPED\r\nroot@t:/# ", &command[65..]);
+    h.inject_rx(tail.as_bytes());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("WRAPPED"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        tx.as_bytes().to_vec(),
+        "折行 echo 判定不重送命令"
+    );
 }
 
 #[test]

@@ -60,7 +60,8 @@ use crate::state_store::{
     StateStore,
 };
 use crate::tx_writer::{
-    spawn_tx_writer, Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterHandle,
+    spawn_tx_writer, Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterContext,
+    TxWriterHandle,
 };
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
@@ -3601,8 +3602,11 @@ impl Shared {
             cancel,
             fence,
             self.wal.clone(),
-            0,
-            control_tx,
+            TxWriterContext {
+                rx: crate::uart_bridge::RxShared::new(1, 0),
+                epoch: 0,
+                control: control_tx,
+            },
         );
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         let job = TxJob {

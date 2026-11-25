@@ -321,6 +321,65 @@ fn console_input_reaches_uart_and_rx_fans_out() {
 }
 
 #[test]
+fn i294_rpc_human_prompt_before_agent_echo_does_not_complete() {
+    let r = ServiceRig::with_console_backend("pty");
+    attach(&r, r#"{"selector":"COM0"}"#);
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+
+    io.push_input(b"echo HUMAN\n");
+    let mut observed_tx = Vec::new();
+    wait_for("human line 寫到 UART", || {
+        observed_tx.extend(dev.take_tx());
+        observed_tx.windows(b"echo HUMAN\n".len()).any(|w| w == b"echo HUMAN\n")
+    });
+
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo RPC_AGENT","mode":"line","timeout_s":2.0}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id");
+    wait_for("agent line 寫到 UART", || {
+        observed_tx.extend(dev.take_tx());
+        observed_tx
+            .windows(b"echo RPC_AGENT\n".len())
+            .any(|w| w == b"echo RPC_AGENT\n")
+    });
+
+    dev.push_rx(b"root@t:/# ");
+    wait_for("human 舊 prompt 已由 RX reader 處理", || {
+        String::from_utf8_lossy(&io.written()).contains("root@t:/# ")
+    });
+    let running = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let command = match running.get("command") {
+        Some(PyValue::Dict(command)) => command,
+        other => panic!("command.get command：{other:?}"),
+    };
+    assert_eq!(
+        s(command, "status"),
+        "running",
+        "RPC 不得以 human prompt 提前完成：{}",
+        j(&running)
+    );
+
+    dev.push_rx(b"echo RPC_AGENT\r\nRPC_AGENT\r\nroot@t:/# ");
+    wait_for("RPC agent 命令完成", || {
+        let got = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(got.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "done")
+    });
+    let done = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let command = match done.get("command") {
+        Some(PyValue::Dict(command)) => command,
+        other => panic!("command.get command：{other:?}"),
+    };
+    assert_eq!(s(command, "stdout"), "RPC_AGENT", "{}", j(&done));
+    assert_eq!(command.get("partial"), Some(&PyValue::Bool(false)));
+    observed_tx.extend(dev.take_tx());
+    assert!(!observed_tx.contains(&0x03) && !observed_tx.contains(&0x04), "不得送救援鍵");
+}
+
+#[test]
 fn console_methods_no_longer_deferred() {
     let r = ServiceRig::with_console_backend("pty");
     // 編譯期內嵌（cargo_l1_results.py 以 repo 根為 cwd 執行測試執行檔，執行期相對路徑會失敗）。

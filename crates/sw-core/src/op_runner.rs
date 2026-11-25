@@ -20,6 +20,7 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{compile, valid_completion_regex, PyFlags, PyRegex};
 
 use crate::arbiter::QueuedCommand;
+use crate::command_completion::{CompletionEvaluator, Evaluation as CompletionEvaluation};
 use crate::file_transfer::{
     pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles,
     TransferAbort, TransferIds, TxRejection,
@@ -82,6 +83,10 @@ pub enum OpOutcome {
     },
     /// 未完成且救援未成功（或 passthrough 無完成條件）；`stdout` 為 `clean_text(pre_offset 起 RX)`。
     PromptTimeout {
+        stdout: String,
+    },
+    /// echo 無法確認且同窗口出現可信 human TX；保留輸出並回 PROMPT_TIMEOUT，不降級 session 或送救援鍵。
+    CompletionUncertain {
         stdout: String,
     },
     ToAttached {
@@ -190,6 +195,21 @@ pub fn extract_command_stdout(
     completion: Option<&PyRegex>,
 ) -> String {
     let mut lines = prompt_cut_lines(raw, prompt_regex, completion);
+    strip_command_echo_lines(raw, &mut lines, command);
+    lines.join("\n").trim_matches('\n').to_string()
+}
+
+/// 依已選定的完成邊界移除重複 command echo；不重新搜尋 prompt。
+pub(crate) fn strip_command_echo_from_text(raw_evidence: &str, text: &str, command: &str) -> String {
+    let mut lines: Vec<String> = splitlines(text.trim_start_matches('\n'))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    strip_command_echo_lines(raw_evidence, &mut lines, command);
+    lines.join("\n").trim_matches('\n').to_string()
+}
+
+fn strip_command_echo_lines(raw: &str, lines: &mut Vec<String>, command: &str) {
     if !command.is_empty() {
         let stripped = py_strip(command);
         let mut removed = false;
@@ -215,7 +235,6 @@ pub fn extract_command_stdout(
             }
         }
     }
-    lines.join("\n").trim_matches('\n').to_string()
 }
 
 /// `clean_text` 後依最後一個 prompt（completion 模式下只裁完成標記之後的尾 prompt）截斷並切行。
@@ -250,15 +269,15 @@ const WRAP_MIN_SEGMENT: usize = 20;
 
 /// 原始串流中的終端折行證據：`newline` 為 BusyBox `\r\r\n`、`space` 為 bash readline `" \r"`。
 #[derive(Clone, Copy)]
-struct WrapEvidence {
-    newline: bool,
-    space: bool,
+pub(crate) struct WrapEvidence {
+    pub(crate) newline: bool,
+    pub(crate) space: bool,
 }
 
 /// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
 /// 命令的每個字元（含空白）都必須依序出現；只有換行或多出的空白（且原始串流有對應證據）可以跳過，
 /// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`] 個字元（第一個插入點以第一行欄位計，含殘留 prompt）。
-fn match_wrapped_echo(
+pub(crate) fn match_wrapped_echo(
     text: &[char],
     start: usize,
     command: &[char],
@@ -778,7 +797,21 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     } else {
         Some(completion_regex.unwrap_or(&t.prompt_regex).to_string())
     };
-    let pre_offset = ctx.rx.snapshot_len();
+    let pre_tx_offset = ctx.rx.snapshot_len();
+    let human_tx_before_send = ctx.rx.human_tx_state();
+    let human_snapshot_before_send = if human_tx_before_send.generation > 0 {
+        ctx.rx.snapshot_from(human_tx_before_send.rx_offset).text
+    } else {
+        String::new()
+    };
+    let echo_prompt_re = (!passthrough
+        && completion_regex.is_none()
+        && !q.req.is_trusted_human()
+        && matches!(mode.as_str(), "line" | "background"))
+    .then(|| compile_or_never(&t.prompt_regex));
+    let echo_evaluator = echo_prompt_re
+        .as_ref()
+        .map(|prompt_re| CompletionEvaluator::new(command, prompt_re));
     if let Some(pattern) = completion_regex {
         let mut meta = PyDict::new();
         meta.insert("event", PyValue::from("command_completion"));
@@ -806,6 +839,23 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
     }
+    let command_boundary = echo_evaluator
+        .as_ref()
+        .and_then(|_| ctx.rx.command_tx_boundary(grant.op_id.0));
+    let pre_offset = command_boundary
+        .as_ref()
+        .map_or(pre_tx_offset, |boundary| boundary.rx_offset);
+    let human_tx_before = command_boundary
+        .as_ref()
+        .map_or(human_tx_before_send, |boundary| boundary.human_tx_state);
+    let human_snapshot_at_boundary = command_boundary
+        .map(|boundary| boundary.human_snapshot.text)
+        .unwrap_or(human_snapshot_before_send);
+    let pending_human_before = echo_evaluator.as_ref().is_some_and(|evaluator| {
+        human_tx_before.generation > 0
+            && (human_tx_before.raw_line_open
+                || !evaluator.has_tail_prompt(&human_snapshot_at_boundary))
+    });
 
     // heartbeat／keepalive 迴圈（有 RX 就續等；整段 wait_chunk 無新 RX 即視為靜默結束）。
     let effective_timeout = match q.req.expected_duration_s {
@@ -819,6 +869,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         .saturating_add((effective_timeout.max(0.0) * 1_000_000_000.0) as u64);
     let wait_re = compile_or_never(completion_pattern.as_deref().unwrap_or("(?!)"));
     let mut matched = false;
+    let mut completion_stdout = None;
+    let mut uncertain_stdout = None;
     loop {
         let now = ctx.clock.mono_ns();
         if now >= deadline {
@@ -827,7 +879,47 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         let remaining = (deadline - now) as f64 / 1_000_000_000.0;
         let wait_chunk = silence_limit.min(remaining);
         let pre_rx = ctx.rx.snapshot_len();
-        if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
+        if let Some(evaluator) = echo_evaluator.as_ref() {
+            let hit = ctx.rx.wait_for_snapshot_from(
+                pre_offset,
+                secs(wait_chunk),
+                &*ctx.clock,
+                |snapshot| {
+                    match evaluator.evaluate(
+                        &snapshot.text,
+                        pending_human_before
+                            || ctx.rx.human_tx_state().generation > human_tx_before.generation,
+                        human_tx_before.raw_line_open
+                            || ctx.rx.human_tx_state().raw_line_open,
+                    ) {
+                        CompletionEvaluation::Complete { stdout } => Some(stdout),
+                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => {
+                            None
+                        }
+                    }
+                },
+            );
+            if let Some((_snapshot, stdout)) = hit {
+                completion_stdout = Some(stdout);
+                matched = true;
+                break;
+            }
+            let snapshot = ctx.rx.snapshot_from(pre_offset);
+            match evaluator.evaluate(
+                &snapshot.text,
+                pending_human_before
+                    || ctx.rx.human_tx_state().generation > human_tx_before.generation,
+                human_tx_before.raw_line_open || ctx.rx.human_tx_state().raw_line_open,
+            ) {
+                CompletionEvaluation::Complete { stdout } => {
+                    completion_stdout = Some(stdout);
+                    matched = true;
+                    break;
+                }
+                CompletionEvaluation::Uncertain { stdout } => uncertain_stdout = Some(stdout),
+                CompletionEvaluation::Pending => uncertain_stdout = None,
+            }
+        } else if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
             matched = true;
             break;
         }
@@ -835,7 +927,23 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             break;
         }
     }
+    if !matched && uncertain_stdout.is_none() {
+        if let Some(evaluator) = echo_evaluator.as_ref() {
+            let snapshot = ctx.rx.snapshot_from(pre_offset);
+            if let CompletionEvaluation::Uncertain { stdout } = evaluator.evaluate(
+                &snapshot.text,
+                pending_human_before
+                    || ctx.rx.human_tx_state().generation > human_tx_before.generation,
+                human_tx_before.raw_line_open || ctx.rx.human_tx_state().raw_line_open,
+            ) {
+                uncertain_stdout = Some(stdout);
+            }
+        }
+    }
     if !matched {
+        if let Some(stdout) = uncertain_stdout {
+            return OpOutcome::CompletionUncertain { stdout };
+        }
         if q.req.is_trusted_human() {
             // `_recover_after_failure` human 分支（DF-02／OD-74，Python `session_manager.py:6988-7012`）：可信 human
             // ＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的 `HumanConsole`（rulings s2 D5），永不看
@@ -857,23 +965,27 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             false,
         );
     }
-    let raw = ctx.rx.text_from(pre_offset);
-    let prompt_valid = valid_completion_regex(Some(&PyValue::from(t.prompt_regex.clone())));
-    let stdout = match completion_regex {
-        Some(pattern) if passthrough && !prompt_valid => {
-            let end = compile(pattern, PyFlags(0))
-                .ok()
-                .and_then(|re| re.search(&raw))
-                .map(|m| m.end);
-            match end {
-                Some(end) => clean_text(&char_prefix(&raw, end)),
-                None => clean_text(&raw),
+    let stdout = if let Some(stdout) = completion_stdout {
+        stdout
+    } else {
+        let raw = ctx.rx.text_from(pre_offset);
+        let prompt_valid = valid_completion_regex(Some(&PyValue::from(t.prompt_regex.clone())));
+        match completion_regex {
+            Some(pattern) if passthrough && !prompt_valid => {
+                let end = compile(pattern, PyFlags(0))
+                    .ok()
+                    .and_then(|re| re.search(&raw))
+                    .map(|m| m.end);
+                match end {
+                    Some(end) => clean_text(&char_prefix(&raw, end)),
+                    None => clean_text(&raw),
+                }
             }
-        }
-        _ => {
-            let prompt_re = compile_or_never(&t.prompt_regex);
-            let completion_re = completion_regex.map(compile_or_never);
-            extract_command_stdout(&raw, command, &prompt_re, completion_re.as_ref())
+            _ => {
+                let prompt_re = compile_or_never(&t.prompt_regex);
+                let completion_re = completion_regex.map(compile_or_never);
+                extract_command_stdout(&raw, command, &prompt_re, completion_re.as_ref())
+            }
         }
     };
     let mut result = pydict! {
