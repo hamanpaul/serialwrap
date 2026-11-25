@@ -3309,40 +3309,86 @@ fn bundle_setup_auto_port_interrupted_recovery_without_config_reselects_port() {
 
 #[cfg(all(test, unix))]
 fn posix_file_mode(path: &std::path::Path) -> u32 {
+    try_posix_file_mode(path).expect("讀取 POSIX 檔案 mode")
+}
+
+#[cfg(all(test, unix))]
+fn try_posix_file_mode(path: &std::path::Path) -> Result<u32, String> {
     let metadata = sw_pal::fs_ops::file_metadata_fingerprint(path, false)
-        .expect("讀取檔案 metadata")
-        .expect("POSIX metadata 應可用");
-    let mode = metadata.split(';').find_map(|field| field.strip_prefix("mode=")).expect("metadata 應包含 mode");
-    u32::from_str_radix(mode, 8).expect("mode 八進位")
+        .map_err(|error| format!("讀取檔案 metadata 失敗：{error:?}"))?
+        .ok_or_else(|| "POSIX metadata 不可用".to_string())?;
+    let mode = metadata
+        .split(';')
+        .find_map(|field| field.strip_prefix("mode="))
+        .ok_or_else(|| "POSIX metadata 缺少 mode".to_string())?;
+    u32::from_str_radix(mode, 8).map_err(|error| format!("解析 POSIX mode 失敗：{error}"))
 }
 
 #[cfg(all(test, unix))]
 fn posix_file_owner_group(path: &std::path::Path) -> (u32, u32) {
+    try_posix_file_owner_group(path).expect("讀取 POSIX 檔案 owner/group")
+}
+
+#[cfg(all(test, unix))]
+fn try_posix_file_owner_group(path: &std::path::Path) -> Result<(u32, u32), String> {
     let metadata = sw_pal::fs_ops::file_metadata_fingerprint(path, false)
-        .expect("讀取檔案 owner/group")
-        .expect("POSIX metadata 應可用");
-    let field = |name| metadata.split(';').find_map(|field| field.strip_prefix(name)).expect("metadata 欄位存在").parse().expect("metadata 整數");
-    (field("uid="), field("gid="))
+        .map_err(|error| format!("讀取檔案 owner/group 失敗：{error:?}"))?
+        .ok_or_else(|| "POSIX owner/group metadata 不可用".to_string())?;
+    let field = |name: &str| -> Result<u32, String> {
+        metadata
+            .split(';')
+            .find_map(|field| field.strip_prefix(name))
+            .ok_or_else(|| format!("POSIX metadata 缺少 {name}"))?
+            .parse()
+            .map_err(|error| format!("解析 POSIX {name} 失敗：{error}"))
+    };
+    Ok((field("uid=")?, field("gid=")?))
 }
 
 #[cfg(all(test, unix))]
 fn posix_set_file_mode(path: &std::path::Path, mode: u32) {
-    sw_pal::fs_ops::posix::test_set_path_mode(path, mode).expect("設定測試檔案 mode");
+    try_posix_set_file_mode(path, mode).expect("設定測試檔案 mode");
 }
 
 #[cfg(all(test, unix))]
-fn posix_secondary_group() -> Option<u32> {
-    let (primary, groups) = sw_pal::fs_ops::posix::test_process_groups().expect("讀取 POSIX 測試行程 groups");
-    groups
+fn try_posix_set_file_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+    sw_pal::fs_ops::posix::test_set_path_mode(path, mode).map_err(|error| format!("設定測試檔案 mode 失敗：{error:?}"))
+}
+
+#[cfg(all(test, unix))]
+fn posix_distinct_supplementary_group(excluded: &[u32]) -> Result<Option<u32>, String> {
+    if std::env::var_os("SERIALWRAP_TEST_NO_DISTINCT_SUPPLEMENTARY_GROUP").is_some() {
+        return Ok(None);
+    }
+    let (primary, groups) = sw_pal::fs_ops::posix::test_process_groups()
+        .map_err(|error| format!("讀取 POSIX 測試行程 groups 失敗：{error:?}"))?;
+    Ok(groups
         .into_iter()
         .filter(|group| *group != primary)
-        .min()
+        .filter(|group| !excluded.contains(group))
+        .min())
 }
 
 #[cfg(all(test, unix))]
-fn posix_setgid_directory(path: &std::path::Path, group: u32) {
-    sw_pal::fs_ops::posix::test_set_path_group(path, group).expect("設定測試目錄 group");
-    posix_set_file_mode(path, posix_file_mode(path) | 0o2000);
+fn posix_setgid_directory(path: &std::path::Path, group: u32) -> Result<(), String> {
+    sw_pal::fs_ops::posix::test_set_path_group(path, group)
+        .map_err(|error| format!("設定測試目錄 group 失敗：{error:?}"))?;
+    let mode = try_posix_file_mode(path)?;
+    try_posix_set_file_mode(path, mode | 0o2000)
+        .map_err(|error| format!("設定測試目錄 setgid mode 失敗：{error}"))
+}
+
+#[cfg(all(test, unix))]
+fn report_distinct_group_evidence_insufficient(reason: &str) {
+    use std::io::Write as _;
+
+    let marker = format!(
+        "SW_L1_EVIDENCE_INSUFFICIENT=cap_posix_distinct_supplementary_group__inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group\n證據不足：{reason}\n"
+    );
+    std::io::stderr()
+        .lock()
+        .write_all(marker.as_bytes())
+        .expect("輸出 L1 capability 證據失敗");
 }
 
 /// inst4-f2 V051-a0b00f2-1：journal 綁定原交易 config；切換環境路徑時 fail closed。
@@ -3518,11 +3564,12 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
     assert_eq!(posix_file_owner_group(&t.config_path()), original_owner_group, "中斷復原必須保留原始 owner/group");
 }
 
-/// inst4-f3：在 setgid config 目錄中驗證實際改寫後的兩種 config 回復。
+/// inst4-f3：在受控 setgid config 目錄中驗證兩種 config 回復的 owner/group。
 #[cfg(all(test, unix))]
 #[test]
-#[ignore = "需要可用且不同於 primary group 的 supplementary group；一般套件測試明確跳過，條件具備時以 --ignored 顯式執行"]
-fn inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group() {
+#[ignore = "cap:posix_distinct_supplementary_group"]
+#[allow(non_snake_case)] // 雙底線是 L1 capability selector 的固定分隔符。
+fn cap_posix_distinct_supplementary_group__inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group() {
     let original = b"supervision_mode: on-demand\n";
 
     let switch = TestEnv::windows()
@@ -3532,13 +3579,60 @@ fn inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group(
         .with_bundle(CURRENT_VERSION)
         .with_rpc_listen(Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716)))
         .with_fs_fault_replace_suffix(".new");
-    posix_set_file_mode(&switch.config_path(), 0o640);
-    let switch_owner_group = posix_file_owner_group(&switch.config_path());
-    let group = posix_secondary_group()
-        .filter(|group| *group != switch_owner_group.1)
-        .expect("顯式執行不同群組案例前，必須有可用且不同於 config 原始 group 的 supplementary group");
+    let mut interrupted = TestEnv::windows()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_rpc_listen(Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716)))
+        .with_crash_at("entries_switching:after_effect");
+    let switch_owner_group = match try_posix_file_owner_group(&switch.config_path()) {
+        Ok(owner_group) => owner_group,
+        Err(reason) => {
+            report_distinct_group_evidence_insufficient(&reason);
+            return;
+        }
+    };
+    let interrupted_owner_group = match try_posix_file_owner_group(&interrupted.config_path()) {
+        Ok(owner_group) => owner_group,
+        Err(reason) => {
+            report_distinct_group_evidence_insufficient(&reason);
+            return;
+        }
+    };
+    let group = match posix_distinct_supplementary_group(&[switch_owner_group.1, interrupted_owner_group.1]) {
+        Ok(Some(group)) => group,
+        Ok(None) => {
+            report_distinct_group_evidence_insufficient(
+                "目前行程沒有不同於 primary group 與原 config group 的 supplementary group",
+            );
+            return;
+        }
+        Err(reason) => {
+            report_distinct_group_evidence_insufficient(&reason);
+            return;
+        }
+    };
+    if let Err(reason) = try_posix_set_file_mode(&switch.config_path(), 0o640) {
+        report_distinct_group_evidence_insufficient(&reason);
+        return;
+    }
+    if let Err(reason) = try_posix_set_file_mode(&interrupted.config_path(), 0o640) {
+        report_distinct_group_evidence_insufficient(&reason);
+        return;
+    }
     let switch_config_dir = switch.config_path().parent().expect("config parent").to_path_buf();
-    posix_setgid_directory(&switch_config_dir, group);
+    if let Err(reason) = posix_setgid_directory(&switch_config_dir, group) {
+        report_distinct_group_evidence_insufficient(&reason);
+        return;
+    }
+    let interrupted_config_dir = interrupted.config_path().parent().expect("config parent").to_path_buf();
+    if let Err(reason) = posix_setgid_directory(&interrupted_config_dir, group) {
+        report_distinct_group_evidence_insufficient(&reason);
+        return;
+    }
+    assert_ne!(group, switch_owner_group.1, "受控 setgid group 必須與切換失敗 config 原始 group 不同");
+    assert_ne!(group, interrupted_owner_group.1, "受控 setgid group 必須與中斷復原 config 原始 group 不同");
 
     let (switch_rc, switch_out, switch_err) = switch.run_from_bundle(&["setup", "--on-demand"]);
 
@@ -3548,19 +3642,6 @@ fn inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group(
     assert_eq!(std::fs::read(switch.config_path()).expect("config 必須存在"), original);
     assert_eq!(posix_file_mode(&switch.config_path()), 0o640, "切換失敗回復必須保留原始 mode");
     assert_eq!(posix_file_owner_group(&switch.config_path()), switch_owner_group, "setgid 目錄中切換失敗回復必須保留原始 owner/group");
-
-    let mut interrupted = TestEnv::windows()
-        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
-        .with_installed("0.4.0")
-        .with_current("0.4.0", None)
-        .with_bundle(CURRENT_VERSION)
-        .with_rpc_listen(Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716)))
-        .with_crash_at("entries_switching:after_effect");
-    posix_set_file_mode(&interrupted.config_path(), 0o640);
-    let interrupted_owner_group = posix_file_owner_group(&interrupted.config_path());
-    assert_ne!(group, interrupted_owner_group.1, "受控 setgid group 必須與 config 原始 group 不同");
-    let interrupted_config_dir = interrupted.config_path().parent().expect("config parent").to_path_buf();
-    posix_setgid_directory(&interrupted_config_dir, group);
 
     let (crash_rc, _out, crash_err) = interrupted.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");

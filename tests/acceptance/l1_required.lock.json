@@ -496,7 +496,6 @@
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_recovery_restores_existing_config_mode",
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_setup_refuses_changed_config_path",
           "cargo:sw-cli::mgmt_setup::inst4_f2_switch_failure_restores_existing_config_mode",
-          "cargo:sw-cli::mgmt_setup::inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group",
           "cargo:sw-cli::mgmt_setup::inst4_f3_interrupted_recovery_refuses_config_ctime_changed_after_chmod_roundtrip",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_released_lock_allows_setup",
@@ -8934,6 +8933,7 @@
           "tests/test_rust_bench_tools_posix.py::test_release_check_still_flags_live_pid_in_host_namespace",
           "tests/test_rust_cargo_l1_results.py::test_build_failure_is_not_success",
           "tests/test_rust_cargo_l1_results.py::test_build_failure_report_still_carries_provenance",
+          "tests/test_rust_cargo_l1_results.py::test_capability_marker_is_reported_as_insufficient",
           "tests/test_rust_cargo_l1_results.py::test_capability_matched_on_last_path_segment",
           "tests/test_rust_cargo_l1_results.py::test_capability_runs_are_single_threaded",
           "tests/test_rust_cargo_l1_results.py::test_caps_only_requires_caps",
@@ -24168,7 +24168,6 @@
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_recovery_restores_existing_config_mode",
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_setup_refuses_changed_config_path",
           "cargo:sw-cli::mgmt_setup::inst4_f2_switch_failure_restores_existing_config_mode",
-          "cargo:sw-cli::mgmt_setup::inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group",
           "cargo:sw-cli::mgmt_setup::inst4_f3_interrupted_recovery_refuses_config_ctime_changed_after_chmod_roundtrip",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_released_lock_allows_setup",
@@ -30109,6 +30108,25 @@
         }
       }
     },
+    "s21_gate:cap_posix_distinct_supplementary_group": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-cli::mgmt_setup::cap_posix_distinct_supplementary_group__inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_posix_distinct_supplementary_group__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "s21_gate:cap_posix_pty": {
       "linux": {
         "nodeids": [
@@ -35777,6 +35795,7 @@
           "tests/test_rust_bench_tools_posix.py::test_release_check_still_flags_live_pid_in_host_namespace",
           "tests/test_rust_cargo_l1_results.py::test_build_failure_is_not_success",
           "tests/test_rust_cargo_l1_results.py::test_build_failure_report_still_carries_provenance",
+          "tests/test_rust_cargo_l1_results.py::test_capability_marker_is_reported_as_insufficient",
           "tests/test_rust_cargo_l1_results.py::test_capability_matched_on_last_path_segment",
           "tests/test_rust_cargo_l1_results.py::test_capability_runs_are_single_threaded",
           "tests/test_rust_cargo_l1_results.py::test_caps_only_requires_caps",
@@ -38817,7 +38836,6 @@
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_recovery_restores_existing_config_mode",
           "cargo:sw-cli::mgmt_setup::inst4_f2_interrupted_setup_refuses_changed_config_path",
           "cargo:sw-cli::mgmt_setup::inst4_f2_switch_failure_restores_existing_config_mode",
-          "cargo:sw-cli::mgmt_setup::inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group",
           "cargo:sw-cli::mgmt_setup::inst4_f3_interrupted_recovery_refuses_config_ctime_changed_after_chmod_roundtrip",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon",
           "cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_released_lock_allows_setup",

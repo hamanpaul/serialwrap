@@ -69,7 +69,7 @@ def _write_exe(exe_dir: Path, name: str, *, run_out: str, exit_code: int = 0) ->
             '>>"%base%argv.log" echo(%*\r\n'
             'if /i "%~1"=="--list" (type "%base%list_all.txt" & exit /b 0)\r\n'
             'if /i "%~1"=="--ignored" if /i "%~2"=="--list" (type "%base%list_ignored.txt" & exit /b 0)\r\n'
-            'if /i "%~1"=="--ignored" if exist "%base%run_cap_out.txt" (type "%base%run_cap_out.txt" & exit /b 0)\r\n'
+            'if /i "%~1"=="--ignored" if exist "%base%run_cap_out.txt" (type "%base%run_cap_out.txt" & if exist "%base%run_cap_err.txt" type "%base%run_cap_err.txt" 1>&2 & exit /b 0)\r\n'
             'type "%base%run_out.txt"\r\n'
             'for /f "usebackq delims=" %%I in ("%base%exit_code") do exit /b %%I\r\n'
             "exit /b 0\r\n",
@@ -201,6 +201,39 @@ def test_ignored_cap_is_skipped_not_pass(tmp_path: Path) -> None:
     res = _load_judge().judge(rep, [A, C], platform="linux")
     assert res["verdict"] == "INSUFFICIENT"
     assert C in [x["nodeid"] for x in res["skipped_required"]]
+
+
+@pytest.mark.process_rpc
+def test_capability_marker_is_reported_as_insufficient(tmp_path: Path) -> None:
+    """能力案例明確回報能力不足時，L1 結果須是 skipped 並列入 evidence_insufficient。"""
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    (exe.parent / "run_cap_out.txt").write_text(
+        "running 1 test\n"
+        "test cap_posix_pty__c ... ok\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.00s\n",
+        encoding="utf-8",
+    )
+    (exe.parent / "run_cap_err.txt").write_text(
+        "SW_L1_EVIDENCE_INSUFFICIENT=cap_posix_pty__c\n證據不足：缺少 PTY 能力\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    summary = tmp_path / "summary.json"
+    r = _run(
+        tmp_path,
+        bin_dir,
+        ["--platform", "linux", "--caps", "posix_pty", "--out", str(out), "--summary-out", str(summary)],
+    )
+    rep = _report(out, r)
+    assert "證據不足" in r.stdout and C in r.stdout
+    assert _rows(rep)[C]["outcome"] == "skipped"
+    assert _rows(rep)[C]["skip_kind"] == "capability"
+    assert json.loads(summary.read_text(encoding="utf-8"))["evidence_insufficient"] == ["posix_pty"]
+    cap_runs = [argv for argv in _test_runs(exe) if "--ignored" in argv]
+    assert cap_runs and all("--nocapture" not in argv for argv in cap_runs)
 
 
 @pytest.mark.process_rpc

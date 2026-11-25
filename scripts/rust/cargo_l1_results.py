@@ -27,6 +27,7 @@ from typing import Any, Sequence
 TEST_LINE = re.compile(r"^test (.*?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 CAPABILITY_TEST = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__")
+EVIDENCE_INSUFFICIENT_PREFIX = "SW_L1_EVIDENCE_INSUFFICIENT="
 
 
 def capability_of(name: str) -> str | None:
@@ -279,14 +280,23 @@ def _run(argv: list[str], timeout_s: float) -> tuple[int, str, str, bool]:
 
 def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
     parsed: list[dict[str, Any]] = []
+    evidence_insufficient = {
+        line.removeprefix(EVIDENCE_INSUFFICIENT_PREFIX).strip()
+        for line in text.splitlines()
+        if line.startswith(EVIDENCE_INSUFFICIENT_PREFIX)
+    }
     for line in text.splitlines():
         matched = TEST_LINE.match(line.strip())
         if not matched:
             continue
         name, status = matched.groups()
         if status == "ok":
-            outcome = "passed"
-            skip_kind = None
+            if name in evidence_insufficient and capability_of(name) is not None:
+                outcome = "skipped"
+                skip_kind = "capability"
+            else:
+                outcome = "passed"
+                skip_kind = None
         elif status == "FAILED":
             outcome = "failed"
             skip_kind = None
@@ -478,7 +488,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if cap_stderr:
                 print(cap_stderr, file=sys.stderr, end="" if cap_stderr.endswith("\n") else "\n")
             _keep_failure_output(out_path, target, f"cap_{cap}", cap_rc, cap_stdout, cap_stderr)
-            cap_results = _parse_results(cap_stdout, target)
+            cap_results = _parse_results(cap_stdout + "\n" + cap_stderr, target)
+            for result in cap_results:
+                if result["outcome"] == "skipped" and result["skip_kind"] == "capability":
+                    print(f"證據不足：capability 測試略過：{result['nodeid']}")
             replaced = {row["nodeid"]: row for row in cap_results}
             target.results = [replaced.get(row["nodeid"], row) for row in target.results]
             known = {row["nodeid"] for row in target.results}

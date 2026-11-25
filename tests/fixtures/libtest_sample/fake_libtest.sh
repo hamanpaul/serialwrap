@@ -16,6 +16,9 @@ case " $* " in
   *" --ignored "*)
     if [ -f "$dir/run_cap_out.txt" ]; then
       cat "$dir/run_cap_out.txt"
+      if [ -f "$dir/run_cap_err.txt" ]; then
+        cat "$dir/run_cap_err.txt" >&2
+      fi
       exit 0
     fi ;;
 esac
