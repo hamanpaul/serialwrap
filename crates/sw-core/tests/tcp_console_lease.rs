@@ -894,15 +894,24 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     let mut h = tcp_ready(&["a"]);
     h.set_auto_complete_human_tx(false);
     let probe_op = start_non_strict_self_test(&mut h);
-    let opened = h.rpc(open_req("agent:nested", 60.0, "", false)).expect("agent soft preempt");
-    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)));
-    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 2, "probe 與 agent lease 各持有一層 suspend");
+    // BC-13（issue 306）：self-test probe 佔用前景槽，在途時 agent interactive_open 被動回 SESSION_BUSY、
+    // 不 soft preempt。「self-test suspend＋agent soft-preempt」兩層巢狀已無法從公開 RPC 到達，
+    // 本測試改驗被拒的 agent open 不動 A 的 mirror 與 suspend，其後 guard／sync／回放斷言不變。
+    let mirror_before = h.core.active_lease().map(|lease| (lease.interactive_id.clone(), lease.owner.clone()));
+    assert_eq!(mirror_before.as_ref().map(|(_, owner)| owner.as_str()), Some("human:a"), "self-test 期間 A 的 mirror lease 仍在");
+    let owner_gen_before_open = h.core.generations().owner_gen;
+    let opened = h.rpc(open_req("agent:nested", 60.0, "", false)).expect("agent open 回覆");
+    assert_eq!(opened.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "probe 在途時 agent open 依 BC-13 被動 busy");
+    assert!(opened.get("soft_preempted").is_none());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "被拒的 agent open 不得增加 suspend");
+    assert_eq!(
+        h.core.active_lease().map(|lease| (lease.interactive_id.clone(), lease.owner.clone())),
+        mirror_before,
+        "被拒的 agent open 不得 stash 或改動 A 的 mirror",
+    );
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_open);
 
     h.fence.with(|fence| fence.flash_critical = true);
-    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close agent lease");
-    assert!(h.core.active_lease().is_none());
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "agent close 立即依既有路徑結算自己的 suspend");
     assert!(h.input("a", b"nested").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
     assert_eq!(h.deferred_len("a"), b"nested".len());
 
@@ -936,31 +945,29 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     h.complete_human_tx(TxOutcome::Completed(b"nestedstill-deferred".len()), None);
 }
 
-fn guarded_nested_handback_after_eof(expire_agent_lease: bool) -> (CoreHarness, u64, u64) {
+/// BC-13（issue 306）之後 probe 在途時 agent open 被動 busy，不再形成兩層巢狀 suspend；
+/// `advance_under_guard` 改驗 guard 關閉、probe 在途時推進時間不會結算 self-test suspend。
+/// EOF／重連、回放一次、guard 開放後重建 mirror 的斷言不變。
+fn guarded_nested_handback_after_eof(advance_under_guard: bool) -> (CoreHarness, u64, u64) {
     let mut h = tcp_ready(&["a"]);
     h.set_auto_complete_human_tx(false);
     let probe_op = start_non_strict_self_test_with_timeout(&mut h, 10.0);
     let opened = h
         .rpc(open_req("agent:r5-nested", 1.0, "", false))
-        .expect("agent soft preempt");
-    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)));
-    let agent_id = opened
-        .get("interactive_id")
-        .and_then(PyValue::as_str)
-        .unwrap()
-        .to_string();
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 2);
+        .expect("agent open 回覆");
+    assert_eq!(opened.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "probe 在途時 agent open 依 BC-13 被動 busy");
+    assert!(opened.get("soft_preempted").is_none());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "被拒的 agent open 不得增加 suspend");
 
     h.fence.with(|fence| fence.flash_critical = true);
-    if expire_agent_lease {
+    if advance_under_guard {
         h.advance(Duration::from_secs(2));
-        assert!(h.core.active_lease().is_none(), "agent lease timer 應已到期");
-    } else {
-        h.rpc(close_req(&agent_id))
-            .expect("guard 關閉期間明確 close agent lease");
-        assert!(h.core.active_lease().is_none());
+        assert!(
+            h.core.active_lease().map_or(true, |lease| lease.owner.starts_with("human:")),
+            "被拒的 agent open 不得留下 agent lease",
+        );
     }
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "close／expiry 立即結算 agent lease 的 suspend");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "guard 關閉期間 probe 在途，suspend 維持一層");
 
     h.disconnect("a");
     assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "EOF 依既有 on_drop 保留 self-test suspend");
