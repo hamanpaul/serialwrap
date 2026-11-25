@@ -319,21 +319,17 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     );
     let copied_config = fs::read_to_string(env.config_dir.join("config.yaml"))
         .expect("讀取 user config 複本");
+    let expected_config_wal_dir = expected_dir.display().to_string();
     assert!(
-        copied_config.lines().any(|line| line.trim() == "wal_dir: archive/wal"),
-        "複製 config 時必須保留 wal_dir 原字串，不得改成絕對路徑：{copied_config}"
+        copied_config
+            .lines()
+            .any(|line| line.trim() == format!("wal_dir: {expected_config_wal_dir}")),
+        "複製 config 時必須將 system config 的相對 wal_dir 固化成絕對路徑：{copied_config}"
     );
     assert!(
-        copied_config.contains("__serialwrap_wal_dir_origin_v1:")
-            && copied_config.contains("__serialwrap_owner: serialwrap")
-            && copied_config.contains(
-                env.system_config
-                    .parent()
-                    .expect("system config parent")
-                    .to_string_lossy()
-                    .as_ref()
-            ),
-        "複本須保留原 config 的相對路徑基準：{copied_config}"
+        !copied_config.contains("__serialwrap_wal_dir_origin_v1")
+            && !copied_config.contains("__serialwrap_internal"),
+        "複製 config 不得新增 WAL 來源紀錄或內部鍵：{copied_config}"
     );
     let mut second = DaemonProc::spawn_with_cwd(&env, &env.vars, &[], &daemon_cwd);
     wait_ready(&env, "COM0");
@@ -371,6 +367,41 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     );
     rpc_once(&env.socket, STOP);
     assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+
+    let mut tilde_env = isolated_env_with_pty_target();
+    tilde_env
+        .vars
+        .insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    fs::create_dir_all(
+        tilde_env
+            .system_config
+            .parent()
+            .expect("system config parent"),
+    )
+    .expect("建立 tilde system config 目錄");
+    fs::write(&tilde_env.system_config, "wal_dir: ~/archive/wal\n")
+        .expect("寫入 tilde system config");
+    let expected_tilde_dir = PathBuf::from(&tilde_env.vars["HOME"]).join("archive/wal");
+    let mut tilde_daemon = DaemonProc::spawn(&tilde_env, &[]);
+    wait_ready(&tilde_env, "COM0");
+    assert_eq!(
+        health_status(&tilde_env.socket)["wal_path"],
+        expected_tilde_dir
+            .join("raw.wal.ndjson")
+            .display()
+            .to_string(),
+        "複製 system config 時必須展開並固化 tilde wal_dir"
+    );
+    rpc_once(&tilde_env.socket, STOP);
+    assert_eq!(tilde_daemon.wait(LONG).code(), Some(0), "{}", tilde_daemon.stderr());
+    let tilde_copy = fs::read_to_string(tilde_env.config_dir.join("config.yaml"))
+        .expect("讀取 tilde system config 複本");
+    assert!(
+        tilde_copy.lines().any(|line| {
+            line.trim() == format!("wal_dir: {}", expected_tilde_dir.display())
+        }),
+        "複製 config 時必須將 tilde wal_dir 固化為展開後的絕對路徑：{tilde_copy}"
+    );
 }
 
 #[test]
@@ -379,9 +410,12 @@ fn system_config_copy_preserves_internal_scalar_and_restarts() {
     env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
     fs::create_dir_all(env.system_config.parent().expect("system config parent"))
         .expect("建立 system config 目錄");
+    let system_config_path = env.system_config.display().to_string();
     fs::write(
         &env.system_config,
-        "wal_dir: archive/wal\n__serialwrap_internal: keep-this\n",
+        format!(
+            "wal_dir: archive/wal\n__serialwrap_internal: keep-this\n__serialwrap_wal_dir_origin_v1_notes:\n  __serialwrap_owner: serialwrap\n  value: archive/wal\n  config_path: {system_config_path}\n  note: retain-me\n"
+        ),
     )
     .expect("寫入 system config");
     let expected_dir = env
@@ -409,8 +443,17 @@ fn system_config_copy_preserves_internal_scalar_and_restarts() {
         "複製設定不得以 WAL 來源中繼資料覆寫既有同名純量：{copied_text}"
     );
     assert!(
-        copied_text.lines().any(|line| line.trim() == "wal_dir: archive/wal"),
-        "複製設定必須保留 wal_dir 原始字串：{copied_text}"
+        copied_text.contains("__serialwrap_wal_dir_origin_v1_notes:")
+            && copied_text.contains(&format!("config_path: {system_config_path}"))
+            && copied_text.contains("note: retain-me"),
+        "複製設定必須原樣保留同前綴、同欄位形狀及額外欄位的既有 mapping：{copied_text}"
+    );
+    assert!(
+        copied_text.lines().any(|line| {
+            line.trim()
+                == format!("wal_dir: {}", expected_dir.display())
+        }),
+        "複製設定必須將 system config 的相對 wal_dir 固化成絕對路徑：{copied_text}"
     );
 
     let mut second = DaemonProc::spawn(&env, &[]);
@@ -422,6 +465,14 @@ fn system_config_copy_preserves_internal_scalar_and_restarts() {
     );
     rpc_once(&env.socket, STOP);
     assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+    let restarted_copy = fs::read_to_string(&copied_config).expect("重新啟動後讀取 config");
+    assert!(
+        restarted_copy.contains("__serialwrap_internal: keep-this")
+            && restarted_copy.contains("__serialwrap_wal_dir_origin_v1_notes:")
+            && restarted_copy.contains(&format!("config_path: {system_config_path}"))
+            && restarted_copy.contains("note: retain-me"),
+        "第二次啟動寫回 endpoint 後仍須保留使用者既有鍵：{restarted_copy}"
+    );
 }
 
 #[test]
@@ -450,7 +501,26 @@ fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restar
     rpc_once(&env.socket, STOP);
     assert_eq!(first.wait(LONG).code(), Some(0), "{}", first.stderr());
 
-    replace_config_wal_dir(&copied_config, "archive/wal", "other/wal");
+    let copied_text = fs::read_to_string(&copied_config).expect("讀取 system config 複本");
+    let copied_wal_dir = copied_text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("wal_dir: "))
+        .expect("system config 複本含 wal_dir")
+        .to_string();
+    replace_config_wal_dir(&copied_config, &copied_wal_dir, "other/wal");
+    let mut user_config = fs::read_to_string(&copied_config).expect("讀取待編輯的 user config");
+    user_config.push_str(
+        "__serialwrap_wal_dir_origin_v1_notes:\n  __serialwrap_owner: serialwrap\n  value: archive/wal\n  config_path: /fixture/system/config.yaml\n  note: retain-me\n__serialwrap_internal:\n  wal_dir_origin:\n    value: archive/wal\n    config_path: /fixture/legacy/config.yaml\n  note: retain-legacy\n",
+    );
+    fs::write(&copied_config, user_config).expect("寫入含既有內部形狀鍵的 user config");
+    #[cfg(all(test, unix))]
+    {
+        assert!(
+            !is_root(),
+            "證據不足：root 下 chmod 無效，config endpoint 寫回失敗路徑須以非 root 執行"
+        );
+        chmod(&copied_config, "444");
+    }
     let mut second = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
     assert_eq!(
@@ -458,8 +528,25 @@ fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restar
         other_dir.join("raw.wal.ndjson").display().to_string(),
         "不同的設定值必須以目前 user config 目錄解析"
     );
+    #[cfg(all(test, unix))]
+    assert!(
+        second.stderr().contains("寫入 config.yaml endpoint 失敗"),
+        "唯讀 user config 必須實際阻擋 endpoint 寫回：{}",
+        second.stderr()
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+    #[cfg(all(test, unix))]
+    chmod(&copied_config, "644");
+    let edited_config = fs::read_to_string(&copied_config).expect("重啟後讀取 user config");
+    assert!(
+        edited_config.contains("__serialwrap_wal_dir_origin_v1_notes:")
+            && edited_config.contains("config_path: /fixture/system/config.yaml")
+            && edited_config.contains("note: retain-me")
+            && edited_config.contains("config_path: /fixture/legacy/config.yaml")
+            && edited_config.contains("note: retain-legacy"),
+        "使用者 config 中任何既有 __serialwrap_* 形狀鍵都必須原樣保留：{edited_config}"
+    );
 
     replace_config_wal_dir(&copied_config, "other/wal", "archive/wal");
     let mut third = DaemonProc::spawn(&env, &[]);
@@ -484,6 +571,13 @@ fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restar
         "改回原字串後隔離 doctor process 必須確認 WAL 目錄一致；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
+    );
+    let restored_config = fs::read_to_string(&copied_config).expect("改回 wal_dir 後讀取 user config");
+    assert!(
+        restored_config.contains("__serialwrap_wal_dir_origin_v1_notes:")
+            && restored_config.contains("note: retain-me")
+            && restored_config.contains("note: retain-legacy"),
+        "使用者把 wal_dir 改回原值後，既有 __serialwrap_* 鍵仍須保留：{restored_config}"
     );
     rpc_once(&env.socket, STOP);
     assert_eq!(third.wait(LONG).code(), Some(0), "{}", third.stderr());

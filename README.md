@@ -873,6 +873,11 @@ on-demand, systemd-user, systemd-system, and Windows scheduled-task launches
 use the same rule. A shell-only environment override may intentionally differ
 from a supervised daemon; to keep every launch mode on one path, put
 `wal_dir: ~/wal-archive` (or an absolute path) in `config.yaml`.
+When the daemon copies a system fallback config to a new user config, it resolves
+a relative `wal_dir` against the system config directory and writes the absolute
+path; `~` is expanded at copy time. Absolute `wal_dir` values are preserved.
+Relative paths the user enters later are resolved against the current config's
+directory.
 `setup`, supervision-mode changes, update, and rollback preserve this key.
 Run `serialwrap daemon status` (`wal_path`/`mirror_path` fields) or
 `serialwrap doctor` (`wal_dir`) to see and compare the *live* daemon path.
@@ -2886,6 +2891,9 @@ WAL 目錄依「daemon 環境的 `SERIALWRAP_WAL_DIR` > `config.yaml` 頂層
 `config.yaml` 所在目錄為基準，並支援 `~`。前景、on-demand、systemd-user、
 systemd-system 與 Windows 工作排程都使用同一套規則；若要所有監管模式固定
 落在同一路徑，請在 `config.yaml` 設 `wal_dir: ~/wal-archive` 或絕對路徑。
+daemon 將 system fallback 複製成新的 user config 時，會在複製當下依 system
+config 所在目錄解析相對 `wal_dir`，並把絕對路徑寫入複本；`~` 會於複製時展開，
+原本的絕對路徑維持不變。使用者之後輸入的相對路徑，則以目前 config 所在目錄為基準。
 `setup`、`supervision-mode set`、更新與 rollback 會保留這個鍵。要確認 live
 daemon 實際在用的路徑，請跑 `serialwrap daemon status`（`wal_path`／
 `mirror_path` 欄位）或 `serialwrap doctor`（`wal_dir` 比對檢查）。

@@ -1604,8 +1604,8 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
         } else {
             RuntimeConfig::from_text(None).map_err(|e| e.to_string())?
         };
-        cfg.invalidate_wal_dir_origin_if_mismatched();
         let flavor = flavor_of(&p.caps);
+        // system fallback 複製成 user config 時固化路徑；複製後的相對設定由目前 config 路徑解析。
         if read_path != write_path {
             let raw_wal_dir = match cfg.wal_dir() {
                 Some(YValue::Str(raw)) => Some(raw.clone()),
@@ -1613,23 +1613,23 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
             };
             if let Some(raw) = raw_wal_dir {
                 let expanded = pypath::expanduser(flavor, &raw, env, &home);
-                if !py_strip(&raw).is_empty() && !pypath::isabs(flavor, &expanded) {
-                    let origin_path = cfg
-                        .wal_dir_origin()
-                        .filter(|(source_value, _)| *source_value == raw.as_str())
-                        .map(|(_, source_path)| source_path.to_string())
-                        .unwrap_or_else(|| {
-                            if pypath::isabs(flavor, &read_path) {
-                                read_path.clone()
-                            } else {
-                                sw_pal::path_norm::absolute_path_from_cwd(
-                                    &read_path,
-                                    p.caps.path_flavor,
-                                )
-                                .unwrap_or_else(|| read_path.clone())
-                            }
-                        });
-                    cfg.set_wal_dir_origin(&raw, &origin_path);
+                if !py_strip(&raw).is_empty()
+                    && (!pypath::isabs(flavor, &raw) || raw.contains('~'))
+                {
+                    let resolved = if pypath::isabs(flavor, &expanded) {
+                        expanded
+                    } else {
+                        let absolute_config_path = sw_pal::path_norm::absolute_path_from_cwd(
+                            &read_path,
+                            p.caps.path_flavor,
+                        )
+                        .ok_or_else(|| {
+                            format!("無法解析 system config 的絕對路徑：{read_path}")
+                        })?;
+                        let config_dir = pypath::dirname(flavor, &absolute_config_path);
+                        pypath::join(flavor, &config_dir, &[&expanded])
+                    };
+                    cfg.set_wal_dir(&resolved);
                 }
             }
         }
