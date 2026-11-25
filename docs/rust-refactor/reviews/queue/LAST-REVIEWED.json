@@ -43,7 +43,7 @@
   "fix/288-submit-console-line-limit": "48b519b",
   "fix/279-tcp-console-lease": "b8483d9",
   "fix/290-timeout-recovery-keys": "b1fb7e6",
-  "fix/inst4-install-upgrade": "95b32f6",
+  "fix/inst4-install-upgrade": "2363457",
   "fix/281-alias-persistence": "af95cf2",
   "feature/304-config-wal-dir": "d0b341a"
 }
