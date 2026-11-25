@@ -930,6 +930,11 @@ impl RuntimeConfig {
         self.data.get_str("socket_path")
     }
 
+    /// `data.get("wal_dir")`（不驗型別；非字串由路徑解析端視為未設定）。
+    pub fn wal_dir(&self) -> Option<&YValue> {
+        self.data.get_str("wal_dir")
+    }
+
     /// 07 §5.1：socket_path Some 才覆寫。
     ///
     /// 對應 `sw_core/runtime_config.py` `set_mode`：`supervision_mode` 必寫；`socket_path` 只在 `Some` 時覆寫，

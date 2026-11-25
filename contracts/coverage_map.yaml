@@ -96,6 +96,19 @@ entries:
     - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
     - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
     owner_phase: P7
+  bc:BC-17:
+    nodeids:
+    - cargo:sw-proto::runtime_paths_golden::test_resolve_wal_dir_env_config_and_default_priority
+    - cargo:sw-proto::runtime_paths_golden::test_resolve_wal_dir_windows_relative_uses_config_parent
+    - cargo:sw-proto::runtime_config_write::runtime_config_set_mode_keeps_other_keys
+    - cargo:sw-daemon::daemon_process::config_wal_dir_is_used_by_daemon_startup_and_writes
+    - cargo:sw-cli::mgmt_doctor::wal_dir_config_mismatch_is_reported
+    - cargo:sw-cli::mgmt_doctor::wal_dir_mismatch
+    - cargo:sw-cli::mgmt_setup::s1m241_assessment_matching_ping_is_reported_once
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_idle_uses_handoff_not_daemon_stop
+    - cargo:sw-cli::mgmt_daemon::autostart_not_for_daemon_status
+    - cargo:sw-cli::mgmt_update::update_release_then_rollback_keeps_released
+    owner_phase: P5
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
@@ -2718,6 +2731,7 @@ l1_only_approvals:
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-13": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-17": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-25 Python 凍結）：bc:BC-17 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

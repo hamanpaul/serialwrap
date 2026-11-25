@@ -1028,6 +1028,30 @@ fn autostart_not_for_daemon_status() {
     assert_eq!(fstr(&json(&out), "error_code"), "SOCKET_ERROR");
     assert!(t.process().spawns().is_empty());
     assert_eq!(t.rpc().connect_count(TestEnv::win_endpoint()), 1, "只連線一次（health.status），不得探測或啟動");
+
+    let live = TestEnv::posix().with_config("wal_dir: ../audit/wal\n");
+    let endpoint = live.default_socket();
+    let expected = live
+        .config_dir()
+        .parent()
+        .expect("config dir 必有父目錄")
+        .join("audit")
+        .join("wal")
+        .join("raw.wal.ndjson")
+        .display()
+        .to_string();
+    let live = live.with_rpc_ok(
+        &endpoint,
+        "health.status",
+        &format!(r#"{{"ok":true,"wal_path":"{expected}"}}"#),
+    );
+    let (rc, out, _) = live.run(&["daemon", "status"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        fstr(&json(&out), "wal_path"),
+        expected,
+        "daemon status 必須原樣回報實際健康資料中的 WAL 路徑"
+    );
 }
 
 #[test]

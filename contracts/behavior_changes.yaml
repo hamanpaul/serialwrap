@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；BC-17 依 OD-111／rulings v051（i304）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 19
+revision: 20
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -248,6 +248,32 @@ changes:
     compatibility_impact: "Rust 0.5.1 的 session.self_test 只在當下診斷，不保留後續 RPC 的操作權。前景槽、有效待執行命令、login／Recover、agent interactive lease、另一個 probe 或進行中的 background capture 會得到被動 SESSION_BUSY 或 SESSION_INTERACTIVE_BUSY（recommended_action=wait）：零 probe TX、不 suspend human、不更新 last_probe_at、不 confirm ready；busy 不代表故障。閒置 probe 在同一 actor 仲裁內取得 foreground、pending 與 Fence op-owner 授權，直到成功、失敗或 Shutdown 收尾；明示 Recover 仍可受理，但會使在途 probe 證據失效。執行回應逐項提供 tx_complete、execution_marker、probe_rc_zero、prompt_after_marker；只有完整 TX、TX 外獨立完整執行標記（由 configured ready_probe 成功後的 POSIX shell printf 發出）、零 RC、標記後 prompt，以及仍有效的 op／連線 epoch／FSM 證據世代全成立時才 probe_ok 並 confirm_ready。Rust 框架 TX 長度與拒絕回應長度可不同於凍結的 Python golden；Python 0.4.x 行為及 golden 不變。自訂 ready_probe 必須可在相容的 POSIX shell 框架中執行；不相容時失敗關閉，不退回 nonce 回顯判準。"
     approval_conditions: "依 OD-111、OD-112 授權的 2026-11-23 i306 編排者定案：保持既有前置分類與 Recover/human lease 政策；忙碌零 TX；在同次仲裁保留 foreground；Fence 提交點驗證 SelfTestProbe op-owner；以 TX 外執行標記、configured probe 零 RC 與標記後 prompt 建立證據；probe 執行結果攜帶四個固定布林欄位；確認前驗證連線 epoch 與證據世代；Shutdown Phase 1 立即沖刷且晚到結果不再回覆、回放或確認；不改 Python golden，不新增錯誤碼。"
     related_decisions: ["OD-111", "OD-112"]
+  - id: "BC-17"
+    kind: "BC"
+    title: "受監管 daemon 採用 config.yaml 的 WAL 目錄"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-25"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 20
+    spec_refs: ["issue-304", "v051.md i304"]
+    reconciliation_refs: ["issue-304"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P3", "P5"]
+    case_ids: ["bc17-config-wal-dir"]
+    compatibility_impact: "Rust daemon 的 WAL 目錄改依 `SERIALWRAP_WAL_DIR` > `config.yaml` 頂層 `wal_dir` > `<state_dir>/wal` 解析；shell、on-demand、systemd-user、systemd-system 與 Windows 工作排程共用同一規則。config 的相對路徑以實際讀取的 config.yaml 所在目錄為基準，`~` 依平台展開。`daemon status` 的 `wal_path` 即實際 WAL writer 路徑，doctor 的 `wal_dir` 以同一解析結果比對並將修正建議指向 config.yaml；setup、supervision-mode set、update／rollback 只更新既有管理鍵而保留 wal_dir。目錄建立或寫入失敗沿用既有 WAL 健康／啟動失敗，不新增錯誤碼。"
+    approval_conditions: "依 OD-111 與 v051 i304：只改 Rust，不改 Python、WAL 格式或其他設定鍵；環境變數保有最高優先序；相對路徑與 `~` 由共用解析器處理；所有監管入口均經同一 daemon 啟動路徑；不得改寫或刪除既有 config wal_dir。"
+    related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"

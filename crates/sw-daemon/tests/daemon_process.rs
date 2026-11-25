@@ -224,6 +224,42 @@ fn last_wal_line(env: &IsolatedEnv) -> String {
 }
 
 #[test]
+fn config_wal_dir_is_used_by_daemon_startup_and_writes() {
+    let mut env = isolated_env_with_pty_target();
+    env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    fs::write(
+        env.config_dir.join("config.yaml"),
+        "wal_dir: ../audit/custom-wal\n",
+    )
+    .expect("寫入 config.yaml");
+    let expected_dir = env.root.join("audit").join("custom-wal");
+    let expected_wal = expected_dir.join("raw.wal.ndjson");
+
+    let mut daemon = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    let health = health_status(&env.socket);
+    assert_eq!(
+        health["wal_path"],
+        expected_wal.display().to_string(),
+        "health.status 必須回報 config wal_dir 實際使用的路徑"
+    );
+    let contents = fs::read_to_string(&expected_wal).unwrap_or_else(|error| {
+        panic!(
+            "config wal_dir 未被 daemon 實際寫入：{}（{error}，stderr={}）",
+            expected_wal.display(),
+            daemon.stderr()
+        )
+    });
+    assert!(
+        contents.lines().any(|line| pyjson::loads(line).is_ok()),
+        "custom WAL 至少須包含一筆有效 JSON 紀錄"
+    );
+
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+#[test]
 fn second_daemon_same_lock_exits_2_with_stderr() {
     let env = isolated_env();
     let mut a = DaemonProc::spawn(&env, &[]);

@@ -619,6 +619,44 @@ fn wal_dir_mismatch() {
         s(check, "detail"),
         "daemon 實際生效 WAL_DIR=/b，與 shell SERIALWRAP_WAL_DIR=/a 不一致"
     );
+    assert!(
+        s(check, "fix").contains("config.yaml")
+            && s(check, "fix").contains("wal_dir"),
+        "修正建議必須指向 config.yaml 的 wal_dir"
+    );
+    assert!(
+        !s(check, "fix").contains("Environment=SERIALWRAP_WAL_DIR"),
+        "不得再要求手動改 systemd unit Environment"
+    );
+}
+
+#[test]
+fn wal_dir_config_mismatch_is_reported() {
+    let t = TestEnv::posix().with_config("wal_dir: ../audit/wal\n");
+    let ep = t.default_socket();
+    let daemon_dir = t.state_dir().join("wal");
+    let t = t.with_rpc_ok(
+        &ep,
+        "health.status",
+        &format!(
+            r#"{{"ok":true,"wal_path":"{}/raw.wal.ndjson"}}"#,
+            daemon_dir.display()
+        ),
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "wal_dir");
+    assert!(!b(check, "ok"), "daemon 未採用 config wal_dir 時 doctor 必須失敗");
+    assert!(
+        s(check, "detail").contains("config.yaml wal_dir"),
+        "{}",
+        s(check, "detail")
+    );
+    assert!(
+        s(check, "fix").contains("config.yaml")
+            && s(check, "fix").contains("wal_dir")
+    );
 }
 
 #[test]

@@ -1,8 +1,11 @@
 mod common;
 
 use sw_proto::{
+    config_types::RuntimeConfig,
     pypath::PathFlavor,
-    runtime_paths::{EnvSnapshot, NativeTraits, PathsError, RuntimePaths},
+    runtime_paths::{
+        resolve_wal_dir, EnvSnapshot, NativeTraits, PathsError, RuntimePaths,
+    },
 };
 
 struct H;
@@ -166,6 +169,97 @@ fn test_resolve_config_path_sc09() {
         );
         assert_eq!(&got, want, "{id}");
     }
+}
+
+#[test]
+fn test_resolve_wal_dir_env_config_and_default_priority() {
+    let native = NativeTraits {
+        default_endpoint_is_tcp: false,
+        path_flavor: PathFlavor::Posix,
+    };
+    let env = env_of(&[
+        ("HOME", "/fixture/home"),
+        ("SERIALWRAP_STATE_DIR", "/state"),
+        ("SERIALWRAP_CONFIG_DIR", "/cfg"),
+    ]);
+    let paths = RuntimePaths::resolve(&env, native, &H).expect("paths");
+    let config_path = "/cfg/sub/config.yaml";
+
+    let cases = [
+        (None, "/state/wal"),
+        (Some("archive/wal"), "/cfg/sub/archive/wal"),
+        (Some("../archive/wal"), "/cfg/archive/wal"),
+        (Some("~/serialwrap-wal"), "/fixture/home/serialwrap-wal"),
+        (Some("   "), "/state/wal"),
+    ];
+    for (configured, expected) in cases {
+        let text = configured.map_or_else(
+            String::new,
+            |value| format!("wal_dir: {value}\n"),
+        );
+        let cfg = RuntimeConfig::from_text(if text.is_empty() {
+            None
+        } else {
+            Some(&text)
+        })
+        .expect("config");
+        assert_eq!(
+            resolve_wal_dir(
+                &env,
+                PathFlavor::Posix,
+                &H,
+                &paths.state_dir,
+                config_path,
+                &cfg,
+            ),
+            expected,
+            "wal_dir={configured:?}"
+        );
+    }
+
+    let env = env_of(&[
+        ("HOME", "/fixture/home"),
+        ("SERIALWRAP_STATE_DIR", "/state"),
+        ("SERIALWRAP_WAL_DIR", "~/env-wal"),
+    ]);
+    let cfg =
+        RuntimeConfig::from_text(Some("wal_dir: config-wal\n")).expect("config");
+    assert_eq!(
+        resolve_wal_dir(
+            &env,
+            PathFlavor::Posix,
+            &H,
+            "/state",
+            config_path,
+            &cfg,
+        ),
+        "/fixture/home/env-wal"
+    );
+}
+
+#[test]
+fn test_resolve_wal_dir_windows_relative_uses_config_parent() {
+    let env = EnvSnapshot::from_pairs_fold_upper([
+        ("USERPROFILE".to_string(), r"C:\Fixture\Users\demo".to_string()),
+        ("HOMEDRIVE".to_string(), "C:".to_string()),
+        (
+            "HOMEPATH".to_string(),
+            r"\Fixture\Users\demo".to_string(),
+        ),
+    ]);
+    let cfg = RuntimeConfig::from_text(Some("wal_dir: ..\\archive\\wal\n"))
+        .expect("config");
+    assert_eq!(
+        resolve_wal_dir(
+            &env,
+            PathFlavor::Windows,
+            &H,
+            r"C:\state",
+            r"C:\config\serialwrap\config.yaml",
+            &cfg,
+        ),
+        r"C:\config\archive\wal"
+    );
 }
 
 /// P7 Task 13（parity-amendments #5，A:G-5）：`EVENTS_LOG_PATH = _env_path("SERIALWRAP_EVENTS_LOG_PATH",

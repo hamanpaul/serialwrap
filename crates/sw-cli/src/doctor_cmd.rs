@@ -19,11 +19,13 @@ use crate::output;
 use crate::pairing::{pairing_item, safe_component_path};
 use sw_pal::device_source::windows_model::{exclude_bluetooth, read_bt_ports, SERIALCOMM_KEY};
 use sw_pal::PalPathFlavor;
+use sw_proto::config_types::RuntimeConfig;
 use sw_proto::pycompat::py_strip;
 use sw_proto::pyfmt::py_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::release_manifest::ReleaseManifest;
+use sw_proto::runtime_paths::resolve_wal_dir;
 use sw_proto::yaml11::{self, py_str_of, py_truthy_of, YValue};
 
 /// 單一 doctor 項目（輸出形狀：`check`、`ok`、`detail`、`fix`、`advisory`，外加 `extra` 的額外鍵）。
@@ -174,22 +176,19 @@ const FIX_MINICOM_WRAPPER: &str = "執行 `serialwrap setup` 物化 minicom wrap
 const FIX_JQ: &str = "安裝 jq（Debian/Ubuntu/Mint: sudo apt install jq）——serialwrap-minicom wrapper 解析 session 狀態需要";
 /// `minicom_on_path`：fix（07 §7.3）。
 const FIX_MINICOM: &str = "安裝 minicom（Debian/Ubuntu/Mint: sudo apt install minicom）";
-/// `wal_dir`：shell 與 daemon WAL_DIR 不一致 fix（07 §7.3）。
+/// `wal_dir`：daemon 與有效 config WAL_DIR 不一致 fix。
 const FIX_WAL_DIR_MISMATCH: &str = concat!(
-    "daemon 由 systemd 管理時 unit 不會繼承 shell 匯出的 env（.bashrc 的 export 對它無效）：",
-    "需在 unit 加 Environment=SERIALWRAP_WAL_DIR=<path> 後 systemctl daemon-reload ",
-    "並 `serialwrap service restart`；on-demand/前景啟動則需在同一個帶該 env 的 shell ",
-    "重跑 `serialwrap daemon stop && serialwrap daemon start`。查詢一律以 ",
-    "`serialwrap daemon status` 的 wal_path 為準，不要用 shell env 去猜",
+    "請在 daemon 實際讀取的 config.yaml 設頂層 wal_dir（相對路徑以 config.yaml 所在目錄為基準，",
+    "支援 ~），再重新啟動 daemon；SERIALWRAP_WAL_DIR 仍可在 daemon 啟動環境中覆寫此值。",
+    "查詢一律以 `serialwrap daemon status` 的 wal_path 為準"
 );
 /// `wal_writable`：不可寫 fix（07 §7.3）。
 const FIX_WAL_WRITABLE: &str = concat!(
     "確認沒有外部工具刪除該目錄（已知案例：testpilot 的 clean_wal() 會 rmtree ",
     "硬編路徑 /tmp/serialwrap/wal，見 hamanpaul/testpilot-core#36）。daemon 會在",
-    "下一次寫入時自動重建目錄續寫，但消失期間的紀錄無法復原；需要持久稽核請把 ",
-    "WAL_DIR 指向非 /tmp 的路徑（systemd 模式在 unit 加 ",
-    "Environment=SERIALWRAP_WAL_DIR=<path> 後 systemctl daemon-reload 並 ",
-    "`serialwrap service restart`）",
+    "下一次寫入時自動重建目錄續寫，但消失期間的紀錄無法復原；需要持久稽核請在 ",
+    "config.yaml 設 wal_dir 指向非 /tmp 的路徑，重啟後再以 `serialwrap daemon status` ",
+    "確認 wal_path",
 );
 /// `profile_bootloader_prompts`：缺 bootloader_prompts fix（07 §7.3）。
 const FIX_PROFILE_PROMPTS: &str = concat!(
@@ -1117,8 +1116,21 @@ fn check_daemon_endpoint(ctx: &CliCtx) -> Check {
     }
 }
 
-/// `wal_dir`（advisory）：daemon 實際生效 WAL_DIR 與 shell `SERIALWRAP_WAL_DIR` 是否一致。
+/// `wal_dir`（advisory）：daemon 實際 WAL 路徑與共用解析器的有效值是否一致。
 fn check_wal_dir(ctx: &CliCtx) -> Check {
+    let flavor = flavor_of(ctx);
+    let home = EnvHome(ctx.p.env.as_ref());
+    let config_path = endpoint_resolve::config_read_path(ctx);
+    let cfg = endpoint_resolve::safe_runtime_config(ctx)
+        .unwrap_or_else(|| RuntimeConfig::from_text(None).expect("空 config 必可解析"));
+    let expected_dir = resolve_wal_dir(
+        &ctx.env,
+        flavor,
+        &home,
+        &ctx.paths.state_dir,
+        &config_path,
+        &cfg,
+    );
     let endpoint = plain_endpoint(ctx);
     let resp = health_status(ctx, &endpoint);
     let wal_path = resp.get("wal_path");
@@ -1128,29 +1140,31 @@ fn check_wal_dir(ctx: &CliCtx) -> Check {
             ok: true,
             detail: format!(
                 "daemon 未在跑或無法連線，僅顯示本地端解析值：WAL_DIR={}",
-                ctx.paths.wal_dir
+                expected_dir
             ),
             fix: Some(String::new()),
             advisory: false,
             extra: PyDict::new(),
         };
     }
-    let flavor = flavor_of(ctx);
     let daemon_dir = pypath::dirname(flavor, &str_of(wal_path));
     let shell_override = py_strip(ctx.env.get("SERIALWRAP_WAL_DIR").unwrap_or("")).to_string();
-    let home = EnvHome(ctx.p.env.as_ref());
-    let mismatch = !shell_override.is_empty()
-        && pypath::normpath(
-            flavor,
-            &pypath::expanduser(flavor, &shell_override, &ctx.env, &home),
-        ) != pypath::normpath(flavor, &daemon_dir);
+    let mismatch =
+        pypath::normpath(flavor, &expected_dir) != pypath::normpath(flavor, &daemon_dir);
     if mismatch {
+        let detail = if shell_override.is_empty() {
+            format!(
+                "daemon 實際生效 WAL_DIR={daemon_dir}，與 config.yaml wal_dir 解析值 {expected_dir} 不一致"
+            )
+        } else {
+            format!(
+                "daemon 實際生效 WAL_DIR={daemon_dir}，與 shell SERIALWRAP_WAL_DIR={shell_override} 不一致"
+            )
+        };
         return Check {
             check: "wal_dir",
             ok: false,
-            detail: format!(
-                "daemon 實際生效 WAL_DIR={daemon_dir}，與 shell SERIALWRAP_WAL_DIR={shell_override} 不一致"
-            ),
+            detail,
             fix: Some(FIX_WAL_DIR_MISMATCH.to_string()),
             advisory: false,
             extra: PyDict::new(),

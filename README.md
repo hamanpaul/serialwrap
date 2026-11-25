@@ -861,19 +861,21 @@ warning; records written while it was missing are unrecoverable. `wal export`
 additionally reports `available_from_seq` and `rotated_out`, so a range that
 predates the current file is stated explicitly rather than coming back empty.
 `serialwrap doctor`'s `wal_writable` check verifies the directory really exists
-and is writable — unlike `wal_dir`, which only compares the shell and daemon
-values and is advisory.
+and is writable — unlike `wal_dir`, which compares the daemon's actual path
+with the CLI's effective configuration and is advisory.
 
 `~/b-log` is **not** the WAL — it only holds agent-triggered on-demand session
-captures. The authoritative WAL always lives under `SERIALWRAP_WAL_DIR`
-(default `~/.local/state/serialwrap/wal/`). A shell-exported
-`SERIALWRAP_WAL_DIR` (e.g. in `.bashrc`) only affects processes started from
-that shell; a systemd-managed daemon does **not** inherit it (the generated
-unit carries no such `Environment=` line by default) and keeps writing to its
-own resolved default regardless. Run `serialwrap daemon status`
-(`wal_path`/`mirror_path` fields) or `serialwrap doctor` (new `wal_dir` check,
-warns on shell/daemon mismatch) to see the path the *live* daemon actually
-uses.
+captures. The authoritative WAL directory is resolved in this order:
+`SERIALWRAP_WAL_DIR` in the daemon's environment, the top-level `wal_dir` in
+the config file, then `~/.local/state/serialwrap/wal/`. A config-relative path
+is relative to the config file's directory, and `~` is expanded. Shell,
+on-demand, systemd-user, systemd-system, and Windows scheduled-task launches
+use the same rule. A shell-only environment override may intentionally differ
+from a supervised daemon; to keep every launch mode on one path, put
+`wal_dir: ~/wal-archive` (or an absolute path) in `config.yaml`.
+`setup`, supervision-mode changes, update, and rollback preserve this key.
+Run `serialwrap daemon status` (`wal_path`/`mirror_path` fields) or
+`serialwrap doctor` (`wal_dir`) to see and compare the *live* daemon path.
 
 ### Windows Support
 
@@ -2873,19 +2875,20 @@ retry，也不等於 daemon 檔案日誌。詳見 [CLI trace 契約](docs/refine
 
 | 檔案 | 說明 |
 |------|------|
-| 預設 `~/.local/state/serialwrap/wal/raw.wal.ndjson`（XDG state home，可由 `SERIALWRAP_WAL_DIR` 覆寫；舊版為 `/tmp/serialwrap/wal/`） | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
+| 預設 `~/.local/state/serialwrap/wal/raw.wal.ndjson`（XDG state home，可由環境變數或 `config.yaml` 的 `wal_dir` 覆寫；舊版為 `/tmp/serialwrap/wal/`） | 權威事件記錄，保留 `seq/cmd_id/source/crc32/...` |
 | 預設 `~/.local/state/serialwrap/wal/raw.mirror.log` | 可讀文字鏡像，接近 console payload |
 | 預設 `~/.local/state/serialwrap/state.json`（可由 `SERIALWRAP_STATE_DIR` 覆寫；舊版為 `/tmp/serialwrap/state.json`） | alias 與 binding 持久化 |
 | Agent log `~/b-log/{COM}_{YYMMDD}-{HHMMSS}.log` | Agent 觸發式 per-session 日誌，純文字 RX 內容 |
 
 `~/b-log` **不是** WAL——它只存放 agent 觸發式的 on-demand session capture。權威
-WAL 一律落在 `SERIALWRAP_WAL_DIR`（預設 `~/.local/state/serialwrap/wal/`）。
-在 shell 裡（例如 `.bashrc`）匯出的 `SERIALWRAP_WAL_DIR` 只對從該 shell 啟動的
-行程有效；systemd 託管的 daemon **不會**繼承它（產生的 unit 預設不含對應的
-`Environment=` 那一行），仍會照自己解析出的預設路徑寫下去。要看 *live* daemon
-實際在用的路徑，請跑 `serialwrap daemon status`（`wal_path`／`mirror_path`
-欄位）或 `serialwrap doctor`（新增的 `wal_dir` 檢查，shell/daemon 不一致時
-會 WARN）。
+WAL 目錄依「daemon 環境的 `SERIALWRAP_WAL_DIR` > `config.yaml` 頂層
+`wal_dir` > 預設 `<state_dir>/wal`」解析。config 的相對路徑以實際讀取的
+`config.yaml` 所在目錄為基準，並支援 `~`。前景、on-demand、systemd-user、
+systemd-system 與 Windows 工作排程都使用同一套規則；若要所有監管模式固定
+落在同一路徑，請在 `config.yaml` 設 `wal_dir: ~/wal-archive` 或絕對路徑。
+`setup`、`supervision-mode set`、更新與 rollback 會保留這個鍵。要確認 live
+daemon 實際在用的路徑，請跑 `serialwrap daemon status`（`wal_path`／
+`mirror_path` 欄位）或 `serialwrap doctor`（`wal_dir` 比對檢查）。
 
 ### Agent 日誌 (log start/stop)
 
@@ -2948,7 +2951,7 @@ serialwrap wal export --from-seq 0 --limit 500
 
 daemon 在下一次 append 時會**自動重建**被刪掉的 WAL 目錄並輸出告警，但消失期間的紀錄無法復原。`wal export` 另回 `available_from_seq`（現行檔最小 seq）與 `rotated_out`（請求區間是否落在已輪替掉的範圍），使「這個區間本來就沒紀錄」與「曾經存在但已被 rotate 掉」不再都只是空陣列。
 
-`serialwrap doctor` 的 **`wal_writable`** 檢查會實際驗證該目錄存在且可寫，**非 advisory**（稽核紀錄整個消失會拉低 doctor 整體 ok）；既有的 `wal_dir` 檢查只比對 shell/daemon 的 WAL_DIR 是否一致、維持 advisory WARN，兩者各司其職。
+`serialwrap doctor` 的 **`wal_writable`** 檢查會實際驗證該目錄存在且可寫，**非 advisory**（稽核紀錄整個消失會拉低 doctor 整體 ok）；`wal_dir` 則以環境、config 與預設的共用優先序算出預期值，和 daemon 實際 `wal_path` 比對並維持 advisory WARN，兩者各司其職。
 
 ### WAL 管理
 
@@ -2973,7 +2976,7 @@ serialwrap wal current-seq
 - `log tail-text` 偏向人類閱讀（`lines` 為純文字行，另附 `from_seq`／`last_seq`／`current_seq`／`returned`／`truncated` metadata，#124）。
 - `log tail-raw` / `wal export` 仍保留完整權威欄位。
 - `log tail-raw` / `log tail-text` 預設為 latest 模式（最新 N 筆）；顯式 `--from-seq N`（含 0）走 range 增量語意（見上方「WAL 查詢」）。
-- 可用 `SERIALWRAP_WAL_DIR` 覆寫 WAL / mirror log 目錄（例如另一顆磁碟或 `~/wal-archive`；**勿**與 agent capture 用的 `~/b-log` 混用，兩者用途不同見上方說明）；這不會改動 daemon socket / lock 的 `RUN_DIR`。systemd 託管的 daemon 不會繼承此 shell env，需寫進 unit 的 `Environment=` 才會生效——`serialwrap doctor` 的 `wal_dir` 檢查會印出實際生效路徑並在不一致時 WARN。
+- 可用 config.yaml 的頂層 `wal_dir` 固定 WAL / mirror log 目錄（例如另一顆磁碟或 `~/wal-archive`；**勿**與 agent capture 用的 `~/b-log` 混用，兩者用途不同見上方說明）；daemon 啟動環境中的 `SERIALWRAP_WAL_DIR` 仍保有最高優先序。兩者都不會改動 daemon socket / lock 的 `RUN_DIR`；`serialwrap doctor` 的 `wal_dir` 檢查會印出實際生效路徑並在不一致時 WARN。
 - `stream tail` 為 legacy alias；新設計優先使用 `cmd result-tail`。
 
 ## 跨平台序列埠與 Windows human console（#84 PORT-1/PORT-2）

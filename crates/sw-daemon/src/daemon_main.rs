@@ -43,7 +43,10 @@ use sw_proto::pycompat::{decode_utf8_strict, py_strip, PyOsError};
 use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::release_manifest::parse_current_release;
-use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
+use sw_proto::runtime_paths::{
+    resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot, NativeTraits, PathsError,
+    RuntimePaths,
+};
 
 use crate::code_identity::{capture as capture_code_identity, CodeIdentity};
 use crate::framing::{RpcHandler, RpcServer, RpcStopAccept};
@@ -1136,7 +1139,7 @@ fn run_guarded(argv: Vec<String>, platform: Platform, hooks: Hooks) -> i32 {
 fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // main.rs 已在建立任何 thread 之前呼叫 p.signals.install()。
     let env = snapshot_of(&p.caps, p.env.vars());
-    let paths = match resolve_paths(&p) {
+    let mut paths = match resolve_paths(&p) {
         Ok(x) => x,
         Err(msg) => {
             eprint!("{msg}");
@@ -1168,7 +1171,8 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         eprint!("{PROG}: 無法解析預設隔離路徑\n");
         return 1;
     };
-    let (cfg, cfg_error) = load_config_for_allowlist(&config_read_path(&env, &paths, &p), &*p.fs); // #47
+    let config_path = config_read_path(&env, &paths, &p);
+    let (cfg, cfg_error) = load_config_for_allowlist(&config_path, &*p.fs); // #47
     let allow = match &cfg_error {
         None => resolve_allowlist_with_caps(&*p.env, &p.caps, Some(&cfg), &iso_defaults),
         Some(err) => decide_on_unreadable_config(&*p.env, &p.caps, &iso_defaults, err),
@@ -1177,6 +1181,14 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         eprint!("{PROG}: TEST_DEVICE_ALLOWLIST_REJECTED: {reason}\n"); // 未建目錄、未取鎖
         return 2;
     }
+    paths.wal_dir = resolve_wal_dir(
+        &env,
+        flavor_of(&p.caps),
+        &SysEnvHome(&*p.env),
+        &paths.state_dir,
+        &config_path,
+        &cfg,
+    );
 
     if let Err(e) = ensure_runtime_dirs(&paths, &dirs, &*p.fs) {
         eprintln!("{}", e.py_message);
