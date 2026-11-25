@@ -134,6 +134,14 @@ pub struct RxShared {
     /// 測試觀察：regex 等待已檢查的最後一個 RX 絕對字元位置。
     #[cfg(feature = "test-fakes")]
     regex_wait_snapshot_end: AtomicU64,
+    /// 測試觀察：snapshot predicate 已檢查的次數與絕對尾端，用於 reader／evaluator processed barrier。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_checks: AtomicU64,
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_end: AtomicU64,
+    /// 測試交錯：命中 completion snapshot 後、waiter 收到結果前暫停。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_match_hook: Mutex<Option<Arc<dyn Fn(&RxSnapshot) + Send + Sync>>>,
 }
 
 impl RxShared {
@@ -157,6 +165,12 @@ impl RxShared {
             regex_wait_checks: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
             regex_wait_snapshot_end: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_checks: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_end: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_match_hook: Mutex::new(None),
         })
     }
 
@@ -173,6 +187,79 @@ impl RxShared {
     #[cfg(feature = "test-fakes")]
     pub fn regex_wait_snapshot_end_for_test(&self) -> u64 {
         self.regex_wait_snapshot_end.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn snapshot_wait_progress_for_test(&self) -> (u64, u64) {
+        (
+            self.snapshot_wait_checks.load(Ordering::Acquire),
+            self.snapshot_wait_end.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn wait_for_reader_bytes_for_test(&self, expected: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        while window.total_bytes < expected {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(window, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|error| error.into_inner());
+            window = next;
+            if timed_out.timed_out() && window.total_bytes < expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn wait_for_snapshot_wait_progress_for_test(
+        &self,
+        after_checks: u64,
+        expected_end: u64,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if self.snapshot_wait_checks.load(Ordering::Acquire) > after_checks
+                && self.snapshot_wait_end.load(Ordering::Acquire) >= expected_end
+            {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(window, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|error| error.into_inner());
+            window = next;
+            if timed_out.timed_out()
+                && (self.snapshot_wait_checks.load(Ordering::Acquire) <= after_checks
+                    || self.snapshot_wait_end.load(Ordering::Acquire) < expected_end)
+            {
+                return false;
+            }
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_snapshot_wait_match_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn(&RxSnapshot) + Send + Sync>>,
+    ) {
+        *self
+            .snapshot_wait_match_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
     }
 
     /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
@@ -496,7 +583,29 @@ impl RxShared {
             let revision = window.revision;
             drop(window);
 
-            if let Some(value) = matches(&snapshot) {
+            let value = matches(&snapshot);
+            #[cfg(feature = "test-fakes")]
+            {
+                let _window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                self.snapshot_wait_end.store(
+                    snapshot
+                        .base
+                        .saturating_add(snapshot.text.chars().count() as u64),
+                    Ordering::Release,
+                );
+                self.snapshot_wait_checks.fetch_add(1, Ordering::AcqRel);
+                self.changed.notify_all();
+            }
+            if let Some(value) = value {
+                #[cfg(feature = "test-fakes")]
+                if let Some(hook) = self
+                    .snapshot_wait_match_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+                {
+                    hook(&snapshot);
+                }
                 return Some((snapshot, value));
             }
 

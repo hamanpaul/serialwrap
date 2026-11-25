@@ -99,6 +99,7 @@ entries:
   bc:BC-22:
     nodeids:
     - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
+    - cargo:sw-core::command_completion::tests::echo_boundary_preserves_command_like_output_lines
     - cargo:sw-core::command_completion::tests::no_echo_human_tx_is_uncertain_but_clean_no_echo_tail_prompt_completes
     - cargo:sw-core::command_completion::tests::raw_half_line_is_not_accepted_as_clean_echo
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::command_boundary_retries_after_would_block
@@ -112,6 +113,8 @@ entries:
     - cargo:sw-core::command_exec::i294_prompt_before_command_tx_is_outside_no_echo_window
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_poison_next_agent_echo
+    - cargo:sw-core::command_exec::i294_shipped_prefix_prompts_handle_split_and_co_packed_rx
+    - cargo:sw-core::command_exec::i294_completion_snapshot_ignores_later_rx
     - cargo:sw-daemon::rpc_console::i294_rpc_human_prompt_before_agent_echo_does_not_complete
     owner_phase: P5
   bc:DF-01:

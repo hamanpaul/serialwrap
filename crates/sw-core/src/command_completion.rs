@@ -8,7 +8,7 @@ use std::ops::Range;
 use sw_proto::pycompat::clean_text;
 use sw_proto::pyre::PyRegex;
 
-use crate::op_runner::{match_wrapped_echo, strip_command_echo_from_text, WrapEvidence};
+use crate::op_runner::{match_wrapped_echo, WrapEvidence};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Evaluation {
@@ -46,12 +46,14 @@ impl<'a> CompletionEvaluator<'a> {
 
         if !raw_half_line {
             if let Some(echo) = find_command_echo(&cleaned, self.command, self.prompt, wraps) {
-                let Some(prompt) = self.prompt.search_from(&cleaned, echo.after_line) else {
+                let Some(prompt) = tail_prompt_range(&cleaned, self.prompt)
+                    .filter(|prompt| prompt.start >= echo.after_line)
+                else {
                     return Evaluation::Pending;
                 };
                 let body = char_slice(&cleaned, echo.after_line..prompt.start);
                 return Evaluation::Complete {
-                    stdout: strip_command_echo_from_text(raw, &body, self.command),
+                    stdout: strip_repeated_echo_compat(&body, self.command),
                 };
             }
         }
@@ -69,6 +71,20 @@ impl<'a> CompletionEvaluator<'a> {
             },
             None => Evaluation::Pending,
         }
+    }
+}
+
+/// 保留既有終端連續回顯相容性：只有完整第一行再次等於命令，且後面仍有輸出時才移除。
+/// 不以命令後綴推測，也不會剝除唯一一行恰好等於命令的 stdout。
+fn strip_repeated_echo_compat(body: &str, command: &str) -> String {
+    let body = body.trim_matches('\n');
+    let Some((first, rest)) = body.split_once('\n') else {
+        return body.to_string();
+    };
+    if first == command && !rest.trim_matches('\n').is_empty() {
+        rest.trim_matches('\n').to_string()
+    } else {
+        body.to_string()
     }
 }
 
@@ -185,6 +201,58 @@ mod tests {
                 false,
             ),
             Evaluation::Complete { stdout: "x".into() }
+        );
+
+        let prpl = evaluator("echo x", r"(?m)^root@prplOS:.*# ");
+        for raw in [
+            "echo x\r\nfirst\r\nroot@prplOS:~# \r\nmore",
+            "echo x\r\nfirst\r\nroot@prplOS:~# extra",
+        ] {
+            assert_eq!(
+                prpl.evaluate(raw, false, false),
+                Evaluation::Pending,
+                "prefix prompt 不完整或不在 snapshot 尾端時不得完成：{raw:?}"
+            );
+        }
+
+        let unanchored = evaluator("echo x", r"root@t:.*# ");
+        assert_eq!(
+            unanchored.evaluate("echo x\r\nfirst root@t:/# ", false, false),
+            Evaluation::Pending,
+            "未錨定的 prompt regex 不得在最後一行中間命中"
+        );
+    }
+
+    #[test]
+    fn echo_boundary_preserves_command_like_output_lines() {
+        let exact = evaluator("cat /tmp/job", r"(?m)^root@t:.*# ");
+        assert_eq!(
+            exact.evaluate(
+                "cat /tmp/job\r\ncat /tmp/job\r\nroot@t:/# ",
+                false,
+                false,
+            ),
+            Evaluation::Complete {
+                stdout: "cat /tmp/job".into()
+            }
+        );
+
+        let suffix = evaluator("cat /tmp/job", r"(?m)^root@t:.*# ");
+        assert_eq!(
+            suffix.evaluate(
+                "cat /tmp/job\r\ndiagnostic: cat /tmp/job\r\nnext\r\nroot@t:/# ",
+                false,
+                false,
+            ),
+            Evaluation::Complete {
+                stdout: "diagnostic: cat /tmp/job\nnext".into()
+            }
+        );
+
+        let repeated = evaluator("ls", r"(?m)^root@t:.*# ");
+        assert_eq!(
+            repeated.evaluate("ls\r\nls\r\na b\r\nroot@t:/# ", false, false),
+            Evaluation::Complete { stdout: "a b".into() }
         );
     }
 

@@ -1638,6 +1638,27 @@ impl ActorRig {
         std::thread::sleep(Duration::from_millis(30));
     }
 
+    /// 注入 RX 並以 reader 累計位元組數與 evaluator snapshot 檢查進度作為 processed barrier。
+    pub fn inject_rx_processed(&self, bytes: &[u8]) {
+        let (checks, _) = self.rx.snapshot_wait_progress_for_test();
+        let base = self.rx.snapshot_len();
+        self.inject_rx_reader_processed(bytes);
+        let expected_end =
+            base.saturating_add(String::from_utf8_lossy(bytes).chars().count() as u64);
+        let checked = self.rx.wait_for_snapshot_wait_progress_for_test(checks, expected_end, RIG_WAIT);
+        assert!(checked, "evaluator 未檢查注入後的 RX snapshot：expected_end={expected_end}, progress={:?}, rx_end={}", self.rx.snapshot_wait_progress_for_test(), self.rx.snapshot_len());
+    }
+
+    /// 注入 RX 並等待 reader 已追加完整資料；用於 evaluator 暫停期間安排晚到 RX。
+    pub fn inject_rx_reader_processed(&self, bytes: &[u8]) {
+        let expected = self.rx.total_bytes().saturating_add(bytes.len() as u64);
+        self.dev.push_rx(bytes);
+        assert!(
+            self.rx.wait_for_reader_bytes_for_test(expected, RIG_WAIT),
+            "RX reader 未追加預期位元組：total={expected}"
+        );
+    }
+
     /// 讓之後所有 WAL 寫入失敗（磁碟滿替身；Review Focus 3）。
     pub fn fail_wal_writes(&self, err: PalError) {
         self.wfs
@@ -1769,6 +1790,48 @@ impl ActorRig {
         );
         let rig = self.attach();
         rig.wait_state("READY");
+        rig
+    }
+
+    /// 使用指定 prompt 回應 attach 與 READY probe，供 prefix 型 profile 的 actor 測試使用。
+    pub fn ready_with_prompt(self, prompt: &[u8]) -> ActorRig {
+        let prompt = String::from_utf8_lossy(prompt).into_owned();
+        let prompt_for_reply = prompt.clone();
+        self.dev.on_tx_reply(b"\n", prompt.as_bytes());
+        self.dev.on_tx_match(
+            r"__READY__[0-9a-f]+",
+            Box::new(move |line: &[u8]| {
+                let text = String::from_utf8_lossy(line).into_owned();
+                let token = text
+                    .split("__READY__")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect::<String>();
+                if let Some(marker_nonce) = text
+                    .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                    .and_then(|(_, rest)| rest.split('\'').next())
+                {
+                    let expected = format!(
+                        "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                    );
+                    if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                        return format!(
+                            "__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\n{prompt_for_reply}"
+                        )
+                        .into_bytes();
+                    }
+                }
+                format!("__READY__{token}\r\n{prompt_for_reply}").into_bytes()
+            }),
+        );
+        let rig = self.attach();
+        rig.wait_state("READY");
+        rig.wait_for("指定 READY prompt 已由 RX reader 追加", |h| {
+            let text = h.rx.snapshot_from(0).text;
+            text.contains("__READY__") && text.ends_with(&prompt)
+        });
         rig
     }
 

@@ -129,6 +129,74 @@ fn wait_tx(h: &ActorRig, payload: &[u8]) {
     h.wait_for("TX 寫出", |h| wal_tx_has(h, payload));
 }
 
+fn run_i294_shipped_prefix_case(prompt_regex: &str, prompt: &str, co_packed: bool) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new_with_hub(&profile).ready_with_prompt(prompt.as_bytes());
+    let console = h.attach_pty_console("i294-prefix-human");
+    let tx_count = h.wal_tx_payloads().len();
+    let human_generation = h.rx.human_tx_state().generation;
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.wait_for("human TX observation 已提交", |h| {
+        h.rx.human_tx_state().generation > human_generation
+    });
+
+    let evaluator_checks = h.rx.snapshot_wait_progress_for_test().0;
+    let id = h.submit_ok("echo PREFIX");
+    wait_tx(&h, b"echo PREFIX\n");
+    h.wait_running(&id);
+    assert!(
+        h.rx.wait_for_snapshot_wait_progress_for_test(
+            evaluator_checks,
+            h.rx.snapshot_len(),
+            Duration::from_secs(5),
+        ),
+        "command evaluator 應先檢查 TX 後的既有 RX snapshot"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "舊 prompt／echo 尚未到達時命令應維持 running"
+    );
+    if co_packed {
+        let packet = format!(
+            "{prompt}\r\n{prompt}echo PREFIX\r\nPREFIX\r\n{prompt}"
+        );
+        h.inject_rx_processed(packet.as_bytes());
+    } else {
+        h.inject_rx_processed(prompt.as_bytes());
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "分包的 human 舊 prompt 不得完成命令"
+        );
+
+        let response = format!("echo PREFIX\r\nPREFIX\r\n{prompt} extra\r\nmore");
+        h.inject_rx_processed(response.as_bytes());
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "prefix 後仍有資料時，命令必須維持 running"
+        );
+        h.inject_rx_processed(format!("\r\n{prompt}").as_bytes());
+    }
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    let expected_stdout = if co_packed {
+        "PREFIX".to_string()
+    } else {
+        format!("PREFIX\n{prompt} extra\nmore")
+    };
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho PREFIX\n".to_vec(),
+        "prefix 完成判定不增加或重送 TX"
+    );
+}
+
 fn state_of(h: &ActorRig) -> String {
     pget(&h.get_state(), "state")
         .as_str()
@@ -202,6 +270,62 @@ fn i294_human_prompt_before_agent_echo_does_not_complete() {
         wal_tx_bytes_since(&h, tx_count),
         b"echo HUMAN\necho AGENT\n".to_vec(),
         "只送原本的人類行與 agent 命令"
+    );
+}
+
+#[test]
+fn i294_shipped_prefix_prompts_handle_split_and_co_packed_rx() {
+    run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", false);
+    run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", true);
+    run_i294_shipped_prefix_case(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+        false,
+    );
+    run_i294_shipped_prefix_case(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+        true,
+    );
+}
+
+#[test]
+fn i294_completion_snapshot_ignores_later_rx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let (matched_tx, matched_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |snapshot| {
+        matched_tx
+            .send(snapshot.clone())
+            .expect("測試仍等待 completion snapshot");
+        resume_rx
+            .recv()
+            .expect("測試釋放 completion snapshot waiter");
+    })));
+
+    let id = h.submit_ok("echo SNAPSHOT");
+    wait_tx(&h, b"echo SNAPSHOT\n");
+    h.dev
+        .push_rx(b"echo SNAPSHOT\r\nSNAPSHOT\r\nroot@t:/# ");
+    let accepted = matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 應接受原始 completion snapshot");
+    assert!(accepted.text.ends_with("SNAPSHOT\r\nroot@t:/# "));
+
+    h.inject_rx_reader_processed(b"\r\nLATE_RX");
+    resume_tx
+        .send(())
+        .expect("completion snapshot waiter 應仍在暫停");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("SNAPSHOT"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo SNAPSHOT\n".to_vec(),
+        "接受 snapshot 後抵達的 RX 不得改變 stdout 或增加 TX"
     );
 }
 

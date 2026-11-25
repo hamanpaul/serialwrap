@@ -199,16 +199,6 @@ pub fn extract_command_stdout(
     lines.join("\n").trim_matches('\n').to_string()
 }
 
-/// 依已選定的完成邊界移除重複 command echo；不重新搜尋 prompt。
-pub(crate) fn strip_command_echo_from_text(raw_evidence: &str, text: &str, command: &str) -> String {
-    let mut lines: Vec<String> = splitlines(text.trim_start_matches('\n'))
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    strip_command_echo_lines(raw_evidence, &mut lines, command);
-    lines.join("\n").trim_matches('\n').to_string()
-}
-
 fn strip_command_echo_lines(raw: &str, lines: &mut Vec<String>, command: &str) {
     if !command.is_empty() {
         let stripped = py_strip(command);
