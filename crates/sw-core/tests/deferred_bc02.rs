@@ -4,7 +4,12 @@ const CAP: usize = 262144;
 fn live(_: &str, _: u64) -> bool { true }
 
 fn rp(cid: &str, life: u64, bytes: &[u8]) -> Replay {
-    Replay { client_id: cid.into(), client_lifetime: life, source: format!("human:{cid}"), bytes: bytes.to_vec() }
+    Replay {
+        client_id: cid.into(),
+        client_lifetime: life,
+        source: format!("human:{cid}"),
+        bytes: bytes.to_vec(),
+    }
 }
 
 #[test] fn overflow_deletes_whole_entry_then_new_bytes_kept() {   // BC-02，P1 T09 規則 1（對照改寫後的 test_deferred_buffer_capped）

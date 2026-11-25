@@ -13,13 +13,13 @@ use sw_proto::pyjson::PyValue;
 
 use super::*;
 use crate::arbiter::{SubmitOrigin, SubmitReq};
-use crate::deferred::{DeferOutcome, Replay};
+use crate::deferred::{ClassifiedReplay, DeferOutcome, Replay};
 use crate::human_console::human_tx::{BacklogItem, BacklogKind, HumanTxTag, InFlightJob};
 use crate::human_console::line_mode::human_console_mode;
 use crate::human_console::ownership::InputRoute;
 use crate::human_console::{ConsoleRecord, ConsoleScanSnapshot, ConsoleTransportKind, ReplayHold};
 use crate::human_console::line_editor::LineEditor;
-use crate::tx_writer::{TxClass, TxReport};
+use crate::tx_writer::{SecretTx, TxClass, TxReport};
 
 /// D-19 限速表上限（超過時整批清空；只影響 WARNING 次數）。
 const DROP_WARN_KEYS_MAX: usize = 1024;
@@ -252,7 +252,7 @@ impl SessionCore {
         self.submit_replays(item.into_iter().collect(), fx);
     }
 
-    fn submit_replays(&mut self, items: Vec<Replay>, fx: &mut Vec<Effect>) {
+    fn submit_replays(&mut self, items: Vec<ClassifiedReplay>, fx: &mut Vec<Effect>) {
         if items.is_empty() {
             return;
         }
@@ -275,13 +275,15 @@ impl SessionCore {
         };
         let epoch = self.generations.input_epoch;
         for item in items {
+            let ClassifiedReplay { replay, secret_tx } = item;
             self.lane_submit(
-                &item.client_id,
-                item.client_lifetime,
+                &replay.client_id,
+                replay.client_lifetime,
                 epoch,
                 TxClass::HumanReplay,
                 Some(hold_id),
-                item.bytes,
+                secret_tx,
+                replay.bytes,
                 fx,
             );
         }
@@ -336,22 +338,28 @@ impl SessionCore {
             return;
         }
         let epoch = self.generations.input_epoch;
-        let live: Vec<(Replay, u64)> = items
+        let live: Vec<(ClassifiedReplay, u64)> = items
             .into_iter()
             .filter(|(tag, _)| self.human.is_live(&tag.client_id, tag.client_lifetime))
             .map(|(tag, bytes)| {
                 (
-                    Replay {
-                        source: format!("human:{}", tag.client_id),
-                        client_id: tag.client_id,
-                        client_lifetime: tag.client_lifetime,
-                        bytes,
+                    ClassifiedReplay {
+                        replay: Replay {
+                            source: format!("human:{}", tag.client_id),
+                            client_id: tag.client_id,
+                            client_lifetime: tag.client_lifetime,
+                            bytes,
+                        },
+                        secret_tx: tag.secret_tx,
                     },
                     tag.input_epoch,
                 )
             })
             .collect();
-        let _ = self.human.deferred_mut().restore_front(live, epoch);
+        let _ = self
+            .human
+            .deferred_mut()
+            .restore_classified_front(live, epoch);
     }
 
     // ---------------- human TX lane（D-15） ----------------
@@ -365,6 +373,7 @@ impl SessionCore {
         input_epoch: u64,
         class: TxClass,
         hold: Option<u64>,
+        secret_tx: Option<SecretTx>,
         payload: Vec<u8>,
         fx: &mut Vec<Effect>,
     ) {
@@ -376,6 +385,7 @@ impl SessionCore {
             input_epoch,
             class,
             len: payload.len(),
+            secret_tx,
         };
         if self.human.lane.in_flight().is_some() {
             let kind = match hold {
@@ -411,7 +421,7 @@ impl SessionCore {
             source: format!("human:{}", tag.client_id),
             cmd_id: None,
             log: true,
-            secret_tx: None,
+            secret_tx: tag.secret_tx.clone(),
             input_epoch: Some(tag.input_epoch),
             replay_hold: hold,
             probe_id: None,
@@ -445,6 +455,7 @@ impl SessionCore {
                         &item.tag.client_id,
                         item.tag.client_lifetime,
                         item.tag.input_epoch,
+                        item.tag.secret_tx,
                         item.payload,
                         now,
                         fx,
@@ -508,7 +519,14 @@ impl SessionCore {
                     let outcome = self
                         .human
                         .deferred_mut()
-                        .append(&cid, job.tag.client_lifetime, job.tag.input_epoch, epoch, &job.payload);
+                        .append_with_secret(
+                            &cid,
+                            job.tag.client_lifetime,
+                            job.tag.input_epoch,
+                            epoch,
+                            &job.payload,
+                            job.tag.secret_tx.clone(),
+                        );
                     self.defer_outcome_warn(&cid, outcome, &mut fx);
                     if self.human.deferred_len_for(&cid) > 0 && self.immediate_replay_allowed(&cid) {
                         self.replay_client(&cid, &mut fx);
@@ -593,6 +611,9 @@ impl SessionCore {
         if self.human.lane.is_busy_for(client_id) {
             // D-15(2)：同源順序
             let seq = self.human.lane.next_seq();
+            let secret_tx = Some(SecretTx::from_human_window(
+                self.deps.rx.human_password_window_snapshot(),
+            ));
             let tag = HumanTxTag {
                 seq,
                 client_id: client_id.to_string(),
@@ -600,6 +621,7 @@ impl SessionCore {
                 input_epoch,
                 class: TxClass::HumanRaw,
                 len: bytes.len(),
+                secret_tx,
             };
             self.push_backlog(
                 BacklogItem {
@@ -611,15 +633,28 @@ impl SessionCore {
             );
             return fx;
         }
-        self.route_console_input(client_id, lifetime, input_epoch, bytes, now, &mut fx);
+        let secret_tx = Some(SecretTx::from_human_window(
+            self.deps.rx.human_password_window_snapshot(),
+        ));
+        self.route_console_input(
+            client_id,
+            lifetime,
+            input_epoch,
+            secret_tx,
+            bytes,
+            now,
+            &mut fx,
+        );
         fx
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn route_console_input(
         &mut self,
         client_id: &str,
         lifetime: u64,
         input_epoch: u64,
+        secret_tx: Option<SecretTx>,
         bytes: Vec<u8>,
         now: Mono,
         fx: &mut Vec<Effect>,
@@ -632,7 +667,14 @@ impl SessionCore {
                     let outcome = self
                         .human
                         .deferred_mut()
-                        .append(client_id, lifetime, input_epoch, epoch, &bytes);
+                        .append_with_secret(
+                            client_id,
+                            lifetime,
+                            input_epoch,
+                            epoch,
+                            &bytes,
+                            secret_tx.clone(),
+                        );
                     self.defer_outcome_warn(client_id, outcome, fx);
                     if self.immediate_replay_allowed(client_id) {
                         self.replay_client(client_id, fx);
@@ -647,6 +689,7 @@ impl SessionCore {
                             input_epoch,
                             TxClass::HumanRaw,
                             None,
+                            secret_tx.clone(),
                             bytes[start..end].to_vec(),
                             fx,
                         );
@@ -659,7 +702,14 @@ impl SessionCore {
                 let outcome = self
                     .human
                     .deferred_mut()
-                    .append(client_id, lifetime, input_epoch, epoch, &bytes);
+                    .append_with_secret(
+                        client_id,
+                        lifetime,
+                        input_epoch,
+                        epoch,
+                        &bytes,
+                        secret_tx,
+                    );
                 self.defer_outcome_warn(client_id, outcome, fx);
             }
             InputRoute::Line => self.console_line_input(client_id, lifetime, &bytes, now, fx),

@@ -118,17 +118,25 @@ impl HumanConsoleState {
     }
 
     /// 取出全部可回放項目（client 存活且 lifetime 相符者；07 D-07 規則 4）。
-    pub(crate) fn take_replay(&mut self, current_epoch: u64) -> Vec<crate::deferred::Replay> {
+    pub(crate) fn take_replay(
+        &mut self,
+        current_epoch: u64,
+    ) -> Vec<crate::deferred::ClassifiedReplay> {
         let consoles = &self.consoles;
         let live = |cid: &str, life: u64| consoles.get(cid).is_some_and(|c| c.client_lifetime == life);
-        self.deferred.take_replay(current_epoch, &live)
+        self.deferred.take_classified_replay(current_epoch, &live)
     }
 
     /// 07 D-15(4)：只取出某 client 的可回放項目。
-    pub(crate) fn take_replay_for(&mut self, client_id: &str, current_epoch: u64) -> Option<crate::deferred::Replay> {
+    pub(crate) fn take_replay_for(
+        &mut self,
+        client_id: &str,
+        current_epoch: u64,
+    ) -> Vec<crate::deferred::ClassifiedReplay> {
         let consoles = &self.consoles;
         let live = |cid: &str, life: u64| consoles.get(cid).is_some_and(|c| c.client_lifetime == life);
-        self.deferred.take_replay_for(client_id, current_epoch, &live)
+        self.deferred
+            .take_classified_replay_for(client_id, current_epoch, &live)
     }
 
     /// 唯讀查詢（SessionCore 與測試的 `deferred_len`）。

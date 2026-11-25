@@ -178,6 +178,16 @@ fn wait_console_contains(
     });
 }
 
+fn wait_controlled_rx(
+    device: &sw_pal::fakes::serial::FakeDevice,
+    expected_read: usize,
+    label: &str,
+) {
+    support::wait_until_within(label, Duration::from_secs(2), || {
+        device.rx_bytes_read() >= expected_read
+    });
+}
+
 fn wait_tx(rig: &WindowRig, expected: usize, label: &str) {
     support::wait_until_within(label, Duration::from_secs(3), || rig.device.tx_len() >= expected);
     assert_eq!(rig.device.tx_len(), expected, "{label} 不得多送 UART bytes");
@@ -198,6 +208,41 @@ fn decode_wal(wal: &str) -> Vec<u8> {
         .filter_map(|line| sw_proto::pyjson::loads(line).ok())
         .filter_map(|row| row.get("payload_b64").and_then(PyValue::as_str).map(str::to_owned))
         .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("WAL payload base64"))
+        .collect()
+}
+
+fn human_tx_payload(rig: &WindowRig, client_id: &str) -> Vec<u8> {
+    let source = format!("human:{client_id}");
+    read_wal(rig)
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .filter(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("TX")
+                && row.get("source").and_then(PyValue::as_str) == Some(source.as_str())
+        })
+        .flat_map(|row| {
+            row.get("payload_b64")
+                .and_then(PyValue::as_str)
+                .map(str::to_owned)
+        })
+        .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("human TX base64"))
+        .collect()
+}
+
+fn secret_meta_rows_for(rig: &WindowRig, client_id: &str) -> Vec<PyValue> {
+    let source = format!("human:{client_id}");
+    read_wal(rig)
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .filter(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("META")
+                && row.get("source").and_then(PyValue::as_str) == Some(source.as_str())
+                && row
+                    .get("meta")
+                    .and_then(|meta| meta.get("event"))
+                    .and_then(PyValue::as_str)
+                    == Some("secret_tx")
+        })
         .collect()
 }
 
@@ -492,6 +537,240 @@ fn issue312_line_buffer_loopback_masks_each_secret_echo_byte() {
 }
 
 #[test]
+fn issue312_f7_raw_actor_decision_survives_writer_window_open() {
+    let rig = build_window_rig_ready();
+    let (client_id, console) = attach_console(&rig);
+    rig.device.set_loopback(false);
+    rig.device
+        .script_write(vec![FakeWriteStep::BlockForever]);
+
+    let tx_start = rig.device.tx_len();
+    console.push_input(b"alpha");
+    rig.device.wait_blocked();
+    console.push_input(b"beta");
+    thread::sleep(Duration::from_millis(100));
+
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"Password: ");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + b"Password: ".len(),
+        "第二筆 raw 已被 actor 接收後才開啟密碼窗口",
+    );
+    wait_console_contains(
+        &console,
+        b"Password: ",
+        "writer 暫停時 console 已收到密碼提示",
+    );
+
+    rig.device.release_block();
+    wait_tx(
+        &rig,
+        tx_start + b"alpha".len() + b"beta".len(),
+        "兩筆 actor 外窗口輸入都完整送入 UART",
+    );
+    rig.service.settle();
+    assert_eq!(
+        human_tx_payload(&rig, &client_id),
+        b"alphabeta",
+        "raw backlog 必須保留 actor 接收當下的明文判定"
+    );
+    assert!(
+        secret_meta_rows_for(&rig, &client_id).is_empty(),
+        "writer 晚點才看到的 password prompt 不得改寫既接收 raw 輸入"
+    );
+}
+
+#[test]
+fn issue312_f7_interactive_actor_decision_survives_writer_window_open() {
+    let rig = build_window_rig_ready();
+    let (raw_id, raw_console) = attach_console(&rig);
+    let (line_id, line_console) = attach_console(&rig);
+    assert_ne!(raw_id, line_id);
+    rig.device.set_loopback(false);
+    rig.device
+        .on_tx_match("^vim$", Box::new(|_| b"vim\r\nroot@t:/# ".to_vec()));
+    rig.device
+        .script_write(vec![FakeWriteStep::BlockForever]);
+
+    let tx_start = rig.device.tx_len();
+    raw_console.push_input(b"busy");
+    rig.device.wait_blocked();
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{raw_id}"}}"#),
+    );
+    assert_eq!(
+        detached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{detached:?}"
+    );
+    line_console.push_input(b"vim\r");
+    support::wait_until_within(
+        "vim 在 actor 出列時已建立 interactive lease",
+        Duration::from_secs(3),
+        || {
+            let state = rig.service.call("session.get_state", r#"{"selector":"COM0"}"#);
+            matches!(
+                state.get("session").and_then(|value| value.get("interactive_session_id")),
+                Some(PyValue::Str(_))
+            )
+        },
+    );
+
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"Password: ");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + b"Password: ".len(),
+        "lease 建立後才開啟密碼窗口",
+    );
+    wait_console_contains(
+        &line_console,
+        b"Password: ",
+        "writer 仍受阻時 console 收到密碼提示",
+    );
+
+    rig.device.release_block();
+    wait_tx(
+        &rig,
+        tx_start + b"busy".len() + b"vim\n".len(),
+        "blocked writer 依序送出 raw 與 interactive line",
+    );
+    rig.service.settle();
+    assert_eq!(
+        human_tx_payload(&rig, &line_id),
+        b"vim\n",
+        "interactive writer 必須沿用 actor 的明文判定"
+    );
+    assert!(
+        secret_meta_rows_for(&rig, &line_id).is_empty(),
+        "窗口在 actor 判定後開啟不得讓 interactive TX 產生 secret META"
+    );
+    let state = rig
+        .service
+        .call("session.get_state", r#"{"selector":"COM0"}"#);
+    assert!(
+        matches!(
+            state
+                .get("session")
+                .and_then(|value| value.get("interactive_session_id")),
+            Some(PyValue::Str(_))
+        ),
+        "actor 建立的 lease 決策不得被晚到窗口撤銷：{state:?}"
+    );
+}
+
+#[test]
+fn issue312_f7_partial_echo_line_end_masks_prefix_in_rx_order() {
+    let (rig, _client_id, console, log_path) = prompted_secret_rig();
+    install_event_probe(&rig, "partial-prefix-after-line", "X");
+    install_event_probe(&rig, "partial-prefix-mismatch", "Q");
+    rig.device.set_loopback(false);
+    submit_blocked_secret(&rig, &console);
+
+    let console_start = console.written().len();
+    let wal_start = decode_wal(&read_wal(&rig)).len();
+    let log_start = std::fs::read_to_string(Path::new(&log_path))
+        .unwrap_or_default()
+        .len();
+    let prefix = &RAW_SECRET.as_bytes()[..3];
+
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(prefix);
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + prefix.len(),
+        "writer 在途時 reader 收到 secret 部分 echo",
+    );
+    rig.device.push_rx(b"\r\n");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + prefix.len() + 2,
+        "reader 收到部分 echo 後的行尾",
+    );
+    rig.device.push_rx(b"X\r\n");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + prefix.len() + 5,
+        "reader 收到行尾後非 secret 前綴",
+    );
+    rig.device.push_rx(prefix);
+    rig.device.push_rx(b"Q\r\n");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + prefix.len() * 2 + 8,
+        "reader 收到未經行尾先失配的 secret 前綴",
+    );
+    support::wait_until_within("event 收到行尾後 X 與失配 Q", Duration::from_secs(3), || {
+        let tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+        matches!(
+            tail.get("entries"),
+            Some(PyValue::List(rows))
+                if rows.iter().any(|row| {
+                    row.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                        && row.get("rule_id").and_then(PyValue::as_str)
+                            == Some("o.partial-prefix-after-line")
+                }) && rows.iter().any(|row| {
+                    row.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                        && row.get("rule_id").and_then(PyValue::as_str)
+                            == Some("o.partial-prefix-mismatch")
+                })
+        )
+    });
+
+    let console_rx = console.written()[console_start..].to_vec();
+    let wal_rx = decode_wal(&read_wal(&rig))[wal_start..].to_vec();
+    let log_rx = std::fs::read_to_string(Path::new(&log_path))
+        .expect("agent log")
+        .as_bytes()[log_start..]
+        .to_vec();
+    let event_tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+    let event_matches = match event_tail.get("entries") {
+        Some(PyValue::List(rows)) => rows
+            .iter()
+            .filter(|row| {
+                row.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                    && matches!(
+                        row.get("matched_text").and_then(PyValue::as_str),
+                        Some("***" | "X" | "Q")
+                    )
+            })
+            .filter_map(|row| {
+                row.get("matched_text")
+                    .and_then(PyValue::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    rig.device.release_block();
+    rig.service.settle();
+
+    let expected = b"***\r\nX\r\n***Q\r\n".to_vec();
+    let expected_log = b"***\nX\n***Q\n".to_vec();
+    assert_eq!(wal_rx, expected, "RX WAL 必須維持遮罩前綴、行尾、後續資料順序");
+    assert_eq!(
+        console_rx, expected,
+        "human console 必須維持遮罩前綴、行尾、後續資料順序"
+    );
+    assert_eq!(
+        log_rx, expected_log,
+        "agent log 必須維持遮罩前綴、行尾、後續資料順序"
+    );
+    assert_eq!(
+        event_matches,
+        vec![
+            "***".to_string(),
+            "X".to_string(),
+            "***".to_string(),
+            "Q".to_string(),
+        ],
+        "event sink 必須先看到遮罩前綴行，再看到失配後資料行"
+    );
+}
+
+#[test]
 fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
     let (rig, _client_id, console, _log_path) = prompted_secret_rig();
     rig.device
@@ -509,15 +788,16 @@ fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
         "would-block 前只能確認前三個 bytes"
     );
 
-    let progress = b"rx-progress-while-tx-waits";
+    let progress = b"unblocked-input-123";
+    let visible_progress = progress;
     rig.device.push_rx(progress);
     let deadline = Instant::now() + Duration::from_millis(500);
     let mut published_during_pause = false;
     while Instant::now() < deadline {
         if console
             .written()
-            .windows(progress.len())
-            .any(|window| window == progress)
+            .windows(visible_progress.len())
+            .any(|window| window == visible_progress)
         {
             published_during_pause = true;
             break;
@@ -534,7 +814,8 @@ fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
 
     assert!(
         published_during_pause,
-        "TX writer 等待可寫期間，reader 不得被 password tracker 鎖停止發布"
+        "TX writer 等待可寫期間，reader 不得被 password tracker 鎖停止發布：{:?}",
+        console.written()
     );
     assert!(
         drained.iter().all(|(_, ok)| *ok),

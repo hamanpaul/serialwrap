@@ -11,7 +11,7 @@ use sw_pal::traits::{TxOutcome, TxResult};
 use sw_proto::constants::HUMAN_TX_BACKLOG_MAX_BYTES;
 
 use crate::mailbox::ControlEvent;
-use crate::tx_writer::{TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
+use crate::tx_writer::{SecretTx, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
 
 /// 一筆 human TX job 的識別（結算時以 `HumanTxCompleted { tag, .. }` 帶回）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub struct HumanTxTag {
     pub input_epoch: u64,
     pub class: TxClass,
     pub len: usize,
+    /// actor 接收當下的判定；回放與 backlog 只沿用，不重拍。
+    pub(crate) secret_tx: Option<SecretTx>,
 }
 
 /// backlog 項目的種類。

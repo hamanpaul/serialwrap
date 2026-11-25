@@ -7138,6 +7138,7 @@ impl SessionCore {
                 command,
                 owner,
                 human_tx: false,
+                secret_tx: None,
             },
         });
         effects
@@ -7383,16 +7384,15 @@ impl SessionCore {
                 }
                 (command, false)
             };
-            if matches!(
-                &command.req.origin,
-                SubmitOrigin::HumanConsole { .. }
-            ) {
-                let snapshot = self.deps.rx.human_password_window_snapshot();
-                command
+            if command.req.is_trusted_human() {
+                let secret_tx = command
                     .req
                     .secret_tx
-                    .get_or_insert_with(Default::default)
-                    .window_snapshot = Some(snapshot);
+                    .get_or_insert_with(Default::default);
+                if secret_tx.window_snapshot.is_none() {
+                    secret_tx.window_snapshot =
+                        Some(self.deps.rx.human_password_window_snapshot());
+                }
             }
             if !was_parked {
                 if let Some(reject) = self.execute_time_reject(&command, now) {
@@ -7482,6 +7482,7 @@ impl SessionCore {
                         command: command.req.command.clone(),
                         owner,
                         human_tx: command.req.is_trusted_human(),
+                        secret_tx: command.req.secret_tx.clone(),
                     },
                 });
                 return effects;

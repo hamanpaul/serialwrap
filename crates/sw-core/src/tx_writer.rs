@@ -63,7 +63,7 @@ pub struct TxPermit {
     pub source: String,
     pub cmd_id: Option<String>,
     pub log: bool,
-    /// 人類密碼列：只跳過 TX payload 前綴，並在行尾寫入長度 META。
+    /// human console 在 actor 接收當下完成的密碼判定；writer 只套用，不重新分類。
     pub secret_tx: Option<SecretTx>,
     /// P6 增補 #3（07 D-03）：只有 HumanRaw／HumanReplay 為 `Some`（擷取當下的 `input_epoch`），06 既有建構點一律 `None`。
     pub input_epoch: Option<u64>,
@@ -74,7 +74,7 @@ pub struct TxPermit {
     pub probe_id: Option<u64>,
 }
 
-/// human console 密碼輸入在 TxWriter 的稽核與回顯遮罩指示。
+/// human console 密碼輸入的單次判定、稽核與回顯遮罩指示。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecretTx {
     /// TX WAL 從此 byte 起記錄；UART 寫入仍使用完整 payload。
@@ -89,7 +89,7 @@ pub struct SecretTx {
     pub echo_seed: Vec<u8>,
     /// 本行已結束，停止擴充 matcher。
     pub echo_finish: bool,
-    /// human console 命令在出列時拍下的密碼窗口快照；writer 不重做與 lease 不同時點的分類。
+    /// actor 接收當下的密碼窗口判定；後續 backlog、lease 與 writer 不得改寫。
     pub(crate) window_snapshot: Option<HumanTxWindowSnapshot>,
 }
 
@@ -105,6 +105,15 @@ impl HumanTxWindowSnapshot {
 
     pub(crate) fn generation(self) -> Option<u64> {
         self.generation
+    }
+}
+
+impl SecretTx {
+    pub(crate) fn from_human_window(snapshot: HumanTxWindowSnapshot) -> Self {
+        Self {
+            window_snapshot: Some(snapshot),
+            ..Self::default()
+        }
     }
 }
 
@@ -1135,24 +1144,36 @@ impl TxWriter {
                     );
                     let (result, human_secret_len, _) = if human_tx {
                         if let Some(rx) = &self.rx {
-                            rx.with_human_tx_window_snapshot(
-                                &job.payload,
-                                job.permit
-                                    .secret_tx
-                                    .as_ref()
-                                    .and_then(|secret| secret.window_snapshot),
-                                |_secret_len| {
-                                    let result = self.writer.write_gated(
-                                        &job.payload,
-                                        &self.cancel,
-                                        &gate,
-                                    );
-                                    let confirmed = confirmed_bytes(&result.outcome);
-                                    let unknown =
-                                        matches!(result.outcome, TxOutcome::Unknown { .. });
-                                    (result, confirmed, unknown)
-                                },
-                            )
+                            if let Some(snapshot) = job
+                                .permit
+                                .secret_tx
+                                .as_ref()
+                                .and_then(|secret| secret.window_snapshot)
+                            {
+                                rx.with_human_tx_window_snapshot(
+                                    &job.payload,
+                                    snapshot,
+                                    |_secret_len| {
+                                        let result = self.writer.write_gated(
+                                            &job.payload,
+                                            &self.cancel,
+                                            &gate,
+                                        );
+                                        let confirmed = confirmed_bytes(&result.outcome);
+                                        let unknown =
+                                            matches!(result.outcome, TxOutcome::Unknown { .. });
+                                        (result, confirmed, unknown)
+                                    },
+                                )
+                            } else {
+                                let result = self.writer.write_gated(
+                                    &job.payload,
+                                    &self.cancel,
+                                    &gate,
+                                );
+                                let confirmed = confirmed_bytes(&result.outcome);
+                                (result, 0, confirmed)
+                            }
                         } else {
                             let result = self.writer.write_gated(
                                 &job.payload,

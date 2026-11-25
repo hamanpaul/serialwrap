@@ -41,6 +41,7 @@ pub enum OpSpec {
         command: String,
         owner: String,
         human_tx: bool,
+        secret_tx: Option<SecretTx>,
     },
     InteractiveSend { payload: Vec<u8>, owner: String },
     RebootRecovery { hard_timeout_s: f64 },
@@ -410,6 +411,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
             command,
             owner,
             human_tx,
+            secret_tx,
         } => {
             let payload = command_payload(&command);
             // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
@@ -418,10 +420,26 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
             } else {
                 TxClass::InteractiveOpenCmd
             };
-            lease_send(ctx, grant, payload, class, &owner, grant.cmd_id.as_deref())
+            lease_send(
+                ctx,
+                grant,
+                payload,
+                class,
+                &owner,
+                grant.cmd_id.as_deref(),
+                secret_tx,
+            )
         }
         OpSpec::InteractiveSend { payload, owner } => {
-            lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner, None)
+            lease_send(
+                ctx,
+                grant,
+                payload,
+                TxClass::LeaseOwner,
+                &owner,
+                None,
+                None,
+            )
         }
         OpSpec::RebootRecovery { .. } => OpOutcome::Error(PyErr::value_error(
             "reboot recovery 由 session actor 以登入 run 驅動（OpRunner 不承接）",
@@ -1041,8 +1059,9 @@ fn lease_send(
     class: TxClass,
     owner: &str,
     cmd_id: Option<&str>,
+    secret_tx: Option<SecretTx>,
 ) -> OpOutcome {
-    let report = send(ctx, grant, &payload, class, owner, cmd_id, true);
+    let report = send_with_secret(ctx, grant, &payload, class, owner, cmd_id, true, secret_tx);
     if fully_sent(&report, payload.len()) {
         return OpOutcome::Sent {
             bytes: payload.len(),

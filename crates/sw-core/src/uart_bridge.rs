@@ -361,35 +361,28 @@ impl RxShared {
         SecretEchoGuard { start_from }
     }
 
-    /// 依 TX 寫出順序判斷 session 密碼窗口；只持鎖完成分類與 echo 登記，OS write
-    /// 與任何可能阻塞的等待一律以當下取得的世代快照執行。
+    /// 測試輔助：在呼叫當下拍一次判定，再沿正式 writer 路徑套用。
     #[cfg(test)]
     pub(crate) fn with_human_tx_window<T>(
         &self,
         payload: &[u8],
         write: impl FnOnce(usize) -> (T, usize, bool),
     ) -> (T, usize, usize) {
-        self.with_human_tx_window_snapshot(payload, None, write)
+        self.with_human_tx_window_snapshot(
+            payload,
+            self.human_password_window_snapshot(),
+            write,
+        )
     }
 
     pub(crate) fn with_human_tx_window_snapshot<T>(
         &self,
         payload: &[u8],
-        snapshot: Option<HumanTxWindowSnapshot>,
+        snapshot: HumanTxWindowSnapshot,
         write: impl FnOnce(usize) -> (T, usize, bool),
     ) -> (T, usize, usize) {
         let (generation, line_end, secret_len, prior_echo_len) = {
-            let generation = match snapshot {
-                Some(snapshot) => snapshot.generation(),
-                None => {
-                    let tracker =
-                        self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
-                    let active = tracker.generation > tracker.rx_end_generation
-                        && tracker.generation > tracker.tx_consumed_generation;
-                    active.then_some(tracker.generation)
-                }
-            }
-            .unwrap_or(0);
+            let generation = snapshot.generation().unwrap_or(0);
             let line_end = payload
                 .iter()
                 .position(|byte| matches!(byte, b'\r' | b'\n'));
@@ -513,7 +506,7 @@ impl RxShared {
         armed.pending.clear();
     }
 
-    /// reader 專用：只發布無法再構成 secret 的 bytes；未決前綴留在 matcher，完整命中後停用。
+    /// reader 專用：只發布未構成 secret 的 bytes；已比對前綴若失配或遇行尾一律遮罩，完整命中後停用。
     fn mask_secret_echo(&self, data: &[u8]) -> MaskedRxChunk {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         let mut visible = Vec::new();
@@ -562,14 +555,6 @@ impl RxShared {
             }
             if armed.dynamic && matches!(byte, b'\r' | b'\n') {
                 let pending_len = armed.pending.len();
-                if window.human_writes_in_flight > 0 && pending_len < armed.secret.len() {
-                    visible.push(byte);
-                    rx_window.push(byte);
-                    index += 1;
-                    armed.after_cr = byte == b'\r';
-                    window.armed = Some(armed);
-                    continue;
-                }
                 visible.resize(visible.len().saturating_add(pending_len), b'*');
                 rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
                 armed.pending.fill(0);
@@ -606,11 +591,18 @@ impl RxShared {
                 continue;
             }
 
+            let mut prior_prefix_len = armed.pending.len();
             armed.pending.push(byte);
             while !armed.secret.starts_with(&armed.pending) {
                 let released = armed.pending.remove(0);
-                visible.push(released);
-                rx_window.push(released);
+                if prior_prefix_len > 0 {
+                    prior_prefix_len -= 1;
+                    visible.push(b'*');
+                    rx_window.push(b'*');
+                } else {
+                    visible.push(released);
+                    rx_window.push(released);
+                }
             }
             if armed.pending.len() == armed.secret.len() && !armed.dynamic {
                 let matched_len = armed.secret.len();

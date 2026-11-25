@@ -408,6 +408,7 @@ fn open_command_sent_after_open() {
             command,
             owner,
             human_tx: false,
+            secret_tx: None,
         } if command == "help" && owner == "agent"
     ));
     finish_op(&mut h, &grant.unwrap(), OpOutcome::Sent { bytes: 5 });

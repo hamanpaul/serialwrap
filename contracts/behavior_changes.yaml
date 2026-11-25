@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 17
+revision: 18
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -186,15 +186,15 @@ changes:
       python: null
       rust:
         stage: "stage-1b"
-    approved_at_revision: 14
+    approved_at_revision: 18
     spec_refs: ["OD-111", "OD-112", "v051.md issue 311"]
     reconciliation_refs: []
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P5"]
     case_ids: ["bc14-login-secret-echo-mask", "bc14-console-unlock-echo-mask", "bc14-secret-echo-one-byte-chunks", "bc14-secret-tx-failure-length-redacted"]
-    compatibility_impact: "自動登入密碼與 console unlock secret 在各自 secret TX 前啟用內容遮罩；reader 在寫 WAL 前將 RX 中與 secret 完全相同的 byte 序列替換為等長 *，並在判斷仍可能是 secret 開頭時扣住尾段，不發布也不作 prompt 候選。後續 byte 不匹配時，扣住部分原樣釋出；不以逾時釋出。首次完整命中後停止遮罩；登入流程結束時若仍有未決前綴，則以等長 * 釋出以避免洩漏。遮罩先於 WAL，因此 WAL、mirror、event、RxShared、agent log、background capture 與 human console 看到相同結果。若 secret 等於 prompt，或 secret 以 prompt 開頭且 DUT 不回顯，prompt 可能被遮罩或扣住，登入會以既有 timeout error code 逾時；有回顯的重疊情境仍可完成登入。每次 secret TX 先寫只含 secret byte 長度的 secret_tx META；secret TX 失敗訊息不輸出已送或要求長度。Python 基線維持不變。"
-    approval_conditions: "依 OD-111 只改 Rust；依 OD-112 與最新 v051 編排者裁決，以內容比對取代行終止符窗口及 TX／reader ingest 等待；啟用在 secret TX 前，不等待 reader，保留 OS submit 時的 fence 重驗。未決前綴不得超時放行；登入流程結束時以遮罩釋出。"
+    compatibility_impact: "自動登入密碼與 console unlock secret 在各自 secret TX 前啟用內容遮罩；reader 在寫 WAL 前將 RX 中與 secret 完全相同的 byte 序列替換為等長 *，並在判斷仍可能是 secret 開頭時扣住尾段，不發布也不作 prompt 候選。RX 一旦已比對到 secret 前綴，後續即使遇到不符 byte 或行尾，該前綴仍一律以 * 結算；真正的非前綴 byte 依原順序發布，行尾不得先於已比對前綴發布。不以逾時釋出。首次完整命中後停止遮罩；登入流程結束時若仍有未決前綴，則以等長 * 釋出以避免洩漏。遮罩先於 WAL，因此 WAL、mirror、event、RxShared、agent log、background capture 與 human console 看到相同結果。若 secret 等於 prompt，或 secret 以 prompt 開頭且 DUT 不回顯，prompt 可能被遮罩或扣住，登入會以既有 timeout error code 逾時；有回顯的重疊情境仍可完成登入。每次 secret TX 先寫只含 secret byte 長度的 secret_tx META；secret TX 失敗訊息不輸出已送或要求長度。Python 基線維持不變。"
+    approval_conditions: "依 OD-111 只改 Rust；依 OD-112 與最新 v051 編排者裁決，以內容比對取代行終止符窗口及 TX／reader ingest 等待；啟用在 secret TX 前，不等待 reader，保留 OS submit 時的 fence 重驗。已比對 secret 前綴不得因失配、行尾或逾時明文放行；行尾後仍保留足夠 matcher 狀態處理完整或延後回顯，登入流程結束時以遮罩釋出。"
     related_decisions: ["OD-111"]
   - id: "BC-16"
     kind: "BC"
@@ -212,15 +212,15 @@ changes:
       python: null
       rust:
         stage: "stage-1b"
-    approved_at_revision: 15
+    approved_at_revision: 18
     spec_refs: ["OD-111", "OD-112", "v051.md issue 312 編排者定案 2026-11-25"]
     reconciliation_refs: []
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P6"]
     case_ids: ["bc16-human-password-raw", "bc16-human-password-line-buffer", "bc16-console-unlock-prompt"]
-    compatibility_impact: "password prompt 窗口屬 session，依 UART 寫出順序判定，不綁 console lifetime。reader 是提示世代與 RX 結束世代的唯一寫入者；TxWriter 是已消耗提示世代的唯一寫入者；提示世代大於 RX 結束及 TX 消耗世代時窗口 active，bridge epoch 重開時歸零。reader 先更新窗口再發布提示 bytes。human TX 在每次 UART 寫出時分類；窗口 active 的 secret TX chunk 在同一寫出點記一筆不含 payload 的 META，含實際寫出長度與 human source；CR/LF 照常記 TX，不保存待結算行或 client lifetime 狀態。secret bytes 在寫 UART 前登記給 reader 做增量 echo 比對；每個窗口最多保留 1024 bytes，超出時不再保存，並將該 RX 行其餘內容遮罩到行尾。沒有未決 echo 前綴時，登記在後續 RX 行尾清除；未決前綴遇到較早 RX 行尾時保留 matcher，完整 echo 的行尾或 bridge epoch 結束時清除登記。提示前輸入屬窗口外，照常記錄與顯示。raw 逐鍵輸入會依每次實際寫出各記一筆 META；line-buffer 以整段提交記一筆。提示送到 console 前已輸入的 bytes 無法追溯遮罩；沒有匹配 password_regex 的 profile 且沒有可辨識 console unlock prompt 時，輸入仍可能明文記錄。提示前綴含無效 UTF-8 時仍會繼續處理同一 RX chunk 的有效文字。Python 基線維持不變。"
-    approval_conditions: "依 OD-111 只改 Rust、保留 Python 基線；依 2026-11-25 v051 編排者定案撤回整行延後分類與 lifetime 結算，改為 session prompt generation window、TX 寫出當下分類與 WAL/META 同點寫入。raw 逐鍵、line-buffer、提示前已輸入、超過 1024 bytes、在途 TX 遇斷線／detach／stop、普通未換行 WAL 與各輸出 sink 均須由 ServiceRig、CoreHarness 或隔離 daemon 驗證。"
+    compatibility_impact: "password prompt 窗口屬 session，不綁 console lifetime。reader 是提示世代與 RX 結束世代的唯一寫入者；TxWriter 是已消耗提示世代的唯一寫入者；提示世代大於 RX 結束及 TX 消耗世代時窗口 active，bridge epoch 重開時歸零。reader 先更新窗口再發布提示 bytes。每筆 human 輸入只在 daemon 接收當下判定一次：line 模式為 actor 將該行出列，raw 模式為 actor 接收該按鍵段；判定結果沿 backlog／deferred／replay、lease mode、writer、TX WAL、META 與 echo 登記原樣傳遞。actor 判定後開啟的窗口不重分類既有輸入，窗口開啟後接收的輸入則一律 secret 且不建立 interactive lease。TxWriter 不依實際提交當下窗口重判；窗口 active 的 secret TX chunk 在同一寫出點記一筆不含 payload 的 META，含實際寫出長度與 human source，CR/LF 照常記 TX，不保存待結算行或 client lifetime 狀態。secret bytes 在寫 UART 前登記給 reader 做增量 echo 比對；每個窗口最多保留 1024 bytes，超出時不再保存，並將該 RX 行其餘內容遮罩到行尾。沒有未決 echo 前綴時，登記在後續 RX 行尾清除；未決前綴遇到較早 RX 行尾時保留 matcher，已比對部分先遮罩後才發布行尾，完整 echo 的行尾或 bridge epoch 結束時清除登記。提示前輸入屬窗口外，照常記錄與顯示。raw 逐鍵輸入會依每次接收時判定與實際寫出各記一筆 META；line-buffer 以整段提交記一筆。提示送到 console 前已輸入的 bytes 無法追溯遮罩；沒有匹配 password_regex 的 profile 且沒有可辨識 console unlock prompt 時，輸入仍可能明文記錄。提示前綴含無效 UTF-8 時仍會繼續處理同一 RX chunk 的有效文字。Python 基線維持不變。"
+    approval_conditions: "依 OD-111 只改 Rust、保留 Python 基線；依 2026-11-26 v051 編排者裁決撤回 TX 寫出當下分類，改為 actor 接收點單次判定並原樣傳遞。raw 逐鍵、line-buffer、actor 判定與 writer 提交間窗口變化、interactive lease、提示前已輸入、超過 1024 bytes、在途 TX 遇斷線／detach／stop、普通未換行 WAL、RX 前綴失配／行尾順序與各輸出 sink 均須由 ServiceRig、CoreHarness 或隔離 daemon 驗證。"
     related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"

@@ -9,12 +9,22 @@
 
 use indexmap::IndexMap;
 
+use crate::tx_writer::SecretTx;
+
 /// 單一 client 的 deferred 位元組（以 `client_id` 為 `IndexMap` key，保持首次插入序）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredEntry {
     pub client_lifetime: u64,
     pub input_epoch: u64,
     pub bytes: Vec<u8>,
+    spans: Vec<DeferredSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredSpan {
+    start: usize,
+    len: usize,
+    secret_tx: Option<SecretTx>,
 }
 
 /// `append` 的結果。
@@ -62,6 +72,12 @@ pub struct Replay {
     pub bytes: Vec<u8>,
 }
 
+/// 產品回放使用的內部分段；每段保留 actor 接收當下的判定。
+pub(crate) struct ClassifiedReplay {
+    pub replay: Replay,
+    pub secret_tx: Option<SecretTx>,
+}
+
 /// 每 client 有上限的 deferred 輸入帳本。
 #[derive(Debug)]
 pub struct DeferredBuffer {
@@ -70,7 +86,28 @@ pub struct DeferredBuffer {
 }
 
 fn replay_of(client_id: String, e: DeferredEntry) -> Replay {
-    Replay { source: format!("human:{client_id}"), client_lifetime: e.client_lifetime, client_id, bytes: e.bytes }
+    Replay {
+        source: format!("human:{client_id}"),
+        client_lifetime: e.client_lifetime,
+        client_id,
+        bytes: e.bytes,
+    }
+}
+
+fn classified_replay_of(client_id: String, e: DeferredEntry) -> Vec<ClassifiedReplay> {
+    let source = format!("human:{client_id}");
+    e.spans
+        .into_iter()
+        .map(|span| ClassifiedReplay {
+            replay: Replay {
+                source: source.clone(),
+                client_lifetime: e.client_lifetime,
+                client_id: client_id.clone(),
+                bytes: e.bytes[span.start..span.start + span.len].to_vec(),
+            },
+            secret_tx: span.secret_tx,
+        })
+        .collect()
 }
 
 impl DeferredBuffer {
@@ -87,21 +124,62 @@ impl DeferredBuffer {
         current_epoch: u64,
         bytes: &[u8],
     ) -> DeferOutcome {
+        self.append_with_secret(
+            client_id,
+            client_lifetime,
+            input_epoch,
+            current_epoch,
+            bytes,
+            None,
+        )
+    }
+
+    pub(crate) fn append_with_secret(
+        &mut self,
+        client_id: &str,
+        client_lifetime: u64,
+        input_epoch: u64,
+        current_epoch: u64,
+        bytes: &[u8],
+        secret_tx: Option<SecretTx>,
+    ) -> DeferOutcome {
         if input_epoch != current_epoch {
             return DeferOutcome::StaleEpoch;
         }
         let e = self
             .entries
             .entry(client_id.to_string())
-            .or_insert_with(|| DeferredEntry { client_lifetime, input_epoch, bytes: Vec::new() });
+            .or_insert_with(|| DeferredEntry {
+                client_lifetime,
+                input_epoch,
+                bytes: Vec::new(),
+                spans: Vec::new(),
+            });
         if e.client_lifetime != client_lifetime || e.input_epoch != input_epoch {
             // 同 id 新生命週期或新上下文：舊內容作廢。
-            *e = DeferredEntry { client_lifetime, input_epoch, bytes: Vec::new() };
+            *e = DeferredEntry {
+                client_lifetime,
+                input_epoch,
+                bytes: Vec::new(),
+                spans: Vec::new(),
+            };
         }
         let merged = e.bytes.len() + bytes.len();
         if merged > self.cap {
             self.entries.shift_remove(client_id); // P1 T09 規則 1：刪除整個 entry
             return DeferOutcome::Overflowed { dropped: merged };
+        }
+        if bytes.is_empty() {
+            return DeferOutcome::Appended { len: e.bytes.len() };
+        }
+        if let Some(last) = e.spans.last_mut().filter(|span| span.secret_tx == secret_tx) {
+            last.len = last.len.saturating_add(bytes.len());
+        } else {
+            e.spans.push(DeferredSpan {
+                start: e.bytes.len(),
+                len: bytes.len(),
+                secret_tx,
+            });
         }
         e.bytes.extend_from_slice(bytes);
         DeferOutcome::Appended { len: e.bytes.len() }
@@ -129,7 +207,20 @@ impl DeferredBuffer {
             .collect()
     }
 
-    /// 07 D-15(4)：只取出該 client 的 entry（不論可否回放都移除）；可回放時回 `Some`，其餘 entry 順序不變。
+    pub(crate) fn take_classified_replay(
+        &mut self,
+        current_epoch: u64,
+        is_live: &dyn Fn(&str, u64) -> bool,
+    ) -> Vec<ClassifiedReplay> {
+        let drained: Vec<(String, DeferredEntry)> = self.entries.drain(..).collect();
+        drained
+            .into_iter()
+            .filter(|(cid, e)| !e.bytes.is_empty() && e.input_epoch == current_epoch && is_live(cid, e.client_lifetime))
+            .flat_map(|(cid, e)| classified_replay_of(cid, e))
+            .collect()
+    }
+
+    /// 07 D-15(4)：只取出該 client 的 entry（不論可否回放都移除）；可回放時回 `Some`，其他 entry 順序不變。
     pub fn take_replay_for(
         &mut self,
         client_id: &str,
@@ -143,14 +234,52 @@ impl DeferredBuffer {
         Some(replay_of(client_id.to_string(), e))
     }
 
+    pub(crate) fn take_classified_replay_for(
+        &mut self,
+        client_id: &str,
+        current_epoch: u64,
+        is_live: &dyn Fn(&str, u64) -> bool,
+    ) -> Vec<ClassifiedReplay> {
+        let Some(e) = self.entries.shift_remove(client_id) else {
+            return Vec::new();
+        };
+        if e.bytes.is_empty() || e.input_epoch != current_epoch || !is_live(client_id, e.client_lifetime) {
+            return Vec::new();
+        }
+        classified_replay_of(client_id.to_string(), e)
+    }
+
     /// 07 D-15(3)／D-22(4)：被撤銷或 `NotSubmitted` 的回放放回前端。`items` 依原送出順序、各帶擷取時的 `input_epoch`；
     /// epoch 不等於 `current_epoch` 者丟棄；其餘依序排在所有既有 entry 之前，同 client 已有 entry 時 bytes 接在該 entry
     /// 前面並把 entry 移到該位置；合併後長度 > cap 依 D-07 刪除整個 entry。回傳丟棄的 bytes 總數。
     /// client 存活與 lifetime 由呼叫端先行判定；既有 entry 的 lifetime 或 epoch 與放回項目不同時，既有內容視為失效一併丟棄。
     pub fn restore_front(&mut self, items: Vec<(Replay, u64)>, current_epoch: u64) -> usize {
+        self.restore_classified_front(
+            items
+                .into_iter()
+                .map(|(replay, epoch)| {
+                    (
+                        ClassifiedReplay {
+                            replay,
+                            secret_tx: None,
+                        },
+                        epoch,
+                    )
+                })
+                .collect(),
+            current_epoch,
+        )
+    }
+
+    pub(crate) fn restore_classified_front(
+        &mut self,
+        items: Vec<(ClassifiedReplay, u64)>,
+        current_epoch: u64,
+    ) -> usize {
         let mut dropped = 0usize;
         let mut front: IndexMap<String, DeferredEntry> = IndexMap::new();
-        for (r, epoch) in items {
+        for (classified, epoch) in items {
+            let ClassifiedReplay { replay: r, secret_tx } = classified;
             if epoch != current_epoch {
                 dropped += r.bytes.len();
                 continue;
@@ -159,10 +288,30 @@ impl DeferredBuffer {
                 client_lifetime: r.client_lifetime,
                 input_epoch: current_epoch,
                 bytes: Vec::new(),
+                spans: Vec::new(),
             });
             if e.client_lifetime != r.client_lifetime {
                 dropped += e.bytes.len();
-                *e = DeferredEntry { client_lifetime: r.client_lifetime, input_epoch: current_epoch, bytes: Vec::new() };
+                *e = DeferredEntry {
+                    client_lifetime: r.client_lifetime,
+                    input_epoch: current_epoch,
+                    bytes: Vec::new(),
+                    spans: Vec::new(),
+                };
+            }
+            let start = e.bytes.len();
+            if let Some(last) = e
+                .spans
+                .last_mut()
+                .filter(|span| span.secret_tx == secret_tx)
+            {
+                last.len = last.len.saturating_add(r.bytes.len());
+            } else {
+                e.spans.push(DeferredSpan {
+                    start,
+                    len: r.bytes.len(),
+                    secret_tx,
+                });
             }
             e.bytes.extend_from_slice(&r.bytes);
         }
@@ -170,6 +319,22 @@ impl DeferredBuffer {
         for (cid, mut e) in front {
             if let Some(old) = self.entries.shift_remove(&cid) {
                 if old.client_lifetime == e.client_lifetime && old.input_epoch == current_epoch {
+                    let offset = e.bytes.len();
+                    for span in old.spans {
+                        if let Some(last) = e
+                            .spans
+                            .last_mut()
+                            .filter(|current| current.secret_tx == span.secret_tx)
+                        {
+                            last.len = last.len.saturating_add(span.len);
+                        } else {
+                            e.spans.push(DeferredSpan {
+                                start: offset + span.start,
+                                len: span.len,
+                                secret_tx: span.secret_tx,
+                            });
+                        }
+                    }
                     e.bytes.extend_from_slice(&old.bytes);
                 } else {
                     dropped += old.bytes.len();
