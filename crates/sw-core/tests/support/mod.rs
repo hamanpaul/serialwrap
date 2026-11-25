@@ -1312,6 +1312,7 @@ impl EffectExecutor for RigExec {
                         let pump = sw_core::human_console::human_tx::HumanTxPump::spawn(
                             "COM0",
                             worker.tx().clone(),
+                            Arc::clone(&self.rx),
                             tx.clone(),
                         );
                         self.pumps.insert(epoch, pump);

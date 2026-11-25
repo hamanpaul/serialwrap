@@ -12,6 +12,7 @@ use sw_proto::constants::HUMAN_TX_BACKLOG_MAX_BYTES;
 
 use crate::mailbox::ControlEvent;
 use crate::tx_writer::{TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
+use crate::uart_bridge::RxShared;
 
 /// 一筆 human TX job 的識別（結算時以 `HumanTxCompleted { tag, .. }` 帶回）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +224,12 @@ fn not_submitted(permit: &TxPermit) -> TxReport {
 }
 
 impl HumanTxPump {
-    pub fn spawn(com: &str, tx: TxWriterHandle, control: Sender<ControlEvent>) -> HumanTxPump {
+    pub fn spawn(
+        com: &str,
+        tx: TxWriterHandle,
+        rx: std::sync::Arc<RxShared>,
+        control: Sender<ControlEvent>,
+    ) -> HumanTxPump {
         let (sender, receiver) = bounded::<PumpItem>(1);
         let join = std::thread::Builder::new()
             .name(format!("serialwrap-human-tx-{com}"))
@@ -236,7 +242,10 @@ impl HumanTxPump {
                         reply,
                         aggregate: None,
                     };
-                    let report = match tx.jobs.send(job) {
+                    let start_guard = rx.begin_human_submit();
+                    let queued = tx.jobs.send(job);
+                    drop(start_guard);
+                    let report = match queued {
                         Ok(()) => tx
                             .wait_report(&report_rx)
                             .unwrap_or_else(|| not_submitted(&permit)),

@@ -573,10 +573,12 @@ fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
     resume_tx.send(()).expect("deadline waiter remains paused");
 
     let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("done"), "截止 snapshot 仍未完成；期限後由 Ctrl-C 救援成功時沿用基線終態：{result:?}");
+    assert_eq!(result["status"], PyValue::from("error"), "截止後、timeout 決策前才開始的 human submit 保守走 human timeout：{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(""), "截止後 RX 不回填 partial snapshot：{result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
-    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
-    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo LATE\n\x03".to_vec());
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo LATE\n".to_vec());
     let recovered = h.request(SessionRequest::ResultTail {
         cmd_id: id,
         from_chunk: 0,
@@ -585,8 +587,8 @@ fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
     assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
     assert_eq!(
         recovered["error_code"],
-        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
-        "逾時救援成功時保留基線 recovery code：{recovered:?}"
+        PyValue::from("PROMPT_TIMEOUT"),
+        "截止後、決策前開始的 submit 必須走 timeout partial：{recovered:?}"
     );
 }
 
@@ -1016,6 +1018,414 @@ fn i294_r9_silence_timeout_without_echo_with_human_tx_suppresses_recovery() {
 #[test]
 fn i294_r9_silence_timeout_without_echo_with_pending_submit_suppresses_recovery() {
     i294_r9_run_silence_timeout_with_human(true, false);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R10SubmitRacePoint {
+    BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+    SnapshotContainsPendingThenSubmitCompletes,
+    SubmitStartsAfterCutoffBeforeSettlement,
+}
+
+fn i294_r10_advance_clock(h: &ActorRig, duration: Duration) {
+    let mut left = duration;
+    while left > Duration::ZERO {
+        let step = left.min(Duration::from_secs(1));
+        left -= step;
+        h.clock.advance(step);
+        h.send_control(ControlEvent::Tick);
+    }
+}
+
+fn i294_r10_begin_human_submit_after_write(
+    h: &ActorRig,
+) -> (
+    u64,
+    crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    crossbeam_channel::Sender<()>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let generation_before = h.rx.human_tx_state().generation;
+    let (accepted_tx, accepted_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let called = Arc::new(AtomicBool::new(false));
+    let called_hook = Arc::clone(&called);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if called_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        accepted_tx.send(()).expect("等待 human OS submit barrier");
+        release_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放已由 fake OS 接受的 human submit");
+    }));
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(h, 9_294_100);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: b"echo HUMAN\n".to_vec(),
+        reply,
+        aggregate: None,
+    };
+    let queued = h.rx.with_human_submit_start_for_test(|| {
+        tx.jobs.send(job)
+    });
+    assert!(queued.is_ok());
+    accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human line 已由 fake OS 接受、observer 尚未登錄");
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        generation_before,
+        "OS accept barrier 尚未返回，human observer 尚未登錄"
+    );
+    assert!(h.rx.snapshot_from(0).tx_submit_pending);
+    (generation_before, report_rx, release_tx)
+}
+
+fn i294_r10_human_line_permit(h: &ActorRig, op_id: u64) -> sw_core::tx_writer::TxPermit {
+    let (epoch, owner_gen, fsm_gen) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+        )
+    });
+    sw_core::tx_writer::TxPermit {
+        op_id: OpId(op_id),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        class: sw_core::tx_writer::TxClass::HumanLine,
+        source: "human:r10-test".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: None,
+        replay_hold: None,
+        probe_id: None,
+    }
+}
+
+fn i294_r10_release_human_submit(
+    h: &ActorRig,
+    generation_before: u64,
+    report_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    release: crossbeam_channel::Sender<()>,
+) {
+    release.send(()).expect("human OS submit barrier 尚在等待");
+    h.wait_for("human observer 登錄並清除 submit pending", |rig| {
+        rig.rx.human_tx_state().generation > generation_before
+            && !rig.rx.snapshot_from(0).tx_submit_pending
+    });
+    report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanLine TxWriter report 已完成");
+    wait_tx(h, b"echo HUMAN\n");
+}
+
+fn i294_r10_run_silence_submit_race(
+    point: I294R10SubmitRacePoint,
+    echo_found: bool,
+) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R10_RACE";
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n").into_bytes()
+    } else {
+        b"partial output\r\n".to_vec()
+    };
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        let expected = rx.total_bytes().saturating_add(response.len() as u64);
+        dev.push_rx(&response);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+    }));
+
+    let (timeout_tx, timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_timeout_tx, release_timeout_rx) = crossbeam_channel::bounded(1);
+    let timeout_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        timeout_tx.send(()).expect("等待 timeout snapshot barrier");
+        release_timeout_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放 timeout snapshot barrier");
+    });
+    match point {
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot => h
+            .rx
+            .set_snapshot_wait_before_deadline_snapshot_hook_for_test(Some(timeout_hook)),
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes
+        | I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement => h
+            .rx
+            .set_snapshot_wait_deadline_hook_for_test(Some(timeout_hook)),
+    }
+
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx
+            .send(())
+            .expect("completion wait deadline 已建立");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    wait_tx(&h, b"printf R10_RACE\n");
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已建立 quiet cutoff 的 snapshot wait");
+    let command_started_at = h.clock.mono_ns();
+
+    match point {
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot => {
+            let (before, _accepted_rx, release) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_advance_clock(&h, Duration::from_secs(29));
+            assert!(
+                h.clock.mono_ns() < command_started_at + 30_000_000_000,
+                "submit 開始仍早於 30 秒靜默 cutoff"
+            );
+            i294_r10_advance_clock(&h, Duration::from_secs(2));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("quiet cutoff 已到，snapshot 建立前暫停");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+        }
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes => {
+            let (before, _accepted_rx, release) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_advance_clock(&h, Duration::from_secs(31));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout snapshot 已在 submit pending 時建立");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+        }
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement => {
+            i294_r10_advance_clock(&h, Duration::from_secs(31));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("無 human 的 timeout snapshot 已建立，settlement 暫停");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            let (before, _accepted_rx, release) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+        }
+    }
+
+    release_timeout_tx
+        .send(())
+        .expect("timeout snapshot barrier 尚在等待");
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        "printf R10_RACE\npartial output"
+    } else {
+        "partial output\n"
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    let mut expected_tx = format!("{command}\n").into_bytes();
+    expected_tx.extend_from_slice(b"echo HUMAN\n");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        expected_tx,
+        "human 交錯 timeout 必須是零救援 TX；point={point:?}, echo_found={echo_found}"
+    );
+}
+
+#[test]
+fn i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_snapshot_pending_then_submit_completes_before_settlement_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_snapshot_pending_then_submit_completes_before_settlement_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_submit_starts_after_cutoff_before_decision_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_submit_starts_after_cutoff_before_decision_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R10_RESCUE_ORDER";
+    let response = format!("{command}\r\npartial output\r\n").into_bytes();
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        let expected = rx.total_bytes().saturating_add(response.len() as u64);
+        dev.push_rx(&response);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+    }));
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx.send(()).expect("completion wait 已開始");
+    })));
+    let (decision_tx, decision_rx) = crossbeam_channel::bounded(1);
+    let (release_decision_tx, release_decision_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_decision_hook_for_test(Some(Arc::new(move || {
+            decision_tx.send(()).expect("timeout 已判定無 human");
+            release_decision_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 timeout rescue decision barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command quiet deadline 已建立");
+    i294_r10_advance_clock(&h, Duration::from_secs(31));
+    decision_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("無 human timeout 已完成救援決策，第一鍵尚未送出");
+
+    let gate_available_at_decision = h.rx.timeout_rescue_gate_available_for_test();
+    let submit_count_before = h.rx.human_submit_start_count_for_test();
+    let tx_start = h.dev.tx_len();
+    let (human_accepted_tx, human_accepted_rx) = crossbeam_channel::bounded(1);
+    let (release_human_tx, release_human_rx) = crossbeam_channel::bounded(1);
+    let human_hook_dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if human_hook_dev.tx_since(tx_start).ends_with(b"echo HUMAN\n") {
+            human_accepted_tx
+                .send(())
+                .expect("等待 human OS submit barrier");
+            release_human_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 human OS submit barrier");
+        }
+    }));
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_101);
+    let submit_rx = Arc::clone(&h.rx);
+    let (enqueued_tx, enqueued_rx) = crossbeam_channel::bounded(1);
+    let (human_done_tx, human_done_rx) = crossbeam_channel::bounded(1);
+    let human_submit = std::thread::spawn(move || {
+        let (reply, report_rx) = crossbeam_channel::bounded(1);
+        let job = sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"echo HUMAN\n".to_vec(),
+            reply,
+            aggregate: None,
+        };
+        let queued = submit_rx.with_human_submit_start_for_test(|| {
+            tx.jobs.send(job)
+        });
+        queued.expect("human submit 已排入 TX writer");
+        enqueued_tx.send(()).expect("回報 human job 已排入 writer");
+        report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("HumanLine writer report");
+        human_done_tx.send(()).expect("回報 human TX 完成");
+    });
+
+    h.wait_for("human submit 抵達 timeout rescue gate", |rig| {
+        rig.rx.human_submit_attempts_for_test() > 0
+    });
+    let submit_count_while_decision_paused = h.rx.human_submit_start_count_for_test();
+    if gate_available_at_decision {
+        enqueued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("未持有 rescue gate 時 human job 先排入 writer");
+        human_accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("未持有 rescue gate 時 human bytes 先到 OS");
+        release_human_tx
+            .send(())
+            .expect("釋放先送出的 human TX");
+        human_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("先送出的 human TX 已結算");
+    }
+    release_decision_tx
+        .send(())
+        .expect("timeout decision barrier 尚在等待");
+    if !gate_available_at_decision {
+        enqueued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("rescue key 排隊後 human job 才可進 writer");
+        human_accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一個救援鍵後 human bytes 才到 OS");
+        release_human_tx
+            .send(())
+            .expect("釋放 rescue key 後的 human TX");
+        human_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("rescue key 後的 human TX 已結算");
+    }
+    human_submit.join().expect("human submit worker 正常結束");
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert!(
+        !gate_available_at_decision,
+        "timeout 無 human 判定至第一救援鍵入列期間必須持有同一 human submit gate"
+    );
+    assert_eq!(
+        submit_count_while_decision_paused,
+        submit_count_before,
+        "decision 與第一救援鍵互斥期間，新 human submit 尚未開始"
+    );
+    let mut expected_tx = format!("{command}\n").into_bytes();
+    expected_tx.extend_from_slice(b"\x03echo HUMAN\n");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), expected_tx);
 }
 
 fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {

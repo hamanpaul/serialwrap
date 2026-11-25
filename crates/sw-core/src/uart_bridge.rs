@@ -28,6 +28,8 @@ use crate::Mono;
 type SnapshotWaitHook = Arc<dyn Fn(&RxSnapshot) + Send + Sync>;
 #[cfg(feature = "test-fakes")]
 type SnapshotWaitEnterHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(feature = "test-fakes")]
+type SnapshotWaitDeadlineHook = Arc<dyn Fn() + Send + Sync>;
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -64,6 +66,7 @@ struct RxWindow {
     revision: u64,
     rate: VecDeque<(Mono, u64)>,
     human_tx_generation: u64,
+    human_submit_start_count: u64,
     last_human_tx_rx_offset: u64,
     human_raw_line_open: bool,
     rx_events: VecDeque<RxEvent>,
@@ -177,6 +180,7 @@ impl RxWindow {
 /// RX 視窗（絕對偏移；跨 epoch 的 watermark 以 `(epoch, rx_seq)` 表示）。
 pub struct RxShared {
     inner: Mutex<RxWindow>,
+    human_submit_rescue_gate: Mutex<()>,
     changed: Condvar,
     /// P7 Task 3：`wait_for_regex_cancellable` 的喚醒通道（append／clear／`RunCancel::trigger` 時 `try_send`）。
     wakers: Mutex<Vec<Sender<()>>>,
@@ -218,6 +222,15 @@ pub struct RxShared {
     /// 測試交錯：snapshot wait 確認逾時後、呼叫端收回結果前暫停。
     #[cfg(feature = "test-fakes")]
     snapshot_wait_deadline_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 測試交錯：期限已到、deadline snapshot 尚未取得 RX 鎖時暫停。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_before_deadline_snapshot_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
+    /// 測試交錯：timeout 已判定無 human、尚未送第一個救援鍵時暫停。
+    #[cfg(feature = "test-fakes")]
+    timeout_rescue_decision_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
+    /// 測試觀察：human pump 已開始 submit、正等待 rescue gate 或 writer queue。
+    #[cfg(feature = "test-fakes")]
+    human_submit_attempts: AtomicU64,
 }
 
 impl RxShared {
@@ -228,6 +241,7 @@ impl RxShared {
                 last_rx_mono: created_mono,
                 ..RxWindow::default()
             }),
+            human_submit_rescue_gate: Mutex::new(()),
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
@@ -253,7 +267,119 @@ impl RxShared {
             snapshot_wait_evaluated_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             snapshot_wait_deadline_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_before_deadline_snapshot_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            timeout_rescue_decision_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            human_submit_attempts: AtomicU64::new(0),
         })
+    }
+
+    /// human pump 在把 job 放入唯一 TX writer 前建立 submit 起點；guard 與 timeout rescue 共用。
+    pub(crate) fn begin_human_submit(&self) -> HumanSubmitRescueGuard<'_> {
+        #[cfg(feature = "test-fakes")]
+        self.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
+        let guard = self
+            .human_submit_rescue_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
+        HumanSubmitRescueGuard { _guard: guard }
+    }
+
+    /// Timeout 決策與第一個救援鍵排入 writer 之間，阻止新的 human submit 起點插入。
+    pub(crate) fn begin_timeout_rescue(
+        &self,
+        command_start_count: u64,
+    ) -> (HumanSubmitRescueGuard<'_>, bool) {
+        let guard = self
+            .human_submit_rescue_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let human_submit_seen = window.human_submit_start_count > command_start_count
+            || window.tx_submit_pending;
+        (HumanSubmitRescueGuard { _guard: guard }, human_submit_seen)
+    }
+
+    pub(crate) fn human_submit_start_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_submit_start_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tx_submit_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .tx_submit_pending
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn human_submit_attempts_for_test(&self) -> u64 {
+        self.human_submit_attempts.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn human_submit_start_count_for_test(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_submit_start_count
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn with_human_submit_start_for_test<T>(&self, enqueue: impl FnOnce() -> T) -> T {
+        let guard = self.begin_human_submit();
+        let result = enqueue();
+        drop(guard);
+        result
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn timeout_rescue_gate_available_for_test(&self) -> bool {
+        self.human_submit_rescue_gate.try_lock().is_ok()
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_snapshot_wait_before_deadline_snapshot_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitDeadlineHook>,
+    ) {
+        *self
+            .snapshot_wait_before_deadline_snapshot_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_timeout_rescue_decision_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitDeadlineHook>,
+    ) {
+        *self
+            .timeout_rescue_decision_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn timeout_rescue_decision_hook_for_test(&self) {
+        if let Some(hook) = self
+            .timeout_rescue_decision_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            hook();
+        }
     }
 
     #[cfg(feature = "test-fakes")]
@@ -530,14 +656,6 @@ impl RxShared {
         human_tx_state(&window)
     }
 
-    /// 讀取目前是否有 OS submit 尚未完成觀察登錄。
-    pub(crate) fn tx_submit_pending(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .tx_submit_pending
-    }
-
     /// 測試控制尚未完成的 submit 窗口；用於重現 OS submit 與 human TX observer 登錄間的交錯。
     #[cfg(feature = "test-fakes")]
     pub fn set_tx_submit_pending_for_test(&self, pending: bool) {
@@ -550,6 +668,7 @@ impl RxShared {
 
     #[cfg(feature = "test-fakes")]
     pub fn record_human_tx_for_test(&self, payload: &[u8], clock: &dyn Clock) {
+        let submit_guard = self.begin_human_submit();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let event_mono = clock.mono_ns();
         let rx_offset = window
@@ -558,6 +677,7 @@ impl RxShared {
         record_human_tx_locked(&mut window, payload, true, rx_offset, event_mono);
         window.revision = window.revision.saturating_add(1);
         drop(window);
+        drop(submit_guard);
         self.wake_all();
     }
 
@@ -908,7 +1028,8 @@ impl RxShared {
             }
             let stale_snapshot = window.revision != revision
                 || human_tx_state(&window) != snapshot.human_tx_state
-                || window.tx_submit_pending != snapshot.tx_submit_pending;
+                || window.tx_submit_pending != snapshot.tx_submit_pending
+                || window.human_submit_start_count != snapshot.human_submit_start_count;
             if stale_snapshot {
                 continue;
             }
@@ -934,6 +1055,15 @@ impl RxShared {
             window = next;
         }
         drop(window);
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = self
+            .snapshot_wait_before_deadline_snapshot_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
         let deadline_snapshot = {
             let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             snapshot_from_window_at(
@@ -1046,6 +1176,8 @@ pub struct RxSnapshot {
     pub watermark: (u64, u64),
     /// 同一個 RX watermark 下的 human TX 狀態。
     pub human_tx_state: HumanTxState,
+    /// 同一個 RX watermark 下的單調 human submit 開始計數。
+    pub human_submit_start_count: u64,
     /// snapshot 建立時是否仍有尚未完成 observer 登錄的 OS submit。
     pub tx_submit_pending: bool,
     /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
@@ -1071,6 +1203,8 @@ pub struct CommandTxBoundary {
     pub rx_offset: u64,
     /// 同一 RX watermark 下的可信 human TX 狀態。
     pub human_tx_state: HumanTxState,
+    /// command OS submit 起點當下的 human submit 開始計數。
+    pub human_submit_start_count: u64,
     /// command TX 前 RX watermark，供 deadline settlement 作為無後續事件時的基線。
     pub watermark: (u64, u64),
     /// TX 邊界當時，自最近 human TX 起累積的 RX 輸出。
@@ -1082,6 +1216,11 @@ struct TxSubmitPendingGuard<'a> {
     clock: &'a dyn Clock,
     human_submit: bool,
     accepted_or_pending: bool,
+}
+
+/// human submit 起點與 timeout 救援排程共用的短期仲裁鎖。
+pub(crate) struct HumanSubmitRescueGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
 }
 
 impl Drop for TxSubmitPendingGuard<'_> {
@@ -1119,6 +1258,7 @@ fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
         text: window.text_from(base).to_string(),
         watermark: window.watermark,
         human_tx_state: human_tx_state(window),
+        human_submit_start_count: window.human_submit_start_count,
         tx_submit_pending: window.tx_submit_pending,
         trimmed_before_from: base > from,
     }
@@ -1159,6 +1299,7 @@ fn snapshot_from_window_at(
             .map(|event| event.watermark)
             .unwrap_or(watermark_before),
         human_tx_state,
+        human_submit_start_count: window.human_submit_start_count,
         tx_submit_pending: window.tx_submit_pending || window.completion_tx_submit_crossed_deadline,
         trimmed_before_from: base > from,
     }
@@ -1180,6 +1321,7 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
             text: String::new(),
             watermark: window.watermark,
             human_tx_state,
+            human_submit_start_count: window.human_submit_start_count,
             tx_submit_pending: window.tx_submit_pending,
             trimmed_before_from: false,
         }
@@ -1191,6 +1333,7 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
             .trimmed
             .saturating_add(window.text.chars().count() as u64),
         human_tx_state,
+        human_submit_start_count: window.human_submit_start_count,
         watermark: window.watermark,
         human_snapshot,
     }

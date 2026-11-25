@@ -5295,6 +5295,7 @@ impl ManagerExec {
                 let pump = crate::human_console::human_tx::HumanTxPump::spawn(
                     &self.com(),
                     worker.tx().clone(),
+                    Arc::clone(&self.rx),
                     control.clone(),
                 );
                 self.pumps.insert(epoch, pump);

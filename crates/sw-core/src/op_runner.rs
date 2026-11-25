@@ -562,6 +562,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 t.platform == "passthrough",
                 None,
                 true,
+                None,
             )
         }
         OpSpec::SelfTestProbe {
@@ -766,7 +767,10 @@ fn send(
         reply,
         aggregate: None,
     };
-    if ctx.tx.jobs.send(job).is_err() {
+    let human_submit_guard = (class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
+    let queued = ctx.tx.jobs.send(job);
+    drop(human_submit_guard);
+    if queued.is_err() {
         return frozen;
     }
     ctx.tx.wait_report(&report).unwrap_or(frozen)
@@ -919,6 +923,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     };
     let pre_tx_offset = ctx.rx.snapshot_len();
     let human_tx_before_send = ctx.rx.human_tx_state();
+    let human_submit_start_before_send = ctx.rx.human_submit_start_count();
     let human_snapshot_before_send = if human_tx_before_send.generation > 0 {
         ctx.rx.snapshot_from(human_tx_before_send.rx_offset).text
     } else {
@@ -975,6 +980,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let human_tx_before = command_boundary
         .as_ref()
         .map_or(human_tx_before_send, |boundary| boundary.human_tx_state);
+    let human_submit_start_before = command_boundary.as_ref().map_or(
+        human_submit_start_before_send,
+        |boundary| boundary.human_submit_start_count,
+    );
     let watermark_before = command_boundary
         .as_ref()
         .map_or_else(|| ctx.rx.watermark(), |boundary| boundary.watermark);
@@ -1004,6 +1013,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let mut completion_stdout = None;
     let mut completion_timeout_snapshot: Option<RxSnapshot> = None;
     let mut completion_silence_expired = false;
+    let mut timeout_rescue_guard = None;
     if let Some(evaluator) = echo_evaluator.as_ref() {
         // 靜默 chunk 與絕對 operation deadline 使用相同的 human TX 救援分流。
         let silence_limit = timeout_s.min(30.0);
@@ -1025,6 +1035,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     match evaluator.evaluate(
                         &snapshot.text,
                         pending_human_before
+                            || snapshot.human_submit_start_count > human_submit_start_before
                             || human_tx_state.generation > human_tx_before.generation,
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open,
                     ) {
@@ -1052,11 +1063,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         continue;
                     }
 
+                    let (rescue_guard, submit_window_has_human_tx) =
+                        ctx.rx.begin_timeout_rescue(human_submit_start_before);
+                    let human_tx_seen = pending_human_before || submit_window_has_human_tx;
                     let human_tx_state = snapshot.human_tx_state;
-                    let human_tx_seen = pending_human_before
-                        || human_tx_state.generation > human_tx_before.generation
-                        || snapshot.tx_submit_pending
-                        || ctx.rx.tx_submit_pending();
                     let raw_half_line =
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open;
                     if human_tx_seen {
@@ -1070,6 +1080,9 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     }
 
                     // 無 human TX 時，靜默逾時沿用完整基線 recovery 結果。
+                    #[cfg(feature = "test-fakes")]
+                    ctx.rx.timeout_rescue_decision_hook_for_test();
+                    timeout_rescue_guard = Some(rescue_guard);
                     completion_silence_expired = true;
                     break 'completion_wait;
                 }
@@ -1108,15 +1121,15 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     passthrough,
                     Some((cmd_id, confirmed_of(&report))),
                     false,
+                    timeout_rescue_guard.take(),
                 );
             }
             let snapshot = completion_timeout_snapshot
                 .expect("absolute deadline wait returns its filtered timeout snapshot");
+            let (rescue_guard, submit_window_has_human_tx) =
+                ctx.rx.begin_timeout_rescue(human_submit_start_before);
+            let human_tx_seen = pending_human_before || submit_window_has_human_tx;
             let human_tx_state = snapshot.human_tx_state;
-            let human_tx_seen = pending_human_before
-                || human_tx_state.generation > human_tx_before.generation
-                || snapshot.tx_submit_pending
-                || ctx.rx.tx_submit_pending();
             let raw_half_line =
                 human_tx_before.raw_line_open || human_tx_state.raw_line_open;
             // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
@@ -1126,6 +1139,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             }
 
             // 無 human TX 時直接採用基線 recovery 的完整結果與 stdout。
+            #[cfg(feature = "test-fakes")]
+            ctx.rx.timeout_rescue_decision_hook_for_test();
             return recover_after_failure(
                 ctx,
                 grant,
@@ -1136,6 +1151,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 passthrough,
                 Some((cmd_id, confirmed_of(&report))),
                 false,
+                Some(rescue_guard),
             );
         }
         if q.req.is_trusted_human() {
@@ -1154,6 +1170,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             passthrough,
             Some((cmd_id, confirmed_of(&report))),
             false,
+            None,
         );
     }
     let stdout = if let Some(stdout) = completion_stdout {
@@ -1262,6 +1279,7 @@ fn recover_after_failure(
     passthrough: bool,
     aborted: Option<(&str, usize)>,
     shutdown_cancellable: bool,
+    mut timeout_rescue_guard: Option<crate::uart_bridge::HumanSubmitRescueGuard<'_>>,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -1280,6 +1298,11 @@ fn recover_after_failure(
             None,
             true,
         );
+        if name == "CTRL_C" {
+            // Decision-to-first-rescue-key is serialized with human submit admission. `send`
+            // returns only after the writer reports whether the key reached the OS.
+            drop(timeout_rescue_guard.take());
+        }
         if !fully_sent(&report, 1) {
             match report.reject {
                 Some(FenceReject::Quiet | FenceReject::ReconfirmPending) => break,

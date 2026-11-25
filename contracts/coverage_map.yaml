@@ -132,6 +132,13 @@ entries:
     - cargo:sw-core::command_exec::i294_r9_deadline_timeout_full_echo_with_pending_submit_suppresses_recovery
     - cargo:sw-core::command_exec::i294_r9_stale_no_echo_completion_rechecked_after_human_tx
     - cargo:sw-core::command_exec::i294_r9_stale_no_echo_completion_rechecked_after_pending_submit
+    - cargo:sw-core::command_exec::i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit
+    - cargo:sw-core::command_exec::i294_r10_snapshot_pending_then_submit_completes_before_settlement_with_echo
+    - cargo:sw-core::command_exec::i294_r10_snapshot_pending_then_submit_completes_before_settlement_without_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_with_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_without_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_with_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_without_echo
     - cargo:sw-core::command_completion::tests::i294_r9_direct_echo_search_has_linear_work_bound
     - cargo:sw-core::i294_r9_baseline_diff::i294_r9_no_human_timeout_stdout_matches_baseline_for_both_echo_states
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo
