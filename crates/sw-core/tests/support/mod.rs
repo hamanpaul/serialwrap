@@ -3484,6 +3484,7 @@ impl TxRig {
                 rx: sw_core::uart_bridge::RxShared::new(65_536, 0),
                 epoch: TXRIG_EPOCH,
                 control: ctl_tx,
+                clock: FakeClock::new(),
             },
         );
         std::mem::forget(_stop);

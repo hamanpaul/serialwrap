@@ -3606,6 +3606,7 @@ impl Shared {
                 rx: crate::uart_bridge::RxShared::new(1, 0),
                 epoch: 0,
                 control: control_tx,
+                clock: self.clock.clone(),
             },
         );
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);

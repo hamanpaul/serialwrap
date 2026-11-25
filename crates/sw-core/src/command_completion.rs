@@ -3,17 +3,13 @@
 //! producer completion、passthrough、human 命令與其他 op 保留既有路徑。此 evaluator 只把同一份 RX snapshot
 //! 中的完整 command echo 作為 prompt 搜尋下界；prompt 身分與無換行輸出裁切由 i294-i2 處理。
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use sw_proto::pycompat::{clean_text, clean_text_with_source_ranges};
 use sw_proto::pyre::PyRegex;
 
-use crate::op_runner::{match_wrapped_echo, WrapEvidence};
-
-/// 每個 evaluator snapshot 最多走訪的折行 matcher 狀態數。
-const MAX_ECHO_MATCH_STEPS: usize = 2_000_000;
-const MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE: usize = 2_000_000;
-const ECHO_MATCH_STEPS_PER_CHAR: usize = 32;
+use crate::op_runner::{match_wrapped_echo_ending_at, WrapEvidence, WRAP_MIN_SEGMENT};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Evaluation {
@@ -103,9 +99,9 @@ struct EchoRange {
 #[derive(Debug, Default)]
 struct EchoSearchMetrics {
     candidate_checks: usize,
+    prompt_prefix_checks: usize,
     prefix_scan_chars: usize,
     matcher_steps: usize,
-    prefix_budget_exhausted: bool,
 }
 
 fn find_command_echo(
@@ -117,82 +113,103 @@ fn find_command_echo(
 ) -> Option<EchoRange> {
     let command_chars: Vec<char> = command.chars().collect();
     let chars: Vec<char> = cleaned.chars().collect();
-    let first = *command_chars.first()?;
+    if command_chars.is_empty() {
+        return None;
+    }
+    let mut line_start_by_char = vec![0usize; chars.len() + 1];
+    let mut current_line_start = 0usize;
+    for (index, ch) in chars.iter().enumerate() {
+        line_start_by_char[index] = current_line_start;
+        if *ch == '\n' {
+            current_line_start = index + 1;
+        }
+    }
+    line_start_by_char[chars.len()] = current_line_start;
     let mut line_start = 0usize;
-    let mut previous_line_empty = false;
-    let mut remaining_match_steps = chars
-        .len()
-        .saturating_add(command_chars.len())
-        .saturating_mul(ECHO_MATCH_STEPS_PER_CHAR)
-        .clamp(64, MAX_ECHO_MATCH_STEPS);
 
     while line_start < chars.len() {
         let line_end = (line_start..chars.len())
             .find(|index| chars[*index] == '\n')
             .unwrap_or(chars.len());
-        let line_chars = &chars[line_start..line_end];
-        let line: String = line_chars.iter().collect();
-        let mut line_prefix_scan_chars = 0usize;
-        for (local_start, (byte_start, ch)) in line.char_indices().enumerate() {
-            if ch != first {
-                continue;
-            }
+        if line_end < chars.len() {
             metrics.candidate_checks = metrics.candidate_checks.saturating_add(1);
-            let candidate = line_start + local_start;
-            if local_start > 0 {
-                let next_scan_chars = line_prefix_scan_chars.saturating_add(local_start);
-                if next_scan_chars > MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE {
-                    metrics.prefix_budget_exhausted = true;
-                    break;
-                }
-                line_prefix_scan_chars = next_scan_chars;
-                metrics.prefix_scan_chars = metrics
-                    .prefix_scan_chars
-                    .saturating_add(local_start);
-                let prefix = &line[..byte_start];
-                if !prompt
-                    .search(prefix)
-                    .is_some_and(|matched| matched.start == 0 && matched.end == local_start)
-                {
-                    continue;
-                }
-            }
-            if candidate == line_start
-                && previous_line_empty
-                && line_start > 0
-                && wraps.is_wrap_at(line_start - 1, '\n')
-            {
-                continue;
-            }
-            let local_start = candidate - line_start;
-            let before_steps = remaining_match_steps;
-            let Some(local_end) = match_wrapped_echo(
-                &chars[line_start..],
-                local_start,
-                &command_chars,
-                wraps,
-                line_start,
-                |local_end| chars.get(line_start + local_end) == Some(&'\n'),
-                &mut remaining_match_steps,
-            ) else {
-                metrics.matcher_steps = metrics
-                    .matcher_steps
-                    .saturating_add(before_steps - remaining_match_steps);
-                continue;
-            };
-            metrics.matcher_steps = metrics
-                .matcher_steps
-                .saturating_add(before_steps - remaining_match_steps);
-            let command_end = line_start + local_end;
-            return Some(EchoRange {
-                _command: candidate..command_end,
-                after_line: command_end + 1,
+            let mut prompt_cache = HashMap::new();
+            let mut valid_start =
+                |command_start: usize, first_wrap_command_chars: Option<usize>| {
+                    if command_start > line_end {
+                        return false;
+                    }
+                    let command_line_start = line_start_by_char[command_start];
+                    let prefix_chars = command_start.saturating_sub(command_line_start);
+                    if first_wrap_command_chars.is_some_and(|wrapped_chars| {
+                        prefix_chars.saturating_add(wrapped_chars) < WRAP_MIN_SEGMENT
+                    }) {
+                        return false;
+                    }
+                    if prefix_chars == 0 {
+                        if command_start > 0 && wraps.is_wrap_at(command_start - 1, '\n') {
+                            let previous_line_start = line_start_by_char[command_start - 1];
+                            if previous_line_start == command_start - 1 {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }
+                    if let Some(matches) = prompt_cache.get(&command_start) {
+                        return *matches;
+                    }
+                    metrics.prompt_prefix_checks = metrics.prompt_prefix_checks.saturating_add(1);
+                    metrics.prefix_scan_chars =
+                        metrics.prefix_scan_chars.saturating_add(prefix_chars);
+                    let prefix: String = chars[command_line_start..command_start].iter().collect();
+                    let matches = prompt
+                        .search(&prefix)
+                        .is_some_and(|matched| matched.start == 0 && matched.end == prefix_chars);
+                    prompt_cache.insert(command_start, matches);
+                    matches
+                };
+
+            let mut direct_steps = 0usize;
+            let direct_start = line_end.checked_sub(command_chars.len()).filter(|start| {
+                chars[*start..line_end]
+                    .iter()
+                    .zip(&command_chars)
+                    .all(|(actual, expected)| {
+                        direct_steps = direct_steps.saturating_add(1);
+                        actual == expected
+                    })
             });
+            metrics.matcher_steps = metrics.matcher_steps.saturating_add(direct_steps);
+            if let Some(command_start) = direct_start.filter(|start| valid_start(*start, None)) {
+                return Some(EchoRange {
+                    _command: command_start..line_end,
+                    after_line: line_end + 1,
+                });
+            }
+
+            let wrap_floor = line_end.saturating_sub(command_chars.len().saturating_mul(2));
+            if (wrap_floor..line_end).any(|index| wraps.is_wrap_at(index, chars[index])) {
+                let mut matcher_steps = 0usize;
+                let candidate = match_wrapped_echo_ending_at(
+                    &chars,
+                    line_end,
+                    &command_chars,
+                    wraps,
+                    &mut valid_start,
+                    &mut matcher_steps,
+                );
+                metrics.matcher_steps = metrics.matcher_steps.saturating_add(matcher_steps);
+                if let Some(command_start) = candidate {
+                    return Some(EchoRange {
+                        _command: command_start..line_end,
+                        after_line: line_end + 1,
+                    });
+                }
+            }
         }
         if line_end == chars.len() {
             break;
         }
-        previous_line_empty = line_end == line_start;
         line_start = line_end + 1;
     }
     None
@@ -438,6 +455,7 @@ mod tests {
         let (cleaned, source_ranges) = clean_text_with_source_ranges(&long_line);
         let wraps = WrapEvidence::from_raw(&long_line, &cleaned, &source_ranges);
         let input_chars = cleaned.chars().count();
+        let line_count = cleaned.chars().filter(|ch| *ch == '\n').count() + 1;
         let mut metrics = EchoSearchMetrics::default();
         let started = std::time::Instant::now();
         let _ = find_command_echo(
@@ -448,22 +466,20 @@ mod tests {
             &mut metrics,
         );
         assert!(
-            metrics.prefix_budget_exhausted,
-            "長單行同首字元候選應受每行 prefix 預算限制：{metrics:?}"
+            metrics.candidate_checks <= line_count * 2,
+            "每行至多檢查行首與 prompt 後起點：{metrics:?}"
         );
         assert!(
-            metrics.candidate_checks <= input_chars,
-            "候選檢查不得超過輸入字元數：{metrics:?}"
+            metrics.prompt_prefix_checks <= line_count,
+            "prompt 前綴每行只檢查一次：{metrics:?}"
         );
         assert!(
-            metrics.prefix_scan_chars
-                <= MAX_ECHO_PREFIX_SCAN_CHARS_PER_LINE
-                    * (cleaned.chars().filter(|ch| *ch == '\n').count() + 1),
-            "prompt 前綴掃描須受每行固定預算限制：{metrics:?}"
+            metrics.prefix_scan_chars <= input_chars,
+            "prompt 前綴總掃描字元數不得超過 RX 輸入長度：{metrics:?}"
         );
         assert!(
-            metrics.matcher_steps <= MAX_ECHO_MATCH_STEPS,
-            "折行 matcher 必須有固定步數上限：{metrics:?}"
+            metrics.matcher_steps <= metrics.candidate_checks * "echo x".chars().count(),
+            "無折行時 matcher 工作量須受候選數 × 命令長度限制：{metrics:?}"
         );
 
         assert_eq!(
@@ -483,6 +499,34 @@ mod tests {
                 stdout: short_lines.trim_end_matches("root@t:/# ").trim_end_matches('\n').to_string()
             }
         );
+        let candidates_then_echo = format!(
+            "{}root@t:/# echo x\r\nx\r\nroot@t:/# ",
+            "e\n".repeat(2_000)
+        );
+        let (cleaned, source_ranges) = clean_text_with_source_ranges(&candidates_then_echo);
+        let wraps = WrapEvidence::from_raw(&candidates_then_echo, &cleaned, &source_ranges);
+        let mut late_echo_metrics = EchoSearchMetrics::default();
+        let line_count = cleaned.chars().filter(|ch| *ch == '\n').count() + 1;
+        let echo = find_command_echo(
+            &cleaned,
+            "echo x",
+            evaluator.prompt,
+            &wraps,
+            &mut late_echo_metrics,
+        );
+        assert!(echo.is_some(), "大量前置候選後仍須找到行尾直接 echo");
+        assert!(
+            late_echo_metrics.candidate_checks <= line_count,
+            "每個行尾至多檢查一次：{late_echo_metrics:?}"
+        );
+        assert!(
+            late_echo_metrics.prompt_prefix_checks <= line_count,
+            "每個候選起點的 prompt 前綴只掃描一次：{late_echo_metrics:?}"
+        );
+        assert_eq!(
+            evaluator.evaluate(&candidates_then_echo, false, false),
+            Evaluation::Complete { stdout: "x".into() }
+        );
         assert_eq!(
             evaluator.evaluate("human residue\nroot@t:/# ", true, false),
             Evaluation::Uncertain {
@@ -490,7 +534,7 @@ mod tests {
             }
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_secs(5),
             "長 RX 完成判定超過寬鬆上限：{:?}",
             started.elapsed()
         );

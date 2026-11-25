@@ -98,6 +98,7 @@ fn rig() -> Rig {
             rx: RxShared::new(65_536, 0),
             epoch: 7,
             control: ctl_tx,
+            clock: sw_pal::fakes::clock::FakeClock::new(),
         },
     );
     Rig {

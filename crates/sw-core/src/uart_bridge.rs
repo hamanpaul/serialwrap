@@ -24,11 +24,31 @@ use crate::tx_writer::{
 use crate::wal::{WalAppendReq, WalWriter};
 use crate::Mono;
 
+#[cfg(feature = "test-fakes")]
+type SnapshotWaitHook = Arc<dyn Fn(&RxSnapshot) + Send + Sync>;
+#[cfg(feature = "test-fakes")]
+type SnapshotWaitEnterHook = Arc<dyn Fn() + Send + Sync>;
+
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
 const RX_RATE_WINDOW_MAX: usize = 4096;
 const RX_WAIT_CLOCK_SLICE: Duration = Duration::from_millis(50);
 const DATA_SEND_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Clone)]
+struct RxEvent {
+    start_offset: u64,
+    end_offset: u64,
+    mono_ns: Mono,
+    watermark: (u64, u64),
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+struct HumanTxEvent {
+    mono_ns: Mono,
+    state: HumanTxState,
+}
 
 /// 哨兵 console（POSIX 內部 PTY）的 I/O 介面：與 PAL 的 `ConsoleIo`（arch §4.7）為同一型別。
 pub use sw_pal::traits::ConsoleIo;
@@ -46,6 +66,11 @@ struct RxWindow {
     human_tx_generation: u64,
     last_human_tx_rx_offset: u64,
     human_raw_line_open: bool,
+    rx_events: VecDeque<RxEvent>,
+    rx_event_chars: usize,
+    human_tx_events: VecDeque<HumanTxEvent>,
+    completion_capture_op_id: Option<u64>,
+    completion_deadline: Option<Mono>,
     command_tx_boundary: Option<(u64, CommandTxBoundary)>,
     tx_submit_pending: bool,
 }
@@ -77,6 +102,46 @@ impl RxWindow {
             .map_or(self.text.len(), |(index, _)| index);
         self.text.drain(..byte_index);
         self.trimmed = self.trimmed.saturating_add(overflow as u64);
+    }
+
+    fn push_rx_event(&mut self, event: RxEvent) {
+        self.rx_event_chars = self
+            .rx_event_chars
+            .saturating_add(event.text.chars().count());
+        self.rx_events.push_back(event);
+        self.trim_rx_events_to_limit();
+    }
+
+    fn trim_rx_events_to_limit(&mut self) {
+        let overflow = self.rx_event_chars.saturating_sub(self.max_chars);
+        let mut remaining = overflow;
+        while remaining > 0 {
+            let Some(front) = self.rx_events.front_mut() else {
+                self.rx_event_chars = 0;
+                break;
+            };
+            let front_chars = front.text.chars().count();
+            if remaining >= front_chars {
+                remaining -= front_chars;
+                self.rx_event_chars = self.rx_event_chars.saturating_sub(front_chars);
+                self.rx_events.pop_front();
+                continue;
+            }
+            let byte_index = front
+                .text
+                .char_indices()
+                .nth(remaining)
+                .map_or(front.text.len(), |(index, _)| index);
+            front.text.drain(..byte_index);
+            front.start_offset = front.start_offset.saturating_add(remaining as u64);
+            self.rx_event_chars = self.rx_event_chars.saturating_sub(remaining);
+            remaining = 0;
+        }
+    }
+
+    fn clear_rx_events(&mut self) {
+        self.rx_events.clear();
+        self.rx_event_chars = 0;
     }
 
     fn prune_rate(&mut self, now: Mono) {
@@ -141,7 +206,13 @@ pub struct RxShared {
     snapshot_wait_end: AtomicU64,
     /// 測試交錯：命中 completion snapshot 後、waiter 收到結果前暫停。
     #[cfg(feature = "test-fakes")]
-    snapshot_wait_match_hook: Mutex<Option<Arc<dyn Fn(&RxSnapshot) + Send + Sync>>>,
+    snapshot_wait_match_hook: Mutex<Option<SnapshotWaitHook>>,
+    /// 測試交錯：外層 deadline 已計算、內層等待器尚未建立期限時暫停。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_enter_hook: Mutex<Option<SnapshotWaitEnterHook>>,
+    /// 測試交錯：predicate 已依 snapshot 完成評估、等待器尚未重取 RX 鎖時暫停。
+    #[cfg(feature = "test-fakes")]
+    snapshot_wait_evaluated_hook: Mutex<Option<SnapshotWaitHook>>,
     /// 測試交錯：snapshot wait 確認逾時後、呼叫端收回結果前暫停。
     #[cfg(feature = "test-fakes")]
     snapshot_wait_deadline_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -174,6 +245,10 @@ impl RxShared {
             snapshot_wait_end: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
             snapshot_wait_match_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_enter_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            snapshot_wait_evaluated_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             snapshot_wait_deadline_hook: Mutex::new(None),
         })
@@ -259,10 +334,32 @@ impl RxShared {
     #[cfg(feature = "test-fakes")]
     pub fn set_snapshot_wait_match_hook_for_test(
         &self,
-        hook: Option<Arc<dyn Fn(&RxSnapshot) + Send + Sync>>,
+        hook: Option<SnapshotWaitHook>,
     ) {
         *self
             .snapshot_wait_match_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_snapshot_wait_enter_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitEnterHook>,
+    ) {
+        *self
+            .snapshot_wait_enter_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_snapshot_wait_evaluated_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitHook>,
+    ) {
+        *self
+            .snapshot_wait_evaluated_hook
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = hook;
     }
@@ -318,7 +415,29 @@ impl RxShared {
     }
 
     pub fn append(&self, data: &[u8], now: Mono, epoch: u64, rx_seq: u64) {
+        self.append_with_time(data, || now, epoch, rx_seq);
+    }
+
+    /// 使用同一 monotonic clock 在 RX 視窗鎖內記錄追加時間與 watermark。
+    pub(crate) fn append_with_clock(
+        &self,
+        data: &[u8],
+        clock: &dyn Clock,
+        epoch: u64,
+        rx_seq: u64,
+    ) {
+        self.append_with_time(data, || clock.mono_ns(), epoch, rx_seq);
+    }
+
+    fn append_with_time(
+        &self,
+        data: &[u8],
+        event_time: impl FnOnce() -> Mono,
+        epoch: u64,
+        rx_seq: u64,
+    ) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let now = event_time();
         window.watermark = (epoch, rx_seq);
         window.revision = window.revision.saturating_add(1);
         if !data.is_empty() {
@@ -327,8 +446,27 @@ impl RxShared {
             window.prune_rate(now);
             window.rate.push_back((now, data.len() as u64));
             window.cap_rate();
-            window.text.push_str(&decode_utf8_replace(data));
+            let decoded = decode_utf8_replace(data);
+            let start_offset = window
+                .trimmed
+                .saturating_add(window.text.chars().count() as u64);
+            window.text.push_str(&decoded);
             window.trim_to_limit();
+            if window.completion_capture_op_id.is_some()
+                && window
+                    .completion_deadline
+                    .is_none_or(|deadline| now <= deadline)
+            {
+                let end_offset = start_offset.saturating_add(decoded.chars().count() as u64);
+                let watermark = window.watermark;
+                window.push_rx_event(RxEvent {
+                    start_offset,
+                    end_offset,
+                    mono_ns: now,
+                    watermark,
+                    text: decoded,
+                });
+            }
         }
         drop(window);
         if !data.is_empty() {
@@ -357,6 +495,7 @@ impl RxShared {
             .trimmed
             .saturating_add(window.text.chars().count() as u64);
         window.text.clear();
+        window.clear_rx_events();
         window.revision = window.revision.saturating_add(1);
         drop(window);
         self.wake_all();
@@ -390,12 +529,16 @@ impl RxShared {
     }
 
     #[cfg(feature = "test-fakes")]
-    pub fn record_human_tx_for_test(&self, payload: &[u8]) {
+    pub fn record_human_tx_for_test(&self, payload: &[u8], clock: &dyn Clock) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let event_mono = clock.mono_ns();
         let rx_offset = window
             .trimmed
             .saturating_add(window.text.chars().count() as u64);
-        record_human_tx_locked(&mut window, payload, true, rx_offset);
+        record_human_tx_locked(&mut window, payload, true, rx_offset, event_mono);
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
     }
 
     /// 在 RX 鎖下於 OS submit 前擷取 watermark；只在已接受或結果不明時提交 human TX 觀察。
@@ -405,6 +548,7 @@ impl RxShared {
         command_op_id: Option<u64>,
         command_boundary_recorded: bool,
         human_payload: Option<(&[u8], bool, usize)>,
+        clock: &dyn Clock,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
         let (candidate_boundary, candidate_human_rx_offset) = {
@@ -428,8 +572,10 @@ impl RxShared {
 
         if submitted {
             let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let event_mono = clock.mono_ns();
             if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
                 if !command_boundary_recorded {
+                    window.human_tx_events.clear();
                     window.command_tx_boundary = Some((op_id, boundary));
                     boundary_recorded = true;
                 }
@@ -446,6 +592,7 @@ impl RxShared {
                             &payload[start..end],
                             raw_input,
                             rx_offset,
+                            event_mono,
                         );
                     }
                 }
@@ -456,6 +603,7 @@ impl RxShared {
                         &mut window,
                         raw_input,
                         rx_offset,
+                        event_mono,
                     );
                 }
                 _ => {}
@@ -475,6 +623,12 @@ impl RxShared {
             let accepted = confirmed.min(payload.len());
             if accepted > 0 {
                 update_raw_line_state(&mut window, &payload[..accepted]);
+            }
+        }
+        let state = human_tx_state(&window);
+        if let Some(event) = window.human_tx_events.back_mut() {
+            if event.state.generation == state.generation {
+                event.state = state;
             }
         }
     }
@@ -505,6 +659,44 @@ impl RxShared {
             .as_ref()
             .filter(|(recorded_op, _)| *recorded_op == op_id)
             .map(|(_, boundary)| boundary.clone())
+    }
+
+    pub(crate) fn begin_command_completion_observation(&self, op_id: u64) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.clear_rx_events();
+        window.completion_capture_op_id = Some(op_id);
+        window.completion_deadline = None;
+    }
+
+    pub(crate) fn set_command_completion_deadline(&self, op_id: u64, deadline: Mono) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if window.completion_capture_op_id != Some(op_id) {
+            return;
+        }
+        window.completion_deadline = Some(deadline);
+        window.rx_events.retain(|event| event.mono_ns <= deadline);
+        window.rx_event_chars = window
+            .rx_events
+            .iter()
+            .map(|event| event.text.chars().count())
+            .sum();
+    }
+
+    pub(crate) fn finish_command_completion_observation(&self, op_id: u64) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if window.completion_capture_op_id == Some(op_id) {
+            window.completion_capture_op_id = None;
+            window.completion_deadline = None;
+            window.clear_rx_events();
+        }
+        if window
+            .command_tx_boundary
+            .as_ref()
+            .is_some_and(|(recorded_op, _)| *recorded_op == op_id)
+        {
+            window.command_tx_boundary = None;
+            window.human_tx_events.clear();
+        }
     }
 
     pub fn tail(&self, max_chars: usize) -> String {
@@ -596,22 +788,51 @@ impl RxShared {
         self.wait_for_match_from(from, timeout, clock, |text| re.search(text).is_some())
     }
 
-    /// 等待 predicate 成功，或回傳逾時前最後實際檢查的 snapshot。
+    /// 等待 predicate 成功，或依指定期限重建截止水位 snapshot。
     pub fn wait_for_snapshot_from<T>(
         &self,
         from: u64,
         timeout: Duration,
         clock: &dyn Clock,
-        mut matches: impl FnMut(&RxSnapshot) -> Option<T>,
+        matches: impl FnMut(&RxSnapshot) -> Option<T>,
     ) -> SnapshotWaitResult<T> {
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
-        if clock.mono_ns() >= deadline {
-            return SnapshotWaitResult::TimedOut { last_snapshot: None };
+        let (human_tx_before, watermark_before) = {
+            let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            (human_tx_state(&window), window.watermark)
+        };
+        self.wait_for_snapshot_until_from(
+            from,
+            deadline,
+            human_tx_before,
+            watermark_before,
+            clock,
+            matches,
+        )
+    }
+
+    /// 等待 predicate 到絕對 monotonic deadline；逾時結算依事件時間重建 deadline snapshot。
+    pub fn wait_for_snapshot_until_from<T>(
+        &self,
+        from: u64,
+        deadline: Mono,
+        human_tx_before: HumanTxState,
+        watermark_before: (u64, u64),
+        clock: &dyn Clock,
+        mut matches: impl FnMut(&RxSnapshot) -> Option<T>,
+    ) -> SnapshotWaitResult<T> {
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = self
+            .snapshot_wait_enter_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
         }
 
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let mut last_snapshot = None;
         while clock.mono_ns() < deadline {
             if window.tx_submit_pending {
                 let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
@@ -627,13 +848,20 @@ impl RxShared {
                 break;
             }
             let snapshot = snapshot_from_window(&window, from);
-            last_snapshot = Some(snapshot.clone());
             let revision = window.revision;
             drop(window);
 
             let value = matches(&snapshot);
             #[cfg(feature = "test-fakes")]
             {
+                if let Some(hook) = self
+                    .snapshot_wait_evaluated_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    hook(&snapshot);
+                }
                 let _window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 self.snapshot_wait_end.store(
                     snapshot
@@ -658,6 +886,9 @@ impl RxShared {
             }
 
             window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if clock.mono_ns() >= deadline {
+                break;
+            }
             if window.revision != revision {
                 continue;
             }
@@ -670,6 +901,16 @@ impl RxShared {
             window = next;
         }
         drop(window);
+        let deadline_snapshot = {
+            let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            snapshot_from_window_at(
+                &window,
+                from,
+                deadline,
+                human_tx_before,
+                watermark_before,
+            )
+        };
         #[cfg(feature = "test-fakes")]
         if let Some(hook) = self
             .snapshot_wait_deadline_hook
@@ -679,7 +920,9 @@ impl RxShared {
         {
             hook();
         }
-        SnapshotWaitResult::TimedOut { last_snapshot }
+        SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(deadline_snapshot),
+        }
     }
 
     #[cfg(feature = "test-fakes")]
@@ -774,7 +1017,7 @@ pub struct RxSnapshot {
     pub trimmed_before_from: bool,
 }
 
-/// 一次 completion snapshot 等待的結果。逾時時只附上 deadline 前實際檢查過的最後 snapshot。
+/// 一次 completion snapshot 等待的結果。逾時時附上只含事件時間不晚於 deadline 的 snapshot。
 pub enum SnapshotWaitResult<T> {
     Matched { snapshot: RxSnapshot, value: T },
     TimedOut { last_snapshot: Option<RxSnapshot> },
@@ -793,6 +1036,8 @@ pub struct CommandTxBoundary {
     pub rx_offset: u64,
     /// 同一 RX watermark 下的可信 human TX 狀態。
     pub human_tx_state: HumanTxState,
+    /// command TX 前 RX watermark，供 deadline settlement 作為無後續事件時的基線。
+    pub watermark: (u64, u64),
     /// TX 邊界當時，自最近 human TX 起累積的 RX 輸出。
     pub human_snapshot: RxSnapshot,
 }
@@ -823,6 +1068,45 @@ fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
     }
 }
 
+fn snapshot_from_window_at(
+    window: &RxWindow,
+    from: u64,
+    deadline: Mono,
+    human_tx_before: HumanTxState,
+    watermark_before: (u64, u64),
+) -> RxSnapshot {
+    let events: Vec<_> = window
+        .rx_events
+        .iter()
+        .filter(|event| event.mono_ns <= deadline && event.end_offset > from)
+        .collect();
+    let first_event = events.first();
+    let last_event = events.last();
+    let history_start = first_event.map_or(from, |event| event.start_offset);
+    let base = from.max(history_start);
+    let end = last_event.map_or(base, |event| event.end_offset).max(base);
+    let history: String = events.iter().flat_map(|event| event.text.chars()).collect();
+    let skip_chars = usize::try_from(base.saturating_sub(history_start)).unwrap_or(usize::MAX);
+    let take_chars = usize::try_from(end.saturating_sub(base)).unwrap_or(usize::MAX);
+    let text: String = history.chars().skip(skip_chars).take(take_chars).collect();
+    let human_tx_state = window
+        .human_tx_events
+        .iter()
+        .rev()
+        .find(|event| event.mono_ns <= deadline)
+        .map(|event| event.state)
+        .unwrap_or(human_tx_before);
+    RxSnapshot {
+        base,
+        text,
+        watermark: last_event
+            .map(|event| event.watermark)
+            .unwrap_or(watermark_before),
+        human_tx_state,
+        trimmed_before_from: base > from,
+    }
+}
+
 fn human_tx_state(window: &RxWindow) -> HumanTxState {
     HumanTxState {
         generation: window.human_tx_generation,
@@ -849,6 +1133,7 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
             .trimmed
             .saturating_add(window.text.chars().count() as u64),
         human_tx_state,
+        watermark: window.watermark,
         human_snapshot,
     }
 }
@@ -858,19 +1143,37 @@ fn record_human_tx_locked(
     payload: &[u8],
     raw_input: bool,
     rx_offset: u64,
+    mono_ns: Mono,
 ) {
     window.human_tx_generation = window.human_tx_generation.saturating_add(1);
     window.last_human_tx_rx_offset = rx_offset;
     if raw_input && !payload.is_empty() {
         update_raw_line_state(window, payload);
     }
+    if window.command_tx_boundary.is_some() {
+        window.human_tx_events.push_back(HumanTxEvent {
+            mono_ns,
+            state: human_tx_state(window),
+        });
+    }
 }
 
-fn record_human_tx_unknown_locked(window: &mut RxWindow, raw_input: bool, rx_offset: u64) {
+fn record_human_tx_unknown_locked(
+    window: &mut RxWindow,
+    raw_input: bool,
+    rx_offset: u64,
+    mono_ns: Mono,
+) {
     window.human_tx_generation = window.human_tx_generation.saturating_add(1);
     window.last_human_tx_rx_offset = rx_offset;
     if raw_input {
         window.human_raw_line_open = true;
+    }
+    if window.command_tx_boundary.is_some() {
+        window.human_tx_events.push_back(HumanTxEvent {
+            mono_ns,
+            state: human_tx_state(window),
+        });
     }
 }
 
@@ -1013,9 +1316,8 @@ fn spawn_reader_inner(
                                     obs.on_rx(&ctx.com, data, wal_entry.seq)
                                 }));
                             }
-                            let now = ctx.clock.mono_ns();
                             rx_seq = rx_seq.saturating_add(1);
-                            ctx.rx.append(data, now, ctx.epoch, rx_seq);
+                            ctx.rx.append_with_clock(data, &*ctx.clock, ctx.epoch, rx_seq);
                             if let Some(hook) = after_rx_append.as_ref() {
                                 hook();
                             }
@@ -1191,7 +1493,7 @@ impl IoWorker {
                 sentinel: args.sentinel,
                 data: args.data,
                 control: args.control.clone(),
-                clock: args.clock,
+                clock: args.clock.clone(),
                 hub: args.hub,
             },
             reader_stop.clone(),
@@ -1209,6 +1511,7 @@ impl IoWorker {
                 rx: args.rx,
                 epoch: args.epoch,
                 control: args.control,
+                clock: args.clock,
             },
         );
         IoWorker {

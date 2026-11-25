@@ -528,17 +528,153 @@ fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
         Duration::from_secs(5),
     ));
 
-    h.advance(Duration::from_millis(200));
+    h.advance(Duration::from_millis(201));
     deadline_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("waiter must reach the configured deadline before late RX");
     h.inject_rx_reader_processed(b"echo LATE\r\nLATE\r\nroot@t:/# ");
-    h.rx.record_human_tx_for_test(b"late human TX");
+    h.rx
+        .record_human_tx_for_test(b"late human TX", &*h.clock);
     resume_tx.send(()).expect("deadline waiter remains paused");
 
     let result = h.wait_done(&id);
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+}
+
+#[test]
+fn i294_r7_absolute_deadline_is_not_restarted_before_snapshot_wait() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        entered_tx.send(()).expect("test waits for inner wait entry");
+        resume_rx.recv().expect("test releases inner wait entry");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo OUTER_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo OUTER_DEADLINE\n");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("外層 deadline 已計算，等待器尚未起算");
+
+    h.advance(Duration::from_millis(201));
+    h.inject_rx_reader_processed(b"echo OUTER_DEADLINE\r\nOUTER_DEADLINE\r\nroot@t:/# ");
+    resume_tx.send(()).expect("釋放等待器入口 barrier");
+
+    // 以救援 TX 的 WAL 作同步點，讓救援等待本身也透過 FakeClock 到期；late prompt 不得被當成
+    // 命令完成或救援回 prompt 的證據。
+    wait_tx(&h, b"\x03");
+    h.advance(Duration::from_secs(2));
+    wait_tx(&h, b"\x04");
+    h.advance(Duration::from_secs(2));
+    let result = h.wait_done(&id);
+    assert_ne!(result["status"], PyValue::from("done"), "外層期限後的 echo 不得完成：{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo OUTER_DEADLINE\n\x03\x04".to_vec());
+}
+
+#[test]
+fn i294_r7_deadline_settlement_includes_pre_deadline_human_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |_| {
+            evaluated_tx.send(()).expect("test waits for evaluator barrier");
+            resume_rx.recv().expect("test releases evaluator barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已釋鎖並檢查舊 snapshot");
+
+    h.clock.advance(Duration::from_millis(500));
+    h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+    h.clock.advance(Duration::from_millis(500));
+    resume_tx.send(()).expect("釋放 evaluator barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_ECHO\n".to_vec());
+}
+
+#[test]
+fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |_| {
+            evaluated_tx.send(()).expect("test waits for evaluator barrier");
+            resume_rx.recv().expect("test releases evaluator barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo DEADLINE_RX", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"echo DEADLINE_RX\n");
+    evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已釋鎖並檢查舊 snapshot");
+
+    h.clock.advance(Duration::from_millis(500));
+    h.inject_rx_reader_processed(b"echo DEADLINE_RX\r\nDEADLINE_RX\r\nroot@t:/# ");
+    h.clock.advance(Duration::from_millis(501));
+    h.inject_rx_reader_processed(&vec![b'z'; 140_000]);
+    resume_tx.send(()).expect("釋放 evaluator barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "截止前已到達的 RX 必須納入結算：{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("DEADLINE_RX"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo DEADLINE_RX\n".to_vec());
+}
+
+fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo x", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo x\n");
+
+    if human_tx {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
+    }
+
+    let raw = format!(
+        "root@t:/{}# echo x\r\nx\r\nroot@t:/# ",
+        "e".repeat(2_000)
+    );
+    h.inject_rx_processed(raw.as_bytes());
+    h.advance(Duration::from_millis(200));
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "human_tx={human_tx}: {result:?}");
+    assert_eq!(result["stdout"], PyValue::from("x"), "human_tx={human_tx}: {result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "human_tx={human_tx}: {result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo x\n".to_vec(), "不得額外 TX 或重送");
+}
+
+#[test]
+fn i294_r7_long_prompt_prefix_echo_completes_without_human_tx() {
+    i294_r7_assert_long_prompt_prefix_echo(false);
+}
+
+#[test]
+fn i294_r7_long_prompt_prefix_echo_completes_with_human_tx() {
+    i294_r7_assert_long_prompt_prefix_echo(true);
 }
 
 #[test]

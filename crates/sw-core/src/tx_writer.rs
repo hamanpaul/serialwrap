@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
+use sw_pal::traits::Clock;
 use sw_pal::{
     CancelToken, PalError, PalErrorKind, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep,
     TxOutcome, TxResult,
@@ -309,9 +310,11 @@ mod observed_tx_submit_tests {
             last_reject: Cell::new(None),
         };
         let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
         let gate = ObservedTxSubmitGate {
             inner: &inner,
             rx: &rx,
+            clock: &*clock,
             human_payload: None,
             human_raw_input: false,
             command_op_id: Some(3),
@@ -349,9 +352,11 @@ mod observed_tx_submit_tests {
             last_reject: Cell::new(None),
         };
         let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
         let gate = ObservedTxSubmitGate {
             inner: &inner,
             rx: &rx,
+            clock: &*clock,
             human_payload: Some(b"abc\n"),
             human_raw_input: true,
             command_op_id: None,
@@ -765,6 +770,7 @@ impl SubmitGate for FenceSubmitGate<'_> {
 struct ObservedTxSubmitGate<'a, 'b> {
     inner: &'b FenceSubmitGate<'a>,
     rx: &'b crate::uart_bridge::RxShared,
+    clock: &'b dyn Clock,
     human_payload: Option<&'b [u8]>,
     human_raw_input: bool,
     command_op_id: Option<u64>,
@@ -794,6 +800,7 @@ impl SubmitGate for ObservedTxSubmitGate<'_, '_> {
                 self.command_op_id,
                 self.command_boundary_recorded.get(),
                 human_payload,
+                self.clock,
                 os_submit,
             );
             self.command_boundary_recorded
@@ -1046,6 +1053,7 @@ struct TxWriter {
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
     rx: Arc<crate::uart_bridge::RxShared>,
+    clock: Arc<dyn Clock>,
     /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
     aggregates: IndexMap<AggregateKey, Vec<u8>>,
 }
@@ -1281,6 +1289,7 @@ impl TxWriter {
                         let observed_gate = ObservedTxSubmitGate {
                             inner: &gate,
                             rx: &self.rx,
+                            clock: &*self.clock,
                             human_payload: human_tx.then_some(job.payload.as_slice()),
                             human_raw_input: is_raw_human_input(job.permit.class),
                             command_op_id: command_tx.then_some(job.permit.op_id.0),
@@ -1604,6 +1613,7 @@ pub struct TxWriterContext {
     pub rx: Arc<crate::uart_bridge::RxShared>,
     pub epoch: u64,
     pub control: Sender<ControlEvent>,
+    pub clock: Arc<dyn Clock>,
 }
 
 pub fn spawn_tx_writer(
@@ -1622,7 +1632,12 @@ pub fn spawn_tx_writer(
     let (settle_tx, settle_rx) = crossbeam_channel::bounded(TX_SETTLE_QUEUE_MAX);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let gauge = Arc::new(LedgerGaugeCells::default());
-    let TxWriterContext { rx, epoch, control } = context;
+    let TxWriterContext {
+        rx,
+        epoch,
+        control,
+        clock,
+    } = context;
     let handle = TxWriterHandle {
         jobs: job_tx,
         settle: settle_tx,
@@ -1643,6 +1658,7 @@ pub fn spawn_tx_writer(
         stop: stop_rx,
         gauge,
         rx,
+        clock,
         aggregates: IndexMap::new(),
     };
     let join = std::thread::spawn(move || worker.run());

@@ -254,7 +254,7 @@ fn prompt_cut_lines(
 }
 
 /// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt；修正 PR `_WRAP_MIN_SEGMENT`），也以此保守估計回顯最多佔幾行。
-const WRAP_MIN_SEGMENT: usize = 20;
+pub(crate) const WRAP_MIN_SEGMENT: usize = 20;
 
 /// 清理後字元索引對應的原始串流折行證據。
 #[derive(Clone, Default)]
@@ -354,49 +354,51 @@ fn strip_wrapped_command_echo_producer(
     None
 }
 
-/// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
-/// 命令的每個字元（含空白）都必須依序出現；只有換行或多出的空白（且原始串流有對應證據）可以跳過，
-/// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`] 個字元（第一個插入點以第一行欄位計，含殘留 prompt）。
-pub(crate) fn match_wrapped_echo(
+/// 從完整 echo 行尾反向比對命令；最多回看兩倍命令長度，覆蓋命令字元與已具局部證據的折行插入。
+/// callback 驗證候選命令起點的 prompt 前綴及首個折行的欄位限制。
+pub(crate) fn match_wrapped_echo_ending_at(
     text: &[char],
-    start: usize,
+    end: usize,
     command: &[char],
     wraps: &WrapEvidence,
-    text_base: usize,
-    valid_end: impl Fn(usize) -> bool,
-    remaining_steps: &mut usize,
+    mut valid_start: impl FnMut(usize, Option<usize>) -> bool,
+    matcher_steps: &mut usize,
 ) -> Option<usize> {
-    // 在「標記空白是命令字元」與「標記空白是 readline 插入」間保留兩條候選路徑。
-    // exact 分支優先，但只有完整命令緊接行界線才採用；若後續字元不合，會回溯插入分支。
-    let mut pending = vec![(start, 0usize, None::<usize>)];
+    if command.is_empty() || end > text.len() {
+        return None;
+    }
+    let floor = end.saturating_sub(command.len().saturating_mul(2));
+    let mut pending = vec![(end, command.len(), None::<usize>)];
     let mut visited = HashSet::new();
-    while let Some((i, j, last_wrap)) = pending.pop() {
-        if *remaining_steps == 0 {
-            return None;
-        }
-        *remaining_steps -= 1;
-        if !visited.insert((i, j, last_wrap)) {
+    while let Some((input_end, command_left, right_wrap_command_pos)) = pending.pop() {
+        *matcher_steps = (*matcher_steps).saturating_add(1);
+        if !visited.insert((input_end, command_left, right_wrap_command_pos)) {
             continue;
         }
-        if j == command.len() {
-            if valid_end(i) {
-                return Some(i);
+        if command_left == 0 {
+            if valid_start(input_end, right_wrap_command_pos) {
+                return Some(input_end);
             }
             continue;
         }
-        let Some(&ch) = text.get(i) else {
+        if input_end <= floor {
             continue;
-        };
-        let is_wrap = wraps.is_wrap_at(text_base.saturating_add(i), ch);
-        if is_wrap && j > 0 {
-            let column = last_wrap.map_or(start + j, |w| j.saturating_sub(w));
-            if column >= WRAP_MIN_SEGMENT {
-                pending.push((i + 1, j, Some(j)));
+        }
+
+        let input_pos = input_end - 1;
+        let ch = text[input_pos];
+        let is_wrap = wraps.is_wrap_at(input_pos, ch);
+        if is_wrap {
+            let has_minimum_segment = right_wrap_command_pos.is_none_or(|right_pos| {
+                right_pos.saturating_sub(command_left) >= WRAP_MIN_SEGMENT
+            });
+            if command_left > 0 && command_left < command.len() && has_minimum_segment {
+                // 先放入折行分支，再放精確字元分支；LIFO 仍優先保留命令原字元。
+                pending.push((input_pos, command_left, Some(command_left)));
             }
         }
-        if ch == command[j] {
-            // 後進先出：先放 skip，再放 exact，故先嘗試命令原字元路徑。
-            pending.push((i + 1, j + 1, last_wrap));
+        if ch == command[command_left - 1] {
+            pending.push((input_pos, command_left - 1, right_wrap_command_pos));
         }
     }
     None
@@ -823,6 +825,18 @@ fn command_tx_class(q: &QueuedCommand) -> TxClass {
     }
 }
 
+struct CompletionObservationGuard {
+    rx: Arc<RxShared>,
+    op_id: u64,
+}
+
+impl Drop for CompletionObservationGuard {
+    fn drop(&mut self) {
+        self.rx
+            .finish_command_completion_observation(self.op_id);
+    }
+}
+
 fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let t = &ctx.profile.template;
     let mode = normalized_mode(&q.req.mode).to_string();
@@ -885,6 +899,13 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let echo_evaluator = echo_prompt_re
         .as_ref()
         .map(|prompt_re| CompletionEvaluator::new(command, prompt_re));
+    let _completion_observation = echo_evaluator.as_ref().map(|_| {
+        ctx.rx.begin_command_completion_observation(grant.op_id.0);
+        CompletionObservationGuard {
+            rx: ctx.rx.clone(),
+            op_id: grant.op_id.0,
+        }
+    });
     if let Some(pattern) = completion_regex {
         let mut meta = PyDict::new();
         meta.insert("event", PyValue::from("command_completion"));
@@ -921,6 +942,9 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let human_tx_before = command_boundary
         .as_ref()
         .map_or(human_tx_before_send, |boundary| boundary.human_tx_state);
+    let watermark_before = command_boundary
+        .as_ref()
+        .map_or_else(|| ctx.rx.watermark(), |boundary| boundary.watermark);
     let human_snapshot_at_boundary = command_boundary
         .map(|boundary| boundary.human_snapshot.text)
         .unwrap_or(human_snapshot_before_send);
@@ -940,23 +964,35 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         .clock
         .mono_ns()
         .saturating_add((effective_timeout.max(0.0) * 1_000_000_000.0) as u64);
+    if echo_evaluator.is_some() {
+        ctx.rx
+            .set_command_completion_deadline(grant.op_id.0, deadline);
+    }
     let wait_re = compile_or_never(completion_pattern.as_deref().unwrap_or("(?!)"));
     let mut matched = false;
     let mut completion_stdout = None;
     let mut uncertain_stdout = None;
-    loop {
+    'completion_wait: loop {
         let now = ctx.clock.mono_ns();
         if now >= deadline {
             break;
         }
         let remaining = (deadline - now) as f64 / 1_000_000_000.0;
         let wait_chunk = silence_limit.min(remaining);
+        let wait_deadline = deadline.min(
+            now.saturating_add(
+                secs(wait_chunk)
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64,
+            ),
+        );
         let pre_rx = ctx.rx.snapshot_len();
         if let Some(evaluator) = echo_evaluator.as_ref() {
-            let mut last_wait_uncertain = None;
-            let wait = ctx.rx.wait_for_snapshot_from(
+            let wait = ctx.rx.wait_for_snapshot_until_from(
                 pre_offset,
-                secs(wait_chunk),
+                wait_deadline,
+                human_tx_before,
+                watermark_before,
                 &*ctx.clock,
                 |snapshot| {
                     let human_tx_state = snapshot.human_tx_state;
@@ -966,18 +1002,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                             || human_tx_state.generation > human_tx_before.generation,
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open,
                     ) {
-                        CompletionEvaluation::Complete { stdout } => {
-                            last_wait_uncertain = None;
-                            Some(stdout)
-                        }
-                        CompletionEvaluation::Pending => {
-                            last_wait_uncertain = None;
-                            None
-                        }
-                        CompletionEvaluation::Uncertain { stdout } => {
-                            last_wait_uncertain = Some(stdout);
-                            None
-                        }
+                        CompletionEvaluation::Complete { stdout } => Some(stdout),
+                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => None,
                     }
                 },
             );
@@ -988,8 +1014,25 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     break;
                 }
                 SnapshotWaitResult::TimedOut { last_snapshot } => {
-                    if last_snapshot.is_some() {
-                        uncertain_stdout = last_wait_uncertain;
+                    if let Some(snapshot) = last_snapshot {
+                        match evaluator.evaluate(
+                            &snapshot.text,
+                            pending_human_before
+                                || snapshot.human_tx_state.generation
+                                    > human_tx_before.generation,
+                            human_tx_before.raw_line_open
+                                || snapshot.human_tx_state.raw_line_open,
+                        ) {
+                            CompletionEvaluation::Complete { stdout } => {
+                                completion_stdout = Some(stdout);
+                                matched = true;
+                                break 'completion_wait;
+                            }
+                            CompletionEvaluation::Uncertain { stdout } => {
+                                uncertain_stdout = Some(stdout);
+                            }
+                            CompletionEvaluation::Pending => uncertain_stdout = None,
+                        }
                     }
                 }
             }
