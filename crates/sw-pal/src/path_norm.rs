@@ -7,12 +7,24 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-/// 以原生工作目錄解析相對 WAL 路徑；Windows 路徑風格在 POSIX 測試宿主上保持相對字串。
+/// 以原生工作目錄解析相對 WAL 路徑；Windows drive-relative 路徑須使用該磁碟的目前目錄。
 pub fn absolute_path_from_cwd(path: &str, _flavor: crate::PalPathFlavor) -> Option<String> {
     #[cfg(unix)]
     if _flavor == crate::PalPathFlavor::Windows {
         return Some(path.to_string());
     }
+
+    #[cfg(windows)]
+    if _flavor == crate::PalPathFlavor::Windows {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        return std::path::absolute(path)
+            .ok()
+            .map(|absolute| absolute.to_string_lossy().into_owned());
+    }
+
     let path = PathBuf::from(path);
     if path.is_absolute() {
         return Some(path.to_string_lossy().into_owned());

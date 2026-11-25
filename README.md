@@ -876,6 +876,8 @@ from a supervised daemon; to keep every launch mode on one path, put
 When the daemon copies a system fallback config to a new user config, it resolves
 a relative `wal_dir` against the system config directory and writes the absolute
 path; `~` is expanded at copy time. Absolute `wal_dir` values are preserved.
+On Windows, a drive-relative value uses that drive's native current directory;
+the copied config stores the resulting fully qualified path.
 Relative paths the user enters later are resolved against the current config's
 directory.
 `setup`, supervision-mode changes, update, and rollback preserve this key.
@@ -2893,7 +2895,8 @@ systemd-system 與 Windows 工作排程都使用同一套規則；若要所有�
 落在同一路徑，請在 `config.yaml` 設 `wal_dir: ~/wal-archive` 或絕對路徑。
 daemon 將 system fallback 複製成新的 user config 時，會在複製當下依 system
 config 所在目錄解析相對 `wal_dir`，並把絕對路徑寫入複本；`~` 會於複製時展開，
-原本的絕對路徑維持不變。使用者之後輸入的相對路徑，則以目前 config 所在目錄為基準。
+原本的絕對路徑維持不變。Windows 磁碟機相對值依該磁碟的原生目前目錄解析，複製時
+也會固化為完整絕對路徑。使用者之後輸入的相對路徑，則以目前 config 所在目錄為基準。
 `setup`、`supervision-mode set`、更新與 rollback 會保留這個鍵。要確認 live
 daemon 實際在用的路徑，請跑 `serialwrap daemon status`（`wal_path`／
 `mirror_path` 欄位）或 `serialwrap doctor`（`wal_dir` 比對檢查）。
