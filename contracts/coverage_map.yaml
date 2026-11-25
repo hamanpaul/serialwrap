@@ -105,6 +105,9 @@ entries:
     - cargo:sw-daemon::daemon_process::config_wal_dir_is_used_by_daemon_startup_and_writes
     - cargo:sw-daemon::daemon_process::config_wal_dir_preserves_symlink_dotdot_filesystem_semantics
     - cargo:sw-daemon::daemon_process::system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart
+    - cargo:sw-daemon::daemon_process::system_config_copy_preserves_internal_scalar_and_restarts
+    - cargo:sw-daemon::daemon_process::system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restarts
+    - cargo:sw-daemon::daemon_process::daemon_and_doctor_in_different_working_directories_do_not_match_relative_wal_paths
     - cargo:sw-daemon::daemon_process::daemon_reports_absolute_path_for_relative_environment_wal_dir
     - cargo:sw-cli::mgmt_doctor::wal_dir_relative_daemon_path_is_not_resolved_from_doctor_cwd
     - cargo:sw-cli::mgmt_doctor::wal_dir_comparison_resolves_symlink_before_dotdot
