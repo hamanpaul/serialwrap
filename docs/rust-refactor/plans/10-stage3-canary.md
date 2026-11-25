@@ -192,7 +192,7 @@ M6 後 → M3 選配工具 4～7；Canary 累積時間另列，不擋預設 1.0.
 - 上段所稱「既有映射」在 repo 中不存在：M0 沒有產出逐案映射檔，`requires_native_com` 只出現在本計畫文字中。
 - **依據**：`requires_native_com` 以 `tests/acceptance/cases.yaml` 該案例的 `capabilities` 是否含 `windows_com` 為準。這份檔案有凍結與 revision 鏈保護。不得以 case ID 前綴推斷；依前綴推斷，15 案中只會抓到 7 案。
 - **現況**：`S3-L15-RELEASE-AB-WINDOWS` 共 50 案，其中 15 案需要原生 COM。
-  - 這 50 案在 `contracts/coverage_map.yaml` 中，除 3 個 s24 案例各有 1 個 nodeid 外，`nodeids` 都是空的。實際 runner 是 func-test 的 `func-test/cases/<id>.yaml`、`func-test/scenarios/<id>.yaml`，或 `scripts/rust/win-spike3.sh`、`scripts/rust/stage1a_gate.py`。
+  - 這 50 案在 `contracts/coverage_map.yaml` 中，除 4 個 s24 案例外（`s24-mcu-rpc-shapes` 有 2 個 nodeid，`s24-ho-windows-com`、`s24-sup-wintask-runtime`、`s24-xfer-no-retry-side-effect` 各 1 個），`nodeids` 都是空的。實際 runner 是 func-test 的 `func-test/cases/<id>.yaml`、`func-test/scenarios/<id>.yaml`，或 `scripts/rust/win-spike3.sh`、`scripts/rust/stage1a_gate.py`。
   - 盤點時找不到 runner 來源的有 15 案；其中需要 COM 的 9 案為：`cap-windows-com--p7-event-fire`、`cap-windows-com--p7-login-ready`、`cap-windows-com--p7-quiet-banner-zero-tx`、`s24-ho-windows-com`、`sc29-com0com-serial-console`、`win-telnet-deferred`、`win-telnet-linebuffer`、`win-telnet-raw-owner`、`win-telnet-suspend-resume`。逐案現況見本文件末的附錄。
 - **負責與時點**：
   - T3 只做映射的格式與驗證（schema、loader、verify_frozen）。測試用的合成映射只能讀 capabilities，並註明不是權威規則。
