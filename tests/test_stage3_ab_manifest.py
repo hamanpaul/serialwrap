@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import threading
 from collections import Counter
 from dataclasses import FrozenInstanceError, is_dataclass, replace
@@ -3348,50 +3349,141 @@ def test_r9_windows_l2_invariant_selected_for_matching_platform_is_covered(tmp_p
 _STATIC_READ_ALLOWLIST = {
     "ab_manifest:_InputSnapshot.read_bytes": {
         "apis": {"snapshot-reader:call": 1},
-        "reason": "同一 resolved path 的唯一快照讀取點，負責快取原始位元組或讀取錯誤。",
+        "reason": "快照唯一的底層讀取呼叫，快取同一 resolved path 的位元組或讀取錯誤。",
     },
     "ab_manifest:_InputSnapshot.__init__": {
         "apis": {"Path.read_bytes:reference": 1},
-        "reason": "只把 Path.read_bytes 設為快照的預設底層 reader；實際呼叫仍經 read_bytes 的單路徑快取。",
+        "reason": "只將 Path.read_bytes 設為快照預設 reader；實際讀取由 read_bytes 的單路徑快取控制。",
     },
     "ab_manifest:_read_bytes": {
         "apis": {"Path.read_bytes:reference": 1},
-        "reason": "供獨立 helper 保留預設讀檔行為；load_manifest、verify_frozen 與 coverage 入口會注入快照 reader。",
+        "reason": "獨立 helper 保留預設讀檔行為；load_manifest、verify_frozen 與 coverage 呼叫鏈會注入快照 reader。",
     },
     "required_cases:_read_bytes": {
         "apis": {"Path.read_bytes:reference": 1},
-        "reason": "供 T1 CLI 與獨立公開函式保留預設讀檔行為；T3 驗證呼叫鏈會注入同一份輸入快照。",
+        "reason": "T1 CLI 與獨立公開函式保留預設 reader；T3 驗證呼叫鏈會注入同一份輸入快照。",
     },
     "candidate_context:load_run_context": {
         "apis": {"Path.read_bytes:call": 1},
-        "reason": "獨立檔案 API；A/B loader 使用 load_run_context_bytes 解析快照已讀取的位元組，不呼叫此讀檔入口。",
+        "reason": "獨立檔案 API；A/B loader 使用 load_run_context_bytes 解析快照位元組，不呼叫此入口。",
     },
     "reason_codes:_load_registry": {
         "apis": {"resource.read_text:call": 1},
-        "reason": "載入套件內固定的 HARNESS 原因碼資源供例外驗證，並非 manifest 凍結輸入。",
+        "reason": "透過 importlib.resources 讀取套件內固定原因碼資源，供例外驗證，並非 manifest 凍結輸入。",
+    },
+    "jsonio:sha256_file": {
+        "apis": {"Path.open:call": 1},
+        "reason": "通用單檔雜湊 helper；A/B manifest 的凍結路徑改由入口快照提供位元組。",
+    },
+    "jsonio:append_ndjson": {
+        "apis": {"Path.open:call": 2},
+        "reason": "一般 WAL/NDJSON 輸出 append；不是 A/B manifest 輸入讀取。",
+    },
+    "jsonio:read_ndjson": {
+        "apis": {"Path.open:call": 1},
+        "reason": "通用 WAL/NDJSON 讀取 helper，不讀取 A/B manifest 凍結輸入。",
+    },
+    "jsonio:atomic_write_text": {
+        "apis": {"os.fdopen:call": 1},
+        "reason": "以 fdopen 包裝新建的暫存輸出描述子，原子寫入文字檔。",
+    },
+    "proc:_SpawnedProc.__init__": {
+        "apis": {"Path.open:call": 1},
+        "reason": "為子行程設定 stdin/stdout/stderr redirection，不讀取 manifest 輸入。",
     },
 }
-_STATIC_READ_API_NAMES = {
-    "open", "FileIO", "read_bytes", "read_text", "fdopen", "read",
+_STATIC_DYNAMIC_ALLOWLIST = {
+    "reason_codes:_load_registry": {
+        "apis": {"dynamic:importlib-import": 1, "dynamic:importlib-reference": 4},
+        "reason": "使用 importlib.resources 讀取套件資源，避免依賴執行目錄並支援 zipapp。",
+    },
 }
+_STATIC_PARSER_ALLOWLIST = {
+    "required_cases:_base_errors": {
+        "parsers": {"yaml.safe_load"},
+        "reason": "base_cases_raw 來自 SourceReader 的 bytes 回傳契約，且在解析前排除 None；AST 無法追蹤 Protocol 回傳型別。",
+    },
+}
+_STATIC_FORBIDDEN_READS = {
+    "builtins.open", "open", "io.open", "io.FileIO", "os.open", "os.read",
+    "os.fdopen", "codecs.open", "mmap", "mmap.mmap",
+}
+_STATIC_PATH_READ_METHODS = {"open", "read_bytes", "read_text"}
+_STATIC_GETATTR_FORBIDDEN_NAMES = {
+    "open", "FileIO", "fdopen", "read", "read_bytes", "read_text", "mmap",
+    "load", "safe_load", "__import__", "importlib", "exec", "eval", "compile",
+}
+_STATIC_DYNAMIC_NAMES = {"__import__", "importlib", "exec", "eval", "compile"}
+_STATIC_PARSER_NAMES = {"yaml.safe_load", "yaml.load", "json.load"}
 
 
-def _static_read_inventory(
-    source: str, module: str, *, functions: set[str] | None = None,
-) -> tuple[Counter, list[str]]:
-    tree = ast.parse(source)
+def _static_from_module(module: str, node: ast.ImportFrom) -> str | None:
+    """將相對匯入解析成完整模組名稱。"""
+    if node.level == 0:
+        return node.module
+    parts = module.split(".")
+    package_parts = parts if module == "tools.stage3" else parts[:-1]
+    remove = max(node.level - 1, 0)
+    if remove > len(package_parts):
+        return None
+    base = package_parts[:len(package_parts) - remove]
+    if node.module:
+        base.extend(node.module.split("."))
+    return ".".join(base)
+
+
+def _static_import_aliases(tree: ast.AST, module: str) -> dict[str, str]:
+    """解析模組匯入與簡單名稱賦值別名；任意執行期反射不在此解析範圍。"""
+    aliases: dict[str, str] = {}
+    import_nodes = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    for node in import_nodes:
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                local = item.asname or item.name.split(".", 1)[0]
+                # `import a.b` 綁定 a；保留此語意後可由 Attribute 鏈還原 a.b。
+                aliases[local] = item.name if item.asname else item.name.split(".", 1)[0]
+        else:
+            imported_from = _static_from_module(module, node)
+            for item in node.names:
+                if item.name == "*":
+                    continue
+                local = item.asname or item.name
+                if imported_from:
+                    aliases[local] = f"{imported_from}.{item.name}"
+                else:
+                    aliases[local] = item.name
+
+    def dotted(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            prefix = dotted(node.value)
+            return f"{prefix}.{node.attr}" if prefix else node.attr
+        return ""
+
+    # 一般賦值別名的來源名稱仍會先被記錄；固定點解析也讓後續呼叫可還原 API。
+    for _ in range(len(aliases) + 1):
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Name, ast.Attribute)):
+                target_name = dotted(node.value)
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in aliases and target_name:
+                        aliases[target.id] = target_name
+                        changed = True
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.value, (ast.Name, ast.Attribute)):
+                target_name = dotted(node.value)
+                if isinstance(node.target, ast.Name) and node.target.id not in aliases and target_name:
+                    aliases[node.target.id] = target_name
+                    changed = True
+        if not changed:
+            break
+    return aliases
+
+
+def _static_function_owners(tree: ast.AST, module: str):
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     function_names: dict[ast.AST, str] = {}
-    import_aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                local = alias.asname or alias.name.split(".", 1)[0]
-                import_aliases[local] = alias.name
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                local = alias.asname or alias.name
-                import_aliases[local] = f"{node.module}.{alias.name}" if node.module else alias.name
 
     class _FunctionOwners(ast.NodeVisitor):
         def __init__(self):
@@ -3420,9 +3512,29 @@ def _static_read_inventory(
                 return f"{module}:{function_names[current]}"
         return f"{module}:<module>"
 
+    return parents, function_names, owner
+
+
+def _static_read_inventory(
+    source: str, module: str, *, functions: set[str] | None = None,
+) -> tuple[Counter, list[str]]:
+    """以有限 AST 規則稽核快照讀取入口；此檢查是回歸防護，不是任意 Python 動態語義證明。
+
+    檢查會解析匯入別名、簡單賦值別名、指定讀取 API 的所有 Name／Attribute 引用、
+    `getattr` 與禁止的動態執行入口，以及 YAML／JSON parser 的輸入形狀。它不承諾
+    覆蓋任意自訂 wrapper、跨函式資料流、反射組合或其他刻意隱藏 API 的動態程式；
+    repo 程式碼仍須經一般審查。此為協調者核定的靜態稽核範圍。
+    """
+    tree = ast.parse(source)
+    import_aliases = _static_import_aliases(tree, module)
+    parents, function_names, owner = _static_function_owners(tree, module)
+
     def dotted(node: ast.AST) -> str:
         if isinstance(node, ast.Name):
-            return import_aliases.get(node.id, node.id)
+            value = import_aliases.get(node.id, node.id)
+            if value in {"open", "getattr", "exec", "eval", "compile", "__import__", "bytes", "str"}:
+                return f"builtins.{value}"
+            return value
         if isinstance(node, ast.Attribute):
             prefix = dotted(node.value)
             return f"{prefix}.{node.attr}" if prefix else node.attr
@@ -3430,86 +3542,237 @@ def _static_read_inventory(
             return dotted(node.func)
         return ""
 
-    observations: Counter = Counter()
-    violations: list[str] = []
-    called_functions = {
-        node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
-    }
+    def selected(current_owner: str) -> bool:
+        if functions is None:
+            return True
+        function_owner = current_owner.split(":", 1)[-1]
+        return any(function_owner == name or function_owner.startswith(name + ".") for name in functions)
+
+    def annotation_kind(annotation: ast.AST | None) -> str | None:
+        if annotation is None:
+            return None
+        if isinstance(annotation, ast.Name) and annotation.id in {"bytes", "str"}:
+            return annotation.id
+        if isinstance(annotation, ast.Attribute) and dotted(annotation) in {"builtins.bytes", "builtins.str"}:
+            return dotted(annotation).split(".")[-1]
+        if isinstance(annotation, ast.Subscript):
+            return annotation_kind(annotation.value)
+        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            left = annotation_kind(annotation.left)
+            right = annotation_kind(annotation.right)
+            if isinstance(annotation.left, ast.Constant) and annotation.left.value is None:
+                return right
+            if isinstance(annotation.right, ast.Constant) and annotation.right.value is None:
+                return left
+            return left if left is not None and left == right else None
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            return annotation.value if annotation.value in {"bytes", "str"} else None
+        return None
+
+    variable_kinds: dict[tuple[str, str], str] = {}
+
+    def expression_kind(expression: ast.AST | None, current_owner: str) -> str | None:
+        if expression is None:
+            return None
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, (bytes, str)):
+            return "bytes" if isinstance(expression.value, bytes) else "str"
+        if isinstance(expression, ast.Name):
+            return variable_kinds.get((current_owner, expression.id))
+        if isinstance(expression, ast.Call):
+            callee = dotted(expression.func)
+            if callee in {"builtins.bytes", "builtins.str"}:
+                return callee.rsplit(".", 1)[-1]
+            if callee in {"_read_bytes", "read_bytes"} or callee.endswith("._read_bytes") or callee.endswith(".read_bytes"):
+                receiver = dotted(expression.func.value) if isinstance(expression.func, ast.Attribute) else ""
+                if callee in {"_read_bytes", "read_bytes"} or callee.endswith("._read_bytes") or receiver in {"snapshot", "input_snapshot", "self._snapshot"}:
+                    return "bytes"
+            if isinstance(expression.func, ast.Attribute) and expression.func.attr == "decode":
+                if expression_kind(expression.func.value, current_owner) == "bytes":
+                    return "str"
+        if isinstance(expression, ast.IfExp):
+            left = expression_kind(expression.body, current_owner)
+            right = expression_kind(expression.orelse, current_owner)
+            return left if left == right else None
+        return None
+
+    # 收集函式參數與可直接判定的局部指派型別；未能判定者不會被推定為安全文字。
     for node in ast.walk(tree):
         current_owner = owner(node)
-        if functions is not None:
-            function_owner = current_owner.split(":", 1)[-1]
-            if not any(
-                function_owner == name or function_owner.startswith(name + ".")
-                for name in functions
+        if not selected(current_owner):
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+                kind = annotation_kind(argument.annotation)
+                if kind:
+                    variable_kinds[(f"{module}:{node.name}", argument.arg)] = kind
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            kind = annotation_kind(node.annotation) or expression_kind(node.value, current_owner)
+            if kind:
+                variable_kinds[(current_owner, node.target.id)] = kind
+        elif isinstance(node, ast.Assign):
+            kind = expression_kind(node.value, current_owner)
+            if kind:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        variable_kinds[(current_owner, target.id)] = kind
+
+    observations: Counter = Counter()
+    violations: list[str] = []
+    call_targets = {node.func for node in ast.walk(tree) if isinstance(node, ast.Call)}
+
+    def add(current_owner: str, api: str) -> None:
+        observations[(current_owner, api)] += 1
+
+    for node in ast.walk(tree):
+        current_owner = owner(node)
+        if not selected(current_owner):
+            continue
+
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom):
+                imported_from = _static_from_module(module, node) or ""
+                for item in node.names:
+                    imported_api = f"{imported_from}.{item.name}" if imported_from else item.name
+                    if imported_api in _STATIC_FORBIDDEN_READS or imported_api == "mmap.mmap":
+                        api = "builtins.open" if imported_api == "open" else imported_api
+                        add(current_owner, f"{api}:reference")
+            else:
+                for item in node.names:
+                    if item.name == "mmap":
+                        add(current_owner, "mmap:reference")
+            imports_importlib = (
+                any(item.name == "importlib" or item.name.startswith("importlib.") for item in node.names)
+                if isinstance(node, ast.Import)
+                else bool(node.module and (node.module == "importlib" or node.module.startswith("importlib.")))
+            )
+            if imports_importlib:
+                if isinstance(node, ast.Import):
+                    local_names = {item.asname or item.name.split(".", 1)[0] for item in node.names}
+                else:
+                    local_names = {item.asname or item.name for item in node.names}
+                usage_owners = {
+                    owner(reference) for reference in ast.walk(tree)
+                    if isinstance(reference, ast.Name)
+                    and reference.id in local_names
+                    and owner(reference) != current_owner
+                }
+                import_owner = next(iter(usage_owners)) if len(usage_owners) == 1 else current_owner
+                add(import_owner, "dynamic:importlib-import")
+
+        if isinstance(node, ast.Name):
+            resolved = dotted(node)
+            if node.id == "importlib" or resolved == "importlib" or resolved.startswith("importlib."):
+                add(current_owner, "dynamic:importlib-reference")
+            if resolved in _STATIC_FORBIDDEN_READS or node.id == "mmap":
+                api = "Path.read_bytes" if resolved.endswith(".read_bytes") else None
+                if api is None:
+                    if resolved in {"builtins.open", "open"}:
+                        api = "builtins.open"
+                    elif resolved in {"io.FileIO", "io.open", "os.open", "os.read", "os.fdopen", "codecs.open", "mmap", "mmap.mmap"}:
+                        api = resolved
+                    elif node.id == "mmap":
+                        api = "mmap"
+                if api:
+                    add(current_owner, f"{api}:{'call' if node in call_targets else 'reference'}")
+            dynamic_name = node.id if node.id in _STATIC_DYNAMIC_NAMES else resolved.rsplit(".", 1)[-1]
+            if dynamic_name in {"__import__", "exec", "eval", "compile"} and (
+                node.id in _STATIC_DYNAMIC_NAMES or resolved == f"builtins.{dynamic_name}"
             ):
-                continue
-        api = None
+                add(current_owner, f"dynamic:{dynamic_name}")
+
+        elif isinstance(node, ast.Attribute):
+            resolved = dotted(node)
+            if resolved == "importlib" or resolved.startswith("importlib."):
+                add(current_owner, "dynamic:importlib-reference")
+            api = None
+            if resolved in _STATIC_FORBIDDEN_READS:
+                api = resolved
+            elif node.attr in _STATIC_PATH_READ_METHODS:
+                receiver = dotted(node.value)
+                receiver_is_snapshot = receiver in {"self._reader", "snapshot", "input_snapshot", "self._snapshot", "_snapshot"}
+                receiver_is_own_snapshot = receiver == "self" and current_owner.startswith(f"{module}:_InputSnapshot.")
+                if node.attr == "read_bytes" and (receiver_is_snapshot or receiver_is_own_snapshot):
+                    if receiver == "self._reader" and current_owner == f"{module}:_InputSnapshot.read_bytes":
+                        api = "snapshot-reader"
+                    # 快照方法的引用與呼叫都走入口建立的單路徑快取。
+                elif node.attr == "read_bytes":
+                    api = "Path.read_bytes"
+                elif node.attr == "read_text" and ".resources.files" in resolved:
+                    api = "resource.read_text"
+                else:
+                    if not (node.attr == "read_bytes" and (receiver_is_snapshot or receiver_is_own_snapshot)):
+                        api = f"Path.{node.attr}"
+            if api:
+                add(current_owner, f"{api}:{'call' if node in call_targets else 'reference'}")
+            if resolved in {f"builtins.{name}" for name in ("__import__", "exec", "eval", "compile")}:
+                add(current_owner, f"dynamic:{resolved.rsplit('.', 1)[-1]}")
+
         if isinstance(node, ast.Call):
-            name = dotted(node.func)
-            if name in {
-                "open", "builtins.open", "io.open", "io.FileIO", "os.open", "os.read",
-                "os.fdopen", "codecs.open", "mmap", "mmap.mmap",
-            }:
-                api = f"{name}:call"
-            elif isinstance(node.func, ast.Attribute) and node.func.attr in _STATIC_READ_API_NAMES:
-                if node.func.attr == "open":
-                    api = "Path.open:call"
-                elif node.func.attr in {"read_bytes", "read_text"}:
-                    receiver = dotted(node.func.value)
-                    receiver_is_path = receiver in {"Path", "pathlib.Path"} or (
-                        isinstance(node.func.value, ast.Call)
-                        and dotted(node.func.value.func) in {"Path", "pathlib.Path"}
-                    )
-                    if receiver_is_path:
-                        api = f"Path.{node.func.attr}:call"
-                    elif "resources.files" in name and node.func.attr == "read_text":
-                        api = "resource.read_text:call"
-                    elif receiver == "self._reader":
-                        api = "snapshot-reader:call"
-                    elif receiver in {"snapshot", "reader"} or (
-                        receiver == "self" and owner(node).startswith(f"{module}:_InputSnapshot.")
-                    ):
-                        # 這些名稱只代表快照方法或由入口注入的讀取器，不是直接開檔 API。
-                        api = None
-                    else:
-                        api = f"object.{node.func.attr}:call"
-                elif node.func.attr == "read_text":
-                    api = "resource.read_text:call"
-                elif node.func.attr == "read":
-                    api = "file.read:call"
-            if name == "json.load" or name.endswith(".yaml.safe_load"):
+            callee = dotted(node.func)
+            if callee == "self._reader":
+                add(current_owner, "snapshot-reader:call")
+            if callee in {"builtins.getattr", "getattr"}:
+                attribute_name = node.args[1] if len(node.args) > 1 else None
+                if not isinstance(attribute_name, ast.Constant) or not isinstance(attribute_name.value, str):
+                    add(current_owner, "dynamic:getattr-nonliteral")
+                elif attribute_name.value in _STATIC_GETATTR_FORBIDDEN_NAMES:
+                    add(current_owner, f"dynamic:getattr-{attribute_name.value}")
+
+            parser_name = next((name for name in _STATIC_PARSER_NAMES if callee == name or callee.endswith("." + name)), None)
+            if parser_name:
                 argument = node.args[0] if node.args else None
-                parsed_content = (
-                    isinstance(argument, ast.Constant)
-                    and isinstance(argument.value, (str, bytes))
-                ) or (
+                kind = expression_kind(argument, current_owner)
+                parser_variable = (
+                    isinstance(argument, ast.Name)
+                    and kind in {"bytes", "str"}
+                    and not argument.id.casefold().endswith(("path", "file", "stream", "handle"))
+                )
+                decoded_content = (
                     isinstance(argument, ast.Call)
                     and isinstance(argument.func, ast.Attribute)
                     and argument.func.attr == "decode"
+                    and expression_kind(argument.func.value, current_owner) == "bytes"
                 )
-                if not parsed_content:
-                    api = f"{name}:path-or-file-input"
-            if (isinstance(node.func, ast.Attribute) and node.func.attr == "_reader"
-                    and dotted(node.func) == "self._reader"):
-                api = "snapshot-reader:call"
-        elif isinstance(node, ast.Attribute) and node.attr in _STATIC_READ_API_NAMES and node not in called_functions:
-            if node.attr in {"read_bytes", "read_text"}:
-                receiver = dotted(node.value)
-                if receiver in {"Path", "pathlib.Path"}:
-                    api = f"Path.{node.attr}:reference"
-                elif receiver not in {"snapshot", "reader"}:
-                    api = f"object.{node.attr}:reference"
-            elif node.attr == "open":
-                api = "Path.open:reference"
-        if api is None:
-            continue
-        observations[(current_owner, api)] += 1
+                snapshot_bytes_call = (
+                    isinstance(argument, ast.Call)
+                    and (
+                        (isinstance(argument.func, ast.Attribute)
+                         and argument.func.attr == "read_bytes"
+                         and dotted(argument.func.value) in {"snapshot", "input_snapshot", "self._snapshot"})
+                        or dotted(argument.func) in {"_read_bytes", "read_bytes"}
+                    )
+                )
+                is_snapshot_call = (
+                    isinstance(argument, ast.Call)
+                    and isinstance(argument.func, ast.Attribute)
+                    and argument.func.attr == "read_bytes"
+                    and dotted(argument.func.value) in {"snapshot", "input_snapshot", "self._snapshot"}
+                )
+                if not (parser_variable or decoded_content or snapshot_bytes_call or is_snapshot_call):
+                    parser_key = current_owner
+                    allowed = _STATIC_PARSER_ALLOWLIST.get(parser_key, {})
+                    if parser_name not in allowed.get("parsers", set()):
+                        violations.append(
+                            f"{current_owner}: {parser_name} input is not a statically known bytes/str snapshot value"
+                        )
+                    else:
+                        add(current_owner, f"parser:{parser_name}:unresolved-input")
+        elif isinstance(node, (ast.Name, ast.Attribute)):
+            resolved = dotted(node)
+            parser_name = next((name for name in _STATIC_PARSER_NAMES if resolved == name or resolved.endswith("." + name)), None)
+            if parser_name and node not in call_targets:
+                violations.append(f"{current_owner}: {parser_name} reference escapes a checked parser call")
 
     expected_by_owner: dict[str, Counter] = {}
-    for entry, definition in _STATIC_READ_ALLOWLIST.items():
+    for allowlist in (_STATIC_READ_ALLOWLIST, _STATIC_DYNAMIC_ALLOWLIST):
+        for entry, definition in allowlist.items():
+            if entry.startswith(f"{module}:"):
+                expected_by_owner.setdefault(entry, Counter()).update(definition["apis"])
+    for entry, definition in _STATIC_PARSER_ALLOWLIST.items():
         if entry.startswith(f"{module}:"):
-            expected_by_owner[entry] = Counter(definition["apis"])
+            expected_by_owner.setdefault(entry, Counter()).update(
+                {f"parser:{name}:unresolved-input": 1 for name in definition["parsers"]}
+            )
     for (current_owner, api), count in observations.items():
         expected = expected_by_owner.get(current_owner)
         if expected is None or expected.get(api, 0) < count:
@@ -3526,56 +3789,257 @@ def _assert_static_read_policy(source: str, module: str) -> None:
     assert not violations, "\n".join(violations)
 
 
-def test_frozen_input_read_apis_are_static_allowlisted():
-    stage3_root = Path(ab_manifest.__file__).resolve().parent
-    audited = {
-        "ab_manifest": (stage3_root / "ab_manifest.py", None),
-        "required_cases": (stage3_root / "required_cases.py", None),
-        "candidate_context": (stage3_root / "candidate_context.py", None),
-        "reason_codes": (stage3_root / "reason_codes.py", {"_load_registry"}),
-        "jsonio": (stage3_root / "jsonio.py", {"dumps_compact"}),
-        "proc": (stage3_root / "proc.py", {"run_cmd"}),
-    }
-    manifest_source = audited["ab_manifest"][0].read_text(encoding="utf-8")
-    manifest_tree = ast.parse(manifest_source)
-    dependencies = set()
-    for node in ast.walk(manifest_tree):
-        if not isinstance(node, ast.ImportFrom) or not node.module:
-            continue
-        if node.module == "tools.stage3":
-            dependencies.update(alias.name for alias in node.names)
-        elif node.module.startswith("tools.stage3."):
-            dependencies.add(node.module.rsplit(".", 1)[-1])
-    assert dependencies == {
-        "candidate_context", "jsonio", "proc", "reason_codes", "required_cases",
-    }
+def _stage3_module_path(repo_root: Path, module: str) -> Path | None:
+    prefix = "tools.stage3"
+    if module != prefix and not module.startswith(prefix + "."):
+        return None
+    relative = Path(*module.split("."))
+    candidate = repo_root / relative.with_suffix(".py")
+    package_init = repo_root / relative / "__init__.py"
+    if candidate.is_file():
+        return candidate
+    if package_init.is_file():
+        return package_init
+    return None
 
+
+def _stage3_dependency_closure(repo_root: Path, entry_module: str) -> dict[str, Path]:
+    """遞迴解析 AST 中的絕對、別名與相對 `tools.stage3` 匯入。"""
+    modules: dict[str, Path] = {}
+    pending = [entry_module]
+    while pending:
+        module = pending.pop()
+        if module in modules:
+            continue
+        path = _stage3_module_path(repo_root, module)
+        if path is None:
+            continue
+        modules[module] = path
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            found: set[str] = set()
+            if isinstance(node, ast.Import):
+                found.update(
+                    alias.name for alias in node.names
+                    if alias.name == "tools.stage3" or alias.name.startswith("tools.stage3.")
+                )
+            elif isinstance(node, ast.ImportFrom):
+                base = _static_from_module(module, node)
+                if base and (base == "tools.stage3" or base.startswith("tools.stage3.")):
+                    found.add(base)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            found.add(f"{base}.{alias.name}")
+            for dependency in found:
+                if dependency not in modules and _stage3_module_path(repo_root, dependency) is not None:
+                    pending.append(dependency)
+    return modules
+
+
+def _assert_stage3_dependency_read_policy(repo_root: Path, entry_module: str = "tools.stage3.ab_manifest") -> set[str]:
+    modules = _stage3_dependency_closure(repo_root, entry_module)
     violations = []
-    for module, (path, functions) in audited.items():
+    for module, path in sorted(modules.items()):
+        short_name = module.rsplit(".", 1)[-1]
         _observations, module_violations = _static_read_inventory(
-            path.read_text(encoding="utf-8"), module, functions=functions,
+            path.read_text(encoding="utf-8"), short_name,
         )
         violations.extend(module_violations)
     assert not violations, "\n".join(violations)
+    return set(modules)
+
+
+def test_frozen_input_read_apis_are_static_allowlisted():
+    """稽核快照呼叫鏈及遞迴匯入依賴；此 AST 防護不證明任意 Python 動態語義。"""
+    repo_root = Path(ab_manifest.__file__).resolve().parents[2]
+    modules = _assert_stage3_dependency_read_policy(repo_root)
+    assert modules == {
+        "tools.stage3", "tools.stage3.ab_manifest", "tools.stage3.candidate_context",
+        "tools.stage3.jsonio", "tools.stage3.proc", "tools.stage3.reason_codes",
+        "tools.stage3.required_cases",
+    }
+
+
+@pytest.mark.parametrize(
+    ("injected", "message"),
+    [
+        (
+            "def injected_reader(path):\n    reader = open\n    return reader(path, 'rb')\n",
+            "builtins.open",
+        ),
+        (
+            "def injected_reader(path):\n    return getattr(os, 'open')(path, os.O_RDONLY)\n",
+            "dynamic:getattr-open",
+        ),
+        (
+            "def injected_reader(os, name):\n    return getattr(os, name)\n",
+            "dynamic:getattr-nonliteral",
+        ),
+        (
+            "import io\\nimport yaml\\ndef injected_parser(stream: io.BufferedReader):\\n    return yaml.safe_load(stream)\\n",
+            "yaml.safe_load input is not a statically known bytes/str snapshot value",
+        ),
+        (
+            "from yaml import safe_load as parse_yaml\\nimport io\\ndef injected_parser(stream: io.BufferedReader):\\n    return parse_yaml(stream)\\n",
+            "yaml.safe_load input is not a statically known bytes/str snapshot value",
+        ),
+        (
+            "from yaml import load as parse_yaml\\nimport io\\ndef injected_parser(stream: io.BufferedReader):\\n    return parse_yaml(stream)\\n",
+            "yaml.load input is not a statically known bytes/str snapshot value",
+        ),
+        (
+            "import json as json_module\\nimport io\\ndef injected_parser(stream: io.BufferedReader):\\n    return json_module.load(stream)\\n",
+            "json.load input is not a statically known bytes/str snapshot value",
+        ),
+        (
+            "import yaml\\ndef injected_parser(path: str):\\n    return yaml.safe_load(path)\\n",
+            "yaml.safe_load input is not a statically known bytes/str snapshot value",
+        ),
+    ],
+    ids=[
+        "assigned-open-alias", "getattr-open-literal", "getattr-variable", "yaml-file-object",
+        "yaml-safe-load-alias", "yaml-load-alias", "json-load-alias", "yaml-path-string",
+    ],
+)
+def test_static_read_audit_rejects_temporary_reader_patterns(tmp_path, injected, message):
+    source_path = Path(ab_manifest.__file__)
+    temporary_copy = tmp_path / source_path.name
+    temporary_copy.write_text(
+        source_path.read_text(encoding="utf-8") + "\n" + injected.replace("\\n", "\n"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match=message):
+        _assert_static_read_policy(temporary_copy.read_text(encoding="utf-8"), "ab_manifest")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from yaml import safe_load as parse_yaml\\ndef parse(payload: bytes):\\n    return parse_yaml(payload)\\n",
+        "import json as json_module\\ndef parse(payload: str):\\n    return json_module.load(payload)\\n",
+        "import yaml\\ndef parse(snapshot, path):\\n    return yaml.safe_load(snapshot.read_bytes(path))\\n",
+        "import yaml\\ndef parse(payload: bytes):\\n    return yaml.safe_load(payload.decode('utf-8'))\\n",
+    ],
+    ids=["yaml-import-alias-bytes", "json-module-alias-str", "snapshot-return", "decoded-snapshot-bytes"],
+)
+def test_static_parser_audit_accepts_bytes_str_and_snapshot_inputs(source):
+    _assert_static_read_policy(source.replace("\\n", "\n"), "parser_probe")
 
 
 @pytest.mark.parametrize(
     "injected",
     [
-        "def injected_reader(path):\n    fd = os.open(path, os.O_RDONLY)\n    return fd\n",
-        "def injected_reader(fd):\n    return os.read(fd, 1)\n",
-        "def injected_reader(path):\n    from os import open as fd_open\n    return fd_open(path, os.O_RDONLY)\n",
-        "def injected_reader(fd):\n    from os import read as fd_read\n    return fd_read(fd, 1)\n",
+        "reader = open\\n",
+        "import io\\nreader = io.open\\n",
+        "import io\\nreader = io.FileIO\\n",
+        "import os\\nreader = os.open\\n",
+        "import os\\nreader = os.read\\n",
+        "import os\\nreader = os.fdopen\\n",
+        "import codecs\\nreader = codecs.open\\n",
+        "import mmap\\nreader = mmap\\n",
+        "from pathlib import Path\\nreader = Path.open\\n",
+        "from pathlib import Path\\nreader = Path.read_bytes\\n",
+        "from pathlib import Path\\nreader = Path.read_text\\n",
     ],
-    ids=["os-open", "os-read", "os-open-alias", "os-read-alias"],
+    ids=[
+        "builtins-open", "io-open", "io-fileio", "os-open", "os-read", "os-fdopen",
+        "codecs-open", "mmap", "path-open", "path-read-bytes", "path-read-text",
+    ],
+)
+def test_static_read_audit_rejects_any_forbidden_api_reference(tmp_path, injected):
+    source_path = Path(ab_manifest.__file__)
+    temporary_copy = tmp_path / source_path.name
+    temporary_copy.write_text(
+        source_path.read_text(encoding="utf-8") + "\n" + injected.replace("\\n", "\n"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="unapproved"):
+        _assert_static_read_policy(temporary_copy.read_text(encoding="utf-8"), "ab_manifest")
+
+
+@pytest.mark.parametrize(
+    "injected",
+    [
+        "def injected(fd):\\n    return os.open(fd, os.O_RDONLY)\\n",
+        "def injected(fd):\\n    return os.read(fd, 1)\\n",
+        "def injected(path):\\n    from os import open as fd_open\\n    return fd_open(path, os.O_RDONLY)\\n",
+        "def injected(fd):\\n    from os import read as fd_read\\n    return fd_read(fd, 1)\\n",
+    ],
+    ids=["os-open", "os-read", "os-open-import-alias", "os-read-import-alias"],
 )
 def test_static_read_audit_rejects_temporary_os_reader(tmp_path, injected):
     source_path = Path(ab_manifest.__file__)
     temporary_copy = tmp_path / source_path.name
     temporary_copy.write_text(
-        source_path.read_text(encoding="utf-8") + "\n" + injected,
+        source_path.read_text(encoding="utf-8") + "\n" + injected.replace("\\n", "\n"),
         encoding="utf-8",
     )
 
-    with pytest.raises(AssertionError, match="unapproved os\\."):
+    with pytest.raises(AssertionError, match="unapproved (os\\.|)read|unapproved os\\.open"):
         _assert_static_read_policy(temporary_copy.read_text(encoding="utf-8"), "ab_manifest")
+
+
+@pytest.mark.parametrize(
+    "injected",
+    [
+        "import builtins\\ndef injected(code):\\n    return builtins.compile(code, '<x>', 'exec')\\n",
+        "def injected(code):\\n    return eval(code)\\n",
+        "def injected(code):\\n    exec(code)\\n",
+        "def injected(name):\\n    return __import__(name)\\n",
+        "import importlib\\n",
+    ],
+    ids=["compile", "eval", "exec", "dunder-import", "importlib-import"],
+)
+def test_static_read_audit_rejects_dynamic_execution_apis(tmp_path, injected):
+    source_path = Path(ab_manifest.__file__)
+    temporary_copy = tmp_path / source_path.name
+    temporary_copy.write_text(
+        source_path.read_text(encoding="utf-8") + "\n" + injected.replace("\\n", "\n"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="unapproved dynamic:"):
+        _assert_static_read_policy(temporary_copy.read_text(encoding="utf-8"), "ab_manifest")
+
+
+def test_static_read_audit_follows_imported_stage3_module_into_temporary_copy(tmp_path):
+    repo_root = tmp_path / "repo"
+    stage3_copy = repo_root / "tools" / "stage3"
+    shutil.copytree(Path(ab_manifest.__file__).resolve().parent, stage3_copy, ignore=shutil.ignore_patterns("__pycache__"))
+    entry = stage3_copy / "ab_manifest.py"
+    with entry.open("a", encoding="utf-8") as stream:
+        stream.write("\nimport tools.stage3.injected_reader\n")
+    (stage3_copy / "injected_reader.py").write_text(
+        "def read_external(path):\n    return open(path, 'rb').read()\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="injected_reader:read_external: unapproved builtins.open"):
+        _assert_stage3_dependency_read_policy(repo_root)
+
+
+def test_stage3_dependency_scan_resolves_absolute_aliased_from_and_relative_imports(tmp_path):
+    stage3_copy = tmp_path / "tools" / "stage3"
+    stage3_copy.mkdir(parents=True)
+    (tmp_path / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (stage3_copy / "__init__.py").write_text("", encoding="utf-8")
+    (stage3_copy / "ab_manifest.py").write_text(
+        "import tools.stage3.alpha\n"
+        "import tools.stage3.beta as beta_alias\n"
+        "from tools.stage3 import gamma\n"
+        "from tools.stage3.delta import value\n"
+        "from . import epsilon\n"
+        "from .zeta import value as zeta_value\n",
+        encoding="utf-8",
+    )
+    for name in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta"):
+        (stage3_copy / f"{name}.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    modules = _stage3_dependency_closure(tmp_path, "tools.stage3.ab_manifest")
+
+    assert set(modules) == {
+        "tools.stage3", "tools.stage3.ab_manifest", "tools.stage3.alpha", "tools.stage3.beta",
+        "tools.stage3.gamma", "tools.stage3.delta", "tools.stage3.epsilon", "tools.stage3.zeta",
+    }
