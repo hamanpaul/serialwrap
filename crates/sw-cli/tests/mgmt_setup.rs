@@ -3518,52 +3518,56 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
     assert_eq!(posix_file_owner_group(&t.config_path()), original_owner_group, "中斷復原必須保留原始 owner/group");
 }
 
-/// inst4-f3：在可用的 supplementary group 上獨立驗證 setgid 目錄中的兩種 config 回復。
+/// inst4-f3：在 setgid config 目錄中驗證實際改寫後的兩種 config 回復。
 #[cfg(all(test, unix))]
 #[test]
+#[ignore = "需要可用且不同於 primary group 的 supplementary group；一般套件測試明確跳過，條件具備時以 --ignored 顯式執行"]
 fn inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group() {
-    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
+    let original = b"supervision_mode: on-demand\n";
 
-    let switch = TestEnv::posix()
+    let switch = TestEnv::windows()
         .with_config(std::str::from_utf8(original).expect("config UTF-8"))
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
         .with_bundle(CURRENT_VERSION)
+        .with_rpc_listen(Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716)))
         .with_fs_fault_replace_suffix(".new");
     posix_set_file_mode(&switch.config_path(), 0o640);
     let switch_owner_group = posix_file_owner_group(&switch.config_path());
-    let Some(group) = posix_secondary_group().filter(|group| *group != switch_owner_group.1) else {
-        use std::io::Write;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group 需要目前行程可使用且不同於 config 原始 group 的 supplementary group；既有內容與 mode 測試不依賴此條件"
-        );
-        return;
-    };
+    let group = posix_secondary_group()
+        .filter(|group| *group != switch_owner_group.1)
+        .expect("顯式執行不同群組案例前，必須有可用且不同於 config 原始 group 的 supplementary group");
     let switch_config_dir = switch.config_path().parent().expect("config parent").to_path_buf();
     posix_setgid_directory(&switch_config_dir, group);
 
-    let (switch_rc, switch_out, _switch_err) = switch.run_from_bundle(&["setup", "--on-demand"]);
+    let (switch_rc, switch_out, switch_err) = switch.run_from_bundle(&["setup", "--on-demand"]);
 
-    assert_eq!(switch_rc, 2, "入口切換注入失敗時 setup 必須回報失敗：{switch_out}");
+    assert_eq!(switch_rc, 2, "入口切換注入失敗時 setup 必須回報失敗：{switch_out} {switch_err}");
+    assert!(switch_err.contains("selected port 48716"), "config 必須先經自動選埠改寫，再進入入口切換失敗：{switch_err}");
     assert!(switch_out.contains("\"reverted\":true"), "切換失敗必須完成回復：{switch_out}");
     assert_eq!(std::fs::read(switch.config_path()).expect("config 必須存在"), original);
     assert_eq!(posix_file_mode(&switch.config_path()), 0o640, "切換失敗回復必須保留原始 mode");
     assert_eq!(posix_file_owner_group(&switch.config_path()), switch_owner_group, "setgid 目錄中切換失敗回復必須保留原始 owner/group");
 
-    let mut interrupted = TestEnv::posix()
+    let mut interrupted = TestEnv::windows()
         .with_config(std::str::from_utf8(original).expect("config UTF-8"))
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
         .with_bundle(CURRENT_VERSION)
+        .with_rpc_listen(Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716)))
         .with_crash_at("entries_switching:after_effect");
     posix_set_file_mode(&interrupted.config_path(), 0o640);
     let interrupted_owner_group = posix_file_owner_group(&interrupted.config_path());
+    assert_ne!(group, interrupted_owner_group.1, "受控 setgid group 必須與 config 原始 group 不同");
     let interrupted_config_dir = interrupted.config_path().parent().expect("config parent").to_path_buf();
     posix_setgid_directory(&interrupted_config_dir, group);
 
-    let (crash_rc, _out, _err) = interrupted.run_from_bundle(&["setup", "--on-demand"]);
+    let (crash_rc, _out, crash_err) = interrupted.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    assert!(crash_err.contains("selected port 48716"), "中斷點前 config 必須先經自動選埠改寫：{crash_err}");
+    let transaction_config = std::fs::read(interrupted.config_path()).expect("讀取交易改寫後 config");
+    assert_ne!(transaction_config, original, "中斷點的 config 必須是交易改寫後內容，確保復原會執行複製");
+    assert!(String::from_utf8_lossy(&transaction_config).contains("48716"), "交易 config 必須含自動選用埠：{}", String::from_utf8_lossy(&transaction_config));
     interrupted.clear_crash();
     let recovery = interrupted.recover().expect("journal");
 
