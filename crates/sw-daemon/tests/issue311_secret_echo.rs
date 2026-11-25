@@ -2512,7 +2512,7 @@ fn issue312_assert_all_sinks_masked(
 #[test]
 fn issue312_raw_password_input_is_meta_only_until_enter() {
     let rig = build_issue312_human_rig(false);
-    let _log_path = start_log(&rig.service);
+    let log_path = start_log(&rig.service);
     let (client_id, console) = issue312_attach_console(&rig);
     let tx_start = rig.device.tx_len();
 
@@ -2577,12 +2577,13 @@ fn issue312_raw_password_input_is_meta_only_until_enter() {
         &client_id,
         b"before-312\rafter-312",
     );
+    issue312_assert_all_sinks_masked(&rig, &[ISSUE312_HUMAN_SECRET], &[&console], &log_path);
 }
 
 #[test]
 fn issue312_console_unlock_prompt_without_password_regex_match_is_meta_only() {
     let rig = build_issue312_human_rig_with_unlock_prompt(false, true);
-    let _log_path = start_log(&rig.service);
+    let log_path = start_log(&rig.service);
     let (client_id, console) = issue312_attach_console(&rig);
     let tx_start = rig.device.tx_len();
 
@@ -2632,13 +2633,14 @@ fn issue312_console_unlock_prompt_without_password_regex_match_is_meta_only() {
         &client_id,
         b"before-312\rafter-312",
     );
+    issue312_assert_all_sinks_masked(&rig, &[ISSUE312_HUMAN_SECRET], &[&console], &log_path);
 }
 
 #[test]
 fn issue312_line_buffer_password_input_is_meta_only_until_enter() {
     let rig = build_issue312_human_rig(true);
-    let _log_path = start_log(&rig.service);
-    let (raw_id, _raw_console) = issue312_attach_console(&rig);
+    let log_path = start_log(&rig.service);
+    let (raw_id, raw_console) = issue312_attach_console(&rig);
     let (line_id, line_console) = issue312_attach_console(&rig);
     assert_ne!(raw_id, line_id);
     assert_eq!(
@@ -2711,13 +2713,19 @@ fn issue312_line_buffer_password_input_is_meta_only_until_enter() {
         &line_id,
         b"before-line-312\n\nafter-line-312\n",
     );
+    issue312_assert_all_sinks_masked(
+        &rig,
+        &[ISSUE312_HUMAN_SECRET],
+        &[&raw_console, &line_console],
+        &log_path,
+    );
 }
 
 #[test]
 fn issue312_line_buffer_command_shaped_password_is_meta_only() {
     let rig = build_issue312_human_rig(true);
-    let _log_path = start_log(&rig.service);
-    let (raw_id, _raw_console) = issue312_attach_console(&rig);
+    let log_path = start_log(&rig.service);
+    let (raw_id, raw_console) = issue312_attach_console(&rig);
     let (line_id, line_console) = issue312_attach_console(&rig);
     let detached = rig.service.call(
         "session.console_detach",
@@ -2754,6 +2762,7 @@ fn issue312_line_buffer_command_shaped_password_is_meta_only() {
 
     issue312_assert_secret_wal(&rig, secret, &line_id, b"before-line-312\n\nafter-cmd\n");
     assert_eq!(rig.device.tx_since(tx_start), b"before-line-312\nvim\nafter-cmd\n", "送到 UART 的位元組不得改變");
+    issue312_assert_all_sinks_masked(&rig, &[secret], &[&raw_console, &line_console], &log_path);
 }
 
 #[test]
@@ -2785,7 +2794,7 @@ fn issue312_split_utf8_prompt_and_isolated_cr_masking() {
         _event: None,
         _log_dir: log_dir,
     };
-    let _log_path = start_log(&rig.service);
+    let log_path = start_log(&rig.service);
     let (client_id, console) = issue312_attach_console(&rig);
     let tx_start = rig.device.tx_len();
 
@@ -2826,6 +2835,7 @@ fn issue312_split_utf8_prompt_and_isolated_cr_masking() {
         "送到 UART 的位元組不得改變"
     );
     issue312_assert_secret_wal(&rig, secret, &client_id, b"before-312\rafter-utf8");
+    issue312_assert_all_sinks_masked(&rig, &[secret], &[&console], &log_path);
 }
 
 #[test]
@@ -2967,7 +2977,7 @@ fn issue312_raw_password_without_enter_settles_meta_on_disconnect() {
 #[test]
 fn issue312_disconnect_halfway_clears_password_state_for_reconnect() {
     let rig = build_issue312_human_rig(false);
-    let _log_path = start_log(&rig.service);
+    let log_path = start_log(&rig.service);
     let (client_id, console) = issue312_attach_console(&rig);
 
     let rx_before = rig.device.rx_bytes_read();
@@ -3023,6 +3033,7 @@ fn issue312_disconnect_halfway_clears_password_state_for_reconnect() {
         .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("human2 TX payload"))
         .collect::<Vec<_>>();
     assert_eq!(human2_tx, b"status\r", "新 console 的普通輸入應完整保留");
+    issue312_assert_all_sinks_masked(&rig, &["abc"], &[&console, &console2], &log_path);
 }
 
 #[test]
