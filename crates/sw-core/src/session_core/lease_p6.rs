@@ -238,6 +238,7 @@ impl SessionCore {
             return false;
         }
         let before = self.human.ownership.interactive_owner.clone();
+        self.settle_incomplete_human_password();
         self.human.ownership.on_detach(client_id);
         self.after_owner_change(before);
         self.human.deferred_mut().remove_client(client_id);

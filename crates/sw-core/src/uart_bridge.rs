@@ -116,6 +116,8 @@ pub struct RxShared {
     secret_echo: Mutex<SecretEchoWindow>,
     /// secret 暫存改變時也喚醒 prompt waiter；RX 視窗不含尚未判定的前綴。
     secret_echo_revision: AtomicU64,
+    /// 密碼提示狀態追蹤器；reader 在推給 console 前即更新，不依賴 actor 佇列時序。
+    password_prompt: Mutex<PasswordPromptTracker>,
     /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
     /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
     run_cancel_gen: AtomicU64,
@@ -139,6 +141,96 @@ struct ArmedSecretEcho {
     pending: Vec<u8>,
     dynamic: bool,
     expire_on_line_end: bool,
+}
+
+#[derive(Default)]
+struct PasswordPromptTracker {
+    password_regex: Option<sw_proto::pyre::PyRegex>,
+    unlock_env: Option<String>,
+    pending_bytes: Vec<u8>,
+    current_line: String,
+    active: bool,
+}
+
+impl PasswordPromptTracker {
+    fn observe_bytes(&mut self, data: &[u8]) {
+        if self.password_regex.is_none() && self.unlock_env.is_none() {
+            return;
+        }
+        let mut slice = data;
+        while !slice.is_empty() {
+            if let Some(pos) = slice.iter().position(|&b| b == b'\r' || b == b'\n') {
+                let part = &slice[..pos];
+                if !part.is_empty() {
+                    self.append_line_bytes(part);
+                }
+                self.pending_bytes.clear();
+                self.current_line.clear();
+                self.active = false;
+                slice = &slice[pos + 1..];
+            } else {
+                self.append_line_bytes(slice);
+                break;
+            }
+        }
+    }
+
+    fn append_line_bytes(&mut self, bytes: &[u8]) {
+        self.pending_bytes.extend_from_slice(bytes);
+        match std::str::from_utf8(&self.pending_bytes) {
+            Ok(s) => {
+                self.current_line.push_str(s);
+                self.pending_bytes.clear();
+                self.trim_line_and_check();
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid_str = unsafe {
+                        std::str::from_utf8_unchecked(&self.pending_bytes[..valid_up_to])
+                    };
+                    self.current_line.push_str(valid_str);
+                    self.pending_bytes.drain(..valid_up_to);
+                    self.trim_line_and_check();
+                }
+                if let Some(err_len) = e.error_len() {
+                    self.pending_bytes.drain(..err_len);
+                }
+            }
+        }
+    }
+
+    fn trim_line_and_check(&mut self) {
+        if self.current_line.len() > 4096 {
+            let trim = self.current_line.len() - 4096;
+            let boundary = self
+                .current_line
+                .char_indices()
+                .find_map(|(i, _)| (i >= trim).then_some(i))
+                .unwrap_or(self.current_line.len());
+            self.current_line.drain(..boundary);
+        }
+        self.check_prompt();
+    }
+
+    fn check_prompt(&mut self) {
+        let uncolored = sw_proto::pycompat::strip_ansi(&self.current_line);
+        let profile_match = self.password_regex.as_ref().is_some_and(|re| {
+            re.search(&uncolored).is_some() || re.search(&self.current_line).is_some()
+        });
+        let unlock_match = self.unlock_env.as_deref().is_some_and(|env| {
+            if env.is_empty() {
+                return false;
+            }
+            let line = uncolored.trim_end().to_ascii_lowercase();
+            let prompt_end = line.ends_with(':') || line.ends_with('?') || line.ends_with('>');
+            prompt_end
+                && ["password", "passphrase", "unlock"]
+                    .iter()
+                    .any(|word| line.contains(word))
+        });
+        self.active |= profile_match || unlock_match;
+    }
 }
 
 struct MaskedRxChunk {
@@ -171,9 +263,42 @@ impl RxShared {
             capture: Mutex::new(None),
             secret_echo: Mutex::new(SecretEchoWindow::default()),
             secret_echo_revision: AtomicU64::new(0),
+            password_prompt: Mutex::new(PasswordPromptTracker::default()),
             run_cancel_gen: AtomicU64::new(0),
             transfer_cancel_gen: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_password_prompt_matcher(
+        &self,
+        password_regex: Option<sw_proto::pyre::PyRegex>,
+        unlock_env: Option<String>,
+    ) {
+        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.password_regex = password_regex;
+        tracker.unlock_env = unlock_env;
+        tracker.pending_bytes.clear();
+        tracker.current_line.clear();
+        tracker.active = false;
+    }
+
+    pub fn is_password_prompt_active(&self) -> bool {
+        self.password_prompt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+    }
+
+    pub fn clear_password_prompt(&self) {
+        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.pending_bytes.clear();
+        tracker.current_line.clear();
+        tracker.active = false;
+    }
+
+    pub fn observe_password_prompt_bytes(&self, data: &[u8]) {
+        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.observe_bytes(data);
     }
 
     /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
@@ -942,6 +1067,7 @@ impl ReaderPublisher<'_> {
             self.ctx.epoch,
             self.rx_seq,
         );
+        self.ctx.rx.observe_password_prompt_bytes(data);
         if let Some(hook) = self.after_rx_append {
             hook();
         }

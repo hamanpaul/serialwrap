@@ -65,6 +65,7 @@ pub enum CompileError {
 }
 
 /// 已編譯的 Python re pattern。
+#[derive(Clone)]
 pub struct PyRegex {
     _pattern: String,
     regex: Option<Regex>,

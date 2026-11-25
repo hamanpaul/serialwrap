@@ -1111,9 +1111,12 @@ impl TxWriter {
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
                     if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
                         let requested_secret_len = secret.log_skip_prefix.min(job.payload.len());
-                        let sent_secret_len = confirmed_bytes(&result.outcome).min(requested_secret_len);
-                        if sent_secret_len < requested_secret_len {
-                            rx.truncate_human_secret_echo(secret.echo_prior_len + sent_secret_len);
+                        let is_unknown = matches!(result.outcome, TxOutcome::Unknown { .. });
+                        if !is_unknown {
+                            let sent_secret_len = confirmed_bytes(&result.outcome).min(requested_secret_len);
+                            if sent_secret_len < requested_secret_len {
+                                rx.truncate_human_secret_echo(secret.echo_prior_len + sent_secret_len);
+                            }
                         }
                     }
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。

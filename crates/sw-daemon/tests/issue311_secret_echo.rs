@@ -2233,16 +2233,16 @@ fn issue312_assert_secret_wal(rig: &Issue312HumanRig, secret: &str, client_id: &
         !String::from_utf8_lossy(&wal_payload).contains(secret),
         "WAL TX payload 外洩 human password：{wal_payload:?}"
     );
-    assert!(
-        String::from_utf8_lossy(&wal_payload).contains("before-312")
-            || String::from_utf8_lossy(&wal_payload).contains("before-line-312"),
-        "密碼提示前的反例 TX 應照常保留：{wal_payload:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&wal_payload).contains("after-312")
-            || String::from_utf8_lossy(&wal_payload).contains("after-line-312"),
-        "換行後的反例 TX 應恢復記錄：{wal_payload:?}"
-    );
+    for chunk in visible_tx
+        .split(|&b| b == b'\r' || b == b'\n')
+        .filter(|s| !s.is_empty())
+    {
+        let chunk_str = String::from_utf8_lossy(chunk);
+        assert!(
+            String::from_utf8_lossy(&wal_payload).contains(&*chunk_str),
+            "提示外或換行後的反例 TX 應照常保留：{wal_payload:?}"
+        );
+    }
     let mirror = String::from_utf8(
         rig.service
             .wfs
@@ -2534,4 +2534,313 @@ fn issue312_line_buffer_password_input_is_meta_only_until_enter() {
         &line_id,
         b"before-line-312\n\nafter-line-312\n",
     );
+}
+
+#[test]
+fn issue312_line_buffer_command_shaped_password_is_meta_only() {
+    let rig = build_issue312_human_rig(true);
+    let _log_path = start_log(&rig.service);
+    let (raw_id, _raw_console) = issue312_attach_console(&rig);
+    let (line_id, line_console) = issue312_attach_console(&rig);
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{raw_id}"}}"#),
+    );
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+
+    rig.device.on_tx_match("^before-line-312$", Box::new(|_| b"\r\nroot@t:/# ".to_vec()));
+    rig.device.on_tx_match("^vim$", Box::new(|_| b"vim\r\nroot@t:/# ".to_vec()));
+    rig.device.on_tx_match("^after-cmd$", Box::new(|_| b"\r\nroot@t:/# ".to_vec()));
+
+    let tx_start = rig.device.tx_len();
+    line_console.push_input(b"before-line-312\r");
+    issue312_wait_tx(&rig.device, tx_start + b"before-line-312\n".len(), "line prompt 外輸入");
+    rig.service.settle();
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPassword: ");
+    wait_controlled_rx(&rig.device, rx_before + b"\r\nPassword: ".len(), "reader 收到 password prompt");
+    rig.service.settle();
+
+    let secret = "vim";
+    line_console.push_input(b"vim\r");
+    issue312_wait_tx(&rig.device, tx_start + b"before-line-312\n".len() + b"vim\n".len(), "line-buffer vim 密碼送出");
+    rig.service.settle();
+
+    line_console.push_input(b"after-cmd\r");
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + b"before-line-312\n".len() + b"vim\n".len() + b"after-cmd\n".len(),
+        "line-buffer 換行後輸入送出",
+    );
+    rig.service.settle();
+
+    issue312_assert_secret_wal(&rig, secret, &line_id, b"before-line-312\n\nafter-cmd\n");
+    assert_eq!(rig.device.tx_since(tx_start), b"before-line-312\nvim\nafter-cmd\n", "送到 UART 的位元組不得改變");
+}
+
+#[test]
+fn issue312_split_utf8_prompt_and_isolated_cr_masking() {
+    let log_dir = tempfile::tempdir().expect("agent log 目錄");
+    let profile = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:/# '\n    password_regex: '密碼[:：] *'\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n",
+        log_dir.path().display()
+    );
+    let env = Arc::new(FakeEnv::default());
+    let serial = FakeSerialBackend::new();
+    let device = serial.add_device(REAL_A);
+    support::install_shell_replies(&device);
+    let service = ServiceRig::build_with_env_serial_console_observers(
+        RigSpec {
+            yaml: profile,
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: vec!["COM0".into()],
+        },
+        env,
+        serial as Arc<dyn SerialBackend>,
+        Vec::new(),
+    );
+    let rig = Issue312HumanRig {
+        service,
+        device,
+        _log_dir: log_dir,
+    };
+    let _log_path = start_log(&rig.service);
+    let (client_id, console) = issue312_attach_console(&rig);
+    let tx_start = rig.device.tx_len();
+
+    console.push_input(b"before-312");
+    issue312_wait_tx(&rig.device, tx_start + "before-312".len(), "提示前輸入");
+    rig.service.settle();
+
+    // 跨 chunk 分段 UTF-8："密" 是 0xE5 0xAF 0x86
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\n\xe5");
+    wait_controlled_rx(&rig.device, rx_before + 3, "第一段 utf8 chunk");
+    rig.service.settle();
+
+    let rx_before2 = rig.device.rx_bytes_read();
+    let chunk2 = [b"\xaf\x86".as_slice(), "碼: ".as_bytes()].concat();
+    rig.device.push_rx(&chunk2);
+    wait_controlled_rx(&rig.device, rx_before2 + chunk2.len(), "第二段 utf8 chunk 拼出完整提示");
+    rig.service.settle();
+
+    let secret = "secret888";
+    for byte in secret.as_bytes() {
+        let expected = rig.device.tx_len() + 1;
+        console.push_input(&[*byte]);
+        issue312_wait_tx(&rig.device, expected, "分段 utf8 後逐鍵送出");
+    }
+    let expected = rig.device.tx_len() + 1;
+    console.push_input(b"\r");
+    issue312_wait_tx(&rig.device, expected, "以 CR 換行");
+    rig.service.settle();
+
+    console.push_input(b"after-utf8");
+    issue312_wait_tx(&rig.device, expected + "after-utf8".len(), "CR 後普通輸入");
+    rig.service.settle();
+
+    assert_eq!(
+        rig.device.tx_since(tx_start),
+        [b"before-312".as_slice(), secret.as_bytes(), b"\rafter-utf8"].concat(),
+        "送到 UART 的位元組不得改變"
+    );
+    issue312_assert_secret_wal(&rig, secret, &client_id, b"before-312\rafter-utf8");
+}
+
+#[test]
+fn issue312_raw_password_without_enter_settles_meta_on_disconnect() {
+    let rig = build_issue312_human_rig(false);
+    let _log_path = start_log(&rig.service);
+    let (client_id, console) = issue312_attach_console(&rig);
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPassword: ");
+    wait_controlled_rx(&rig.device, rx_before + b"\r\nPassword: ".len(), "reader 收到 password prompt");
+    rig.service.settle();
+
+    let partial_secret = b"abc";
+    for byte in partial_secret {
+        let expected = rig.device.tx_len() + 1;
+        console.push_input(&[*byte]);
+        issue312_wait_tx(&rig.device, expected, "raw 部分密碼");
+    }
+    rig.service.settle();
+
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{client_id}"}}"#),
+    );
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    rig.service.settle();
+
+    let wal_text = String::from_utf8(
+        rig.service
+            .wfs
+            .contents(&rig.service.wal.wal_path())
+            .expect("raw.wal.ndjson"),
+    )
+    .expect("WAL UTF-8");
+    assert!(!wal_text.contains("abc"), "WAL 不得含有未完成密碼明文：{wal_text}");
+    let rows = wal_text
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .collect::<Vec<_>>();
+    let metas = rows
+        .iter()
+        .filter(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("META")
+                && row
+                    .get("meta")
+                    .and_then(|meta| meta.get("event"))
+                    .and_then(PyValue::as_str)
+                    == Some("secret_tx")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(metas.len(), 1, "未按 Enter 斷線時應結算一筆 secret_tx META：{metas:?}");
+    assert_eq!(
+        metas[0].get("meta").and_then(|m| m.get("secret_len")).and_then(PyValue::as_i64),
+        Some(3)
+    );
+}
+
+#[test]
+fn issue312_disconnect_halfway_clears_password_state_for_reconnect() {
+    let rig = build_issue312_human_rig(false);
+    let _log_path = start_log(&rig.service);
+    let (client_id, console) = issue312_attach_console(&rig);
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPassword: ");
+    wait_controlled_rx(&rig.device, rx_before + b"\r\nPassword: ".len(), "reader 收到 password prompt");
+    rig.service.settle();
+
+    for byte in b"abc" {
+        let expected = rig.device.tx_len() + 1;
+        console.push_input(&[*byte]);
+        issue312_wait_tx(&rig.device, expected, "raw 部分密碼");
+    }
+    rig.service.settle();
+
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{client_id}"}}"#),
+    );
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    rig.service.settle();
+
+    let (client_id2, console2) = issue312_attach_console(&rig);
+    let tx_start2 = rig.device.tx_len();
+
+    console2.push_input(b"status\r");
+    issue312_wait_tx(&rig.device, tx_start2 + b"status\r".len(), "重連後普通輸入");
+    rig.service.settle();
+
+    let wal_text = String::from_utf8(
+        rig.service
+            .wfs
+            .contents(&rig.service.wal.wal_path())
+            .expect("raw.wal.ndjson"),
+    )
+    .expect("WAL UTF-8");
+    let wal_payload = decode_wal_payloads(&wal_text);
+    assert!(
+        String::from_utf8_lossy(&wal_payload).contains("status"),
+        "重連後的普通 human 輸入應恢復明文記錄：{wal_text}"
+    );
+    let rows = wal_text
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .collect::<Vec<_>>();
+    let human2_tx = rows
+        .iter()
+        .filter(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("TX")
+                && row.get("source").and_then(PyValue::as_str)
+                    == Some(format!("human:{client_id2}").as_str())
+        })
+        .flat_map(|row| row.get("payload_b64").and_then(PyValue::as_str).into_iter())
+        .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("human2 TX payload"))
+        .collect::<Vec<_>>();
+    assert_eq!(human2_tx, b"status\r", "新 console 的普通輸入應完整保留");
+}
+
+#[test]
+fn issue312_set_profile_updates_password_regex() {
+    let log_dir = tempfile::tempdir().expect("agent log 目錄");
+    let profile = format!(
+        "profiles:\n  t1:\n    platform: passthrough\n    prompt_regex: '(?m)^root@t:/# '\n    password_regex: 'Password:'\n    timeout_s: 2.0\n  t2:\n    platform: passthrough\n    prompt_regex: '(?m)^root@t:/# '\n    password_regex: 'Passcode:'\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\n",
+        log_dir.path().display()
+    );
+    let env = Arc::new(FakeEnv::default());
+    let serial = FakeSerialBackend::new();
+    let device = serial.add_device(REAL_A);
+    let service = ServiceRig::build_with_env_serial_console_observers(
+        RigSpec {
+            yaml: profile,
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 0,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        env,
+        serial as Arc<dyn SerialBackend>,
+        Vec::new(),
+    );
+    support::wait_until("動態 COM0 session 建立", || service.session("COM0").is_some());
+    let rig = Issue312HumanRig {
+        service,
+        device,
+        _log_dir: log_dir,
+    };
+    let _log_path = start_log(&rig.service);
+
+    // 初始狀態為動態 session，先 pin 到 t1
+    let pinned1 = rig.service.call("session.pin", r#"{"selector":"COM0","profile":"t1"}"#);
+    assert_eq!(pinned1.get("ok"), Some(&PyValue::Bool(true)), "{pinned1:?}");
+
+    // 切換 profile 為 t2（新的 password_regex 為 Passcode:）
+    let pinned2 = rig.service.call("session.pin", r#"{"selector":"COM0","profile":"t2"}"#);
+    assert_eq!(pinned2.get("ok"), Some(&PyValue::Bool(true)), "{pinned2:?}");
+    let cleared = rig.service.call("session.clear", r#"{"selector":"COM0"}"#);
+    assert_eq!(cleared.get("ok"), Some(&PyValue::Bool(true)), "{cleared:?}");
+    support::wait_until("COM0 依新 profile t2 re-attach", || {
+        rig.service
+            .session("COM0")
+            .and_then(|session| session.get("profile").and_then(PyValue::as_str).map(str::to_string))
+            == Some("t2".to_string())
+    });
+
+    let (client_id, console) = issue312_attach_console(&rig);
+    let tx_start = rig.device.tx_len();
+
+    console.push_input(b"before-312");
+    issue312_wait_tx(&rig.device, tx_start + "before-312".len(), "提示前輸入");
+    rig.service.settle();
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPasscode: ");
+    wait_controlled_rx(&rig.device, rx_before + b"\r\nPasscode: ".len(), "reader 收到新 profile 的 passcode prompt");
+    rig.service.settle();
+
+    let secret = "passcode123";
+    for byte in secret.as_bytes() {
+        let expected = rig.device.tx_len() + 1;
+        console.push_input(&[*byte]);
+        issue312_wait_tx(&rig.device, expected, "passcode 逐鍵送出");
+    }
+    let expected = rig.device.tx_len() + 1;
+    console.push_input(b"\r");
+    issue312_wait_tx(&rig.device, expected, "passcode 結尾 CR 送出");
+    console.push_input(b"after-312");
+    issue312_wait_tx(&rig.device, expected + "after-312".len(), "換行後普通輸入");
+    rig.service.settle();
+
+    assert_eq!(
+        rig.device.tx_since(tx_start),
+        [b"before-312".as_slice(), secret.as_bytes(), b"\rafter-312"].concat()
+    );
+    issue312_assert_secret_wal(&rig, secret, &client_id, b"before-312\rafter-312");
 }
