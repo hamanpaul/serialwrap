@@ -278,18 +278,34 @@ _ROOT_METADATA_FILES = frozenset({"SHA256SUMS", "release-manifest.json"})
 RETIRED_ASSET_DIR = "assets/pending-t16"
 
 
+def _expected_bundle_sums(root: Path) -> str:
+    sums = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        rel = path.relative_to(root).as_posix()
+        if path.is_file() and rel not in _ROOT_METADATA_FILES:
+            sums.append(f"{sha256_file(path)}  {rel}\n")
+    return "".join(sums)
+
+
+def refresh_bundle_sums(bundle_dir: Path) -> Path:
+    """在 make_bundle 之後新增或改動 bundle 檔案時，重建根目錄 SHA256SUMS。
+
+    Task 16 的正向 fixture 在 make_bundle(stage="3") 之後放入 ``assets/skill/SKILL.md``；
+    須在凍結 target 與 rc_archive 之前呼叫本函式。改動 manifest 所指的 component 檔案時，
+    呼叫端另須同步更新 release manifest 的對應摘要。
+    """
+    root = Path(bundle_dir)
+    _write_bundle_sums(root)
+    return root / "SHA256SUMS"
+
+
 def _write_bundle_sums(root: Path) -> None:
     """依 bundle 實際檔案重建 SHA256SUMS；只豁免 bundle 根目錄的兩個 metadata 檔。
 
     比照 scripts/rust/mkbundle.sh 與 crates/sw-cli/src/install_layout.rs：以相對 bundle 根的
     完整路徑判斷，巢狀的同名檔（例如 ``bin/SHA256SUMS``）仍須列入。
     """
-    sums = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        rel = path.relative_to(root).as_posix()
-        if path.is_file() and rel not in _ROOT_METADATA_FILES:
-            sums.append(f"{sha256_file(path)}  {rel}\n")
-    (root / "SHA256SUMS").write_text("".join(sums), encoding="utf-8", newline="\n")
+    (root / "SHA256SUMS").write_text(_expected_bundle_sums(root), encoding="utf-8", newline="\n")
 
 
 def make_bundle(
@@ -514,6 +530,9 @@ def rc_archive(bundle_dir: Path) -> Path:
     版本樹只收一般檔案與目錄，archive 位元組取自實際內容，不以 manifest hash 代替。
     """
     bundle = Path(bundle_dir)
+    sums_path = bundle / "SHA256SUMS"
+    if not sums_path.is_file() or sums_path.read_text(encoding="utf-8") != _expected_bundle_sums(bundle):
+        raise ValueError("bundle 的 SHA256SUMS 與實際檔案不符；新增或改動檔案後請先呼叫 refresh_bundle_sums")
     platform_name, version, entries = _archive_entries(bundle)
     archive = bundle.parent / f"{bundle.name}{'.tar.gz' if platform_name == 'linux' else '.zip'}"
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -695,6 +714,13 @@ def _set_dotted(doc: dict[str, Any], dotted: str, value: Any) -> None:
         node[int(final)] = value
     else:
         node[final] = value
+
+
+def _destructive_case_ids(repo_root: Path, case_ids: Sequence[str]) -> list[str]:
+    """回傳 case_ids 中在假 repo 的 cases.yaml 標為 destructive 的案例。"""
+    cases_doc = yaml.safe_load((Path(repo_root) / "tests" / "acceptance" / "cases.yaml").read_text(encoding="utf-8"))
+    destructive = {case["case_id"] for case in cases_doc.get("cases", []) if case.get("destructive") is True}
+    return sorted(set(case_ids) & destructive)
 
 
 def write_ab_manifest(
@@ -884,11 +910,17 @@ def write_ab_manifest(
     doc["dut"] = {"kind": dut_kind, "transport": dut_transport, "com_pair": None,
                   "image": None, "image_digest": None, "boards": boards, "reset_argv": [],
                   "fingerprint_argv": [], "expected_fingerprint": {}}
-    doc["authorization"] = {
-        "allow_destructive": layer == "l2",
-        "decision_ref": "FAKE-L2-TEST-AUTH" if layer == "l2" else None,
-        "boards": ["TEST0"] if layer == "l2" else [],
-    }
+    # 合成授權（R6-01）：選入的必要案例含 destructive 時，以明確的測試用 decision_ref 授權 DUT 內的
+    # board，保留完整分母；這只是 fixture 的授權，不代表任何實機授權。
+    destructive = _destructive_case_ids(root, doc["case_ids"])
+    if layer == "l2" or destructive:
+        doc["authorization"] = {
+            "allow_destructive": True,
+            "decision_ref": f"FAKE-{layer.upper().replace('.', '')}-TEST-AUTH",
+            "boards": boards[:1],
+        }
+    else:
+        doc["authorization"] = {"allow_destructive": False, "decision_ref": None, "boards": []}
     doc["release"] = {"timeout_s": 120, "poll_s": 1, "endpoints": [], "device_paths": [],
                       "lock_paths": [], "device_open_probe": layer == "l1.5", "accept_unreadable_holders": False}
     doc["endpoint"] = None if layer != "l3" else "explicit-endpoint-placeholder"

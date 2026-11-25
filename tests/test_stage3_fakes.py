@@ -743,6 +743,8 @@ def test_rc_archive_changes_for_same_manifest_different_tree(tmp_path):
     sidecar = bundle_b / "assets" / "unlisted-sidecar.bin"
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     sidecar.write_bytes(b"real fixture content\n")
+    # 依 Task 16 順序：新增檔案後先重建 SHA256SUMS 再打包；release manifest 不變。
+    fakes.refresh_bundle_sums(bundle_b)
     archive_b = fakes.rc_archive(bundle_b).read_bytes()
 
     assert manifest_a == manifest_b
@@ -996,3 +998,52 @@ def test_retired_bundle_leaves_task_asset_path_absent(tmp_path, target):
     added.parent.mkdir(parents=True, exist_ok=True)
     added.write_text("# 新增的資產\n", encoding="utf-8", newline="\n")
     assert fakes.tree_sha256(bundle) != before, "新增資產必須改變樹摘要（不是覆寫既有檔）"
+
+
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+@pytest.mark.parametrize("layer", ["l1.5", "l2", "l3"])
+@pytest.mark.parametrize("stage", ["2.4", "3"])
+def test_positive_manifest_authorizes_every_destructive_case(tmp_path, stage, layer, platform):
+    """正向 manifest 選入 destructive 必要案例時，須帶 Task 3 認可的授權（R6-01），分母不得縮減。"""
+    fakes = _fakes()
+    manifest_path = fakes.write_ab_manifest(tmp_path / "auth", stage=stage, layer=layer, platform=platform)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cases_doc = yaml.safe_load((REPO_ROOT / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))
+    destructive = {case["case_id"] for case in cases_doc["cases"] if case.get("destructive") is True}
+    selected = set(manifest["case_ids"]) & destructive
+    auth = manifest["authorization"]
+    if selected:
+        assert auth is not None
+        assert auth["allow_destructive"] is True
+        assert isinstance(auth["decision_ref"], str) and auth["decision_ref"].startswith("FAKE-")
+        assert set(auth["boards"]) <= set(manifest["dut"]["boards"])
+    if stage == "3":
+        lock = json.loads((manifest_path.parent / manifest["required_cases_lock"]["path"]).read_text(encoding="utf-8"))
+        assert set(manifest["case_ids"]) == required_cases.required_for_exit(lock, manifest["exit_item_id"], platform)
+
+
+@pytest.mark.parametrize("target", ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"])
+def test_added_asset_requires_refreshed_sums_before_archive(tmp_path, target):
+    """Task 16 順序：make_bundle 後新增資產 → refresh_bundle_sums → rc_archive；未重建清單時 archive 拒絕（R6-02）。"""
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "bundle", stage="3", target=target)
+    added = bundle / "assets" / "skill" / "SKILL.md"
+    added.parent.mkdir(parents=True, exist_ok=True)
+    added.write_text("# 新增的資產\n", encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError):
+        fakes.rc_archive(bundle)
+
+    fakes.refresh_bundle_sums(bundle)
+    _assert_bundle_sums_match_files(bundle)
+    archive = fakes.rc_archive(bundle)
+    if archive.suffix == ".zip":
+        with zipfile.ZipFile(archive) as zf:
+            sums_name = next(n for n in zf.namelist() if n.endswith("/SHA256SUMS") and "/versions/" in n)
+            sums_text = zf.read(sums_name).decode("utf-8")
+    else:
+        with tarfile.open(archive, "r:gz") as tf:
+            member = next(m for m in tf.getmembers() if m.name.endswith("/SHA256SUMS") and "/versions/" in m.name)
+            sums_text = tf.extractfile(member).read().decode("utf-8")
+    assert sums_text == (bundle / "SHA256SUMS").read_text(encoding="utf-8")
+    assert "  assets/skill/SKILL.md\n" in sums_text
