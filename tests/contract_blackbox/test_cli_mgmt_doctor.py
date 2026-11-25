@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +38,69 @@ pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
 _RUNTIME_CHECKS = ("python", "pyyaml")
 _RUNTIME_CHECK_NAMES = ("python", "pyyaml", "pyserial")
 _REINSTALL_FIX = "重新安裝發佈組合（serialwrap setup）"
+_DAEMON_CODE_CURRENT_FIX = (
+    "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；"
+    "on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；"
+    "serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝"
+)
+
+
+def _assert_doctor_check_payload(actual: dict, expected: dict, context: str) -> None:
+    """逐欄比對 doctor check 的完整外部 payload。"""
+    assert actual == expected, f"{context}: doctor check payload mismatch"
+
+
+def _python_code_fingerprint(bundle_root: Path, full_oracle: bool) -> str:
+    """以 Python oracle 自己的 interpreter 計算基線指紋，不在測試行程匯入產品模組。"""
+    if full_oracle:
+        interpreter = bundle_root / "py" / "bin" / "python3"
+        command = [str(interpreter), "-I", "-B"]
+    else:
+        command = [sys.executable]
+    command.extend(
+        ["-c", "from sw_core.version import code_fingerprint; print(code_fingerprint() or '')"]
+    )
+    result = subprocess.run(
+        command,
+        cwd=repo_root(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"Python doctor 指紋計算失敗：{result.stderr}"
+    fingerprint = result.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{12}", fingerprint), f"Python doctor 指紋格式錯誤：{fingerprint!r}"
+    return fingerprint
+
+
+def _assert_doctor_payload_mutations_rejected() -> None:
+    expected = {
+        "advisory": True,
+        "check": "daemon_code_current",
+        "detail": "daemon 與目前安裝的程式碼相同（code 0123456789ab）",
+        "fix": "",
+        "ok": True,
+    }
+    counterexamples = (
+        ("A", "detail", "錯誤診斷"),
+        ("A", "fix", "錯誤修復指示"),
+        ("B", "fix", "錯誤修復指示"),
+    )
+    for context, field, value in counterexamples:
+        malformed = dict(expected)
+        malformed[field] = value
+        with pytest.raises(AssertionError):
+            _assert_doctor_check_payload(malformed, expected, context)
+
+
+def _daemon_code_current_payload(*, ok: bool, detail: str, fix: str) -> dict:
+    return {
+        "advisory": True,
+        "check": "daemon_code_current",
+        "detail": detail,
+        "fix": fix,
+        "ok": ok,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -323,6 +388,8 @@ def test_doctor_profile_template_fields_not_materialized(tmp_path: Path) -> None
 @pytest.mark.case("sc25-release-manifest-version-pairing")
 @pytest.mark.pidns_rig
 def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
+    _assert_doctor_payload_mutations_rejected()
+
     # 受測 artifact：有指定 SERIALWRAP_CLI_EXE（Rust）時即為該 bundle（不另行重建）；否則建置自含 bundle。
     artifact = _specified_rust_bundle()
     bundle_root = artifact if artifact is not None else _full_bundle_version_dir(tmp_path)
@@ -333,6 +400,7 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
     # Python oracle：自含 bundle 內的 py（P1 T18，`-I -m sw_core.cli`）；sentinel artifact 的 py 不含 sw_core，
     # 則以凍結的 Python 基線對同一份 manifest 與檔案執行（version_pairing 只比對 manifest 目錄內的檔案）。
     full_oracle = _bundle_has_python_oracle(bundle_root)
+    python_fp = _python_code_fingerprint(bundle_root, full_oracle)
     if full_oracle:
         py_doctor = [str(bundle_root / "py" / "bin" / "python3"), "-I", "-B", "-m", "sw_core.cli", "doctor"]
     else:
@@ -363,22 +431,37 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
                 # 此 advisory 比對各 CLI 與目前 daemon 的實作指紋；Stage 2 Rust daemon 的指紋不等於 Python 基線。
                 assert py_item["advisory"] is True and rust_item["advisory"] is True, state
                 if state == "daemon_down":
-                    expected = {
-                        "advisory": True,
-                        "check": "daemon_code_current",
-                        "detail": "daemon 未在跑或無法連線，略過",
-                        "fix": "",
-                        "ok": True,
-                    }
-                    assert py_item == rust_item == expected, (state, py_item, rust_item)
+                    expected = _daemon_code_current_payload(
+                        ok=True,
+                        detail="daemon 未在跑或無法連線，略過",
+                        fix="",
+                    )
+                    _assert_doctor_check_payload(py_item, expected, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected, f"{state}: Rust")
                 elif is_rust():
                     daemon_fp = rust_daemon_code_fingerprint()
-                    assert rust_item["ok"] is True, (state, rust_item, evidence)
-                    assert rust_item["detail"] == f"daemon 與目前安裝的程式碼相同（code {daemon_fp}）", rust_item
-                    assert py_item["ok"] is False, (state, py_item, evidence)
-                    assert f"code {daemon_fp}" in py_item["detail"], py_item
+                    expected_rust = _daemon_code_current_payload(
+                        ok=True,
+                        detail=f"daemon 與目前安裝的程式碼相同（code {daemon_fp}）",
+                        fix="",
+                    )
+                    expected_py = _daemon_code_current_payload(
+                        ok=False,
+                        detail=(
+                            f"daemon 載入的程式碼（code {daemon_fp}）與目前安裝的（code {python_fp}）不同"
+                        ),
+                        fix=_DAEMON_CODE_CURRENT_FIX,
+                    )
+                    _assert_doctor_check_payload(py_item, expected_py, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected_rust, f"{state}: Rust")
                 else:
-                    assert py_item["ok"] is True and rust_item["ok"] is True, (state, py_item, rust_item)
+                    expected = _daemon_code_current_payload(
+                        ok=True,
+                        detail=f"daemon 與目前安裝的程式碼相同（code {python_fp}）",
+                        fix="",
+                    )
+                    _assert_doctor_check_payload(py_item, expected, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected, f"{state}: Rust")
                 continue
             if not full_oracle and name in _RUNTIME_CHECK_NAMES:
                 # 基線 interpreter 與 artifact 內的 runtime 可能不同，只比名稱與 advisory。
