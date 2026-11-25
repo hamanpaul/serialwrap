@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 17,
+  "x-catalog-revision": 18,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -7602,6 +7602,35 @@
                   "self_test"
                 ]
               },
+              "probe_evidence": {
+                "type": "object",
+                "x-note": "Rust 0.5.1 實際執行 probe 的唯讀證據；四項皆為布林值，busy／未執行 probe 的回應不含此欄位",
+                "properties": {
+                  "tx_complete": {
+                    "type": "boolean",
+                    "x-note": "ready_probe 框架 payload 的 UART TX 完整送出"
+                  },
+                  "execution_marker": {
+                    "type": "boolean",
+                    "x-note": "RX 出現 nonce 對應、完整且獨立成行的 TX 外執行標記"
+                  },
+                  "probe_rc_zero": {
+                    "type": "boolean",
+                    "x-note": "configured ready_probe 成功完成，POSIX shell && 後的標記得以執行"
+                  },
+                  "prompt_after_marker": {
+                    "type": "boolean",
+                    "x-note": "prompt_regex 在執行標記結束位置之後成立"
+                  }
+                },
+                "required": [
+                  "tx_complete",
+                  "execution_marker",
+                  "probe_rc_zero",
+                  "prompt_after_marker"
+                ],
+                "additionalProperties": false
+              },
               "interactive_owner": {
                 "type": [
                   "string",
@@ -7635,6 +7664,22 @@
               "probe_ok",
               "rx_bytes_last_10s",
               "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "x-rust-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "rx_bytes_last_10s",
+              "recommended_action",
+              "probe_evidence",
               "interactive_owner",
               "human_attached",
               "human_active",
@@ -7705,6 +7750,35 @@
                   "self_test"
                 ]
               },
+              "probe_evidence": {
+                "type": "object",
+                "x-note": "Rust 0.5.1 實際執行 probe 的唯讀證據；四項皆為布林值，busy／未執行 probe 的回應不含此欄位",
+                "properties": {
+                  "tx_complete": {
+                    "type": "boolean",
+                    "x-note": "ready_probe 框架 payload 的 UART TX 完整送出"
+                  },
+                  "execution_marker": {
+                    "type": "boolean",
+                    "x-note": "RX 出現 nonce 對應、完整且獨立成行的 TX 外執行標記"
+                  },
+                  "probe_rc_zero": {
+                    "type": "boolean",
+                    "x-note": "configured ready_probe 成功完成，POSIX shell && 後的標記得以執行"
+                  },
+                  "prompt_after_marker": {
+                    "type": "boolean",
+                    "x-note": "prompt_regex 在執行標記結束位置之後成立"
+                  }
+                },
+                "required": [
+                  "tx_complete",
+                  "execution_marker",
+                  "probe_rc_zero",
+                  "prompt_after_marker"
+                ],
+                "additionalProperties": false
+              },
               "interactive_owner": {
                 "type": [
                   "string",
@@ -7737,6 +7811,21 @@
               "current_real_path",
               "probe_ok",
               "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "x-rust-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "probe_ok",
+              "recommended_action",
+              "probe_evidence",
               "interactive_owner",
               "human_attached",
               "human_active",
@@ -7818,6 +7907,35 @@
                   "self_test"
                 ]
               },
+              "probe_evidence": {
+                "type": "object",
+                "x-note": "Rust 0.5.1 實際執行 probe 的唯讀證據；四項皆為布林值，busy／未執行 probe 的回應不含此欄位",
+                "properties": {
+                  "tx_complete": {
+                    "type": "boolean",
+                    "x-note": "ready_probe 框架 payload 的 UART TX 完整送出"
+                  },
+                  "execution_marker": {
+                    "type": "boolean",
+                    "x-note": "RX 出現 nonce 對應、完整且獨立成行的 TX 外執行標記"
+                  },
+                  "probe_rc_zero": {
+                    "type": "boolean",
+                    "x-note": "configured ready_probe 成功完成，POSIX shell && 後的標記得以執行"
+                  },
+                  "prompt_after_marker": {
+                    "type": "boolean",
+                    "x-note": "prompt_regex 在執行標記結束位置之後成立"
+                  }
+                },
+                "required": [
+                  "tx_complete",
+                  "execution_marker",
+                  "probe_rc_zero",
+                  "prompt_after_marker"
+                ],
+                "additionalProperties": false
+              },
               "interactive_owner": {
                 "type": [
                   "string",
@@ -7857,9 +7975,97 @@
               "human_active",
               "recovery_mode",
               "command_capable"
+            ],
+            "x-rust-order": [
+              "ok",
+              "classification",
+              "session",
+              "attached_real_path",
+              "current_real_path",
+              "attached_vtty",
+              "bridge_generation",
+              "probe_ok",
+              "recommended_action",
+              "probe_evidence",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ]
+          },
+          {
+            "type": "object",
+            "x-branch": "RUST_BUSY",
+            "x-order": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
+            ],
+            "properties": {
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "classification": {
+                "type": "string",
+                "enum": [
+                  "SESSION_BUSY",
+                  "SESSION_INTERACTIVE_BUSY"
+                ],
+                "x-note": "Rust-only 被動忙碌分類；session.self_test 未執行 probe"
+              },
+              "session": {
+                "$ref": "#/$defs/SessionPublic"
+              },
+              "recommended_action": {
+                "type": "string",
+                "const": "wait"
+              },
+              "interactive_owner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "x-note": "lease 擁有者（human:<client>／agent 等）；無 lease 為 null"
+              },
+              "human_attached": {
+                "type": "boolean",
+                "x-updated-by": "請求當下由 lease.owner 是否以 human: 開頭判定"
+              },
+              "human_active": {
+                "type": "boolean",
+                "x-unit": "s（判定窗 HUMAN_ACTIVE_WINDOW_S=60.0）",
+                "x-updated-by": "請求當下由 bridge.last_human_input_at 與 time.monotonic() 判定"
+              },
+              "recovery_mode": {
+                "type": "boolean"
+              },
+              "command_capable": {
+                "type": "boolean",
+                "x-note": "由 Rust service 在所有分支最外層追加"
+              }
+            },
+            "required": [
+              "ok",
+              "classification",
+              "session",
+              "recommended_action",
+              "interactive_owner",
+              "human_attached",
+              "human_active",
+              "recovery_mode",
+              "command_capable"
             ]
           }
-        ]
+        ],
+        "x-rust-note": "Rust 0.5.1 執行 probe 的分支另回 probe_evidence；busy 分支與 Python 0.4.x wire 分支保持各自語意"
       },
       "errors": [
         "INVALID_ARGS",
@@ -7871,25 +8077,25 @@
       ],
       "side_effects": [
         {
-          "what": "送 ready_probe（${nonce} 換成 uuid4 前 8 碼）到 UART（source system:self_test）；TX 非冪等",
+          "what": "Python 0.4.x 送 ready_probe（${nonce} 換成 uuid4 前 8 碼）；Rust 0.5.1 送 POSIX shell 執行框架（source system:self_test），執行標記不在 TX；TX 非冪等",
           "when": "on_success",
           "idempotent": false,
-          "x-condition": "僅於未命中早退分類（SESSION_NOT_FOUND／RELEASED／SESSION_RECOVERING／HUMAN_INTERACTIVE_ACTIVE／DEVICE_MISSING／DEVICE_REBOUND_REQUIRED／BRIDGE_DOWN／VTTY_STALE／AUTOBOOT_QUIET）時才送出",
+          "x-condition": "僅於未命中早退分類（SESSION_NOT_FOUND／RELEASED／SESSION_RECOVERING／HUMAN_INTERACTIVE_ACTIVE／DEVICE_MISSING／DEVICE_REBOUND_REQUIRED／BRIDGE_DOWN／VTTY_STALE／AUTOBOOT_QUIET）時才送出；Rust SESSION_BUSY／SESSION_INTERACTIVE_BUSY 分支被動回覆且零 probe TX",
           "x-uart-tx": "possible"
         },
         {
-          "what": "last_probe_at 更新；human lease 時 suspend／resume interactive",
+          "what": "Python 0.4.x 依既有分支更新 last_probe_at，human lease 時 suspend／resume；Rust 0.5.1 僅在獲准執行 probe 時更新 last_probe_at，busy 不更新，human suspend token 於本 probe 收尾配對結算",
           "when": "always",
           "idempotent": false,
-          "x-condition": "僅 session 存在時（SESSION_NOT_FOUND 早退前不執行）"
+          "x-condition": "Python：僅 session 存在時（SESSION_NOT_FOUND 早退前不執行）；Rust：busy 分支不執行此副作用"
         },
         {
-          "what": "nonce 回應且 prompt 成立時 confirm_ready()（清 quiet 與 pending）",
+          "what": "Python 0.4.x 依 nonce 回應與 prompt 呼叫 confirm_ready()；Rust 0.5.1 僅四項 probe_evidence 全真且 op、epoch、FSM 證據世代有效時 confirm_ready()",
           "when": "on_success",
           "idempotent": false
         },
         {
-          "what": "FLASHING 狀態亦會走 nonce probe 分支（H-07）",
+          "what": "Python 0.4.x FLASHING 狀態亦可能走 nonce probe 分支（H-07）；Rust 0.5.1 保留既有前置分類，不以此條改變狀態政策",
           "when": "on_success",
           "idempotent": false,
           "x-condition": "僅於未命中早退分類（SESSION_NOT_FOUND／RELEASED／SESSION_RECOVERING／HUMAN_INTERACTIVE_ACTIVE／DEVICE_MISSING／DEVICE_REBOUND_REQUIRED／BRIDGE_DOWN／VTTY_STALE／AUTOBOOT_QUIET）時才送出",
@@ -7904,6 +8110,10 @@
       "source": "sw_core/service.py:762-772 → self_test sw_core/session_manager.py:4286",
       "x-notes": {
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
+      },
+      "x-rust-behavior": {
+        "busy": "SESSION_BUSY 與 SESSION_INTERACTIVE_BUSY 是 Rust-only 被動回應：recommended_action=wait，不附 probe_ok／probe_evidence，不送 probe TX、不 suspend human、不更新 last_probe_at、不 confirm_ready。前景 busy 包含有效 queue、login／Recover、agent lease、另一個 probe 與進行中的 background capture。",
+        "executed_probe": "Rust 以 POSIX shell 框架執行 configured ready_probe，成功後才由 printf 輸出不在 TX 中的 nonce 標記。只有完整 TX、execution_marker、probe_rc_zero、prompt_after_marker 與仍有效的 op／epoch／證據世代全成立時才 probe_ok 並 confirm_ready；執行過 probe 的回應必帶四項 probe_evidence。Python 0.4.x nonce probe 分支與 last_probe_at／confirm 規則維持既有基線。"
       }
     },
     "session.unpin": {

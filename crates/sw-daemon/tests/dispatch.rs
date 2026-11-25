@@ -5008,7 +5008,7 @@ fn gpx_rpc_reprobe_skipped_while_human_types() {
 }
 
 /// S2-GP-gpx ITEM 5：`timeout_s=1e300` 的 READY self-test 後 side lane 仍能在期限內完成一般呼叫。
-/// Python `service.py:1090-1099` 直通 `session_manager.py:7926-7934` 的回應形狀另由黑箱固定。
+/// Python `service.py:1090-1099` 直通 `session_manager.py:7926-7934` 的基準欄位另由黑箱固定；Rust 另加 BC-13 證據欄位。
 #[test]
 fn gpx_rpc_self_test_huge_timeout_keeps_side_lane() {
     let r = ServiceRig::ready_shell();
@@ -5027,7 +5027,7 @@ fn gpx_rpc_self_test_huge_timeout_keeps_side_lane() {
     let normal = normal.unwrap();
     assert_eq!(keys(&huge), vec![
         "ok", "classification", "session", "attached_real_path", "current_real_path", "attached_vtty",
-        "bridge_generation", "probe_ok", "recommended_action", "interactive_owner", "human_attached",
+        "bridge_generation", "probe_ok", "recommended_action", "probe_evidence", "interactive_owner", "human_attached",
         "human_active", "recovery_mode", "command_capable", "version",
     ], "Python self-test response shape：{}", j(&huge));
     assert_eq!(huge.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&huge));

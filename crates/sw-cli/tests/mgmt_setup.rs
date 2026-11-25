@@ -2498,6 +2498,26 @@ fn plain_setup_waits_for_existing_install_lock_holder() {
     assert!(t.rpc().requests().is_empty());
 }
 
+#[test]
+fn p277_supervision_switch_waits_for_install_lock_before_hold() {
+    let t = TestEnv::windows()
+        .with_real_service()
+        .with_config("supervision_mode: windows-task\n")
+        .with_install_lock_holder();
+    let config_before = t.config_bytes();
+
+    let (rc, out, _) = t.run(&["supervision-mode", "set", "on-demand"]);
+
+    assert_eq!(rc, 2, "監管切換須等待 windows-task 生命週期鎖：{out}");
+    let response = json(&out);
+    assert_eq!(str_field(&response, "error_code"), "TIMEOUT");
+    assert_eq!(str_field(&response, "phase"), "install_lock");
+    assert!(t.calls().is_empty(), "取得鎖前不得操作監管工作");
+    assert!(t.rpc().requests().is_empty(), "取得鎖前不得停止 daemon");
+    assert!(!t.state_dir().join("autostart-hold.json").exists());
+    assert_eq!(t.config_bytes(), config_before);
+}
+
 fn restart_request(
     t: &TestEnv,
     old_mode: sw_pal::traits::SupervisionMode,

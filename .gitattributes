@@ -32,3 +32,8 @@ scripts/rust/goldens/pyre_corpus.txt text eol=lf
 # 架構文件以位元組雜湊與逐位元組重建驗證（docs/architecture/toolchain.json）；加工工具與 skill 副本以 sha256 比對。跨平台檢出不得轉換行尾
 docs/architecture/** -text
 tools/architecture_overlay.py -text
+
+# Stage 3 凍結工具、公開證據與退役 metadata 以原始位元組計算雜湊；Windows checkout 不做任何 EOL 轉換。
+tools/stage3/** -text
+docs/rust-refactor/evidence/** -text
+packaging/python_daemon_retirement.json -text

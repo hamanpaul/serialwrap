@@ -20,8 +20,9 @@ use sw_pal::proc_scan::{is_serialwrapd_argv, extract_socket_arg, ArgvFlavor, Dae
 use sw_pal::PalErrorKind;
 use sw_proto::pyjson::{PyInt, PyValue};
 
-/// `health.ping` 與 `health.status` 的成功回應（pid 與版本欄位即可）。
-const PING_OK: &str = r#"{"ok":true,"pid":4321,"version":"0.4.0"}"#;
+/// 正式 `health.ping` 成功回應；PID 只由 `health.status` 提供。
+const PING_OK: &str = r#"{"ok":true,"pong":true}"#;
+const HEALTH_STATUS_OK: &str = r#"{"ok":true,"pid":4321,"version":"0.4.0"}"#;
 /// `session list` 的成功回應（與 P3 client 形狀一致）。
 const SESSION_LIST_OK: &str = r#"{"id":1,"ok":true,"sessions":[],"version":"0.4.0"}"#;
 /// `env -0` 的 bash 呼叫（與 P4-T7 `load_daemon_env` 的 POSIX 路徑逐字一致）。
@@ -338,7 +339,14 @@ fn start_routes_windows_task_to_schtasks() {
         .with_config("supervision_mode: windows-task\n")
         .with_real_service();
     let (_, _, _) = t.run(&["daemon", "start"]);
-    assert_eq!(t.calls(), vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])]);
+    // #276：daemon start 轉送 service start，同樣先恢復啟用再 /Run。
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
+    );
 }
 
 #[test]
@@ -1219,4 +1227,350 @@ fn autostart_waits_on_update_hold_lock() {
     assert_eq!(rc, 0, "{out}");
     assert!(t.process().spawns().is_empty());
     assert_eq!(rpc_count(&t, "session.list"), 1);
+}
+
+#[test]
+fn p277_daemon_start_rechecks_journal_after_transaction_wait() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_creating_journal(3.0)
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (rc, out, err) = t.run(&["daemon", "start"]);
+    let response = json(&out);
+
+    assert_eq!(rc, 2, "journal hold 下沿用停用工作的 /Run 結果：{out}");
+    assert_eq!(fstr(&response, "_routed_to"), "service start");
+    assert_eq!(fstr(&response, "mode"), "windows-task");
+    assert_eq!(fstr(&response, "action"), "start");
+    assert_eq!(field(&response, "rc"), &PyValue::Int(PyInt::Small(1)));
+    assert!(!out.contains("\"phase\""), "hold 路徑不得新增 phase：{out}");
+    assert_eq!(
+        t.calls(),
+        vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])],
+        "daemon start 必須轉送共用 hold 分支，且不得 /ENABLE"
+    );
+    assert!(
+        t.journal_bytes().is_some(),
+        "持鎖交易應在釋放前建立 journal"
+    );
+    assert!(err.contains("更新／回滾進行中"), "{err}");
+    assert!(err.contains("install-journal.json"), "{err}");
+    assert!(err.contains("請待 serialwrap setup 完成"), "{err}");
+}
+
+#[test]
+fn p277_daemon_start_preserves_interrupted_update_hold() {
+    let mut t = TestEnv::windows()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_supervisor_state("windows-task", true, true)
+        .with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
+        .with_crash_at("stop_supervisor:after_hold")
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (setup_rc, _, setup_err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(
+        setup_rc, 137,
+        "setup 未在 hold 後的 crash point 中斷：{setup_err}"
+    );
+
+    let journal_before = t.journal_bytes().expect("setup 中斷後必須留下真實 journal");
+    assert_eq!(t.journal_json().unwrap()["step"], "stop_supervisor");
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    assert!(
+        !hold_path.exists(),
+        "windows-task update hold 不使用 switch 檔"
+    );
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下不得 /ENABLE"
+    );
+
+    let calls_before_start = t.calls().len();
+    t.clear_crash();
+    t.use_real_service();
+    let (rc, out, err) = t.run(&["daemon", "start"]);
+    let response = json(&out);
+
+    assert_eq!(rc, 2, "daemon start 必須沿用停用工作的 /Run 結果：{out}");
+    assert_eq!(fstr(&response, "_routed_to"), "service start");
+    assert_eq!(fstr(&response, "mode"), "windows-task");
+    assert_eq!(fstr(&response, "action"), "start");
+    assert_eq!(field(&response, "rc"), &PyValue::Int(PyInt::Small(1)));
+    assert!(!out.contains("\"phase\""), "不得新增 phase：{out}");
+    assert_eq!(
+        &t.calls()[calls_before_start..],
+        vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])],
+        "真實 journal hold 下 daemon start 只可 /Run，不得 /ENABLE"
+    );
+    assert!(err.contains("UNKNOWN_ERROR"), "沿用既有錯誤碼輸出：{err}");
+    assert!(err.contains("更新／回滾進行中"), "{err}");
+    assert!(err.contains("install-journal.json"), "{err}");
+    assert!(err.contains("請待 serialwrap setup 完成"), "{err}");
+    assert_eq!(
+        err.matches("install-journal.json").count(),
+        1,
+        "journal hold 提示應只輸出一次：{err}"
+    );
+    assert_eq!(
+        t.journal_bytes().as_deref(),
+        Some(journal_before.as_slice()),
+        "daemon start 不得改寫 journal"
+    );
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下 daemon start 不得 /ENABLE"
+    );
+}
+
+#[test]
+fn p277_daemon_start_rechecks_mode_after_transaction_wait() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_switching_to_on_demand(3.0)
+        .with_rpc_ok(endpoint, "health.ping", PING_OK);
+
+    let actual = t.run(&["--endpoint", endpoint, "daemon", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: on-demand\n")
+        .with_rpc_ok(endpoint, "health.ping", PING_OK)
+        .run(&["--endpoint", endpoint, "daemon", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後須依 on-demand 重新分派");
+    assert_eq!(t.config_bytes(), b"supervision_mode: on-demand\n");
+    assert!(
+        !t.state_dir().join("autostart-hold.json").exists(),
+        "交錯期間不得建立 hold 檔"
+    );
+    assert!(
+        !t.calls()
+            .iter()
+            .any(|call| { call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run") }),
+        "重讀到 on-demand 後不得呼叫排程工作：{:?}",
+        t.calls()
+    );
+
+    // 第一次讀取是入口模式；第二次在鎖內讀到 on-demand。若釋鎖後再次讀設定，
+    // 測試替身會在那次讀取前切成 windows-task，確保本次命令仍沿用鎖內結果。
+    let interleaved = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_switching_to_on_demand(3.0)
+        .with_rpc_ok(endpoint, "health.ping", PING_OK)
+        .with_config_rewritten_on_nth_read(3, b"supervision_mode: windows-task\n");
+    let raced = interleaved.run(&["--endpoint", endpoint, "daemon", "start"]);
+
+    assert_eq!(raced, expected, "不得在鎖外重讀並改派至 windows-task");
+    assert_eq!(
+        interleaved
+            .event_order()
+            .count_prefix("fs:install-lock:acquired"),
+        1,
+        "鎖內讀到 on-demand 後不得再次取得安裝鎖"
+    );
+    assert!(
+        !interleaved.config_rewrite_applied(),
+        "本次分派不得讀取鎖外切成 windows-task 的設定"
+    );
+    assert_eq!(
+        interleaved.config_bytes(),
+        b"supervision_mode: on-demand\n",
+        "鎖內重讀後的模式應維持本次分派依據"
+    );
+    assert!(
+        !interleaved
+            .calls()
+            .iter()
+            .any(|call| { call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run") }),
+        "重新分派不得呼叫 /ENABLE 或 /Run：{:?}",
+        interleaved.calls()
+    );
+}
+
+#[test]
+fn p277_daemon_start_preserves_non_serializable_mode_after_transaction_wait() {
+    let contents = b"supervision_mode: 2020-01-01\n";
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_writing_config(1.0, contents);
+
+    let actual = t.run(&["daemon", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: 2020-01-01\n")
+        .with_real_service()
+        .run(&["daemon", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後需保留 daemon start 直接解析新模式的輸出");
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run")
+        }),
+        "不可序列化模式不得呼叫排程工作：{:?}",
+        t.calls()
+    );
+}
+
+#[test]
+fn p277_nested_autostart_passes_held_lock_to_windows_task_start() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_kind(endpoint, PalErrorKind::ConnectionRefused);
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_eq!(t.config_bytes(), b"supervision_mode: windows-task\n");
+    assert!(
+        !out.contains("TIMEOUT") && !err.contains("TIMEOUT"),
+        "nested start 不得因重取同一把鎖而逾時：rc={rc}, out={out}, err={err}"
+    );
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ],
+        "nested start 應沿用外層持有的 autostart.lock，並完成 windows-task 動作"
+    );
+}
+
+#[test]
+fn p277_nested_autostart_waits_for_windows_task_daemon_readiness() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_then_ok(endpoint, "session.list", SESSION_LIST_OK)
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#)
+        .with_rpc_ok(endpoint, "health.status", HEALTH_STATUS_OK);
+    t.rpc().respond_at(
+        endpoint,
+        "health.ping",
+        t.clock().clone(),
+        Duration::from_secs(5),
+        PING_OK,
+    );
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_eq!(rc, 0, "daemon ready 後才重送原 RPC：out={out}, err={err}");
+    assert!(
+        err.contains("pid=4321"),
+        "PID 應另由 health.status 取得：{err}"
+    );
+    assert!(
+        t.clock().elapsed() >= Duration::from_secs(5),
+        "應等待到排程 daemon 回報 ready：{:?}",
+        t.clock().elapsed()
+    );
+    assert_eq!(rpc_count(&t, "session.list"), 1, "ready 前不得重送原 RPC");
+    assert_eq!(
+        rpc_count(&t, "health.status"),
+        1,
+        "PID 應由 health.status 查詢"
+    );
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
+    );
+}
+
+#[test]
+fn p277_nested_autostart_fails_when_windows_task_daemon_never_becomes_ready() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_then_ok(endpoint, "session.list", SESSION_LIST_OK)
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#);
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_ne!(rc, 0, "daemon 未 ready 不得回成功：out={out}, err={err}");
+    assert!(err.contains("DAEMON_NOT_READY"), "須回既有 not-ready 錯誤：{err}");
+    assert!(!err.contains("pid=0"), "不得以 pid=0 宣稱已啟動：{err}");
+    assert_eq!(rpc_count(&t, "session.list"), 0, "daemon ready 前不得重送原 RPC");
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
+    );
 }

@@ -4203,6 +4203,30 @@ pub fn run_supervision_switch(
     with_sudo: bool,
     force_requested: bool,
 ) -> i32 {
+    let old_mode = configured_mode_checked(ctx).ok();
+    let needs_lifecycle_lock = target == &SupervisionMode::WindowsTask
+        || old_mode.as_ref() == Some(&SupervisionMode::WindowsTask);
+    if !needs_lifecycle_lock {
+        return run_supervision_switch_unlocked(ctx, target, with_sudo, force_requested);
+    }
+
+    // windows-task start 也持有此既有安裝交易鎖；在 hold recovery／建立 hold 前先序列化。
+    let root = install_layout::resolve_install_root(ctx);
+    let install_lock = match install_layout::install_lock(ctx, &root) {
+        Ok(lock) => lock,
+        Err(response) => return emit(ctx, response, "supervision-mode", 2),
+    };
+    let result = run_supervision_switch_unlocked(ctx, target, with_sudo, force_requested);
+    drop(install_lock);
+    result
+}
+
+fn run_supervision_switch_unlocked(
+    ctx: &mut CliCtx<'_>,
+    target: &SupervisionMode,
+    with_sudo: bool,
+    force_requested: bool,
+) -> i32 {
     let recovered = match recover_autostart_hold(ctx) {
         Ok(value) => value,
         Err(response) => return emit(ctx, response, "supervision-mode", 2),
@@ -4483,7 +4507,48 @@ fn autostart_hold_path(ctx: &CliCtx<'_>) -> PathBuf {
     ctx.env.get("SERIALWRAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&ctx.paths.state_dir)).join("autostart-hold.json")
 }
 
-fn acquire_switch_autostart_lock(ctx: &mut CliCtx<'_>) -> Result<(), ErrorCode> {
+/// switch hold 涉及 windows-task 時，setup 復原前須加入安裝交易鎖。
+pub(crate) fn autostart_hold_involves_windows_task(ctx: &CliCtx<'_>) -> bool {
+    let path = autostart_hold_path(ctx);
+    let Ok(bytes) = ctx.p.fs.read(&path) else {
+        return false;
+    };
+    let Ok(PyValue::Dict(record)) = pyjson::loads(&String::from_utf8_lossy(&bytes)) else {
+        return false;
+    };
+    if record.get("op").and_then(as_str) != Some("supervision_set") {
+        return false;
+    }
+    let old_mode = record.get("old_mode").or_else(|| record.get("mode")).and_then(as_str);
+    let target_mode = record.get("target_mode").and_then(as_str);
+    old_mode == Some(SupervisionMode::WindowsTask.as_str())
+        || target_mode == Some(SupervisionMode::WindowsTask.as_str())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutostartHoldReason {
+    SupervisionSwitch,
+    InstallJournal,
+}
+
+/// 是否有更新或監管模式切換留下的 autostart hold（進行中或中斷皆算）。
+/// 有 hold 時監管項的停用狀態屬於 hold 的一部分，呼叫端不得自行恢復啟用（#276）。
+pub(crate) fn autostart_hold_present(ctx: &CliCtx<'_>) -> Option<AutostartHoldReason> {
+    if ctx.p.fs.exists(&autostart_hold_path(ctx)) {
+        return Some(AutostartHoldReason::SupervisionSwitch);
+    }
+    let journal = crate::install_layout::resolve_install_root(ctx)
+        .root
+        .join("install-journal.json");
+    ctx.p
+        .fs
+        .exists(&journal)
+        .then_some(AutostartHoldReason::InstallJournal)
+}
+
+pub(crate) fn acquire_switch_autostart_lock(
+    ctx: &mut CliCtx<'_>,
+) -> Result<(), ErrorCode> {
     if ctx.autostart_lock.as_ref().is_some_and(|guard| guard.is_held()) {
         return Ok(());
     }

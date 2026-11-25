@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -80,6 +81,56 @@ def _finish_test_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str
     finish_test_rig(bridge, daemon, cli, env)
 
 
+def _wait_bridge_quiet(bridge: BridgeTarget) -> None:
+    """等 TX 的兩個 bridge 觀測點都落盤，再取穩定的零 TX 快照。"""
+    result = bridge.control.call(
+        "barrier", {"mode": "passive", "quiet_ms": 500, "timeout_ms": 10000},
+    )
+    assert result.get("settled") is True, f"UART bridge 未在期限內靜止：{result!r}"
+
+
+def _hold_cmd_tx_rows(env: dict[str, str], cmd_id: str) -> list[dict]:
+    return [
+        row for row in wal_rows(env)
+        if row.get("dir") == "TX" and row.get("cmd_id") == cmd_id
+    ]
+
+
+def _hold_cmd_wal_evidence(env: dict[str, str], cmd_id: str) -> str:
+    rows = _hold_cmd_tx_rows(env, cmd_id)
+    if not rows:
+        return f"cmd_id={cmd_id} 的 WAL TX：<無紀錄>"
+
+    details = []
+    for row in rows:
+        try:
+            payload = base64.b64decode(row.get("payload_b64") or "", validate=True).decode(
+                "utf-8", errors="replace",
+            )
+        except Exception as exc:
+            payload = f"<解碼失敗 {type(exc).__name__}: {exc}>"
+        details.append(
+            f"seq={row.get('seq')!r} wall_ts={row.get('wall_ts')!r} "
+            f"source={row.get('source')!r} len={row.get('len')!r} payload={payload!r}"
+        )
+    return f"cmd_id={cmd_id} 的 WAL TX（{len(rows)} 筆）：\n" + "\n".join(details)
+
+
+def _wait_for_hold_cmd_wal_tx(env: dict[str, str], cmd_id: str, timeout_s: float = 10.0) -> list[dict]:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        rows = _hold_cmd_tx_rows(env, cmd_id)
+        if rows:
+            return rows
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"hold cmd_id={cmd_id} 的 TX 未於 {timeout_s:.1f}s 內寫入 daemon WAL；"
+                f"{_hold_cmd_wal_evidence(env, cmd_id)}"
+            )
+        time.sleep(min(0.02, remaining))
+
+
 def _serialwrapd_pids() -> set[int]:
     """掃描 /proc 中 cmdline 含 serialwrapd 的行程；非 Linux（無 /proc）回傳空集合。"""
     proc_root = Path("/proc")
@@ -148,7 +199,7 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str]) -> None:
 @pytest.mark.rust_only
 @pytest.mark.pidns_rig
 def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
-    """背景 hold 命令期間更新回 SESSION_BUSY，拒絕前後 DUT TX delta 為零。"""
+    """背景 hold 命令期間更新回 SESSION_BUSY，hold 的 WAL TX 恰一筆且 DUT wire TX 不增加。"""
     old, new = update_bundles()
     old_cli = _install_old(old, env, tmp_path)
     bridge, daemon = _start_test_rig(tmp_path, env)
@@ -160,13 +211,29 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
         cmd_id = submitted["cmd_id"]
         # daemon 送出的行尾依平台而異：POSIX 為 LF，Windows 為 CR（與 TX 實際位元組一致）。
         wait_wire_contains(bridge.evidence_dir, b"hold\n" if os.name != "nt" else b"hold\r")
+        _wait_bridge_quiet(bridge)
+        hold_tx_before = _wait_for_hold_cmd_wal_tx(env, cmd_id)
+        assert len(hold_tx_before) == 1, (
+            f"更新前 hold cmd_id={cmd_id} 的 WAL TX 必須恰好一筆，實際 {len(hold_tx_before)} 筆；"
+            f"{_hold_cmd_wal_evidence(env, cmd_id)}"
+        )
         tx_before = tx_bytes(bridge.evidence_dir)
 
         result = run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=120.0)
+        _wait_bridge_quiet(bridge)
         data = json_stdout(result)
         assert result.returncode == 2, result.stdout + result.stderr
         assert data.get("error_code") == "SESSION_BUSY", data
-        assert tx_bytes(bridge.evidence_dir) == tx_before
+        hold_tx_after = _hold_cmd_tx_rows(env, cmd_id)
+        assert len(hold_tx_after) == 1 and len(hold_tx_after) == len(hold_tx_before), (
+            f"SESSION_BUSY 拒絕窗口內 hold cmd_id={cmd_id} 的 WAL TX 必須維持恰好一筆；"
+            f"拒絕前={len(hold_tx_before)}，拒絕後={len(hold_tx_after)}。\n"
+            f"{_hold_cmd_wal_evidence(env, cmd_id)}"
+        )
+        assert tx_bytes(bridge.evidence_dir) == tx_before, (
+            f"SESSION_BUSY 拒絕窗口內 DUT wire TX 不得增加。\n"
+            f"{_hold_cmd_wal_evidence(env, cmd_id)}"
+        )
         assert daemon_pid(env) == daemon.proc.pid
         assert installed_version(env) == OLD_BUNDLE_VERSION
     finally:

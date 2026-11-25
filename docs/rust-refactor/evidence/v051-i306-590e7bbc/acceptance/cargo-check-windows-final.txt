@@ -1,0 +1,56 @@
+warning: unused import: `getsockopt`
+  --> crates/sw-pal/src/console_tcp/windows.rs:13:23
+   |
+13 |     bind as wsa_bind, getsockopt, listen as wsa_listen, recv, send, setsockopt,
+   |                       ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `posix::PosixDeviceSource`
+  --> crates/sw-pal/src/device_source/mod.rs:14:16
+   |
+14 | pub(crate) use posix::PosixDeviceSource;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `escape_comm_function` is never read
+  --> crates/sw-pal/src/console_com0com/windows.rs:44:5
+   |
+42 | struct CommApiCounters {
+   |        --------------- field in this struct
+43 |     set_comm_state: AtomicU32,
+44 |     escape_comm_function: AtomicU32,
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `counters` is never read
+  --> crates/sw-pal/src/console_com0com/windows.rs:66:5
+   |
+59 | struct Com0comState {
+   |        ------------ field in this struct
+...
+66 |     counters: CommApiCounters,
+   |     ^^^^^^^^
+
+warning: function `api_call_counts` is never used
+   --> crates/sw-pal/src/console_com0com/windows.rs:440:15
+    |
+440 | pub(crate) fn api_call_counts(id: u64) -> (u32, u32) {
+    |               ^^^^^^^^^^^^^^^
+
+warning: struct `PosixDeviceSource` is never constructed
+  --> crates/sw-pal/src/device_source/posix.rs:49:19
+   |
+49 | pub(crate) struct PosixDeviceSource {
+   |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/sw-pal/src/device_source/posix.rs:55:19
+   |
+54 | impl PosixDeviceSource {
+   | ---------------------- associated function in this implementation
+55 |     pub(crate) fn new(dirs: Vec<PathBuf>, allowlist: Option<Vec<String>>) -> Self {
+   |                   ^^^
+
+warning: `sw-pal` (lib) generated 7 warnings (run `cargo fix --lib -p sw-pal` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s

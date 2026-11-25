@@ -29,7 +29,9 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 ## 標準執行順序（Agent 必須遵守）
 1. 健康檢查：`serialwrap daemon status`。
 2. 探測資源：`serialwrap session list`、`serialwrap device list`。
-3. 鎖定目標：`serialwrap session self-test --selector COM0`（回報 classification 與 recommended_action）。
+3. **只有 session 狀態不明時才做診斷**：`serialwrap session self-test --selector COM0`（回報 classification 與 recommended_action）。每次命令前不必 probe；self-test 是當下診斷，不會鎖定目標或保留下一個 RPC 的操作權。
+   - **忙碌時的 self-test 是被動式回應，不發 probe、不送 TX**：若前景槽仍有在途命令、有效 queue、login／recover 或進行中的 background capture，回應為 `ok: true`、`classification: "SESSION_BUSY"`、`recommended_action: "wait"`；有效 agent interactive lease 則回 `classification: "SESSION_INTERACTIVE_BUSY"`。兩種回應都**不附 `probe_ok`**，也不更新 `last_probe_at`、不 suspend human、不確認 ready、不清除 readiness pending。操作者應等待前景操作或 capture 結束後重跑 self-test；也可依既有規則由下一個命令終結 background capture。忙碌不代表故障，只表示當下不適合探測。
+   - probe 實際執行時才有 `probe_evidence`：`tx_complete`、`execution_marker`、`probe_rc_zero`、`prompt_after_marker`。四項全真且 op／連線 epoch／證據世代有效，才可確認 READY。完整回應語意見 [Self-test 行為](../../../docs/self-test.md)。
 4. 若 session 未 READY、tty 已變更、或 bridge stale：
    - tty 變更／需重綁：`serialwrap session bind --selector COM0 --device-by-id <by-id>` → `serialwrap session attach --selector COM0`。
    - 不健康／`TARGET_UNRESPONSIVE`：`serialwrap session recover --selector COM0`（非 device attach；可加 `--force` 做 clear+reattach+wait-ready）。
@@ -249,7 +251,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 長流命令（`logread -f`、`tcpdump`、kernel debug）：`--mode background` 不會讓命令脫離 `--cmd-timeout` 期限，到點（或靜默超過上限）一樣被 Ctrl-C 結束，期間也佔住該 session 的命令佇列。限時抓取可用 `--mode background` 並把 `--cmd-timeout` 設成想抓的時長；要長時間或可能靜默的，改在板上丟背景（見「`cmd submit` 的期限語意」）。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
-- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
+- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 ## `--source` 的語意
 `--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner` 的字串**不只是追蹤標籤**：daemon 用它的**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
@@ -269,7 +271,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
-- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
+- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，超過的 `cmd submit` 在提交時就回 `CMD_TOO_LONG`（零 TX，`limit` 為該 profile 的值）；收到時縮短命令，或把內容寫成腳本 `file push` 上去再執行。broker 的全域上限（4 KB warning／16 KB reject）可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼；profile 的 `max_console_line_chars` 不在 `limits` 中，以 profile 設定為準。
 - **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`。小檔（數十 KB 內）改用 `serialwrap file push`；firmware image 這類大檔在 DUT 有網路通道時一律走 SCP／TFTP，不要交給 `file push`（界線見「透過 UART 推送／拉取檔案」）。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
 - **長命令**：`--expected-duration <秒>` 只延長總期限、不延長靜默上限（見「`cmd submit` 的期限語意」）；會靜默的長命令在板上 `setsid … &` 丟背景再用短命令輪詢，不要靠它硬撐。
@@ -372,7 +374,7 @@ PY
 | `CMD_CONTAINS_NEWLINE` | rpc／posix、windows | 修正參數後 | 命令字串含換行字元，拒絕送入 UART | 移除命令中的換行並以單行命令重送 |
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
-| `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交 | 縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
+| `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，或超過 session profile 的 max_console_line_chars（console 單行上限，不含結尾換行），拒絕提交；limit 為實際套用的上限 | 縮短命令內容；limit 是 profile 的 console 單行上限時，做不到就把內容寫成腳本，以 file push 傳到 target 後執行。超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
 | `COMMAND_ABORTED_IN_FLIGHT` | rpc、rec／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止；file.push／file.pull 為傳輸已寫出至少 1 byte 後，因 drain、世代過期或取消而中止（OD-62） | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態；file.push 另需確認 remote_path 與 /tmp/.sw_upload_* 後再決定是否重新傳輸 |
 | `COMMAND_FAILED` | rec／posix、windows | 否 | 命令結果為 ok:false 但未帶 error_code 時的後備碼 | 視為失敗，先以 session self-test 確認狀態 |
 | `CONSOLE_LINE_LIMIT_TOO_SMALL` | rpc／posix、windows | 否 | profile 的 max_console_line_chars 太小，放不下傳輸必要的命令 | 調大 profile 的 max_console_line_chars 後重試 |
@@ -396,7 +398,7 @@ PY
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rpc、rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）；file.push／file.pull 為傳輸尚未寫出任何 byte 即因 drain、世代過期或取消而中止（OD-62） | 確認 session 已回到 READY 後才可重送 |
-| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
+| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 視情況 | daemon 停止時，尚未執行的排隊命令被清空（未送出）；在途的 session.self_test、session.recover、session.interactive_open 與 session.interactive_send 可能已送出 bytes，須依裝置狀態確認實際副作用；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | 確認操作類型：排隊中且尚未送出的命令，待 daemon 重新啟動並確認 session 為 READY 後可重送；在途操作可能已送出 bytes，須先確認實際副作用，不得只憑此錯誤碼自動重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |

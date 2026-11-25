@@ -4,7 +4,7 @@
 //! `catch_unwind(core.on_event(..))` 隔離 panic，效果交 `EffectExecutor` 執行；1 s `Tick`。
 //! I/O 效果交給注入的 executor；定時事件與單調時鐘 tick 由 actor 排程。
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -54,6 +54,7 @@ pub struct ActorLatencyProbe {
 #[derive(Default)]
 struct ProbeInner {
     data_items: u64,
+    op_finished: u64,
     /// 最近處理的 data item 之開始時刻（單調 ns；上限 `PROBE_LOG_MAX`），timer／tick 見證數用。
     data_started: std::collections::VecDeque<u64>,
     log: std::collections::VecDeque<ProbeEntry>,
@@ -100,7 +101,18 @@ impl ActorLatencyProbe {
 
     /// 累計處理的 data item 數。
     pub fn data_items(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).data_items
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data_items
+    }
+
+    /// actor 已完成分派的 `OpFinished` 事件數。
+    pub fn op_finished_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .op_finished
     }
 
     /// 指定標籤的紀錄（`Release`、`CancelQueued`、`LeaseExpiry`、`Shutdown`、`WorkerStopped`、`Request`、`Timer`、`Tick`、`Control`）。
@@ -124,13 +136,24 @@ impl ActorLatencyProbe {
         g.data_started.push_back(started_ns);
     }
 
+    fn after_op_finished(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.op_finished = g.op_finished.saturating_add(1);
+    }
+
     /// actor 內部 timer／tick：到期時刻 `due_ns` 之後才開始處理的 data item 數。
     fn data_since(&self, due_ns: u64) -> u64 {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.data_started.iter().filter(|at| **at >= due_ns).count() as u64
     }
 
-    fn before_other(&self, label: &'static str, data_backlog: usize, data_while_waiting: u64, pre_dependency_data: u64) {
+    fn before_other(
+        &self,
+        label: &'static str,
+        data_backlog: usize,
+        data_while_waiting: u64,
+        pre_dependency_data: u64,
+    ) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.log.len() >= PROBE_LOG_MAX {
             g.log.pop_front();
@@ -193,8 +216,10 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         // OD-45：stop_request 的 L1 結構 gate（`at_most_one_data_item_before_control`）；drain_receipt 依 OD-64 為
         // `at_most_pre_dependency_data_plus_one`（見 `ProbeEntry::pre_dependency_data`）。
         MailboxItem::Control(ControlEvent::ShutdownGate { .. }) => Some("ShutdownGate"),
+        MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => Some("ShutdownFlushWaiters"),
         MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
+        MailboxItem::Control(ControlEvent::OpFinished { .. }) => Some("OpFinished"),
         #[cfg(feature = "test-fakes")]
         MailboxItem::Control(ControlEvent::ArmPanic { .. }) => Some("ArmPanic"),
         MailboxItem::Control(_) => Some("Control"),
@@ -205,7 +230,8 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
 fn probe_pause_label(item: &MailboxItem) -> Option<&'static str> {
     match item {
         MailboxItem::Control(ControlEvent::Request {
-            req: SessionRequest::Bind { .. } | SessionRequest::BindWithAck { .. }, ..
+            req: SessionRequest::Bind { .. } | SessionRequest::BindWithAck { .. },
+            ..
         }) => Some("Bind"),
         MailboxItem::Control(ControlEvent::LoginFinished { .. }) => Some("LoginFinished"),
         _ => probe_label(item),
@@ -248,7 +274,9 @@ impl ActorHandle {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(PyErr::value_error("internal timeout"))
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.disconnected_error()),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(self.disconnected_error())
+            }
         }
     }
 }
@@ -336,7 +364,9 @@ impl ActorHandle {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(PyErr::value_error("internal timeout"))
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.disconnected_error()),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(self.disconnected_error())
+            }
         }
     }
 
@@ -358,7 +388,9 @@ impl ActorHandle {
 /// 效果執行器（executor 在 actor thread 外的 IO worker 側實作；測試以替身實作）。
 pub trait EffectExecutor: Send {
     /// 單次事件的帳本輸入；無帳本的 sans-IO executor 以空帳本回覆。
-    fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> { None }
+    fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> {
+        None
+    }
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
     /// S2-PAR-wp510r R1: 效果立即回饋佇列（executor 推回的事件先於下一次 mailbox 收取被處理）。
     ///
@@ -372,7 +404,10 @@ pub trait EffectExecutor: Send {
         feedback: &mut std::collections::VecDeque<ControlEvent>,
     ) {
         if let Effect::ClaimByIdForRelease { by_id, .. } = e {
-            feedback.push_back(ControlEvent::ReleaseClaimed { by_id, claims: Vec::new() });
+            feedback.push_back(ControlEvent::ReleaseClaimed {
+                by_id,
+                claims: Vec::new(),
+            });
             return;
         }
         self.execute(e, tx, safety);
@@ -396,9 +431,11 @@ impl std::error::Error for SpawnError {
 }
 
 #[cfg(feature = "test-fakes")]
-static INJECT_ACTOR_SPAWN_FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INJECT_ACTOR_SPAWN_FAIL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(feature = "test-fakes")]
-static INJECT_ACTOR_SPAWN_FAIL_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static INJECT_ACTOR_SPAWN_FAIL_TARGET: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(feature = "test-fakes")]
 pub fn inject_actor_spawn_fail(n: usize) {
@@ -423,7 +460,14 @@ pub fn try_spawn_actor(
     exec: Box<dyn EffectExecutor>,
     clock: Arc<dyn Clock>,
 ) -> Result<ActorHandle, SpawnError> {
-    try_spawn_actor_with_reaper(core, mailbox, exec, clock, crate::custody::ActorId::allocate(), None)
+    try_spawn_actor_with_reaper(
+        core,
+        mailbox,
+        exec,
+        clock,
+        crate::custody::ActorId::allocate(),
+        None,
+    )
 }
 
 /// 支援帶不可變 ActorId 與回收者命令通道的 actor 啟動。
@@ -483,7 +527,8 @@ pub fn try_spawn_actor_with_reaper(
 
             let mut core = core;
             let mut timers: Vec<(u64, TimerEvent)> = Vec::new();
-            let mut immediate_feedback: std::collections::VecDeque<ControlEvent> = std::collections::VecDeque::new();
+            let mut immediate_feedback: std::collections::VecDeque<ControlEvent> =
+                std::collections::VecDeque::new();
             let mut processed = (0u64, 0u64);
             let mut next_tick = clock.mono_ns().saturating_add(1_000_000_000);
             let mut panic_type: Option<&'static str> = None;
@@ -491,7 +536,12 @@ pub fn try_spawn_actor_with_reaper(
 
             // 啟動效果在進入 loop 前執行
             for effect in startup_effects {
-                exec.execute_with_feedback(effect, &thread_control, &thread_safety, &mut immediate_feedback);
+                exec.execute_with_feedback(
+                    effect,
+                    &thread_control,
+                    &thread_safety,
+                    &mut immediate_feedback,
+                );
             }
 
             loop {
@@ -521,7 +571,12 @@ pub fn try_spawn_actor_with_reaper(
                 if let Some(index) = timers.iter().position(|(at, _)| *at <= now) {
                     let (_due, event) = timers.remove(index);
                     #[cfg(feature = "test-fakes")]
-                    thread_probe.before_other(timer_label(&event), mailbox.data_backlog(), thread_probe.data_since(_due), 0);
+                    thread_probe.before_other(
+                        timer_label(&event),
+                        mailbox.data_backlog(),
+                        thread_probe.data_since(_due),
+                        0,
+                    );
                     if dispatch(
                         &mut core,
                         MailboxItem::Control(ControlEvent::Timer(event)),
@@ -547,7 +602,12 @@ pub fn try_spawn_actor_with_reaper(
                         next_tick = next_tick.saturating_add(1_000_000_000);
                     }
                     #[cfg(feature = "test-fakes")]
-                    thread_probe.before_other("Tick", mailbox.data_backlog(), thread_probe.data_since(tick_due), 0);
+                    thread_probe.before_other(
+                        "Tick",
+                        mailbox.data_backlog(),
+                        thread_probe.data_since(tick_due),
+                        0,
+                    );
                     if dispatch(
                         &mut core,
                         MailboxItem::Control(ControlEvent::Tick),
@@ -587,6 +647,9 @@ pub fn try_spawn_actor_with_reaper(
                 #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
+                let is_op_finished =
+                    matches!(&item, MailboxItem::Control(ControlEvent::OpFinished { .. }));
+                #[cfg(feature = "test-fakes")]
                 let pause_label = probe_pause_label(&item);
                 #[cfg(feature = "test-fakes")]
                 let data_started = clock.mono_ns();
@@ -623,6 +686,10 @@ pub fn try_spawn_actor_with_reaper(
                     &mut panic_count,
                     &mut immediate_feedback,
                 );
+                #[cfg(feature = "test-fakes")]
+                if is_op_finished {
+                    thread_probe.after_op_finished();
+                }
                 if let Some(mark) = data_mark {
                     // 依賴事件只會在 current epoch 時判定；保留舊 epoch 的 dispatch watermark，
                     // 讓 OD-69 drain barrier 在 release 已清除 conn_epoch 後仍能確認 reader RX 已處理。
@@ -703,11 +770,16 @@ fn dispatch(
         | MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
             (Some(reply.clone()), "Request")
         }
+        MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => {
+            (None, "ShutdownFlushWaiters")
+        }
         MailboxItem::Control(ControlEvent::ConsoleConnected { .. }) => (None, "ConsoleConnected"),
         MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
         MailboxItem::Control(ControlEvent::DeviceAttached { .. }) => (None, "DeviceAttached"),
-        MailboxItem::Control(ControlEvent::DeviceAttachedRetry { .. }) => (None, "DeviceAttachedRetry"),
+        MailboxItem::Control(ControlEvent::DeviceAttachedRetry { .. }) => {
+            (None, "DeviceAttachedRetry")
+        }
         MailboxItem::Control(ControlEvent::DeviceDetached { .. }) => (None, "DeviceDetached"),
         MailboxItem::Control(ControlEvent::DeviceMissing) => (None, "DeviceMissing"),
         MailboxItem::Control(ControlEvent::EvictCapture { .. }) => (None, "EvictCapture"),
@@ -728,8 +800,12 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::StateCommitted { .. }) => (None, "StateCommitted"),
         MailboxItem::Control(ControlEvent::Tick) => (None, "Tick"),
         // P8 Task 8：flash 事件的 `FlashReply` 隨事件移入 core；panic 時被丟棄，呼叫端以通道斷線收斂。
-        MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. }) => (None, "FlashSyncProbeStart"),
-        MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => (None, "FlashProbeReleased"),
+        MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. }) => {
+            (None, "FlashSyncProbeStart")
+        }
+        MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => {
+            (None, "FlashProbeReleased")
+        }
         MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
         MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
         MailboxItem::Control(ControlEvent::CustodyClaimed { .. }) => (None, "CustodyClaimed"),
@@ -737,7 +813,9 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::CustodyTerminal { .. }) => (None, "CustodyTerminal"),
         MailboxItem::Control(ControlEvent::CustodyOffer { .. }) => (None, "CustodyOffer"),
         MailboxItem::Control(ControlEvent::PlaceholderOpened { .. }) => (None, "PlaceholderOpened"),
-        MailboxItem::Control(ControlEvent::HandoffWorkerPrepared { .. }) => (None, "HandoffWorkerPrepared"),
+        MailboxItem::Control(ControlEvent::HandoffWorkerPrepared { .. }) => {
+            (None, "HandoffWorkerPrepared")
+        }
         MailboxItem::Control(ControlEvent::RetireResult { .. }) => (None, "RetireResult"),
         #[cfg(feature = "test-fakes")]
         MailboxItem::Control(ControlEvent::ArmPanic { .. }) => (None, "ArmPanic"),
@@ -747,29 +825,68 @@ fn dispatch(
     let result = catch_unwind(AssertUnwindSafe(|| {
         // 只在可能開埠、交還或結算資源的事件讀帳本；RX／Tick 不可因查詢 manager 鎖而堵住唯讀 RPC。
         let observes_custody = match &item {
-            MailboxItem::Control(ControlEvent::Request { req: SessionRequest::GetState | SessionRequest::Activity, .. }) => false,
+            MailboxItem::Control(ControlEvent::Request {
+                req: SessionRequest::GetState | SessionRequest::Activity,
+                ..
+            }) => false,
             #[cfg(feature = "test-fakes")]
-            MailboxItem::Control(ControlEvent::Request { req: SessionRequest::RetiredDrainsForTest, .. }) => false,
-            MailboxItem::Control(ControlEvent::Request { .. }
-                | ControlEvent::DeviceAttached { .. } | ControlEvent::DeviceAttachedRetry { .. }
-                | ControlEvent::DeviceDetached { .. } | ControlEvent::DeviceMissing
-                | ControlEvent::BridgeOpened { .. } | ControlEvent::UartIoError { .. }
-                | ControlEvent::WorkerStopped(_) | ControlEvent::WorkerDrainTimeout { .. }
-                | ControlEvent::StateCommitted { .. } | ControlEvent::Shutdown { .. }
-                | ControlEvent::CustodyClaimed { .. } | ControlEvent::ReleaseClaimed { .. }
-                | ControlEvent::CustodyTerminal { .. } | ControlEvent::CustodyOffer { .. }
-                | ControlEvent::PlaceholderOpened { .. } | ControlEvent::HandoffWorkerPrepared { .. }
-                | ControlEvent::RetireResult { .. }) => true,
-            MailboxItem::Control(ControlEvent::Timer(TimerEvent::CustodyPoll | TimerEvent::DrainTimeout { .. } | TimerEvent::BindWaitTimeout { .. })) => true,
-            MailboxItem::Data(DataEvent::UartRxChunk { .. } | DataEvent::ConsoleInputBytes { .. } | DataEvent::ConsoleDisconnected { .. })
-                | MailboxItem::Control(ControlEvent::EvictCapture { .. } | ControlEvent::ConsoleCountChanged { .. }
-                    | ControlEvent::UartTxCompleted { .. } | ControlEvent::DrainDataBarrier { .. }
-                    | ControlEvent::OpFinished { .. } | ControlEvent::LoginFinished { .. } | ControlEvent::Tick
-                    | ControlEvent::ShutdownGate { .. }
-                    | ControlEvent::ConsoleConnected { .. } | ControlEvent::ConsoleScan { .. } | ControlEvent::HumanTxCompleted { .. }
-                    | ControlEvent::FlashSyncProbeStart { .. } | ControlEvent::FlashProbeReleased { .. }
-                    | ControlEvent::FlashSyncMatched { .. } | ControlEvent::FlashHolderGone { .. }
-                    | ControlEvent::Timer(TimerEvent::BootQuietExpired { .. } | TimerEvent::LeaseExpiry { .. } | TimerEvent::ForceRecoverPoll { .. })) => false,
+            MailboxItem::Control(ControlEvent::Request {
+                req: SessionRequest::RetiredDrainsForTest,
+                ..
+            }) => false,
+            MailboxItem::Control(
+                ControlEvent::Request { .. }
+                | ControlEvent::DeviceAttached { .. }
+                | ControlEvent::DeviceAttachedRetry { .. }
+                | ControlEvent::DeviceDetached { .. }
+                | ControlEvent::DeviceMissing
+                | ControlEvent::BridgeOpened { .. }
+                | ControlEvent::UartIoError { .. }
+                | ControlEvent::WorkerStopped(_)
+                | ControlEvent::WorkerDrainTimeout { .. }
+                | ControlEvent::StateCommitted { .. }
+                | ControlEvent::Shutdown { .. }
+                | ControlEvent::CustodyClaimed { .. }
+                | ControlEvent::ReleaseClaimed { .. }
+                | ControlEvent::CustodyTerminal { .. }
+                | ControlEvent::CustodyOffer { .. }
+                | ControlEvent::PlaceholderOpened { .. }
+                | ControlEvent::HandoffWorkerPrepared { .. }
+                | ControlEvent::RetireResult { .. },
+            ) => true,
+            MailboxItem::Control(ControlEvent::Timer(
+                TimerEvent::CustodyPoll
+                | TimerEvent::DrainTimeout { .. }
+                | TimerEvent::BindWaitTimeout { .. },
+            )) => true,
+            MailboxItem::Data(
+                DataEvent::UartRxChunk { .. }
+                | DataEvent::ConsoleInputBytes { .. }
+                | DataEvent::ConsoleDisconnected { .. },
+            )
+            | MailboxItem::Control(
+                ControlEvent::EvictCapture { .. }
+                | ControlEvent::ConsoleCountChanged { .. }
+                | ControlEvent::UartTxCompleted { .. }
+                | ControlEvent::DrainDataBarrier { .. }
+                | ControlEvent::OpFinished { .. }
+                | ControlEvent::LoginFinished { .. }
+                | ControlEvent::Tick
+                | ControlEvent::ShutdownGate { .. }
+                | ControlEvent::ShutdownFlushWaiters
+                | ControlEvent::ConsoleConnected { .. }
+                | ControlEvent::ConsoleScan { .. }
+                | ControlEvent::HumanTxCompleted { .. }
+                | ControlEvent::FlashSyncProbeStart { .. }
+                | ControlEvent::FlashProbeReleased { .. }
+                | ControlEvent::FlashSyncMatched { .. }
+                | ControlEvent::FlashHolderGone { .. }
+                | ControlEvent::Timer(
+                    TimerEvent::BootQuietExpired { .. }
+                    | TimerEvent::LeaseExpiry { .. }
+                    | TimerEvent::ForceRecoverPoll { .. },
+                ),
+            ) => false,
             #[cfg(feature = "test-fakes")]
             MailboxItem::Control(ControlEvent::ArmPanic { .. }) => false,
         };

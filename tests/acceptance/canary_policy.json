@@ -1,0 +1,89 @@
+{
+  "active_day": {
+    "min_distinct_submits": 20,
+    "min_snapshot_coverage_s": 3600
+  },
+  "collector": {
+    "episode_max_gap_factor": 3,
+    "gap_incident_s": 900,
+    "interval_s": 30,
+    "post_boot_grace_s": 300,
+    "reboot_corroboration_s": 60,
+    "result_poll_max_per_cycle": 50,
+    "unreachable_incident_polls": 3
+  },
+  "cycles": {
+    "coexist_bucket_s": 600,
+    "coexist_cap_per_day": 5,
+    "recover_cluster_s": 120
+  },
+  "decision_ref": null,
+  "frozen_at": null,
+  "frozen_by": null,
+  "incidents": {
+    "stuck_incident_s": 900
+  },
+  "platforms": {
+    "linux": {
+      "evidence_owner": null,
+      "quotas": {
+        "active_days": 14,
+        "cycles_max_type_share": 0.4,
+        "cycles_min_per_type": {
+          "dut_reboot": 10,
+          "flash": 0,
+          "handoff_release_attach": 10,
+          "hotplug_reattach": 5,
+          "human_agent_coexist": 10,
+          "planned_restart": 0,
+          "recovery": 5
+        },
+        "cycles_total": 50,
+        "submits": 5000
+      },
+      "utc_offset_changes": [],
+      "utc_offset_minutes": 480
+    },
+    "windows": {
+      "evidence_owner": null,
+      "quotas": {
+        "active_days": 14,
+        "cycles_max_type_share": 0.4,
+        "cycles_min_per_type": {
+          "dut_reboot": 10,
+          "flash": 0,
+          "handoff_release_attach": 10,
+          "hotplug_reattach": 5,
+          "human_agent_coexist": 10,
+          "planned_restart": 0,
+          "recovery": 5
+        },
+        "cycles_total": 50,
+        "submits": 5000
+      },
+      "utc_offset_changes": [],
+      "utc_offset_minutes": 480
+    }
+  },
+  "safety": {
+    "allowed_tx_source_regex": "^(agent:[A-Za-z0-9._:-]+|human:[A-Za-z0-9._:-]+|system|system:[a-z_]+|flash)$",
+    "human_replay_min_len": 8,
+    "resend_window_s": 3600
+  },
+  "schema_version": 1,
+  "status": "draft",
+  "submit_counting": {
+    "cmd_id_regex": "^[0-9a-f]{32}$",
+    "dedup_key": [
+      "host_id",
+      "cmd_id"
+    ],
+    "exclude_source_prefixes": [
+      "human:",
+      "system",
+      "flash"
+    ],
+    "require_terminal_result": true,
+    "source": "wal_tx_cmd_id"
+  }
+}

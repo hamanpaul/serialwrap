@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+
+running 6 tests
+UART_TX="( echo __READY__26047fa0 ) && printf '\\n__SW_ST_%s_OK__\\n' '26047fa0'\n"
+
+thread 'rpc_newline_prefixed_prompt_after_marker_confirms_ready' (96459) panicked at crates/sw-daemon/tests/self_test_safety.rs:426:5:
+assertion `left == right` failed: PyDict({"ok": Bool(true), "classification": Str("TARGET_UNRESPONSIVE"), "session": Dict(PyDict({"session_id": Str("t:COM0"), "profile": Str("t"), "com": Str("COM0"), "alias": Str("t+1"), "act_no": Int(Small(1)), "device_by_id": Str("/s/by-id/usb-A"), "platform": Str("shell"), "profile_source": Str("yaml-target"), "command_capable": Bool(true), "state": Str("READY"), "last_error": Null, "last_error_detail": Null, "detached_at": Null, "last_ready_at": Str("1970-01-01T00:00:00.300000+00:00"), "vtty": Null, "attached_real_path": Str("/fake/tty-A"), "bridge_generation": Int(Small(1)), "recovering": Bool(false), "interactive_session_id": Null, "foreground_busy": Bool(false), "fg_cmd_expected_duration_s": Null, "console_count": Int(Small(0)), "last_state_change_at": Str("1970-01-01T00:00:00.300000+00:00"), "last_rx_at": Str("1970-01-01T00:00:00.300000+00:00"), "last_tx_at": Str("1970-01-01T00:00:00.300000+00:00"), "last_probe_at": Str("1970-01-01T00:00:00.300000+00:00"), "reprobe_attempts": Int(Small(0)), "next_reprobe_at": Null, "reprobe_exhausted": Bool(false), "boot_quiet_remaining_s": Null, "ready_reconfirm_pending": Bool(false), "ready_reconfirm_failed": Bool(false), "ready_reconfirm_remaining_s": Null, "boot_evidence_wait_remaining_s": Null, "idle_for_ms": Int(Small(3010)), "last_rx_age_s": Float(3.0), "last_tx_age_s": Float(3.0), "rx_bytes_last_10s": Int(Small(84)), "rx_rate_bps": Int(Small(8)), "outstanding_commands": Int(Small(0)), "activity_classification": Str("active"), "released_by": Null, "released_at": Null, "released_reason": Null, "capture": Null, "drain_stalled": Bool(false), "drain_timeout_epoch": Null})), "attached_real_path": Str("/fake/tty-A"), "current_real_path": Str("/fake/tty-A"), "probe_ok": Bool(false), "recommended_action": Str("recover"), "probe_evidence": Dict(PyDict({"tx_complete": Bool(true), "execution_marker": Bool(true), "probe_rc_zero": Bool(true), "prompt_after_marker": Bool(false)})), "interactive_owner": Null, "human_attached": Bool(false), "human_active": Bool(false), "recovery_mode": Bool(false), "command_capable": Bool(true), "version": Str("0.0.0-t18")})
+  left: Bool(false)
+ right: Bool(true)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test rpc_probe_evidence_preserves_each_boolean ... ok
+test rpc_newline_prefixed_prompt_after_marker_confirms_ready ... FAILED
+test rpc_echo_only_target_remains_unconfirmed ... ok
+test rpc_probe_and_submit_have_deterministic_order ... ok
+test rpc_probe_evidence_reports_failure_scenarios_and_pending_state ... ok
+test rpc_self_test_busy_has_zero_probe_tx ... ok
+
+failures:
+
+failures:
+    rpc_newline_prefixed_prompt_after_marker_confirms_ready
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+error: test failed, to rerun pass `-p sw-daemon --test self_test_safety`

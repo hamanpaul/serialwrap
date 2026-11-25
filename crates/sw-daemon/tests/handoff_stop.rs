@@ -657,9 +657,9 @@ fn handoff_session_query_timeout_preserves_lease_ticket() {
     assert!(!r.svc.admission().frozen(), "查詢不完整不得凍結 admission");
 }
 
-/// 背景 TX（不經 admission、不持 lease；Python `bridge.send_bytes(b"probe\n", source="system:probe")` 的對應）：
-/// 經 COM 目前 bridge 的 TxWriter 以 `SelfTestProbe` 類別送出（epoch 取 Fence 的 `active_epoch`，permit 由 Fence 重驗）。
-/// 回傳 TxWriter 的回條通道。
+/// 以 TxWriter 直接安排一筆在途的背景命令 TX（不經 admission、不持 lease）。
+/// BC-13 的 SelfTestProbe 必須先有 actor reservation；此處測交接的通用在途 TX，使用 Command permit。
+/// epoch 取 Fence 的 `active_epoch`，permit 仍由 Fence 重驗；回傳 TxWriter 的回條通道。
 fn inject_background_tx(r: &ServiceRig, payload: &[u8], op: u64) -> crossbeam_channel::Receiver<TxReport> {
     inject_background_tx_on(r, "COM0", payload, op)
 }
@@ -683,9 +683,9 @@ fn inject_background_tx_on(
             epoch,
             owner_gen: 0,
             fsm_gen: 0,
-            class: TxClass::SelfTestProbe,
-            source: "system:probe".to_string(),
-            cmd_id: None,
+            class: TxClass::Command,
+            source: "agent".to_string(),
+            cmd_id: Some(format!("handoff-bg-{op}")),
             log: true,
             input_epoch: None,
             replay_hold: None,
@@ -1216,7 +1216,9 @@ fn handoff_ok_then_sc11_stop_order() {
     assert!(trace.contains(&TraceEvent::SessionsDrained { flushed: vec![], stalled: vec![] }), "{trace:?}");
 }
 
-/// force recover 的最後輪詢與一般 daemon.stop 交錯時，仍回 FORCE_RECOVER_TIMEOUT 並讓 daemon exit 0。
+/// force recover 的最後輪詢與一般 daemon.stop 交錯時，handler 收尾並讓 daemon exit 0。
+/// 0.5.1 起（BC-06，rulings/v051.md「i297 驗收重跑：handoff_stop force recover 期望」）：裝置拔除後 session 已是 DETACHED、
+/// 仍在輪詢的 force recover 等待者，於 Shutdown Phase 1 以 FLUSHED_BY_SHUTDOWN 立即回覆，不再等到自身逾時回 FORCE_RECOVER_TIMEOUT。
 #[test]
 fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
     let env = isolated_env();
@@ -1284,7 +1286,7 @@ fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
     let (stop, recover) = client.join().expect("daemon client thread");
 
     assert!(!stop.is_empty(), "daemon.stop 應收到 RPC 回覆");
-    assert!(recover.contains("FORCE_RECOVER_TIMEOUT"), "force recover 終態：{recover}");
+    assert!(recover.contains("\"error_code\":\"FLUSHED_BY_SHUTDOWN\""), "force recover 終態（BC-06 停機沖刷）：{recover}");
     assert_eq!(code, 0, "force recover handler 收斂後 daemon 應 exit 0：{:?}", trace.lock().unwrap());
 }
 

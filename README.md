@@ -95,8 +95,11 @@ console views, command result capture, and diagnostics.
 ### Prerequisites
 
 - **Linux x86_64 with glibc >= 2.39** (Ubuntu 24.04 or later)
-- **`/usr/bin/python3.12`** — the Python daemon runtime shipped in the bundle is
-  tied to this interpreter (the requirement goes away in 0.5.0 with the Rust daemon)
+- **`/usr/bin/python3.12`** — `install.sh` still checks it in 0.5.0. The daemon
+  that runs is now the Rust `serialwrapd`, but the bundle still ships a Python
+  runtime (`py/`) tied to this interpreter. Retiring the Python daemon is
+  scheduled for 1.0.0 (Stage 3); see
+  [Rust refactor: baseline comparison and benefits](#rust-refactor-benefits-en)
 - **curl** or **wget** — to download the release (not needed with `--bundle`)
 - **PyYAML** — shipped inside the bundle; no separate install
 - **jq** — required by the broker minicom route
@@ -489,6 +492,13 @@ A target inherits an omitted value from its template; an explicit target `null`
 clears that limit. A measured limit is still required on affected boards;
 upgrading does not set every prpl console to 505.
 
+In the Rust daemon, the same limit also applies to `cmd submit`: a command
+whose UTF-8 length exceeds the session's `max_console_line_chars` is rejected
+before anything is queued or transmitted, with `CMD_TOO_LONG` whose `limit` is
+the profile value (the 16 KB broker limit reports `limit: 16384`). Without the
+check such a command is truncated by the target, never reaches the prompt and
+times out. Profiles that leave the value unset keep the old behaviour.
+
 **Scope — small files only.** `file push` is meant for config files, scripts and
 probes (tens of KB). A UART at 115200 baud tops out around 11 KB/s raw, and the
 echo-ACK pacing below lowers that further, so an 81 MB firmware image would take
@@ -558,7 +568,7 @@ ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s
 
 ### Diagnostics and Recovery
 
-Start with:
+When the session state is uncertain, use these diagnostics:
 
 ```bash
 serialwrap session self-test --selector COM0
@@ -566,7 +576,17 @@ serialwrap doctor
 serialwrap daemon status
 ```
 
-Common classifications include `OK`, `DEVICE_MISSING`,
+`session self-test` is an optional, point-in-time diagnostic. It does not
+reserve the target for the next RPC. A busy response (`SESSION_BUSY` or
+`SESSION_INTERACTIVE_BUSY`) means no probe ran, not that the target is unhealthy.
+Wait for foreground work or a background capture to end, or let the next
+command end the capture under the existing rules. An executed Rust probe reports
+`probe_evidence` (`tx_complete`, `execution_marker`, `probe_rc_zero`, and
+`prompt_after_marker`); READY confirmation requires all four, including a prompt
+after the execution marker. See [Self-test behavior](docs/self-test.md).
+
+Common classifications include `OK`, `SESSION_BUSY`,
+`SESSION_INTERACTIVE_BUSY`, `DEVICE_MISSING`,
 `DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
 `REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`,
@@ -621,9 +641,12 @@ daemon restart.
 
 All detach-class paths — recovery, `session clear`, device release, rebind,
 hot unplug, re-attach — terminate not-yet-started commands with
-`FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. Both carry
-the same semantics: the command was never executed and can be resubmitted once
-the session is `READY` again.
+`FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. For Rust
+0.5.1, queued but not-yet-sent commands may be retried after `READY`, but
+in-flight `self_test`/`recover`/`interactive_open`/`interactive_send`
+operations can also return this code after bytes may already have been sent;
+verify side effects before retrying, and do not auto-resubmit just because the
+code is `FLUSHED_BY_SHUTDOWN` (BC-06).
 
 #### Attach and recovery errors (SC-34)
 
@@ -713,7 +736,7 @@ no caller action required:
   (`attach_session`'s `ATTACHED`-branch probe and `recover_session`'s
   `ATTACHED`-branch reprobe share one probe entry point, gated at that single
   point), the forced CTRL_C/CTRL_D keystrokes sent after a command timeout,
-  and `session self-test`'s READY-branch nonce probe (reported back as
+  and `session self-test`'s READY-branch verified execution probe (reported back as
   classification `AUTOBOOT_QUIET`). The daemon waits passively on RX instead.
   `session list` exposes the remaining time as `boot_quiet_remaining_s`.
 - **Released** immediately when RX matches the session's `login_regex` /
@@ -744,7 +767,7 @@ no caller action required:
   side effects (previously those bytes landed in the autoboot countdown and
   the command died 10 s later as `PROMPT_TIMEOUT`). **Since #162 the gate is
   cleared only by an actual READY re-confirmation** (attach probe / reboot
-  recovery / a successful self-test nonce — note the 2 s prompt-return after
+  recovery / a self-test with complete execution evidence — note the 2 s prompt-return after
   a `reboot` command is **not** a confirmation point: prpl/OpenWrt's `reboot`
   is asynchronous, the shell reprints its prompt within milliseconds while
   the board really is rebooting): window expiry or an RX prompt match alone no longer
@@ -901,8 +924,10 @@ human lease (OD-85).
 
 Each GitHub Release can carry `serialwrap-<version>-windows-x86_64.zip` next to
 the Linux tarball (built on GitHub-hosted `windows-latest`; the `SHA256SUMS`
-asset lists both). It is a Rust CLI plus the Python daemon on a private CPython
-3.12.3 runtime (PyYAML and pyserial included), so no system Python is needed.
+asset lists both). Since 0.5.0 both the CLI and the daemon in the zip are Rust
+(`serialwrapd.exe`; 0.4.1 shipped the Python daemon). The zip still carries a
+private CPython 3.12.3 runtime (`py\`, with PyYAML, pyserial, and `sw_core`),
+so no system Python is needed.
 It is **not code-signed** (SmartScreen may warn; verify the SHA-256 instead) and
 does **not** include com0com. Install (PowerShell):
 
@@ -1549,7 +1574,7 @@ serialwrap setup --with-com0com
 
 - **Lifecycle Control**: `daemon restart` provides two-reader-safe daemon recycling (stops the old daemon gracefully, waits up to 10 seconds for process exit and device handle release, and launches the new instance).
 - **Supervision Management**: `supervision-mode set <MODE>` switches active supervision between `on-demand`, `systemd-user`, `systemd-system`, `windows-task`, and `windows-service` (on Windows, `windows-service` outputs `pending_sudo` instructions for operator execution). Switching performs fail-closed safety preflight and atomic handoff (`daemon.handoff_stop`): active flashing, file transfers, in-flight commands, active leases, or unconfirmed probes refuse the switch; `--force` does not override this safety guard (records `force_ignored: true`).
-- **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure.
+- **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure. `daemon stop` disables the task while stopping and re-enables it afterwards; if the stop is interrupted midway (Ctrl-C, closed window) the task stays disabled, so `daemon start` / `service start` re-enable it before `schtasks /Run` only when neither the supervision-switch hold (`autostart-hold.json`) nor an update/rollback journal (`install-journal.json`) exists. Under either hold, start skips `/ENABLE`, preserves the existing `/Run` response and exit code, and prints a hold explanation to stderr (#276). Start waits up to 5 seconds for the install lock and 15 seconds for the autostart lock. A lock timeout returns exit code 2 and `TIMEOUT` (or the lock's error code) with the original `message`: install-lock failure keeps `phase=install_lock`, while autostart-lock failure keeps `phase=update_autostart_hold` and `reason=autostart_lock_timeout`. Neither response uses `hint` or invokes `/Run`. After acquiring both locks, start reloads `config.yaml`; if the mode is no longer `windows-task`, it releases the lifecycle locks and dispatches the original command once under the new mode. An on-demand `daemon start` continues through the regular daemon-start path. The hold check and `/ENABLE` / `/Run` run under the existing `.install.lock` and `autostart.lock` used by lifecycle transactions. A `supervision-mode set` involving `windows-task` also takes the install lock and can return `TIMEOUT` with `phase=install_lock`. Before setup recovers a switch hold involving `windows-task`, it also takes the existing install transaction lock, even when the hold exists before `.install.lock` has been created.
 - **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`. The first install that replaces a pipx 0.3.2 install has no previous bundle, so `setup --rollback` cannot return to that pipx install: it returns `INVALID_ARGS` (`rollback_unavailable`) and does not change the installation. A manual return to 0.3.2 is not a supported downgrade.
 - **Upgrading from 0.3.x with the daemon running (OD-48, SC-39)**: a 0.3.x daemon does not support `daemon.handoff_stop`. When `setup` positively identifies it (version below 0.4.0, a pipx Python daemon process outside the bundle `versions/` directory), it refuses while flashing or busy, otherwise records the old process in `install-journal.legacy.json` and stops it with its own supervisor (`systemctl stop` when it is the unit's MainPID, else RPC `daemon.stop`; never a hard kill). It switches only after the old process tree has exited and no process of the same user holds the UART for 5 consecutive seconds (up to 330 s), then starts the new daemon. Same-user processes that cannot be inspected at all (their `/proc/<pid>/fd` is unreadable, or every fd entry is denied — on hosts with a systemd user session these are `(sd-pam)` and `systemd --user`) do not block the switch when every other same-user process is clear, provided they already existed when the stop was sent (matched by pid and start time), whether or not all four of their uids (real, effective, saved, fs) are yours — a resident setuid `fusermount3` is admitted too; they are listed in `legacy_stop.uninspectable_procs` (pid, start_ticks, comm, reason, plus `uid_match` — `all`, `partial` such as a setuid tool, or `unknown` — and `uids`) with `holders_status: "partial"`. An uninspectable process that appears after the stop (for example a non-dumpable `ssh-agent` or a setuid UART tool), whatever its uids, a failed pre-stop snapshot (then no uninspectable process is admitted), and any other scan failure still wait until the limit; a process exiting during the scan or the device being unplugged while waiting does not count as a failure. Known trade-off: a setuid tool that was already running before the stop and opens the UART during the wait is not caught. The timeout response reports the last poll's `holders_status`, `uninspectable_procs`, `before_stop_snapshot`, `daemon_scan`, and `last_unstable` (when and why the stability window last broke). 0.4.0 itself waits the full 330 s on such hosts; stop the 0.3.x daemon first when upgrading to 0.4.0. If a later step fails, the install is restored but the old daemon is **not** restarted; the response carries `legacy_daemon_stopped`, `restored`, and `restart_hint`. Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, `--on-demand`); without a flag `setup` picks one automatically exactly like 0.3.2.
 
@@ -1559,10 +1584,10 @@ serialwrap setup --with-com0com
 |---|---|---|
 | `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Flashing, file transfer, or command in flight; wait for completion before retrying (`--force` does not override) |
 | `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | Old daemon did not terminate within 10 s or device held; verify process exit and retry (no switch made) |
-| `install_lock` | `TIMEOUT` | Lock held by another `setup` instance; verify concurrent operations |
+| `install_lock` | `TIMEOUT` | Response includes `phase=install_lock` and the lock message; verify concurrent operations |
 | `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | Bundle SHA256 or manifest mismatch; re-acquire or rebuild bundle |
 | `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | New daemon failed health verification; automatically reverted to previous version |
-| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | Failed to hold supervisor autostart; check permissions |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO`, `TIMEOUT` | Failed to hold supervisor autostart; for a lock timeout, response includes `reason=autostart_lock_timeout` and the message; check permissions or concurrent operations |
 | `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | Daemon handoff refused during recovery; wait for idle and run `setup` again |
 
 #### Deployment and Verification References
@@ -1634,6 +1659,241 @@ to include them (they record SKIP otherwise). Reports land in
 for a newly fixed bug" SOP:
 [`docs/regression-plugin.md`](./docs/regression-plugin.md).
 
+<a id="rust-refactor-benefits-en"></a>
+
+### Rust refactor: baseline comparison and benefits (0.5.0)
+
+This section shows the before/after benefits of the Rust refactor using only data already committed to the repository; no new measurements were taken. The parentheses after a number give its source (a path relative to the repository root, plus the field); "computed" marks a value derived from fields of the same source, and "inference" marks something that is not a measurement. The numbers fall into three categories:
+
+- **Python 0.4.1 vs Rust 0.5.0**: long-run latency, throughput, errors, stuck time, and RSS ("Long-run conditions" through "Resources: RSS"). The candidate is 0.5.0-rc.1; its judgment files record `run.daemon_version` as `0.5.0`. Each platform ran once (n=1), with no rerun.
+- **Python development tree vs Rust**: the WAL microbenchmark, event latency, and CLI round trip. For the WAL microbenchmark and event latency, the Python side is a refactor development tree from 2026-10-29 (VERSION still 0.3.2, not an ancestor of v0.4.0 or v0.4.1) that already contains BC-01. The `sw_core/wal.py` used by the WAL microbenchmark is the same blob as in v0.4.1, but the Python daemon used for event latency is not identical to v0.4.1. The CLI round trip compares the Python CLI and the Rust CLI from the same source version. The Rust side is not the 0.5.0 release either.
+- **Qualitative only**: the choice of baseline, DF backports, contracts, tests and the L1 lock, the evolution of Windows support, and costs. None of these has before/after numbers measured the same way.
+
+Short names used below:
+
+| Short name | Path |
+|---|---|
+| Linux baseline judgment | `evidence/stage0/baseline/linux/release-gate.json` |
+| Linux candidate judgment | `evidence/stage2/longrun/linux/release-gate.json` |
+| Windows baseline judgment | `evidence/stage0/baseline/windows/release-gate.json` |
+| Windows official judgment | `evidence/stage2/longrun/windows/release-gate.json` |
+| OD-110 judgment | `evidence/stage2/longrun/windows/od110/release-gate-od110.json` |
+| Linux latency file | `evidence/stage2/longrun/linux/latency/latency-linux.json` (method: `evidence/stage2/longrun/linux/latency/METHOD.md`) |
+| Windows latency file | `evidence/stage2/longrun/windows/latency/latency-windows.json` (method: `evidence/stage2/longrun/windows/latency/METHOD.md`) |
+
+#### What is compared, and why the baseline is 0.4.1
+
+- Only one pair can be compared strictly: the Python daemon 0.4.1 baseline against the Rust daemon 0.5.0-rc.1 candidate, on the same `lr-mixed` engine, the same load, and the same real hardware, 24 h each on Linux and on Windows (`evidence/stage2/longrun/README.md`; `mode` and `run.daemon_version` in the four judgment files).
+- This pair only measures "the daemon changed language":
+  - 0.4.1 is already a Rust CLI plus the Python daemon (the version table in `docs/rust-refactor/plans/00-master-plan.md`). The baseline judgments' `run.cli_identity` and `run.deployed_content.daemon_live` also show that the CLI under test is `bin/serialwrap` in the version directory and the daemon is the Python interpreter in that version directory's `py/`.
+  - 0.4.1 also already contains the Stage 0 Python fixes: 19 DFs were backported to Python and released (see "Benefits of the refactoring process").
+  - The benefits of the Stage 1 CLI rewrite and of the Stage 0 fixes are therefore already inside the baseline, so these numbers **underestimate** the overall benefit of the refactor (inference).
+- Why the baseline is 0.4.1:
+  - OD-10 item 2 (translated): "Stage 0 runs only the **fixed** Python 48h baseline (once per platform); the pre-fix state is referenced through the existing 32h historical data, and BC-01 performance is verified with microbenchmarks and short tests" (OD-10 in `docs/rust-refactor/owner-decisions-2026-10-15.md`). The duration was later changed to 24 h per platform by OD-94 (`workload.min_continuous_duration_s` is 86400 in `realhw/acceptance/longrun_acceptance.yaml`; the OD-94 entry under [0.5.0] in `CHANGELOG.md`).
+  - OD-102: the OD-102 entry itself is not in the repository, so this relies on repository documents that cite it. The long-run section of `realhw/acceptance/README.md` says the rounds run staggered per OD-102/OD-103, starting with the Windows Python 0.4.1 baseline (COM6) and then the Linux Python baseline; the opening paragraph of `evidence/stage2/longrun/README.md` describes the candidate long runs as required by OD-102 and states that both platforms are compared with the Python 0.4.1 24-hour baseline of the same platform. 0.4.1 is a released maintenance version (the version table in `docs/rust-refactor/plans/00-master-plan.md`).
+- 0.3.2 is used only in the OD-91 MCU flashing simulation A/B: tag `v0.3.2`, origin/main, and the Rust daemon run the existing flash, MCU RPC, handoff, and busy-guard cases, compared node by node, and every difference must be attributed to a source (the OD-91 entry under [0.5.0] in `CHANGELOG.md`; `tests/contract_blackbox/mcu_flash_parity.py`). The A/B result report is not in the repository.
+- A long run with 0.3.2 as the baseline, quantifying the overall benefit of Stage 0 through Stage 2, is scheduled after Stage 3; there is no such data yet.
+- The old 32h long run ([32h long-run stability summary](#longrun-32h-history), Traditional Chinese section) is historical reference only:
+  - It tested v0.0.1-era code: the summary was written in commit 945a905e, and `git describe --tags` gives `v0.0.1-2-g945a905e`.
+  - Its controller restarted serialwrap automatically whenever a session was unhealthy (31 run segments, 30 daemon restarts). The current long run preserves the failure state and never restarts automatically: `checks[id=fault_retention_attested].detail.auto_restart_disabled` is true in all four judgment files, and the engine only stops the load on a major event (module docstring of `realhw/cases/longrun.py`).
+  - The `lr-mixed` engine was only added on 2026-07-20 (commit 4b4c9c0b, first in v0.2.4). The engine, board count, automatic restarts, and counting definitions all differ, and the spec classifies that run as historical diagnostic evidence (§15.11.5 of `docs/rust-refactor/serialwrap-rust-spec-final.md`), so it cannot be compared side by side with the numbers in this section.
+
+#### Long-run conditions
+
+- Load `lr-mixed` (`realhw/cases/longrun.py`): 4 agent workers send commands to the boards in turn; rounds that are multiples of 10 do an interactive open/close, the other multiples of 3 a background echo, and all remaining rounds a line `submit_and_wait`; each round is followed by a sleep of `uniform(0.5, 2.0)` s. 1 human thread types a line on COM0 every 2–5 minutes. A snapshot is taken every 300 s and an observer sample every 10 s (`workload` in `realhw/acceptance/longrun_acceptance.yaml`).
+- Both versions ran the same engine and load contract: `run.engine_files_sha256`, `run.cases_yaml_sha256`, and `acceptance.workload_contract_sha256` are identical in all five judgment files. The threshold-file revision differs: the baselines were judged with `2026-11-20.1` and the candidates with `2026-11-21.1`, frozen by OD-109 (`acceptance.revision` in the judgment files; OD-109 in `docs/rust-refactor/owner-decisions-addenda.md`).
+- Frozen thresholds (`thresholds` in `realhw/acceptance/longrun_acceptance.yaml`): unexpected error rate ≤ 0.01 and not higher than the baseline; completions per hour ≥ 0.95 × baseline; RSS limits Linux peak 40390 / steady 40325 kB and Windows 48005 / 38585 kB, slope 256 kB/h; comparison tolerances of 0.002 for the error rate, 0.02 for the throughput ratio, and 300 s for stuck time.
+
+| Platform | Hardware | Baseline 0.4.1 | Candidate 0.5.0-rc.1 |
+|---|---|---|---|
+| Linux | Two BRCM boards (COM0, COM1); the human only on COM0 | from 2026-11-20T10:27:05Z, 86403 s | from 2026-11-21T10:52:40Z, 86402 s |
+| Windows | One Orange Pi 3 board (physical COM6, selector COM0), shared by 4 workers | from 2026-11-20T00:10:53Z, 86402 s | from 2026-11-21T10:49:33Z; the engine stopped itself at 68125 s with `both_boards_stuck`; the OD-110 effective segment ends at 2026-11-22T05:29:16Z (18.66 h) |
+
+(`run.started_at_utc`, `run.duration_s`, and the `counts` keys in the judgment files; `evidence/stage2/longrun/README.md`; `cutoff` in `evidence/stage2/longrun/windows/od110/truncation-receipt.json`)
+
+- **The official judgment of the Windows candidate is FAIL.** At 2026-11-22T05:29:17Z Windows re-enumerated COM6, the session stayed in DETACHED with `last_error` `ATTACH_FAILED:FileNotFoundError`, and every later agent command returned `SESSION_NOT_READY` (`evidence/stage2/longrun/windows/od110/detached-session-list.json`). Under OD-110 the owner excluded the disturbed interval, accepted the valid 18.66 h, and ruled out a rerun (OD-110 in `docs/rust-refactor/owner-decisions-addenda.md`). The OD-110 recalculated judgment itself still has `release_gate_result` FAIL (18 PASS, 2 FAIL, 5 INSUFFICIENT_EVIDENCE; `checks[].result` in the OD-110 judgment); under OD-110 the owner waived `engine_verdict`, `continuous_duration`, `worker_liveness`, `observation_gaps`, `safety_double_holder`, `resources`, and `error_rate_relative` (OD-110 in `docs/rust-refactor/owner-decisions-addenda.md`; `evidence/stage2/longrun/README.md`). There is therefore **no complete 24 h Windows Rust evidence** yet; everything below compares "baseline, full 24 h → candidate, effective segment" on Windows.
+- Not retrying a failed attach automatically is a limitation shared by 0.4.1 and 0.5.0 (in `contracts/session_last_errors.yaml`, `auto_reprobe` for `ATTACH_FAILED:*` is false for both `attached` and `detached`; `evidence/stage2/longrun/README.md`) and is listed as 0.5.0 known issue #300. 0.4.1 was not tested in the same situation.
+- The runbook in `realhw/acceptance/README.md` says all four rounds run on the Orange Pi 3; the actual Linux hardware follows the COM0/COM1 keys of `counts` in the judgment files and `evidence/stage2/longrun/README.md`: two BRCM boards.
+- The two platforms cannot be compared with each other: on Windows the 4 workers share one board lock, estimated to be busy about 96% of the time, and line p50 is about 3.2 s; on Linux it is about 1.7 s. Memory is also measured differently (see "Resources: RSS").
+
+#### Performance: latency and throughput
+
+Line latency has a floor set by the harness: `submit_and_wait` waits a fixed 1.5 s after submitting and then polls `cmd status` every 0.5 s (`settle_s` and `poll_s` in `realhw/drivers.py`), so the minimum is about 1.5 s with 0.5 s steps, and it measures when the harness sees the result, not how long the daemon took. Background results are polled every 1 s (`BG_POLL_INTERVAL_S` in `realhw/cases/longrun.py`), so `bg_result` has about 1 s resolution. The submit event is written before the board lock is taken, so latency includes waiting for the lock. Only interactive and background submit→accepted are free of the polling floor. Percentiles are nearest-rank over successfully completed commands only, in seconds, written as "baseline → candidate".
+
+**Linux** (`runs.<run>.latency['*|<mode>'].<metric>` in the Linux latency file)
+
+| mode: metric | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| line: `submit_to_done_s` | 76201 → 76441 | 1.711 → 1.699 | 3.212 → 3.194 | 4.401 → 4.340 | 8.201 → 5.073 | 14.058 → 13.018 |
+| interactive: `submit_to_done_s` | 10303 → 10864 | 0.112 → 0.163 | 1.694 → 1.605 | 2.836 → 2.774 | 3.469 → 3.748 | 10.533 → 10.782 |
+| background: `submit_to_accepted_s` | 38106 → 38225 | 0.009 → 0.004 | 1.434 → 1.440 | 2.627 → 2.601 | 3.638 → 3.277 | 11.397 → 9.204 |
+| background: `bg_result_latency_s_field` | 38102 → 38220 | 0.557 → 0.511 | 0.956 → 0.912 | 1.050 → 1.002 | 1.073 → 1.018 | 11.100 → 10.463 |
+| background: `submit_to_bg_result_s` | 38102 → 38220 | 0.857 → 0.805 | 2.069 → 2.027 | 3.277 → 3.185 | 4.580 → 4.050 | 12.023 → 10.466 |
+
+- The line and background median differences are within measurement resolution. Line p99.9 went from 8.201 to 5.073 s; line commands over 6 s occur only on COM0, the board with the human, and dropped from 84 to 22 (sum of the two keys of `runs.<run>.line_tail_gt_6s_attribution`, computed).
+- Interactive p50 got slower, 0.112 → 0.163 s (minimum 0.0038 → 0.0257 s); the cause cannot be determined from the event files.
+
+**Windows** (`runs.<run>.segments.<segment>.latency['*|<mode>'].<metric>` in the Windows latency file; the baseline uses `full`, 86400.789 s; the candidate uses `effective_od110`, from the start to the cutoff, 67182.824 s)
+
+| mode: metric | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| line: `submit_to_done_s` | 51575 → 39701 | 3.228 → 3.288 | 4.924 → 4.992 | 5.715 → 5.777 | 5.987 → 6.022 | 6.305 → 7.232 |
+| interactive: `submit_to_done_s` | 4829 → 4773 | 2.076 → 1.897 | 3.681 → 3.534 | 4.256 → 4.298 | 4.558 → 4.442 | 4.691 → 4.828 |
+| background: `submit_to_accepted_s` | 25790 → 19853 | 1.961 → 1.998 | 3.590 → 3.630 | 4.190 → 4.244 | 4.367 → 4.382 | 4.712 → 4.697 |
+| background: `bg_result_latency_s_field` | 25794 → 19856 | 0.578 → 0.563 | 0.969 → 0.969 | 1.094 → 1.079 | 1.141 → 1.141 | 1.188 → 2.937 |
+| background: `submit_to_bg_result_s` | 25790 → 19852 | 2.536 → 2.564 | 4.160 → 4.212 | 4.944 → 4.997 | 5.233 → 5.263 | 5.428 → 5.878 |
+
+- Most of the raw latency is board-lock queueing: the estimated lock busy fraction is 0.9605 → 0.963 (`comparison_effective_vs_baseline.lock_busy_fraction_est`), and the estimated median lock wait is 1.753 → 1.789 s (the `*` key of `segments.<segment>.lock_wait_est_s`). The differences in the table above mainly reflect queueing, not the daemon.
+- With queueing removed, the estimated service time (mean; `mean_diff_ms` in `comparison_effective_vs_baseline.service_time_est_s`) is slower on the candidate, as the table below shows. It is the sum of the CLI subprocess, the RPC, and the daemon, and the two CLIs are different builds, so it cannot be attributed to the daemon alone.
+
+| Windows action (estimated service time, mean) | Baseline → candidate (s) | Difference |
+|---|---|---|
+| line (minus the 1.5 s settle) | 0.0792 → 0.0932 | +14.0 ms |
+| interactive open + close | 0.0782 → 0.0903 | +12.1 ms |
+| background submit | 0.0395 → 0.0466 | +7.1 ms |
+
+- WAL breakdown (`comparison_effective_vs_baseline.wal_decomposition_s`): the median from the estimated lock acquisition to the WAL TX record is 0.0456 → 0.0457 s, from WAL TX to the returning prompt 0.0231 → 0.0235 s, and for human input from WAL TX to the output-line RX 0.0125 → 0.0131 s.
+- The line maximum of 7.232 s falls around an unexplained RX stall in the candidate (the largest gap between adjacent WAL records in the effective segment is 4.261 s, `segments.effective_od110.wal.largest_gaps_wall_s`); the cause cannot be determined from the evidence files.
+- Each run had one backward step of the system wall clock (baseline −1.541 s, candidate −1.493 s, `runs.<run>.clock_steps_observer`). Pairs that span the step are left out of latency and service time (the service-time chain excludes 15 in the baseline and 14 in the candidate effective segment, `segments.<segment>.service_chain_excluded`); completion and error counts are not affected.
+
+**Throughput** (closed-loop load)
+
+| Platform | Completions per hour | Change | Per-worker ratio (judgment file, threshold ≥ 0.95) |
+|---|---|---|---|
+| Linux | 5191.7 → 5230.1 | +0.74% | 1.0022–1.0161, all 8 keys PASS |
+| Windows | 3425.344 → 3447.667 | +0.652% (submissions per hour −0.997%) | 0.9909–0.9960, all 4 keys PASS |
+
+(Linux: `runs.<run>.throughput['*'].completed_per_h` in the Linux latency file, and `checks[id=throughput_relative]` in the Linux candidate judgment. Windows: `comparison_effective_vs_baseline.throughput['*']` in the Windows latency file, whose denominator is the wall length of the segment, 18.6619 h for the candidate; `checks[id=throughput_relative]` in the OD-110 judgment, whose denominator is the engine's 68125 s including the excluded DETACHED interval, so its ratios are lower; the Windows official judgment, which removes the non-READY interval, gives 1.0046–1.0098)
+
+- Throughput is closed-loop: each worker waits for its previous action to finish before sending the next, line has an extra 1.5 s settle, and each round is followed by a random 0.5–2.0 s sleep. Completion counts can only show "not slower"; they are not a capacity measurement. The change on both platforms is within the 0.02 throughput tolerance, so the conclusion is **not worse than the baseline**.
+- Windows by mode: line and background completions per hour are 0.98998 and 0.98999 × the baseline, and only interactive is 1.27141 × (`comparison_effective_vs_baseline.throughput_by_mode`). Interactive went up because the share rejected with `SESSION_BUSY` fell from 22.589% to 0.317% (`comparison_effective_vs_baseline.interactive_session_busy_share`). The higher Linux completion count also matches fewer interactive `SESSION_BUSY` rejects (699 → 136, see "Stability"; inference). So neither +0.652% nor +0.74% can be read as "faster overall".
+
+#### Stability
+
+| Item | Linux: baseline → candidate | Windows: baseline → candidate effective segment |
+|---|---|---|
+| Unexpected errors | 19 → 10, all on COM0 | 0 → 2 |
+| Unexpected error rate | 1.5246e-04 → 7.966e-05 | 0 → 3.108e-05 (the OD-110 judgment says 6.2e-05; see below) |
+| Error types | baseline: FLUSHED_BY_RECOVERY 15, reported done but no marker in stdout 4; candidate: FLUSHED_BY_RECOVERY 9, reported done but no marker in stdout 1 | candidate: 2, both line, reported done but no marker in stdout |
+| Expected rejects (not errors) | 2398 → 1876: `busy` 1699 → 1740, interactive `SESSION_BUSY` 699 → 136 | 3768 → 1843: `busy` 1826 → 1822, interactive `SESSION_BUSY` 1942 → 21 |
+| unresolved / bg_lost | 0 / 0 → 0 / 0 | 0 / 0 → 2 / 0 (finished after the cutoff; see below) |
+| Stuck (continuous non-READY) | 0 s → 0 s on both boards | 0 s → 0 s (the official judgment has an open 929.99–943.72 s segment on COM0) |
+| Daemon restarts | `liveness_restart` 0 → 0, pid unchanged throughout | same |
+| WAL safety scan | 302287 → 302992 records; `loss_flags`, `unauthorized_tx`, `cross_context_replay`, `dangerous_auto_resend` all empty | 360117 → 276660 records (full run for the candidate); all empty as well |
+| Double holder | `safety_double_holder` events 0 → 0 | events 0 → 0; exclusivity probes 288 → 224, all `exclusive`; the candidate check is INSUFFICIENT_EVIDENCE (`detail.reason` is `probe_gap`, COM0 67444.7–67825 s; per `evidence/stage2/longrun/README.md` the gap falls in the excluded interval), waived under OD-110 |
+| Judgment | baseline 17 PASS + 8 NOT_APPLICABLE_BASELINE → candidate 25/25 PASS | baseline `baseline_result` PASS → candidate official **FAIL**; the OD-110 recalculation still has `release_gate_result` **FAIL** (18 PASS, 2 FAIL, 5 INSUFFICIENT_EVIDENCE), and its 7 non-PASS checks are waived under OD-110 |
+
+(`counts['*']`, `stuck`, `walscan`, `checks[].result`, `checks[id=liveness_restart]`, `checks[id=safety_double_holder]`, `baseline_result`, and `release_gate_result` in the judgment files, with the Windows candidate column from the OD-110 judgment; error types and reject breakdown from `runs.<run>.unexpected.items` and `runs.<run>.rejects.total` in the Linux latency file, and from `segments.<segment>.unexpected`, `segments.<segment>.rejects.total`, `segments.<segment>.exclusivity_probes`, and `segments.<segment>.observer.daemon_pids` in the Windows latency file)
+
+- Linux is one 24 h run against one 24 h run, and the error-rate difference is far below the 0.002 tolerance, so the conclusion is **not worse than the baseline**; it cannot be written as "errors halved".
+- On Windows, 2 commands were submitted before the cutoff and finished after it (one line `done`, one background `bg_result:done`, `segments.effective_od110.cut_by_segment_end`). The gate counts them as unresolved, so the OD-110 judgment's error rate is (2 + 2) ÷ (64340 + 2 + 2) = 6.2e-05; with "completed + unexpected" as the denominator the actual rate is 3.108e-05 (`segments.effective_od110.unexpected.rate_vs_completed_plus_unexpected`). That is higher than the baseline's 0 but within the 0.002 tolerance; the gate still judges `error_rate_relative` INSUFFICIENT_EVIDENCE (`checks[id=error_rate_relative].detail['*'].result` in the OD-110 judgment), and it is waived under OD-110.
+- Checked one by one against the WAL, those 2 Windows errors are #294 type B, i.e. a human and an agent operating the same session at once, a 0.5.0 known issue (`evidence/stage2/longrun/README.md`). The same README describes the 1 such error in the Linux candidate as "an agent inserted while a human line was split".
+- The full Windows candidate run also has 2860 `SESSION_NOT_READY` (line 1716, background 858, interactive 286), all after 05:29:17Z, which makes the full-run error rate 0.0426 (`counts['*'].error_rate` in the Windows official judgment; `segments.full.unexpected.by_mode_detail` in the Windows latency file).
+- In Linux `safety_double_holder`, `holder_unknown_samples` is 8648 on both sides, which equals all observer samples; on Linux this check therefore relies only on multi_open, foreign_holders, and the scan for other serialwrapd processes (`_double_holder_check` in `realhw/acceptance/gate.py`).
+
+#### Resources: RSS
+
+| kB | Linux (VmRSS): baseline → candidate | Windows (WorkingSetSize): baseline → candidate effective segment |
+|---|---|---|
+| First | 30372 → 14224 | 37064 → 11816 |
+| Peak | 32312 → 22428 | 38404 → 35396 |
+| Steady (gate definition) | 32260 → 22032 | 30868 → 33906 |
+| Last | 32064 → 22128 | 30868 → 34020 |
+| Slope (kB/h) | −9.53 → +55.17 | −233.106 → +31.939 |
+| Common window [4 h, 18.66 h): median / slope | — | 30802 → 33890 / −22.036 → −32.695 |
+| Valid snapshots (288 expected) | 287 → 287 | 287 → 224 |
+| Judgment | candidate PASS (limits 40390 / 40325 / 256) | candidate values within the limits 48005 / 38585 / 256, but too few snapshots, so INSUFFICIENT_EVIDENCE, waived under OD-110 |
+
+(`checks[id=resources].detail.calibration` in the Linux baseline judgment and `checks[id=resources].detail.stats` in the Linux candidate judgment, reproduced by `runs.<run>.resources` in the Linux latency file; `segments.<segment>.resources` and `rss_common_window` in the Windows latency file, identical to `checks[id=resources]` in the Windows baseline judgment and the OD-110 judgment)
+
+- The Linux candidate's peak and steady RSS are about 30% lower than the baseline (−30.6% and −31.7%, computed), but the slope turned from negative to positive; +55.17 kB/h is within the 256 limit, and 24 h is not enough to tell whether it levels off.
+- The Windows candidate's steady value is 9.8% **higher** than the baseline (computed). The two windows differ in length (24 h vs 18.66 h), and the common window is higher as well (median 30802 → 33890 kB). The baseline's first value is above its steady value: the hourly medians for t in 2–3 h, 3–4 h, and 4–5 h are 38404, 36208, and 30932 kB (keys `2`, `3`, `4` of `segments.full.resources.hourly_median_kb` in the Windows latency file), and only after that is it stable, so its negative slope does not mean a continuing decline.
+- Linux measures the daemon process's VmRSS and Windows measures WorkingSetSize (`realhw/procobs.py`); the measures differ, so the two platforms cannot be compared. Neither side has comparable CPU, thread, or fd/handle data.
+
+#### Measurements outside the long run (Python development tree vs Rust)
+
+| Measurement | Python | Rust | Source |
+|---|---|---|---|
+| WAL append p50 / p99 (ms) | 1.010 / 3.207 | 0.0211–0.0216 / 0.0505–0.0591 | `docs/rust-refactor/reviews/p5-evidence/od61-wal-s1w-wsl2-86b54d8/README.md`; `append_ns` in the JSON files of the same directory |
+| WAL rotate maximum pause (ms) | 902.3 | 41.3–55.2 | same, `rotate_max_ns` |
+| Event latency, release_request, idle (ms) | max 154.2–156.4 | p99 6.54–7.11 (max 11.84–76.32) | `runs` in `docs/rust-refactor/reviews/p5-evidence/event-latency-od45-python-diagnostic-r7-261029.json` and `docs/rust-refactor/reviews/p5-evidence/event-latency-od45-rust-r7-261029.json` |
+| Event latency, release_request, flood 20000 B/s (ms) | max 14.7–28.3 | p99 6.05–8.07 (max 9.62–30.59) | same |
+| Event latency, stop_request and command_cancel (ms) | p99 all ≤ 3.42 | p99 all ≤ 1.88 (max ≤ 16.08) | same |
+| CLI round trip `daemon status` p50 / p95 (ms) | about 155 / 220 | about 16 / 20 | the CLI performance item in `docs/rust-refactor/release-0.4.0-plan.md` |
+
+- **WAL (OD-61)**: an in-process WalWriter microbenchmark (S1-W: 4 streams × 10,000 records × 1,024 B, rotate at 64 MiB, unthrottled), without the daemon, the serial port, or RPC. WSL2 host (AMD Ryzen 9 9900X, ext4), the same time window on 2026-10-29, one Python run and three Rust runs.
+  - The Python side is the 86b54d8 development tree (`git describe --tags` gives `v0.3.2-584-g86b54d8d`; not an ancestor of v0.4.0 or v0.4.1). The JSON's `env.artifacts.cli` says `serialwrap 0.3.2`, but that is only the VERSION string: this tree already contains BC-01 (commit b707ad6e), and its `sw_core/wal.py` is the same blob as in v0.4.1. WAL writing in v0.3.2 was never measured.
+  - The rotate pause depends on how much dirty data is pending at fsync time; in an earlier measurement on the same host Python took only 108–132 ms, so the ratio is unstable.
+  - Both sides exceed the native thresholds of spec §1.2; Rust passed all three runs under the OD-66 WSL2 thresholds (F200 and F201 in `docs/rust-refactor/reviews/p5-fix-responses.md`).
+- **Event latency (OD-45 r7)**: an external "RPC sent → response" measurement on a 4-core Linux host (round 7 in `docs/rust-refactor/reviews/p5-t22-gate-run.md`).
+  - Both sides were built from 1b83da9d (`identity.source_commit` in both JSON files). On the Python side, VERSION says 0.3.2 but the tree already contains BC-01; `git describe --tags` gives `v0.3.2-591-g1b83da9d`, it is not an ancestor of v0.4.0 or v0.4.1 (`git merge-base --is-ancestor`), and its `sw_core` plus `serialwrapd.py` differ from v0.4.1 in 16 files (`git diff --shortstat 1b83da9d v0.4.1 -- sw_core serialwrapd.py`), so this Python daemon is not the 0.4.1 baseline. Rust is a P5 build, not 0.5.0.
+  - Python ran in diagnostic mode with 50 samples per run (p99 equals max); Rust had 500 samples per run. The two sides are not symmetric.
+  - Both verdicts are INSUFFICIENT_EVIDENCE (limits not frozen; `verdict`, `reasons`). Python r6 was also judged FAIL: one idle release_request run had a max of 255.37 ms, above the 250 ms limit (`docs/rust-refactor/reviews/p5-evidence/event-latency-od45-python-diagnostic-r6-261029.json`).
+  - Only idle release_request differs by more than an order of magnitude: Python max (n=50, equal to p99) 154.2–156.4 ms against Rust p99 6.54–7.11 ms is about 22–24× (computed); max against max it is still about 2.0–13.2× (computed). Under flood, Python max 14.7–28.3 ms against Rust p99 6.05–8.07 ms is only about 1.8–4.7× (computed), and the Rust max of 9.62–30.59 ms overlaps the Python max, with its highest value of 30.59 ms above Python's 28.3 ms. For stop_request and command_cancel, p99 stays within a few ms on both sides, but the Rust max reaches 16.08 ms (command_cancel, idle, run 1) while the Python max is ≤ 3.42 ms (`runs[].max_ms`).
+- **CLI round trip (Stage 1)**: the Rust CLI against the Python CLI from the same source version; both CLIs talked to the same Python daemon, measured on WSL2 under heavy background load, not a standard environment, and Windows was not measured. This is a 0.4.0 benefit already inside the 0.4.1 baseline, so the long-run comparison cannot see it.
+
+#### Benefits of the refactoring process (qualitative only)
+
+- **DF (defect fix) backports**: `contracts/behavior_changes.yaml` (revision 11) registers 27 DFs.
+  - 19 were also fixed in Python and released with 0.4.0 and 0.4.1: DF-01–17 and DF-19 (0.4.0) and DF-25 (0.4.1). The basis is that these 19 are IMPLEMENTED in `contracts/behavior_changes.yaml` at the v0.4.1 tag (`changes[].status`, `applies_to.python.min_version`), plus [0.4.0] and [0.4.1] in `CHANGELOG.md`. Of these, 8 are CLI or setup items (the CLI shipped in 0.4.x is already Rust) and 11 are on the daemon side.
+  - 7 are fixed only in Rust, with Python keeping the old behavior: DF-20–24, DF-26, and DF-27 (per each item's `compatibility_impact`).
+  - The Python fix for DF-18 (`os.rename` changed to `os.replace`) exists only in the v0.5.0 tree and was not released with any Python daemon version.
+  - Most of these DFs were found while auditing Python against the final spec (§1.2 "DF: defect and safety fixes (fixed on both sides)" in `docs/rust-refactor/plans/spec-reconciliation.md`), so they are a benefit of the refactoring process and not all a benefit of the Rust language (inference).
+  - The current `status` field reads 21 IMPLEMENTED, 6 APPROVED, 0 VERIFIED (only the owner marks VERIFIED), so it cannot be read directly as completion.
+- **Test counts** (static counts, parametrization not expanded; `git ls-tree -r --name-only <tag> -- tests crates`, `git grep -c -E '^\s*(async )?def test_' <tag> -- tests`, `git grep -c -E '#\[(tokio::)?test' <tag> -- crates`) are in the table below. A large share of the new pytest tests are gates, contracts, and A/B black-box tests, so product coverage did not grow in the same proportion.
+
+| Test counts | v0.3.2 | v0.4.1 | v0.5.0 |
+|---|---|---|---|
+| `test_*.py` files / `def test_` under `tests/` | 147 / 1759 | 340 / 4602 | 425 / 5415 |
+| `.rs` files / `#[test]` + `#[tokio::test]` under `crates/` | 0 / 0 | 194 / 1116 | 449 / 3721 |
+
+- **Behavior contracts**: v0.3.2 has no `contracts/`; v0.4.1 has 564 files and v0.5.0 has 601 (`git ls-tree -r <tag> -- contracts/`). In v0.5.0, `contracts/error_codes.yaml` defines 100 error codes and `x-methods` in `contracts/rpc_schema.json` lists 55 RPC methods; the registry has 68 entries (BC 5, SC 36, DF 27).
+- **L1 required-node lock** (`sets` in `tests/acceptance/l1_required.lock.json`): v0.3.2 has none; v0.4.1 has 10 sets and 5306 unique nodeids; v0.5.0 has 61 sets and 10849 (pytest 7142, cargo 3707).
+- **Evolution of Windows support**:
+  - v0.3.2: the Python daemon already supported Windows (pyserial serial port, TCP loopback RPC, Telnet console, #84, #131), and releases carried PyInstaller-built `serialwrap.exe` / `serialwrapd.exe` (the `publish-windows-exe` job in `.github/workflows/release.yml` at the v0.3.2 tag).
+  - 0.4.1: the Windows zip was first published (OD-78), containing the Rust CLI/launcher plus the Python daemon on a bundled CPython 3.12.3 runtime ([0.4.1] in `CHANGELOG.md`).
+  - 0.5.0: the daemon in the zip is now Rust. `run.deployed_content.daemon_live[0].image_path` in the Windows official judgment points to `bin\serialwrapd.exe` in the version directory, while the baseline's points to `py\python.exe`. The Rust daemon provides the Windows TCP/Telnet console and the optional com0com console ([0.5.0] in `CHANGELOG.md`). The Windows rows of the L1 lock, summed over its sets (cross-set duplicates included), grew from 5442 in v0.4.1 to 13070 in v0.5.0; unique Windows nodeids went from 4407 to 6808 (`sets.*.windows.nodeids`). It is also the first Windows 24 h baseline-versus-candidate long run (official FAIL, effective segment accepted under OD-110).
+
+#### Costs and known issues
+
+- **Install artifact size**: the repository has no citable measurement, so no numbers are given here.
+- **0.5.0 still ships a Python runtime and still requires `/usr/bin/python3.12`**:
+  - Linux: in v0.5.0, `scripts/rust/mkbundle.sh` still creates `py/` with `python3 -m venv --copies` inside `assemble_bundle()`; Stage 2 only changes the manifest's `components.daemon.implementation` to `rust` and `entry` to `bin/serialwrapd`. `install.sh` still checks `/usr/bin/python3.12` (`PYTHON312_DEFAULT` and the requirement check) and exits 2 when it is missing; `install.sh` is identical in v0.5.0 and v0.4.1.
+  - Windows: `versions\<version>\py\` in the zip still contains the CPython 3.12.3 embeddable runtime, PyYAML/pyserial, and `sw_core` (header of `scripts/rust/mkbundle-windows.ps1`).
+  - Retiring the Python daemon is scheduled for Stage 3 (1.0.0, the version table in `docs/rust-refactor/plans/00-master-plan.md`); 0.5.0 has not yet delivered the benefit of dropping the Python dependency.
+- **Code size** (per-file counts of `git grep -c '' <tag> -- ':(glob)sw_core/**/*.py' serialwrapd.py` and `git grep -c '' <tag> -- 'crates/**/*.rs'`, summed, including blank lines and comments; without `:(glob)` the files directly under `sw_core/` are missed) is in the table below. 0.5.0 carries two implementations at once: the Python daemon is still in the source tree and in the bundle (only 2 files changed from v0.4.1 to v0.5.0, i.e. DF-18), and the Rust side is about 267 thousand lines (including tests).
+
+| Lines of code (files) | v0.3.2 | v0.4.1 | v0.5.0 |
+|---|---|---|---|
+| Python: `sw_core/**/*.py` + `serialwrapd.py` | 19,522 (53) | 29,480 (62) | 29,480 (62) |
+| Rust: `crates/**/*.rs` (including tests) | 0 (0) | 92,142 (194) | 267,061 (449) |
+
+- **0.5.0 known issues** (to be fixed in 0.5.1; "Known issues" in `docs/rust-refactor/stage2-release-install.md`):
+  1. Stopping or restarting the daemon during a file push (#282, #296).
+  2. In-flight `session self-test`, `session recover`, and interactive operations return `EXCEPTION` at shutdown (#297).
+  3. When a human and an agent operate the same session at once, the agent command may return `done` with empty output or only the remains of the human's line (#294). The 2 unexpected errors of the Windows long-run candidate are of this kind.
+  4. A USB serial port that drops briefly and comes back is not re-attached automatically (#300; 0.4.x behaves the same). The official FAIL of the Windows long-run candidate comes from this.
+  5. Upgrade install: on Linux, `setup` returns `SESSION_BUSY` while an interactive console is connected; on Windows it may return `TIMEOUT` when the daemon is not running, and the safety check does not read `socket_path` from config.yaml; a `__pycache__` left in the bundle directory makes checksum verification fail.
+  6. The Windows zip does not include the optional com0com component.
+- **Unfavorable or uncertain results** (see the sections above):
+  - Long run: Linux interactive p50 0.112 → 0.163 s; the Linux RSS slope turned positive (+55.17 kB/h); Windows unexpected errors 0 → 2 (within the 0.002 tolerance, but the gate's `error_rate_relative` is INSUFFICIENT_EVIDENCE, waived under OD-110); Windows line and background completions per hour are about 1% below the baseline (0.98998 and 0.98999 ×; computed); Windows line max 6.305 → 7.232 s and `bg_result_latency_s_field` max 1.188 → 2.937 s; the estimated Windows service time is 7.1–14.0 ms higher per action; Windows steady RSS is 9.8% higher; there is no complete 24 h Windows Rust evidence, and the OD-110 recalculated judgment is still FAIL and is accepted only through waivers.
+  - Outside the long run: under flood the highest Rust event-latency release_request max (30.59 ms) is above the Python max (28.3 ms); the Rust stop_request/command_cancel max reaches 16.08 ms against Python ≤ 3.42 ms.
+
+#### Where the evidence is
+
+| Content | Path |
+|---|---|
+| 0.4.1 baseline judgments | `evidence/stage0/baseline/linux/release-gate.json`, `evidence/stage0/baseline/windows/release-gate.json` |
+| 0.5.0-rc.1 candidate judgments, OD-110 recalculation and notes | `evidence/stage2/longrun/README.md`, `evidence/stage2/longrun/linux/release-gate.json`, `evidence/stage2/longrun/windows/release-gate.json`, `evidence/stage2/longrun/windows/od110/` |
+| Recalculated latency, throughput, errors, and RSS (each with METHOD.md, JSON, tools/, SHA256SUMS) | `evidence/stage2/longrun/linux/latency/`, `evidence/stage2/longrun/windows/latency/` |
+| Long-run engine, thresholds, and gate | `realhw/cases/longrun.py`, `realhw/drivers.py`, `realhw/procobs.py`, `realhw/acceptance/longrun_acceptance.yaml`, `realhw/acceptance/gate.py`, `realhw/acceptance/README.md` |
+| Owner decisions, spec, and version plan | `docs/rust-refactor/owner-decisions-2026-10-15.md` (OD-10), `docs/rust-refactor/owner-decisions-addenda.md` (OD-109, OD-110), `docs/rust-refactor/serialwrap-rust-spec-final.md` (§15.11.5), `docs/rust-refactor/plans/00-master-plan.md` |
+| WAL microbenchmark, event latency, CLI round trip | `docs/rust-refactor/reviews/p5-evidence/od61-wal-s1w-wsl2-86b54d8/`, the event-latency-od45 files in `docs/rust-refactor/reviews/p5-evidence/`, `docs/rust-refactor/reviews/p5-t22-gate-run.md`, `docs/rust-refactor/reviews/p5-fix-responses.md`, `docs/rust-refactor/release-0.4.0-plan.md` |
+| Contracts, behavior-change registry, L1 lock | `contracts/`, `contracts/behavior_changes.yaml`, `tests/acceptance/l1_required.lock.json` |
+| MCU flashing simulation A/B (OD-91) | `tests/contract_blackbox/mcu_flash_parity.py` |
+| 0.5.0 known issues and install notes | `docs/rust-refactor/stage2-release-install.md` |
+| 32h historical data | [32h long-run stability summary](#longrun-32h-history) (Traditional Chinese section) |
+
 ### Further Reading
 
 - Detailed design and API contract: [`docs/serialwrap-spec.md`](./docs/serialwrap-spec.md)
@@ -1661,7 +1921,7 @@ for a newly fixed bug" SOP:
 ## 依賴
 
 - Linux x86_64，glibc >= 2.39（Ubuntu 24.04 以上）
-- `/usr/bin/python3.12`：bundle 內附的 Python daemon runtime 綁定此直譯器（0.5.0 改 Rust daemon 後此需求消失）
+- `/usr/bin/python3.12`：0.5.0 的 `install.sh` 仍會檢查它。實際執行的 daemon 已是 Rust 的 `serialwrapd`，但 bundle 仍內附綁定此直譯器的 Python runtime（`py/`）。Python daemon 退役排在 1.0.0（Stage 3），見 [Rust 重構：基線比較與效益](#rust-refactor-benefits-zh)
 - `curl` 或 `wget`：下載 release 用（`--bundle` 離線安裝不需要）
 - `pyyaml`：已內附於 bundle，無需另外安裝
 - `jq`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 session 狀態需要，不要直接 `minicom -D /dev/ttyUSBx`
@@ -2242,7 +2502,7 @@ broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown 
 `AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
 `command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
 
-**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
+**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷；Rust daemon 的 session profile 設了 `max_console_line_chars` 時，超過的 `cmd submit` 改在提交時回 `CMD_TOO_LONG`（`limit` 為該 profile 的值；這個上限以 profile 設定為準，不在 `limits` 欄位中）。broker 的全域上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
 **長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
@@ -2347,6 +2607,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `md5sum` 及可用的 `base64` 或 OpenSSL 編解碼器。傳輸前以實際輸出驗證工具，優先 `base64`、不可用時 fallback 至 OpenSSL；命令回顯不算工具可用的證據。全部不可用時，push 回 `TARGET_DECODER_MISSING`，pull 回 `TARGET_ENCODER_MISSING`。
 
 已量測 console 行長限制時，可在 profile template 或 target 設定，例如 `max_console_line_chars: 505`。值須為正整數，計算完整命令的 UTF-8 bytes（不含結尾換行），不是字元個數，也不是平台預設。Push 扣除 Base64 膨脹及 shell 開銷後限制要求的 chunk 大小；雙向傳輸也檢查各自的 probe、checksum、move、cleanup 等控制命令。預算容不下必要命令時，在任何 TX 前回 `CONSOLE_LINE_LIMIT_TOO_SMALL`。Template 省略或設 `null` 則不限制既有 chunk 設定（預設 512 raw bytes）；target 省略會繼承 template，明設 `null` 才清除該限制。受影響的板仍須依量測設定，升級不會把所有 prpl console 自動設成 505。
+
+Rust daemon 的 `cmd submit` 也套用同一個上限：命令的 UTF-8 長度超過 session 的 `max_console_line_chars` 時，在入列與任何 TX 之前回 `CMD_TOO_LONG`，`limit` 為該 profile 的值（broker 16 KB 硬上限則是 `limit: 16384`）。沒有這道檢查時，這種命令會被 target 截斷、等不到 prompt 而逾時。未設此欄位的 profile 行為不變。
 
 **適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
@@ -2461,9 +2723,19 @@ serialwrap session console-detach --selector COM0 --client-id <client_id>
 serialwrap session self-test --selector COM0
 ```
 
+Self-test 是可選的當下診斷，不會替下一個 RPC 保留 session 操作權。忙碌回應
+（`SESSION_BUSY` 或 `SESSION_INTERACTIVE_BUSY`）代表**未探測**，不代表故障：不送 probe、
+不更新 `last_probe_at`，也不確認 READY。等待前景工作或 background capture 結束；
+也可依既有規則提交下一個命令，讓 capture 結束。Rust 實際執行 probe 時會回傳
+`probe_evidence` 四個布林值：`tx_complete`、`execution_marker`、`probe_rc_zero`、
+`prompt_after_marker`。只有四項全真且 op、連線 epoch、證據世代仍有效，才可確認 READY；
+prompt 必須出現在執行標記之後。詳見 [Self-test 行為](docs/self-test.md)，包括 POSIX shell
+相容限制。
+
 常見 `classification`：
 
 - `OK`
+- `SESSION_BUSY`／`SESSION_INTERACTIVE_BUSY`（BC-13）：忙碌時未探測，等待即可；不要因此 recover。
 - `DEVICE_MISSING`
 - `DEVICE_REBOUND_REQUIRED`
 - `BRIDGE_DOWN`
@@ -2563,7 +2835,7 @@ recover 行為分成三種：
 
 recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列中**尚未啟動**的命令會以 `status=error`、`error_code: FLUSHED_BY_RECOVERY` 終結（#128）。此類命令**從未送進 UART**——client 收到即代表未執行，應於 session 回 `READY` 後重送；正在執行中（in-flight）的命令不受影響，仍由 worker 以真實結果終結。flush 同時立即釋放 per-session pending 額度，stale 佇列記錄不再永久佔額度、把 session 卡死在 `SESSION_QUEUE_FULL` 直到 daemon 重啟。
 
-所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。兩者語意相同＝命令未執行、可於 session 回 `READY` 後重送。
+所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 
@@ -2588,10 +2860,10 @@ DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要
 - **觸發**：
   1. agent 送出 reboot 類指令**當下**即進入 quiet window（不等 banner——真板從 shutdown 訊息到 banner 可能間隔數秒，且 U-Boot 可能吃到 banner 前緩衝的 bytes）；
   2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
-- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的 nonce probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。CTRL_C/CTRL_D 迴圈的 gate 是**逐 byte 重驗**的（兩個 byte 間隔最長 2s，恰好落在 autoboot 3s 倒數窗內，只在迴圈外評估一次會讓第二個 byte 打斷開機）；banner 偵測的比對窗為「舊 rolling tail 尾段＋**整個** RX chunk」，不截掉大 chunk 的開頭（實機 345/354 字元的 banner chunk 曾因截頭漏判）。
+- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的驗證執行 probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。CTRL_C/CTRL_D 迴圈的 gate 是**逐 byte 重驗**的（兩個 byte 間隔最長 2s，恰好落在 autoboot 3s 倒數窗內，只在迴圈外評估一次會讓第二個 byte 打斷開機）；banner 偵測的比對窗為「舊 rolling tail 尾段＋**整個** RX chunk」，不截掉大 chunk 的開頭（實機 345/354 字元的 banner chunk 曾因截頭漏判）。
 - **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`，或 profile 選配的 `boot_done_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。出貨 `prpl-template` 把 `boot_done_regex` 設為 askconsole 的「`Please press Enter to activate this console`」——它不匹配前兩者，未設時只能等過期（實測 askconsole 在 U-Boot banner 後約 18s 出現，READY 卻要等滿 180s）。例外：若命中的尾行本身就是該 session 的 `bootloader_prompts`（如 U-Boot 自己的 `=> `），**不**視為開機完成、window 續留——避免寬鬆撰寫的 `prompt_regex`（如 `[>#]\s*$`）誤配 bootloader 自身 prompt，在板子仍卡在 bootloader 的最危險時刻誤解除。（#162：解除／過期只結束 **TX 靜默**維度；agent 顯式命令 gate 的解除另綁 READY 再確認，見下一點。）
 - **絕不 gate**：human console bytes、interactive lease TX。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。
-- **agent 顯式命令（#139 雙層 gate；#162 解除改綁 READY 再確認）**：本欄位仍**不會**降級 `session.state`，但 agent 顯式命令（`cmd submit`／`file push`／`file pull`）在「quiet 已 arm 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——submit-time 即時回錯（附 `retry_after_s`、不產生 cmd_id）、execute-time 第二層堵 queue race（`cmd status` 終態可觀測）；兩層皆零 UART 副作用（舊行為：bytes 落入 autoboot 倒數窗、10s 後以 `PROMPT_TIMEOUT` 吞掉）。**#162 起清空判定＝READY 再確認（nonce probe）**：任一 READY 確認點（attach probe／reboot recovery／self-test nonce 成功）落定才解除——**`reboot` 命令後 2s 內的 prompt 回顯不算確認點**（prpl/OpenWrt 的 `reboot` 非同步，shell 毫秒內就重印 prompt 但板子確實在重開，把它當 READY 實證會讓下一個 agent 命令落進正在 shutdown 的系統、逾時升級成 CTRL-C/CTRL-D 打在 autoboot 上）；quiet **過期或 RX prompt 解除不再直接放行**——prpl/OpenWrt askconsole 會停在「`Please press Enter to activate this console`」，既不匹配 `login_regex` 也不匹配 `prompt_regex`，若過期即放行，第一個 agent 命令的 `\n` 會觸發啟用、命令被 askfirst 吞掉、stdout 吃到啟用 banner（#162 根因）。quiet 結束後 reprobe 引擎會在 RX 靜默後自動補一輪確認 probe（`\n`＋nonce，**順帶消耗 askconsole 啟用 banner**），確認後 agent 命令永遠放行。過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`。**pending 有上限**（`READY_RECONFIRM_MAX_S`＝300s／`READY_RECONFIRM_MAX_ATTEMPTS`＝5，剩餘秒數見 `ready_reconfirm_remaining_s`）：逾越後四個 gate 一律改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action: "self_test"`，`ready_reconfirm_failed` 為 `true`）——避免呼叫端在一個永遠不可能成功的「可重試」錯誤上無界重試。刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
+- **agent 顯式命令（#139 雙層 gate；#162 解除改綁 READY 再確認）**：本欄位仍**不會**降級 `session.state`，但 agent 顯式命令（`cmd submit`／`file push`／`file pull`）在「quiet 已 arm 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——submit-time 即時回錯（附 `retry_after_s`、不產生 cmd_id）、execute-time 第二層堵 queue race（`cmd status` 終態可觀測）；兩層皆零 UART 副作用（舊行為：bytes 落入 autoboot 倒數窗、10s 後以 `PROMPT_TIMEOUT` 吞掉）。**#162 起清空判定＝READY 再確認（nonce probe）**：任一 READY 確認點（attach probe／reboot recovery／self-test 的完整執行證據成立）落定才解除——**`reboot` 命令後 2s 內的 prompt 回顯不算確認點**（prpl/OpenWrt 的 `reboot` 非同步，shell 毫秒內就重印 prompt 但板子確實在重開，把它當 READY 實證會讓下一個 agent 命令落進正在 shutdown 的系統、逾時升級成 CTRL-C/CTRL-D 打在 autoboot 上）；quiet **過期或 RX prompt 解除不再直接放行**——prpl/OpenWrt askconsole 會停在「`Please press Enter to activate this console`」，既不匹配 `login_regex` 也不匹配 `prompt_regex`，若過期即放行，第一個 agent 命令的 `\n` 會觸發啟用、命令被 askfirst 吞掉、stdout 吃到啟用 banner（#162 根因）。quiet 結束後 reprobe 引擎會在 RX 靜默後自動補一輪確認 probe（`\n`＋nonce，**順帶消耗 askconsole 啟用 banner**），確認後 agent 命令永遠放行。過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`。**pending 有上限**（`READY_RECONFIRM_MAX_S`＝300s／`READY_RECONFIRM_MAX_ATTEMPTS`＝5，剩餘秒數見 `ready_reconfirm_remaining_s`）：逾越後四個 gate 一律改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action: "self_test"`，`ready_reconfirm_failed` 為 `true`）——避免呼叫端在一個永遠不可能成功的「可重試」錯誤上無界重試。刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
 - 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。線上 `profiles/*.yaml` 若是舊版物化結果而缺此欄位（配置漂移），偵測會退回 `UBOOT_FALLBACK_PROMPTS`（`=> `／`U-Boot> `／`CFE> `）而非整條 no-op；漂移本身由 `serialwrap doctor` 的 advisory 檢查 `profile_bootloader_prompts` 指出。
 - **卡 bootloader 的可診斷終態（#162）**：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 時，session 的 `last_error` 改為 `BOOTLOADER_STUCK`、停止無效重探，`session self-test` 與 `session recover` 回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`——取代舊版「第 10 次靜默 exhausted、state/last_error 不變、不發事件」的無資訊放棄。
 
@@ -2739,7 +3011,7 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
 
 ### Windows 發佈 zip（`serialwrap-<版本>-windows-x86_64.zip`）
 
-GitHub Release 除 Linux tarball 外，另附 `serialwrap-<版本>-windows-x86_64.zip`（由 GitHub hosted `windows-latest` 建置，`SHA256SUMS` 兩者皆列）。內容為 Rust CLI 加 Python daemon，runtime 為隨 bundle 附帶的 CPython 3.12.3（含 PyYAML、pyserial），不需系統 Python。**未做程式碼簽署**（SmartScreen 可能警告，請以 SHA-256 核對），**不含 com0com**。安裝（PowerShell）：
+GitHub Release 除 Linux tarball 外，另附 `serialwrap-<版本>-windows-x86_64.zip`（由 GitHub hosted `windows-latest` 建置，`SHA256SUMS` 兩者皆列）。0.5.0 起 zip 內的 CLI 與 daemon 都是 Rust（`serialwrapd.exe`；0.4.1 附的是 Python daemon）。zip 仍附帶私有的 CPython 3.12.3 runtime（`py\`，含 PyYAML、pyserial 與 `sw_core`），不需系統 Python。**未做程式碼簽署**（SmartScreen 可能警告，請以 SHA-256 核對），**不含 com0com**。安裝（PowerShell）：
 
 ```powershell
 # 1. 以 SHA256SUMS 核對下載檔
@@ -2862,7 +3134,7 @@ serialwrap setup --with-com0com
 
 - **生命週期控制**：`daemon restart` 提供具備 two-reader 安全防護之重啟機制（有序停止舊 daemon、等待行程於 10 秒內完全結束並釋放裝置控制代碼，確認釋放後再啟動新實例）。
 - **監管模式切換**：`supervision-mode set <MODE>` 可在 `on-demand`、`systemd-user`、`systemd-system`、`windows-task` 與 `windows-service` 之間動態切換（Windows 上 `windows-service` 輸出 `pending_sudo` 指令由管理員執行）。切換前執行嚴格之安全預檢與原子交接（`daemon.handoff_stop`）：若有 Flash 燒錄、檔案傳輸、活躍操作或探測不明時一律拒絕切換，且此保護**不受 `--force` 影響**（`--force` 不覆寫交接護欄，只在輸出標記 `force_ignored:true`）。
-- **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。
+- **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。`daemon stop` 停止期間會暫時停用排程工作、停完再恢復；若 stop 中途被打斷（Ctrl-C、關閉視窗），工作會停在停用，因此 `daemon start`／`service start` 只在監管切換 hold（`autostart-hold.json`）與更新／回滾 journal（`install-journal.json`）都不存在時，才先恢復啟用再 `schtasks /Run`。任一 hold 存在時略過 `/ENABLE`，維持原本 `/Run` 回應與 exit code，並在 stderr 說明 hold（#276）。start 會等安裝鎖最多 5 秒、autostart 鎖最多 15 秒。鎖逾時維持 exit code 2 與 `TIMEOUT`（或鎖錯誤傳出的碼），並帶原有 `message`：安裝鎖為 `phase=install_lock`，autostart 鎖為 `phase=update_autostart_hold`、`reason=autostart_lock_timeout`；不以 `hint` 取代，也不執行 `/Run`。取得兩把鎖後會重讀 `config.yaml`；若監管模式已不是 `windows-task`，會釋放生命週期鎖並依新模式重新分派原命令一次；`daemon start` 重讀為 `on-demand` 時會繼續走 daemon 啟動流程。hold 檢查及 `/ENABLE`／`/Run` 都在生命週期交易共用的既有 `.install.lock` 與 `autostart.lock` 內完成。涉及 `windows-task` 的 `supervision-mode set` 也會取得安裝交易鎖，逾時可能回 `TIMEOUT` 與 `phase=install_lock`。`setup` 復原涉及 `windows-task` 的切換 hold 前，也會先取得既有安裝交易鎖，即使 hold 已存在而 `.install.lock` 尚未建立。
 - **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。第一次從 pipx 的 0.3.2 換成 bundle 時沒有上一個 bundle 版本，因此 `setup --rollback` 不能回到該 pipx 安裝：命令回 `INVALID_ARGS`（`rollback_unavailable`），且不改動現場。手動回到 0.3.2 不是受支援的降級。
 - **0.3.x daemon 執行中直接升級（OD-48、SC-39）**：0.3.x daemon 不支援 `daemon.handoff_stop`。`setup` 正向辨識它（版本低於 0.4.0、為 bundle `versions/` 以外的 pipx Python daemon 行程）後，flash 或忙碌時拒絕；否則把舊行程資訊記進 `install-journal.legacy.json`，以原監管手段停止（為 unit 的 MainPID 時 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹結束、且沒有同使用者行程持有 UART，連續 5 秒（上限 330 秒）才切換，之後啟動新 daemon。整個無法檢查的同使用者行程（`/proc/<pid>/fd` 讀不到，或 fd 條目全部被拒；有 systemd user session 的機器上即 `(sd-pam)` 與 `systemd --user`），只要送出 stop 時就已存在（以 pid 與啟動時間比對），不論四個 uid（real、effective、saved、fs）是否都是自己（常駐的 setuid `fusermount3` 也放行），在其餘同使用者行程都未持有 UART 時不擋切換，改列在 `legacy_stop.uninspectable_procs`（pid、start_ticks、comm、reason，以及 `uid_match`〔`all`；`partial`，例如 setuid 工具；`unknown`〕與 `uids`）並標註 `holders_status: "partial"`。stop 後才出現的無法檢查行程（例如 non-dumpable 的 `ssh-agent` 或 setuid UART 工具）不論 uid、停止前快照取得失敗（此時任何無法檢查的行程都不放行）與其他掃描失敗仍會等到上限；掃描中行程結束或等待中拔除裝置不算失敗。已知代價：停止前就已在執行的 setuid 工具若在等待期間才打開 UART，不會被擋。逾時回應附最後一次輪詢的 `holders_status`、`uninspectable_procs`、`before_stop_snapshot`、`daemon_scan`，以及 `last_unstable`（穩定窗最後一次被打斷的時間與原因）。0.4.0 本身在這類機器上會等滿 330 秒，升級到 0.4.0 時請先停止 0.3.x daemon。後續步驟失敗時還原安裝，但**不會**重啟舊 daemon；回應附 `legacy_daemon_stopped`、`restored` 與 `restart_hint`。升級時請明確指定目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇。
 
@@ -2872,10 +3144,10 @@ serialwrap setup --with-com0com
 |---|---|---|
 | `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Target 正處於 flash 燒錄、檔案傳輸或命令執行中；等待完成後重試（`--force` 不會覆寫） |
 | `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | 舊 daemon 未能在 10 秒內完全終止或裝置未釋放；確認行程退出後重試（未進行切換） |
-| `install_lock` | `TIMEOUT` | 無法取得 `.install.lock` 鎖；確認是否有並行之 `setup` 實例正在執行 |
+| `install_lock` | `TIMEOUT` | 回應帶 `phase=install_lock` 與鎖錯誤訊息；確認是否有並行之 `setup` 實例正在執行 |
 | `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | 安裝包 SHA256 或 release-manifest 校驗失敗；重新取得或重新打包安裝 bundle |
 | `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | 新版 daemon 啟動或健康檢查失敗；系統已自動回退至原始版本 |
-| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | 抑制排程工作自動重啟失敗；檢查使用者權限（若為 service 需提權） |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO`, `TIMEOUT` | 抑制排程工作自動重啟失敗；鎖逾時回應帶 `reason=autostart_lock_timeout` 與訊息；檢查使用者權限或並行操作 |
 | `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | 復原時停止目前 daemon 被拒；等待 daemon 閒置後再次執行 `setup` 完成復原 |
 
 #### 部署與驗證參考文件
@@ -2929,9 +3201,248 @@ testpilot run serialwrap_regression --case f3-fail-error-code # 單一 case
 
 破壞性 family（F9 開機/U-Boot——會 reboot 板子；F10 帳密隔離——暫時 device 交接）受 gate 管控：在 `regression/serialwrap_regression/testbed.yaml` 設 `allow_destructive: true` 才會跑（否則記 SKIP）。報告落 `~/b-log/regression-reports/tp-<ts>/`。case↔issue 對照與「從新修好的 bug 新增 case」SOP 見 [`docs/regression-plugin.md`](./docs/regression-plugin.md)。
 
+<a id="rust-refactor-benefits-zh"></a>
+
+### Rust 重構：基線比較與效益（0.5.0）
+
+本節只用 repo 內已入庫的資料呈現 Rust 重構前後的效益，沒有補新量測。數字後的括號是來源（相對 repo 根目錄的路徑與欄位）；標「計算」的是由同一來源的欄位換算，標「推論」的不是量測。數字分三類：
+
+- **Python 0.4.1 對 Rust 0.5.0**：長跑的延遲、吞吐、錯誤、stuck 與 RSS（「長跑條件」到「資源：RSS」）。候選是 0.5.0-rc.1，判定檔的 `run.daemon_version` 記為 `0.5.0`。每平台各跑一輪（n=1），沒有重跑。
+- **Python 開發樹對 Rust**：WAL 微基準、事件延遲、CLI 往返。WAL 微基準與事件延遲的 Python 端是 2026-10-29 的重構開發樹（VERSION 仍為 0.3.2，不是 v0.4.0、v0.4.1 的祖先），已含 BC-01。WAL 微基準所用的 `sw_core/wal.py` 與 v0.4.1 是同一個 blob，事件延遲所用的 Python daemon 則與 v0.4.1 不完全相同。CLI 往返比的是同版原始碼的 Python CLI 對 Rust CLI。Rust 端也不是 0.5.0 release。
+- **只能定性**：基線的選擇、DF 回修、契約、測試與 L1 鎖、Windows 支援演進、成本。這些沒有同口徑的前後數字。
+
+下文的簡稱：
+
+| 簡稱 | 路徑 |
+|---|---|
+| Linux 基線判定檔 | `evidence/stage0/baseline/linux/release-gate.json` |
+| Linux 候選判定檔 | `evidence/stage2/longrun/linux/release-gate.json` |
+| Windows 基線判定檔 | `evidence/stage0/baseline/windows/release-gate.json` |
+| Windows 官方判定檔 | `evidence/stage2/longrun/windows/release-gate.json` |
+| OD-110 判定檔 | `evidence/stage2/longrun/windows/od110/release-gate-od110.json` |
+| Linux 延遲檔 | `evidence/stage2/longrun/linux/latency/latency-linux.json`（方法見 `evidence/stage2/longrun/linux/latency/METHOD.md`） |
+| Windows 延遲檔 | `evidence/stage2/longrun/windows/latency/latency-windows.json`（方法見 `evidence/stage2/longrun/windows/latency/METHOD.md`） |
+
+#### 比較什麼、為什麼基線是 0.4.1
+
+- 能嚴格比較的只有一組：同一套 `lr-mixed` 引擎、同樣的負載、同一台實機上，Python daemon 0.4.1 基線對 Rust daemon 0.5.0-rc.1 候選，Linux 與 Windows 各 24 h（`evidence/stage2/longrun/README.md`；四份判定檔的 `mode`、`run.daemon_version`）。
+- 這組比到的只是「daemon 換語言」：
+  - 0.4.1 已是 Rust CLI 加 Python daemon（`docs/rust-refactor/plans/00-master-plan.md` 的版號表）。基線判定檔的 `run.cli_identity` 與 `run.deployed_content.daemon_live` 也顯示，受測 CLI 是版本目錄的 `bin/serialwrap`，daemon 是版本目錄 `py/` 內的 Python 直譯器。
+  - 0.4.1 也已含 Stage 0 的 Python 修正：19 個 DF 已回修到 Python 並發布（見「重構流程的效益」）。
+  - Stage 1 CLI 改寫與 Stage 0 修正的效益都已含在基線裡，所以這組數字會**低估**重構的整體效益（推論）。
+- 基線選 0.4.1 的依據：
+  - OD-10 第 2 點：「Stage 0 只跑**修正後** Python 48h 基線（兩平台各一次），修正前以既有 32h 歷史資料參考、BC-01 效能以微基準與短測驗證」（`docs/rust-refactor/owner-decisions-2026-10-15.md` 的 OD-10）。時數後來依 OD-94 改為每平台 24 h（`realhw/acceptance/longrun_acceptance.yaml` 的 `workload.min_continuous_duration_s` 為 86400；`CHANGELOG.md` [0.5.0] 的 OD-94 項）。
+  - OD-102：OD-102 的裁決條目本身不在 repo，以下依 repo 內文件的引述。`realhw/acceptance/README.md` 的長跑一節寫「依 OD-102／OD-103 錯開執行：Windows Python 0.4.1 基線（COM6）→ Linux Python 基線 → …」；`evidence/stage2/longrun/README.md` 的開頭一段把候選長跑寫成「OD-102 規定的」，並寫明兩平台都以「同平台的 Python 0.4.1 24 小時基線」比較。0.4.1 是已發布的維護版（`docs/rust-refactor/plans/00-master-plan.md` 的版號表）。
+- 0.3.2 只用在 OD-91 的 MCU 燒錄模擬 A/B：以 tag `v0.3.2`、origin/main 與 Rust daemon 跑既有的 flash、MCU RPC、handoff 與忙碌守衛案例，逐節點比較，每個差異都要有來源歸因（`CHANGELOG.md` [0.5.0] 的 OD-91 項；`tests/contract_blackbox/mcu_flash_parity.py`）。A/B 的結果報告不在 repo。
+- 以 0.3.2 為基線、量化 Stage 0 到 Stage 2 整體效益的長跑，排在 Stage 3 之後，目前沒有資料。
+- 舊的 32h 長跑（[32h 長時間穩定度測試摘要](#longrun-32h-history)）只能當歷史參考：
+  - 測的是 v0.0.1 時期的程式碼：摘要由 commit 945a905e 寫入，`git describe --tags` 為 `v0.0.1-2-g945a905e`。
+  - controller 遇到 session 不健康就自動重啟 serialwrap（31 個 run segment、30 次 daemon restart）。現行長跑保留現場、不自動重啟：四份判定檔的 `checks[id=fault_retention_attested].detail.auto_restart_disabled` 都是 true，引擎遇重大事件只停負載（`realhw/cases/longrun.py` 的模組說明）。
+  - `lr-mixed` 引擎在 2026-07-20 才加入（commit 4b4c9c0b，最早出現在 v0.2.4）。引擎、板數、自動重啟與計數定義都不同，規格把那輪結果定為歷史診斷證據（`docs/rust-refactor/serialwrap-rust-spec-final.md` §15.11.5），不能和本節的數字並列比較。
+
+#### 長跑條件
+
+- 負載 `lr-mixed`（`realhw/cases/longrun.py`）：4 個 agent worker 輪流對各板送命令；輪次是 10 的倍數時做 interactive open/close，其餘 3 的倍數輪次做 background echo，其他輪次做 line `submit_and_wait`；每輪之間 sleep `uniform(0.5, 2.0)` s。1 個 human thread 每 2～5 分鐘在 COM0 輸入一行。snapshot 每 300 s、observer 每 10 s（`realhw/acceptance/longrun_acceptance.yaml` 的 `workload`）。
+- 兩版的引擎與負載契約相同：五份判定檔的 `run.engine_files_sha256`、`run.cases_yaml_sha256`、`acceptance.workload_contract_sha256` 都一樣。門檻檔的 revision 不同：基線以 `2026-11-20.1` 判定，候選以 OD-109 凍結的 `2026-11-21.1` 判定（判定檔的 `acceptance.revision`；`docs/rust-refactor/owner-decisions-addenda.md` 的 OD-109）。
+- 凍結門檻（`realhw/acceptance/longrun_acceptance.yaml` 的 `thresholds`）：非預期錯誤率 ≤ 0.01 且不高於基線；每小時完成數 ≥ 基線的 0.95 倍；RSS 上限 Linux peak 40390／steady 40325 kB、Windows 48005／38585 kB，斜率 256 kB/h；比較容差為錯誤率 0.002、吞吐比 0.02、stuck 300 s。
+
+| 平台 | 硬體 | 基線 0.4.1 | 候選 0.5.0-rc.1 |
+|---|---|---|---|
+| Linux | 兩塊 BRCM 板（COM0、COM1），human 只在 COM0 | 2026-11-20T10:27:05Z 起，86403 s | 2026-11-21T10:52:40Z 起，86402 s |
+| Windows | Orange Pi 3 一塊板（實體 COM6，selector COM0），4 個 worker 共用 | 2026-11-20T00:10:53Z 起，86402 s | 2026-11-21T10:49:33Z 起；68125 s 時引擎以 `both_boards_stuck` 自行停止；OD-110 有效段到 2026-11-22T05:29:16Z（18.66 h） |
+
+（判定檔的 `run.started_at_utc`、`run.duration_s` 與 `counts` 的鍵；`evidence/stage2/longrun/README.md`；`evidence/stage2/longrun/windows/od110/truncation-receipt.json` 的 `cutoff`）
+
+- **Windows 候選的官方判定是 FAIL**。2026-11-22T05:29:17Z COM6 被 Windows 重新列舉，session 停在 DETACHED，`last_error` 為 `ATTACH_FAILED:FileNotFoundError`，之後的 agent 命令都回 `SESSION_NOT_READY`（`evidence/stage2/longrun/windows/od110/detached-session-list.json`）。擁有者依 OD-110 排除擾動區間、接受有效的 18.66 h、不重跑（`docs/rust-refactor/owner-decisions-addenda.md` 的 OD-110）。OD-110 重算判定檔本身的 `release_gate_result` 仍為 FAIL（18 PASS、2 FAIL、5 INSUFFICIENT_EVIDENCE；OD-110 判定檔的 `checks[].result`）；擁有者依 OD-110 豁免 `engine_verdict`、`continuous_duration`、`worker_liveness`、`observation_gaps`、`safety_double_holder`、`resources`、`error_rate_relative`（`docs/rust-refactor/owner-decisions-addenda.md` 的 OD-110；`evidence/stage2/longrun/README.md`）。所以目前**沒有完整 24 h 的 Windows Rust 證據**；下文的 Windows 一律比「基線 24 h 全程 → 候選有效段」。
+- attach 失敗後不自動重試是 0.4.1 與 0.5.0 共有的限制（`contracts/session_last_errors.yaml` 中 `ATTACH_FAILED:*` 的 `auto_reprobe` 在 `attached`、`detached` 皆為 false；`evidence/stage2/longrun/README.md`），列為 0.5.0 已知問題 #300。0.4.1 在同一情境下沒有實測。
+- `realhw/acceptance/README.md` 的 runbook 寫四輪都在 Orange Pi 3 上；Linux 的實際硬體以判定檔 `counts` 的 COM0／COM1 鍵與 `evidence/stage2/longrun/README.md` 為準，是兩塊 BRCM 板。
+- 兩平台的數字不能互相比較：Windows 的 4 個 worker 共用一塊板的鎖，估計佔用率約 96%，line p50 約 3.2 s；Linux 約 1.7 s。記憶體的量測口徑也不同（見「資源：RSS」）。
+
+#### 效能：延遲與吞吐
+
+line 延遲有 harness 設下的下限：`submit_and_wait` 送出後固定等 1.5 s，之後每 0.5 s 輪詢一次 `cmd status`（`realhw/drivers.py` 的 `settle_s`、`poll_s`），所以最小值約 1.5 s、以 0.5 s 為階，量的是 harness 看到結果的時間，不是 daemon 的執行時間。background 結果每 1 s 輪詢一次（`realhw/cases/longrun.py` 的 `BG_POLL_INTERVAL_S`），`bg_result` 的解析度約 1 s。submit 事件在取得板鎖之前寫入，延遲也含等鎖時間。不受輪詢下限影響的只有 interactive 與 background submit→accepted。分位數用 nearest-rank，只計成功完成的命令，單位為秒，格式為「基線 → 候選」。
+
+**Linux**（Linux 延遲檔的 `runs.<run>.latency['*|<mode>'].<指標>`）
+
+| mode：指標 | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| line：`submit_to_done_s` | 76201 → 76441 | 1.711 → 1.699 | 3.212 → 3.194 | 4.401 → 4.340 | 8.201 → 5.073 | 14.058 → 13.018 |
+| interactive：`submit_to_done_s` | 10303 → 10864 | 0.112 → 0.163 | 1.694 → 1.605 | 2.836 → 2.774 | 3.469 → 3.748 | 10.533 → 10.782 |
+| background：`submit_to_accepted_s` | 38106 → 38225 | 0.009 → 0.004 | 1.434 → 1.440 | 2.627 → 2.601 | 3.638 → 3.277 | 11.397 → 9.204 |
+| background：`bg_result_latency_s_field` | 38102 → 38220 | 0.557 → 0.511 | 0.956 → 0.912 | 1.050 → 1.002 | 1.073 → 1.018 | 11.100 → 10.463 |
+| background：`submit_to_bg_result_s` | 38102 → 38220 | 0.857 → 0.805 | 2.069 → 2.027 | 3.277 → 3.185 | 4.580 → 4.050 | 12.023 → 10.466 |
+
+- line 與 background 的中位數差在量測解析度內。line 的 p99.9 由 8.201 降到 5.073 s；超過 6 s 的 line 只出現在有 human 的 COM0，由 84 筆降到 22 筆（`runs.<run>.line_tail_gt_6s_attribution` 兩個鍵相加，計算）。
+- interactive 的 p50 變慢，0.112 → 0.163 s（最小值 0.0038 → 0.0257 s）；原因從事件檔無法判定。
+
+**Windows**（Windows 延遲檔的 `runs.<run>.segments.<區段>.latency['*|<mode>'].<指標>`；基線取 `full`，86400.789 s；候選取 `effective_od110`，從開始到截斷點 67182.824 s）
+
+| mode：指標 | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| line：`submit_to_done_s` | 51575 → 39701 | 3.228 → 3.288 | 4.924 → 4.992 | 5.715 → 5.777 | 5.987 → 6.022 | 6.305 → 7.232 |
+| interactive：`submit_to_done_s` | 4829 → 4773 | 2.076 → 1.897 | 3.681 → 3.534 | 4.256 → 4.298 | 4.558 → 4.442 | 4.691 → 4.828 |
+| background：`submit_to_accepted_s` | 25790 → 19853 | 1.961 → 1.998 | 3.590 → 3.630 | 4.190 → 4.244 | 4.367 → 4.382 | 4.712 → 4.697 |
+| background：`bg_result_latency_s_field` | 25794 → 19856 | 0.578 → 0.563 | 0.969 → 0.969 | 1.094 → 1.079 | 1.141 → 1.141 | 1.188 → 2.937 |
+| background：`submit_to_bg_result_s` | 25790 → 19852 | 2.536 → 2.564 | 4.160 → 4.212 | 4.944 → 4.997 | 5.233 → 5.263 | 5.428 → 5.878 |
+
+- 原始延遲大半是板鎖排隊：估計的板鎖佔用率 0.9605 → 0.963（`comparison_effective_vs_baseline.lock_busy_fraction_est`），估計等鎖時間的中位數 1.753 → 1.789 s（`segments.<區段>.lock_wait_est_s` 的 `*` 鍵）。上表的差異主要反映排隊，不是 daemon。
+- 扣掉排隊後的服務時間（估計值，取平均；`comparison_effective_vs_baseline.service_time_est_s` 的 `mean_diff_ms`）候選比較慢，見下表。這是 CLI 子行程、RPC 與 daemon 的合計，兩版的 CLI 又是不同 build，不能只歸因給 daemon。
+
+| Windows 動作（服務時間估計，平均） | 基線 → 候選（s） | 差 |
+|---|---|---|
+| line（扣掉 1.5 s settle） | 0.0792 → 0.0932 | +14.0 ms |
+| interactive open＋close | 0.0782 → 0.0903 | +12.1 ms |
+| background 提交 | 0.0395 → 0.0466 | +7.1 ms |
+
+- WAL 拆解（`comparison_effective_vs_baseline.wal_decomposition_s`）：估計取得鎖到 WAL 記下 TX 的中位數 0.0456 → 0.0457 s，WAL TX 到 prompt 回來 0.0231 → 0.0235 s，human 輸入從 WAL TX 到輸出行 RX 0.0125 → 0.0131 s。
+- line 的最大值 7.232 s 出現在候選一段原因不明的 RX 停頓前後（有效段 WAL 相鄰紀錄的最大間隔 4.261 s，`segments.effective_od110.wal.largest_gaps_wall_s`），原因從證據檔無法判定。
+- 兩次長跑各有一次系統牆鐘往回跳（基線 −1.541 s、候選 −1.493 s，`runs.<run>.clock_steps_observer`）。跨過跳變的配對不計入延遲與服務時間（服務時間鏈排除基線 15 筆、候選有效段 14 筆，`segments.<區段>.service_chain_excluded`），完成數與錯誤數不受影響。
+
+**吞吐**（閉迴路負載）
+
+| 平台 | 每小時完成數 | 變化 | 各 worker 的比值（判定檔，門檻 ≥ 0.95） |
+|---|---|---|---|
+| Linux | 5191.7 → 5230.1 | +0.74% | 1.0022～1.0161，8 個鍵全 PASS |
+| Windows | 3425.344 → 3447.667 | +0.652%（每小時提交數 −0.997%） | 0.9909～0.9960，4 個鍵全 PASS |
+
+（Linux：Linux 延遲檔的 `runs.<run>.throughput['*'].completed_per_h`、Linux 候選判定檔的 `checks[id=throughput_relative]`。Windows：Windows 延遲檔的 `comparison_effective_vs_baseline.throughput['*']`，分母是區段的 wall 長度，候選為 18.6619 h；OD-110 判定檔的 `checks[id=throughput_relative]`，分母是引擎的 68125 s，含已排除的 DETACHED 區段，所以比值較低；Windows 官方判定檔扣掉非 READY 區間後為 1.0046～1.0098）
+
+- 吞吐是閉迴路：每個 worker 等前一個動作結束才送下一個，line 另有 1.5 s settle，每輪之間再隨機睡 0.5～2.0 s。完成數只能說明「沒有變慢」，不是容量量測。兩平台的變化都在吞吐容差 0.02 內，結論是**不比基線差**。
+- Windows 依 mode 拆開：line 與 background 每小時完成數是基線的 0.98998 與 0.98999 倍，只有 interactive 是 1.27141 倍（`comparison_effective_vs_baseline.throughput_by_mode`）。interactive 變多，是因為被 `SESSION_BUSY` 拒絕的比例從 22.589% 降到 0.317%（`comparison_effective_vs_baseline.interactive_session_busy_share`）。Linux 完成數的增加也對應到 interactive `SESSION_BUSY` 拒絕減少（699 → 136，見「穩定度」；推論）。所以 +0.652%、+0.74% 都不能解讀成整體變快。
+
+#### 穩定度
+
+| 項目 | Linux：基線 → 候選 | Windows：基線 → 候選有效段 |
+|---|---|---|
+| 非預期錯誤 | 19 → 10，全在 COM0 | 0 → 2 |
+| 非預期錯誤率 | 1.5246e-04 → 7.966e-05 | 0 → 3.108e-05（OD-110 判定檔為 6.2e-05，見下） |
+| 錯誤類型 | 基線：FLUSHED_BY_RECOVERY 15、回報 done 但 stdout 沒有 marker 4；候選：FLUSHED_BY_RECOVERY 9、回報 done 但 stdout 沒有 marker 1 | 候選 2 筆都是 line、回報 done 但 stdout 沒有 marker |
+| 預期拒絕（不算錯誤） | 2398 → 1876：`busy` 1699 → 1740、interactive `SESSION_BUSY` 699 → 136 | 3768 → 1843：`busy` 1826 → 1822、interactive `SESSION_BUSY` 1942 → 21 |
+| unresolved／bg_lost | 0／0 → 0／0 | 0／0 → 2／0（截斷點後才完成，見下） |
+| stuck（連續非 READY） | 兩板都是 0 s → 0 s | 0 s → 0 s（官方判定檔的 COM0 有 929.99～943.72 s 的未結束區段） |
+| daemon 重啟 | `liveness_restart` 0 → 0，pid 全程不變 | 同左 |
+| WAL 安全掃描 | 302287 → 302992 筆，`loss_flags`、`unauthorized_tx`、`cross_context_replay`、`dangerous_auto_resend` 皆為空 | 360117 → 276660 筆（候選為全程），同樣皆為空 |
+| 雙重持有 | `safety_double_holder` events 0 → 0 | events 0 → 0；排他性探測 288 → 224 筆全為 `exclusive`；候選此項判 INSUFFICIENT_EVIDENCE（`detail.reason` 為 `probe_gap`，COM0 67444.7～67825 s；依 `evidence/stage2/longrun/README.md`，缺口落在排除區間內），依 OD-110 豁免 |
+| 判定 | 基線 17 PASS＋8 NOT_APPLICABLE_BASELINE → 候選 25／25 PASS | 基線 `baseline_result` PASS → 候選官方 **FAIL**；OD-110 重算的 `release_gate_result` 仍是 **FAIL**（18 PASS、2 FAIL、5 INSUFFICIENT_EVIDENCE），其中 7 個非 PASS 項依 OD-110 豁免 |
+
+（判定檔的 `counts['*']`、`stuck`、`walscan`、`checks[].result`、`checks[id=liveness_restart]`、`checks[id=safety_double_holder]`、`baseline_result`、`release_gate_result`，Windows 候選欄取 OD-110 判定檔；錯誤類型與拒絕拆分取 Linux 延遲檔的 `runs.<run>.unexpected.items`、`runs.<run>.rejects.total`，以及 Windows 延遲檔的 `segments.<區段>.unexpected`、`segments.<區段>.rejects.total`、`segments.<區段>.exclusivity_probes`、`segments.<區段>.observer.daemon_pids`）
+
+- Linux 是一次 24 h 對一次 24 h，錯誤率的差值遠小於 0.002 容差，結論是**不比基線差**，不能寫成「錯誤減半」。
+- Windows 有 2 筆命令在截斷點前送出、截斷點後才完成（一筆 line `done`、一筆 background `bg_result:done`，`segments.effective_od110.cut_by_segment_end`）。判定器把它們算成 unresolved，所以 OD-110 判定檔的錯誤率是 (2＋2)÷(64340＋2＋2)＝6.2e-05；以「完成＋非預期」為分母，實際是 3.108e-05（`segments.effective_od110.unexpected.rate_vs_completed_plus_unexpected`）。這高於基線的 0，但在 0.002 容差內；判定器的 `error_rate_relative` 仍判 INSUFFICIENT_EVIDENCE（OD-110 判定檔的 `checks[id=error_rate_relative].detail['*'].result`），依 OD-110 豁免。
+- Windows 那 2 筆經 WAL 逐筆核對為 #294 B 型，即 human 與 agent 同時操作同一 session，屬 0.5.0 已知問題（`evidence/stage2/longrun/README.md`）。Linux 候選那 1 筆，同一份 README 描述為「human 行被拆段時 agent 插入」。
+- Windows 候選全程另有 2860 筆 `SESSION_NOT_READY`（line 1716、background 858、interactive 286），全部在 05:29:17Z 之後；全程錯誤率因此是 0.0426（Windows 官方判定檔的 `counts['*'].error_rate`；Windows 延遲檔的 `segments.full.unexpected.by_mode_detail`）。
+- Linux 的 `safety_double_holder` 中，`holder_unknown_samples` 兩邊都是 8648，等於全部 observer 樣本；這項在 Linux 只靠 multi_open、foreign_holders 與其他 serialwrapd 的掃描判定（`realhw/acceptance/gate.py` 的 `_double_holder_check`）。
+
+#### 資源：RSS
+
+| kB | Linux（VmRSS）：基線 → 候選 | Windows（WorkingSetSize）：基線 → 候選有效段 |
+|---|---|---|
+| 首值 | 30372 → 14224 | 37064 → 11816 |
+| 峰值 | 32312 → 22428 | 38404 → 35396 |
+| 穩態（判定器定義） | 32260 → 22032 | 30868 → 33906 |
+| 末值 | 32064 → 22128 | 30868 → 34020 |
+| 斜率（kB/h） | −9.53 → +55.17 | −233.106 → +31.939 |
+| 共同窗口 [4 h, 18.66 h) 的中位數／斜率 | — | 30802 → 33890／−22.036 → −32.695 |
+| 有效快照（應有 288） | 287 → 287 | 287 → 224 |
+| 判定 | 候選 PASS（上限 40390／40325／256） | 候選數值在上限 48005／38585／256 內，但快照數不足判 INSUFFICIENT_EVIDENCE，依 OD-110 豁免 |
+
+（Linux 基線判定檔的 `checks[id=resources].detail.calibration`、Linux 候選判定檔的 `checks[id=resources].detail.stats`，Linux 延遲檔的 `runs.<run>.resources` 重算結果相同；Windows 延遲檔的 `segments.<區段>.resources` 與 `rss_common_window`，與 Windows 基線判定檔、OD-110 判定檔的 `checks[id=resources]` 相同）
+
+- Linux 候選的峰值與穩態比基線低約 30%（−30.6%、−31.7%，計算），但斜率由負轉正；+55.17 kB/h 在 256 上限內，24 h 內看不出是否收斂。
+- Windows 候選的穩態比基線**高** 9.8%（計算）。兩邊的窗口長度不同（24 h 對 18.66 h），改看共同窗口一樣較高（中位數 30802 → 33890 kB）。基線的首值高於穩態：t 為 2–3 h、3–4 h、4–5 h 的每小時中位數分別是 38404、36208、30932 kB（Windows 延遲檔 `segments.full.resources.hourly_median_kb` 的鍵 `2`、`3`、`4`），之後才穩定，所以它的負斜率不代表持續下降。
+- Linux 量的是 daemon 行程的 VmRSS，Windows 量的是 WorkingSetSize（`realhw/procobs.py`），口徑不同，兩平台不能互相比較。CPU、thread、fd／handle 兩邊都沒有可比較的資料。
+
+#### 長跑以外的量測（Python 開發樹對 Rust）
+
+| 量測 | Python | Rust | 來源 |
+|---|---|---|---|
+| WAL append p50／p99（ms） | 1.010／3.207 | 0.0211～0.0216／0.0505～0.0591 | `docs/rust-refactor/reviews/p5-evidence/od61-wal-s1w-wsl2-86b54d8/README.md`；同目錄 JSON 的 `append_ns` |
+| WAL rotate 最大停頓（ms） | 902.3 | 41.3～55.2 | 同上，`rotate_max_ns` |
+| 事件延遲 release_request，idle（ms） | max 154.2～156.4 | p99 6.54～7.11（max 11.84～76.32） | `docs/rust-refactor/reviews/p5-evidence/event-latency-od45-python-diagnostic-r7-261029.json`、`docs/rust-refactor/reviews/p5-evidence/event-latency-od45-rust-r7-261029.json` 的 `runs` |
+| 事件延遲 release_request，flood 20000 B/s（ms） | max 14.7～28.3 | p99 6.05～8.07（max 9.62～30.59） | 同上 |
+| 事件延遲 stop_request、command_cancel（ms） | p99 皆 ≤ 3.42 | p99 皆 ≤ 1.88（max ≤ 16.08） | 同上 |
+| CLI 往返 `daemon status` p50／p95（ms） | 約 155／220 | 約 16／20 | `docs/rust-refactor/release-0.4.0-plan.md` 的 CLI 效能段 |
+
+- **WAL（OD-61）**：行程內 WalWriter 微基準（S1-W：4 流 × 10,000 筆 × 1,024 B，rotate 64 MiB，不節流），不含 daemon、序列埠與 RPC。WSL2 主機（AMD Ryzen 9 9900X，ext4），2026-10-29 同一時段，Python 一輪、Rust 三輪。
+  - Python 端是 86b54d8 的開發樹（`git describe --tags` 為 `v0.3.2-584-g86b54d8d`，不是 v0.4.0、v0.4.1 的祖先）。JSON 的 `env.artifacts.cli` 寫 `serialwrap 0.3.2`，那只是 VERSION 字串：這棵樹已含 BC-01（commit b707ad6e），`sw_core/wal.py` 與 v0.4.1 是同一個 blob。v0.3.2 的 WAL 寫入沒有量過。
+  - rotate 停頓取決於 fsync 當下的髒頁量；同主機前一次量測，Python 只有 108～132 ms，所以倍數不穩定。
+  - 兩邊都高於規格 §1.2 的原生門檻；Rust 依 OD-66 的 WSL2 門檻判定三輪 PASS（`docs/rust-refactor/reviews/p5-fix-responses.md` 的 F200、F201）。
+- **事件延遲（OD-45 r7）**：外部量測「RPC 送出 → 回應」，4 核 Linux 主機（`docs/rust-refactor/reviews/p5-t22-gate-run.md` 第 7 輪）。
+  - 兩邊都從 1b83da9d 建置（兩份 JSON 的 `identity.source_commit`）。Python 端的 VERSION 寫 0.3.2，但已含 BC-01；`git describe --tags` 為 `v0.3.2-591-g1b83da9d`，不是 v0.4.0、v0.4.1 的祖先（`git merge-base --is-ancestor`），`sw_core`＋`serialwrapd.py` 與 v0.4.1 相差 16 個檔（`git diff --shortstat 1b83da9d v0.4.1 -- sw_core serialwrapd.py`），所以這個 Python daemon 不是 0.4.1 基線。Rust 是 P5 的 build，不是 0.5.0。
+  - Python 是診斷模式，每輪 50 樣本（p99 等於 max）；Rust 每輪 500 樣本。兩邊不對稱。
+  - 判定都是 INSUFFICIENT_EVIDENCE（上限值未凍結，`verdict`、`reasons`）。Python 的 r6 另判 FAIL：idle release_request 有一輪 max 255.37 ms，超過 250 ms 上限（`docs/rust-refactor/reviews/p5-evidence/event-latency-od45-python-diagnostic-r6-261029.json`）。
+  - 差一個數量級以上的只有 idle 的 release_request：Python max（n=50，等於 p99）154.2～156.4 ms 對 Rust p99 6.54～7.11 ms，約 22～24 倍（計算）；改比 max 對 max 也有約 2.0～13.2 倍（計算）。flood 下 Python max 14.7～28.3 ms 對 Rust p99 6.05～8.07 ms 只差約 1.8～4.7 倍（計算），Rust 的 max 9.62～30.59 ms 與 Python 的 max 重疊，最高的 30.59 ms 還高於 Python 的 28.3 ms。stop_request 與 command_cancel 的 p99 兩邊都在幾 ms 內，但 Rust 的 max 最高 16.08 ms（command_cancel idle 第 1 輪），Python 的 max ≤ 3.42 ms（`runs[].max_ms`）。
+- **CLI 往返（Stage 1）**：Rust CLI 對同版原始碼的 Python CLI，兩邊連同一個 Python daemon，在 WSL2 高背景負載下量測，不是標準環境，Windows 未量。這是 0.4.0 的效益，已含在 0.4.1 基線內，所以長跑比較看不到。
+
+#### 重構流程的效益（只能定性）
+
+- **DF（缺陷修正）回修**：`contracts/behavior_changes.yaml`（revision 11）共登記 27 個 DF。
+  - 19 個也修到 Python，並隨 0.4.0、0.4.1 發布：DF-01～17、DF-19（0.4.0）與 DF-25（0.4.1）。依據是 v0.4.1 tag 的 `contracts/behavior_changes.yaml` 中這 19 個為 IMPLEMENTED（`changes[].status`、`applies_to.python.min_version`），以及 `CHANGELOG.md` 的 [0.4.0]、[0.4.1]。其中 8 個是 CLI 或 setup 項目（0.4.x 出貨的 CLI 已是 Rust），11 個屬 daemon 端。
+  - 7 個只在 Rust 修，Python 保留原行為：DF-20～24、DF-26、DF-27（依各項的 `compatibility_impact`）。
+  - DF-18 的 Python 修正（`os.rename` 改 `os.replace`）只在 v0.5.0 的程式樹，沒有隨任何 Python daemon 版本發布。
+  - 這些 DF 多半是依定稿規格盤點 Python 時找到的（`docs/rust-refactor/plans/spec-reconciliation.md` §1.2「DF：缺陷與安全修正（兩邊都修）」），屬重構流程的效益，不全是 Rust 語言的效益（推論）。
+  - 目前的 `status` 欄位是 21 IMPLEMENTED、6 APPROVED、0 VERIFIED（VERIFIED 只由擁有者標記），不能直接當完成度。
+- **測試數**（靜態計數，不展開參數化；`git ls-tree -r --name-only <tag> -- tests crates`、`git grep -c -E '^\s*(async )?def test_' <tag> -- tests`、`git grep -c -E '#\[(tokio::)?test' <tag> -- crates`）見下表。新增的 pytest 有很大一部分是 gate、契約與 A/B 黑箱，不等於產品覆蓋同比例增加。
+
+| 測試數 | v0.3.2 | v0.4.1 | v0.5.0 |
+|---|---|---|---|
+| `tests/` 的 `test_*.py` 檔／`def test_` | 147／1759 | 340／4602 | 425／5415 |
+| `crates/` 的 `.rs` 檔／`#[test]`＋`#[tokio::test]` | 0／0 | 194／1116 | 449／3721 |
+
+- **行為契約**：v0.3.2 沒有 `contracts/`；v0.4.1 有 564 個檔案，v0.5.0 有 601 個（`git ls-tree -r <tag> -- contracts/`）。v0.5.0 的 `contracts/error_codes.yaml` 定義 100 個錯誤碼，`contracts/rpc_schema.json` 的 `x-methods` 列出 55 個 RPC 方法；登記檔共 68 筆（BC 5、SC 36、DF 27）。
+- **L1 必要節點鎖**（`tests/acceptance/l1_required.lock.json` 的 `sets`）：v0.3.2 沒有；v0.4.1 有 10 個集合、5306 個不重複 nodeid；v0.5.0 有 61 個集合、10849 個（pytest 7142、cargo 3707）。
+- **Windows 支援演進**：
+  - v0.3.2：Python daemon 已支援 Windows（pyserial 序列埠、TCP loopback RPC、Telnet console，#84、#131），release 附 PyInstaller 打包的 `serialwrap.exe`／`serialwrapd.exe`（v0.3.2 tag 的 `.github/workflows/release.yml` 中 `publish-windows-exe` job）。
+  - 0.4.1：開始發布 Windows zip（OD-78），內容是 Rust CLI／launcher 加 Python daemon，runtime 為自帶的 CPython 3.12.3（`CHANGELOG.md` [0.4.1]）。
+  - 0.5.0：zip 內的 daemon 改為 Rust。Windows 官方判定檔的 `run.deployed_content.daemon_live[0].image_path` 指向版本目錄的 `bin\serialwrapd.exe`，基線則是 `py\python.exe`。Rust daemon 提供 Windows TCP/Telnet console 與選配的 com0com console（`CHANGELOG.md` [0.5.0]）。L1 鎖中 Windows 平台在各集合的列數（含跨集合重複）由 v0.4.1 的 5442 增到 v0.5.0 的 13070，不重複 nodeid 由 4407 增到 6808（`sets.*.windows.nodeids`）。這也是第一次有 Windows 的 24 h 基線對候選長跑（官方 FAIL，依 OD-110 接受有效段）。
+
+#### 成本與已知問題
+
+- **安裝產物大小**：repo 內沒有可引用的量測，本節不列數字。
+- **0.5.0 仍內附 Python runtime，也仍需要 `/usr/bin/python3.12`**：
+  - Linux：v0.5.0 的 `scripts/rust/mkbundle.sh` 仍在 `assemble_bundle()` 內以 `python3 -m venv --copies` 建立 `py/`；Stage 2 只把 manifest 的 `components.daemon.implementation` 改成 `rust`、`entry` 改成 `bin/serialwrapd`。`install.sh` 仍檢查 `/usr/bin/python3.12`（`PYTHON312_DEFAULT` 與需求檢查），不符就 exit 2；v0.5.0 與 v0.4.1 的 `install.sh` 逐字相同。
+  - Windows：zip 的 `versions\<版本>\py\` 仍含 CPython 3.12.3 embeddable、PyYAML／pyserial 與 `sw_core`（`scripts/rust/mkbundle-windows.ps1` 檔頭說明）。
+  - Python daemon 退役排在 Stage 3（1.0.0，`docs/rust-refactor/plans/00-master-plan.md` 的版號表），0.5.0 還沒有拿到「去除 Python 相依」的效益。
+- **程式規模**（`git grep -c '' <tag> -- ':(glob)sw_core/**/*.py' serialwrapd.py` 與 `git grep -c '' <tag> -- 'crates/**/*.rs'` 的各檔計數加總，含空行與註解；少了 `:(glob)` 會漏掉 `sw_core/` 第一層的檔案）見下表。0.5.0 同時帶著兩份實作：Python daemon 仍在程式樹與 bundle 內（v0.4.1 → v0.5.0 只改了 2 個檔，即 DF-18），Rust 端約 26.7 萬行（含測試）。
+
+| 程式行數（檔數） | v0.3.2 | v0.4.1 | v0.5.0 |
+|---|---|---|---|
+| Python：`sw_core/**/*.py`＋`serialwrapd.py` | 19,522（53） | 29,480（62） | 29,480（62） |
+| Rust：`crates/**/*.rs`（含測試） | 0（0） | 92,142（194） | 267,061（449） |
+
+- **0.5.0 已知問題**（預定 0.5.1 修，`docs/rust-refactor/stage2-release-install.md` 的「已知問題」）：
+  1. 檔案推送中停止或重啟 daemon（#282、#296）。
+  2. 停機時進行中的 `session self-test`、`session recover`、interactive 操作回 `EXCEPTION`（#297）。
+  3. human 與 agent 同時操作同一 session 時，agent 命令可能回 `done`，但輸出是空的或只有 human 那行的殘餘（#294）。Windows 長跑候選的 2 筆非預期錯誤屬這一類。
+  4. USB 序列埠短暫斷線又回來後不會自動接回（#300，0.4.x 也一樣）。Windows 長跑候選的官方 FAIL 由此而來。
+  5. 升級安裝：Linux 有互動 console 連著時 `setup` 回 `SESSION_BUSY`；Windows 的 daemon 沒在執行時可能回 `TIMEOUT`，安全檢查也不讀 config.yaml 的 `socket_path`；bundle 目錄內留下的 `__pycache__` 會讓 checksum 驗證失敗。
+  6. Windows zip 不含 com0com 選用元件。
+- **不利或不確定的結果**（見上文各節）：
+  - 長跑：Linux interactive p50 0.112 → 0.163 s；Linux RSS 斜率轉正（+55.17 kB/h）；Windows 非預期錯誤 0 → 2（在 0.002 容差內，但判定器的 `error_rate_relative` 判 INSUFFICIENT_EVIDENCE，依 OD-110 豁免）；Windows line 與 background 每小時完成數比基線少約 1%（0.98998、0.98999 倍；計算）；Windows line max 6.305 → 7.232 s、`bg_result_latency_s_field` max 1.188 → 2.937 s；Windows 每個動作的服務時間估計多 7.1～14.0 ms；Windows 穩態 RSS 高 9.8%；Windows 沒有完整 24 h 的 Rust 證據，OD-110 重算判定仍是 FAIL，只靠豁免接受。
+  - 長跑以外：flood 下 Rust 事件延遲 release_request 的 max 最高 30.59 ms，高於 Python 的 28.3 ms；Rust stop_request／command_cancel 的 max 最高 16.08 ms，Python ≤ 3.42 ms。
+
+#### 證據位置
+
+| 內容 | 路徑 |
+|---|---|
+| 0.4.1 基線判定檔 | `evidence/stage0/baseline/linux/release-gate.json`、`evidence/stage0/baseline/windows/release-gate.json` |
+| 0.5.0-rc.1 候選判定檔、OD-110 重算與說明 | `evidence/stage2/longrun/README.md`、`evidence/stage2/longrun/linux/release-gate.json`、`evidence/stage2/longrun/windows/release-gate.json`、`evidence/stage2/longrun/windows/od110/` |
+| 延遲、吞吐、錯誤與 RSS 的重算（各含 METHOD.md、JSON、tools/、SHA256SUMS） | `evidence/stage2/longrun/linux/latency/`、`evidence/stage2/longrun/windows/latency/` |
+| 長跑引擎、門檻與判定器 | `realhw/cases/longrun.py`、`realhw/drivers.py`、`realhw/procobs.py`、`realhw/acceptance/longrun_acceptance.yaml`、`realhw/acceptance/gate.py`、`realhw/acceptance/README.md` |
+| 擁有者裁決、規格與版本規劃 | `docs/rust-refactor/owner-decisions-2026-10-15.md`（OD-10）、`docs/rust-refactor/owner-decisions-addenda.md`（OD-109、OD-110）、`docs/rust-refactor/serialwrap-rust-spec-final.md`（§15.11.5）、`docs/rust-refactor/plans/00-master-plan.md` |
+| WAL 微基準、事件延遲、CLI 往返 | `docs/rust-refactor/reviews/p5-evidence/od61-wal-s1w-wsl2-86b54d8/`、`docs/rust-refactor/reviews/p5-evidence/` 的 event-latency-od45 系列、`docs/rust-refactor/reviews/p5-t22-gate-run.md`、`docs/rust-refactor/reviews/p5-fix-responses.md`、`docs/rust-refactor/release-0.4.0-plan.md` |
+| 契約、行為變更登記、L1 鎖 | `contracts/`、`contracts/behavior_changes.yaml`、`tests/acceptance/l1_required.lock.json` |
+| MCU 燒錄模擬 A/B（OD-91） | `tests/contract_blackbox/mcu_flash_parity.py` |
+| 0.5.0 已知問題與安裝說明 | `docs/rust-refactor/stage2-release-install.md` |
+| 32h 歷史資料 | [32h 長時間穩定度測試摘要](#longrun-32h-history) |
+
+<a id="longrun-32h-history"></a>
+
 ### 32h 長時間穩定度測試摘要
 
-最近對 `COM1` 做了一輪 **32 小時** 長時間穩定度測試，負載模型是：
+> **歷史資料，不是現行基線**：這輪測的是 v0.0.1 時期的程式碼（摘要於 2026-03-23 由 commit 945a905e 寫入，`git describe --tags` 為 `v0.0.1-2-g945a905e`），controller 允許自動重啟 serialwrap，引擎、板數與計數定義都和現行的 `lr-mixed` 長跑不同，只能當歷史參考，不能和 0.4.1／0.5.0 的長跑數字並列比較。現行的基線比較見 [Rust 重構：基線比較與效益（0.5.0）](#rust-refactor-benefits-zh)。
+
+對 `COM1` 做了一輪 **32 小時** 長時間穩定度測試，負載模型是：
 
 - 4 個 agent source 持續送 `serialwrap cmd submit`
 - 1 個 human console 透過 `tmux + minicom + tmux send-keys`

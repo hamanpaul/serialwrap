@@ -145,9 +145,10 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
         &outcome.resp,
     ) {
         AutostartDecision::Started { pid } => {
+            let pid_text = pid.map(|pid| format!("（pid={pid}）")).unwrap_or_default();
             let _ = ctx.io.err_str(&format!(
-                "serialwrap: on-demand：預設 endpoint {} 沒有 daemon，已自動啟動（pid={pid}）\n",
-                resolved.endpoint
+                "serialwrap: on-demand：預設 endpoint {} 沒有 daemon，已自動啟動{pid_text}\n",
+                resolved.endpoint,
             ));
             match client::rpc_call_origin(
                 ctx.p,

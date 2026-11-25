@@ -871,6 +871,25 @@ fn cancel_queued_removes_from_heap() {
 }
 
 #[test]
+fn queue_has_accepted_ignores_terminal_registry_residue() {
+    let registry = CommandRegistry::new();
+    let mut queue = SessionQueue::new();
+    let admitted = registry
+        .admit(req("echo stale"), true, "stale".into(), T)
+        .expect("命令應先完成 admission");
+    queue.push(admitted.queued, &registry);
+
+    registry.cancel("stale", T);
+
+    assert_eq!(queue.len(), 1, "測試保留 queue registry 殘項");
+    assert_eq!(queue.physical_len(), 1, "測試保留 heap 實體項目");
+    assert!(
+        !queue.has_accepted(&registry),
+        "registry 已終態的項目不得讓 self-test 誤判忙碌"
+    );
+}
+
+#[test]
 fn pending_excludes_interactive() {
     let r = CommandRegistry::new();
     r.admit(req("a"), true, "c1".into(), T).expect("admit");
@@ -891,4 +910,73 @@ fn pending_excludes_interactive() {
 
     r.admit(req("b"), true, "c2".into(), T).expect("admit");
     assert_eq!(r.pending(SID), 1);
+}
+
+// ---------------------------------------------------------------------------
+// OD-111：Rust-only profile console 單行上限（`max_console_line_chars`）；Python 基線不含此行為。
+// ---------------------------------------------------------------------------
+
+fn admit_limited(
+    r: &CommandRegistry,
+    request: SubmitReq,
+    limit: Option<i128>,
+    id: &str,
+) -> Result<sw_core::arbiter::Admitted, PyDict> {
+    let limit = limit.map(sw_proto::pyjson::PyInt::Small);
+    r.admit_with_line_limit(request, limit.as_ref(), true, id.into(), T)
+}
+
+#[test]
+fn console_line_limit_rejects_with_exact_response_and_no_enqueue() {
+    let r = CommandRegistry::new();
+    let e = admit_limited(&r, req(&format!("echo {}", "A".repeat(20))), Some(20), "c1")
+        .err()
+        .expect("超過 profile 上限應被拒絕");
+    assert_eq!(
+        format!("{}\n", dumps(&PyValue::Dict(e), &RPC_WIRE)),
+        "{\"ok\":false,\"error_code\":\"CMD_TOO_LONG\",\"cmd_length\":25,\"limit\":20,\"hint\":\"Command exceeds this console's line limit (profile max_console_line_chars) and would be truncated by the target. Shorten it, or push a script with file push and run that instead.\"}\n"
+    );
+    assert!(r.get("c1").is_none(), "被拒的命令不得建立紀錄");
+}
+
+#[test]
+fn console_line_limit_boundaries_and_utf8_bytes() {
+    let r = CommandRegistry::new();
+    assert!(admit_limited(&r, req(&"A".repeat(20)), Some(20), "at").is_ok(), "等於上限應接受");
+    let utf8_at_limit = format!("{}{}", "中".repeat(6), "A".repeat(2));
+    assert_eq!(utf8_at_limit.len(), 20);
+    assert!(admit_limited(&r, req(&utf8_at_limit), Some(20), "utf8-at").is_ok(), "UTF-8 bytes 等於上限應接受");
+    // 與 file transfer 的單行預算相同，以 UTF-8 bytes 計（「中」為 3 bytes）。
+    let e = admit_limited(&r, req(&"中".repeat(7)), Some(20), "utf8").err().expect("21 bytes 應被拒絕");
+    assert_eq!((field(&e, "cmd_length"), field(&e, "limit")), (PyValue::from(21i64), PyValue::from(20i64)));
+    // 未設上限：行為不變（5000 bytes 只附 CMD_LENGTH_WARNING）。
+    assert!(admit_limited(&r, req(&"A".repeat(5000)), None, "none").is_ok());
+}
+
+#[test]
+fn console_line_limit_applies_to_every_submit_mode() {
+    let r = CommandRegistry::new();
+    for (i, mode) in ["line", "background", "fg", "bg", "interactive"].into_iter().enumerate() {
+        let mut q = req(&"A".repeat(21));
+        q.mode = mode.into();
+        let e = admit_limited(&r, q, Some(20), &format!("m{i}")).err().expect(mode);
+        assert_eq!(
+            (field(&e, "error_code"), field(&e, "limit")),
+            (PyValue::from("CMD_TOO_LONG"), PyValue::from(20i64)),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn console_line_limit_order_matches_contract() {
+    // 16 KB 硬上限先判（limit=16384）；profile 上限與 CMD_TOO_LONG 同位、先於換行檢查
+    // （contracts/rpc_schema.json command.submit 的 error_order：CMD_TOO_LONG → CMD_CONTAINS_NEWLINE）。
+    let r = CommandRegistry::new();
+    let e = admit_limited(&r, req(&"A".repeat(16_385)), Some(20), "hard").err().unwrap();
+    assert_eq!((field(&e, "error_code"), field(&e, "limit")), (PyValue::from("CMD_TOO_LONG"), PyValue::from(16384i64)));
+    let e = admit_limited(&r, req(&format!("{}\n", "A".repeat(30))), Some(20), "nl-long").err().unwrap();
+    assert_eq!((field(&e, "error_code"), field(&e, "limit")), (PyValue::from("CMD_TOO_LONG"), PyValue::from(20i64)));
+    let e = admit_limited(&r, req(&format!("{}\n", "A".repeat(5))), Some(20), "nl-short").err().unwrap();
+    assert_eq!(field(&e, "error_code"), PyValue::from("CMD_CONTAINS_NEWLINE"));
 }
