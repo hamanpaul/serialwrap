@@ -79,12 +79,16 @@ entries:
     - cargo:sw-core::tcp_console_lease::tcp_mirror_secondary_line_respects_lease_busy
     - cargo:sw-core::tcp_console_lease::tcp_mirror_interactive_close_revokes_regular_human_lease
     - cargo:sw-core::tcp_guard_off_baseline::guard_off_tcp_raw_matches_pre_package_baseline
-    - tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_selftest_and_arbitration
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_eof_reconnect
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_foreground_refresh_and_replay
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_rpc_source_policy
     owner_phase: P6
+  case:bc23-tcp-telnet-second-console-line-busy:
+    nodeids:
+    - tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line
+    owner_phase: P6
+    rust_only: true
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01

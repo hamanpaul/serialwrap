@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "cases_revision": "2026-11-21.3",
-  "total": 240,
+  "total": 241,
   "by_suite": {
     "contract-blackbox": 100,
     "func-test": 14,
@@ -9,11 +9,11 @@
     "manual-procedure": 1,
     "realhw": 37,
     "regression": 46,
-    "rust-l1": 6,
+    "rust-l1": 7,
     "windows-native": 21
   },
   "by_layer": {
-    "L1": 46,
+    "L1": 47,
     "L1.5": 104,
     "L2": 47,
     "L3": 42,
@@ -21,7 +21,7 @@
   },
   "by_slice": {
     "2.1": 48,
-    "2.2": 50,
+    "2.2": 51,
     "2.3": 71,
     "2.4": 36,
     "None": 35
