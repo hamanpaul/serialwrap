@@ -51,6 +51,8 @@ TEST_SECTIONS = {
     # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
     "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
     "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
+    "linux_cap_posix_distinct_supplementary_group": (
+        "linux", "s21_gate:cap_posix_distinct_supplementary_group"),
     # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
     "py_parity": ("linux", "s21_gate:py_parity_full"),
     # F-S19：Windows 原生 pytest 證據由共用 windows_l1 匯入。
@@ -59,6 +61,7 @@ TEST_SECTIONS = {
     "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
 CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_supervisor_runtime": "supervisor_runtime",
+          "linux_cap_posix_distinct_supplementary_group": "posix_distinct_supplementary_group",
           "windows_cap_windows_native": "windows_native", "windows_cap_interactive_desktop": "interactive_desktop",
           "windows_cap_supervisor_runtime": "supervisor_runtime"}
 NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
@@ -975,8 +978,10 @@ def test_non_test_section_fragment_cannot_carry_gate_set(case):
 # --------------------------------------------------------------------------- 第 7 輪：SPEC-GAP #1／#2（編排者裁決）
 
 DISPOSITION = {"sys_admin": "BLOCKED-OWNER", "supervisor_runtime": "BLOCKED-OWNER",
+               "posix_distinct_supplementary_group": "BLOCKED-OWNER",
                "windows_native": "LOCAL-WINDOWS-TODO", "interactive_desktop": "LOCAL-WINDOWS-TODO"}
 NEEDS = {"sys_admin": "CAP_SYS_ADMIN", "supervisor_runtime": "systemd", "windows_native": "Windows",
+         "posix_distinct_supplementary_group": "不同於 primary/config group 的 supplementary group",
          "interactive_desktop": "Windows"}
 # OD-55（Windows 部分）：同一能力在 windows section 的所需能力與處置（supervisor_runtime 於 Windows 為工作排程器、LOCAL-WINDOWS）。
 SECTION_DISPOSITION = {"windows_cap_supervisor_runtime": "LOCAL-WINDOWS-TODO"}
@@ -1004,6 +1009,13 @@ def test_capability_section_never_passes_without_capability_probe(case, name):
         assert any(needs in r and disposition in r for r in s["reasons"]), s["reasons"]
         assert out["verdict"] == "INCOMPLETE"
     assert _sec(j.judge(case.report(), case.expect()), name)["status"] == "PASS"   # 具備能力且全 passed
+    if name == "linux_cap_posix_distinct_supplementary_group":
+        nodeid = GATE_NODEIDS[name][0]
+        case.l1[name] = _l1("linux", "cargo", [_row(nodeid, "skipped", "capability")])
+        out = j.judge(case.report(), case.expect())
+        section = _sec(out, name)
+        assert section["status"] == "EVIDENCE_MISSING", section["reasons"]
+        assert section["l1_verdict"]["verdict"] == "INSUFFICIENT", section["l1_verdict"]
 
 
 def test_capability_section_failure_with_capability_is_fail(case):
@@ -1223,7 +1235,8 @@ def test_gate_script_runs_capability_and_py_parity_sections():
     assert text.count("record linux_cap_posix_pty_workspace ") >= 2
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
     # 擁有者裁決 2026-11-12 第 4 點：windows_native／interactive_desktop 的 linux section 退役（改由 windows_cap_<cap> 承擔）
-    assert "for cap in sys_admin supervisor_runtime; do" in text
+    assert "for cap in sys_admin supervisor_runtime posix_distinct_supplementary_group; do" in text
+    assert "posix_distinct_supplementary_group)" in text
     assert "record linux_cap_windows_native " not in text and "record linux_cap_interactive_desktop " not in text
     # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
     assert '"${CAPS_ARGV[@]}"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
@@ -1266,7 +1279,8 @@ def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
     assert workspace_plan == {"caps": ["posix_pty"], "argv": selector, "caps_only": True}, workspace_plan
     plan = j.caps_plan("linux_cap_posix_pty", exp, lock)
     assert plan == {"caps": [], "argv": ["-p", "sw-pal", "--features", "test-fakes"], "caps_only": False}, plan
-    for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
+    for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime",
+                "posix_distinct_supplementary_group"):
         plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
         if cap in ("windows_native", "interactive_desktop"):
             # OD-68 核准移除這兩個集合的 Linux 列；擁有者裁決 2026-11-12 第 4 點：linux section 退役，
@@ -1420,12 +1434,14 @@ def test_linux_cap_posix_pty_run_as_root_is_evidence_missing(case):
 def test_capability_how_to_run_uses_caps_only():
     """sol P5-54dd588-2：能力 section 的單獨執行命令（judge 原因文字與 runbook）須帶 --caps-only，否則先跑預設 run 必 FAIL。"""
     j = _judge_mod()
-    for name in ("linux_cap_sys_admin", "linux_cap_supervisor_runtime"):
+    for name in ("linux_cap_sys_admin", "linux_cap_supervisor_runtime",
+                 "linux_cap_posix_distinct_supplementary_group"):
         assert "--caps-only" in j.CAPABILITY_SECTIONS[name]["how_to_run"], name
     runbook = (ROOT / "docs/rust-refactor/slice21-owner-runbook.md").read_text(encoding="utf-8")
     rows = [ln for ln in runbook.splitlines() if ln.startswith("| `linux_cap_sys_admin`")
-            or ln.startswith("| `linux_cap_supervisor_runtime`")]
-    assert len(rows) == 2 and all("--caps-only" in ln for ln in rows), rows
+            or ln.startswith("| `linux_cap_supervisor_runtime`")
+            or ln.startswith("| `linux_cap_posix_distinct_supplementary_group`")]
+    assert len(rows) == 3 and all("--caps-only" in ln for ln in rows), rows
 
 
 def test_gate_script_capability_sections_caps_only_and_posix_pty_non_root():

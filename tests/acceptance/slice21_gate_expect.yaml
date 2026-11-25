@@ -63,6 +63,9 @@ sections:
      command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json <caps-plan：--caps-only --caps sys_admin -- 集合 selector argv>"}
   - {name: linux_cap_supervisor_runtime, kind: test, platform: linux, required_set: "s21_gate:cap_supervisor_runtime",
      command: "能力探測（systemctl --user is-system-running 為 running／degraded）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_supervisor_runtime/l1-results.json <caps-plan：--caps-only --caps supervisor_runtime -- 集合 selector argv>"}
+  - {name: linux_cap_posix_distinct_supplementary_group, kind: test, platform: linux,
+     required_set: "s21_gate:cap_posix_distinct_supplementary_group",
+     command: "能力探測（行程有不同於 primary/config group 的 supplementary group）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_distinct_supplementary_group/l1-results.json <caps-plan：--caps-only --caps posix_distinct_supplementary_group -- 集合 selector argv>；能力不足記 EVIDENCE_MISSING，不得以 skipped 計為通過"}
   - {name: windows_native_l1, kind: test, platform: windows, required_set: s21_core,
      command: "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon"}
   - {name: windows_cap_windows_com, kind: test, platform: windows, required_set: "s21_gate:windows_cap_windows_com",

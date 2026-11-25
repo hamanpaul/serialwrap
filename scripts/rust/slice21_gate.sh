@@ -211,6 +211,7 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --reason "$why"
   record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
   record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
+  record linux_cap_posix_distinct_supplementary_group --required-set s21_gate:cap_posix_distinct_supplementary_group --reason "$why"
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
   record py_parity_windows --required-set s21_gate:py_parity --reason "$why；須以 shared-evidence --windows-l1 匯入原生 pytest L1"
   record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "$why"
@@ -361,12 +362,27 @@ cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<�
       else
         echo "unavailable:systemctl --user is-system-running=${st:-unavailable}"
       fi ;;
+    posix_distinct_supplementary_group)
+      local primary groups group found=0
+      primary="$(id -g 2>/dev/null || true)"
+      groups="$(id -G 2>/dev/null || true)"
+      for group in $groups; do
+        if [[ "$group" =~ ^[0-9]+$ && -n "$primary" && "$group" != "$primary" ]]; then
+          found=1
+          break
+        fi
+      done
+      if [[ "$found" == "1" ]]; then
+        echo "available:euid=$(id -u 2>/dev/null || echo unknown) primary_gid=$primary supplementary_groups=$groups"
+      else
+        echo "unavailable:euid=$(id -u 2>/dev/null || echo unknown) primary_gid=${primary:-unknown} supplementary_groups=${groups:-unknown}"
+      fi ;;
     *)
       echo "unavailable:linux 主機（$(uname -s)）無法提供 cap_$1（需原生 Windows）" ;;
   esac
 }
 # 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：windows_native／interactive_desktop 的 linux section 退役，改由 windows_cap_<cap> 承擔（見下方 LOCAL-WINDOWS 匯入）。
-for cap in sys_admin supervisor_runtime; do
+for cap in sys_admin supervisor_runtime posix_distinct_supplementary_group; do
   sec="linux_cap_$cap"
   # 編排者裁決 2026-11-17 第 3 點（slice21-04）：外部 root 容器證據須先核對 HEAD、鎖 selector 與 euid／CapEff；
   # 環境變數有值但證據無效時只記 EVIDENCE_MISSING，不退回主機探測或執行，也不得把 sys_admin 改成可缺。

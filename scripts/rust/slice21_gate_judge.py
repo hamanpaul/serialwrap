@@ -63,6 +63,7 @@ TEST_SECTIONS: dict[str, str] = {
     # （OD-68 已無 linux 必要集合），改由 windows_cap_windows_native／windows_cap_interactive_desktop 承擔。
     "linux_cap_sys_admin": "linux",
     "linux_cap_supervisor_runtime": "linux",
+    "linux_cap_posix_distinct_supplementary_group": "linux",
     # P5 第 6 輪 SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合 s21_gate:py_parity_full 判定；
     # 舊集合 s21_gate:py_parity 不改不刪、仍由 pytest_full 承擔（兩者皆由 gate 執行）。
     "py_parity": "linux",
@@ -88,6 +89,16 @@ CAPABILITY_SECTIONS: dict[str, dict[str, str]] = {
                       "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_supervisor_runtime/l1-results.json "
                       "--caps-only --caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__"
                       "（--caps-only：只跑能力列；gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
+    "linux_cap_posix_distinct_supplementary_group": {
+        "cap": "posix_distinct_supplementary_group",
+        "needs": "不同於 primary/config group 的 supplementary group，且可將其設為 POSIX 目錄 group",
+        "disposition": "BLOCKED-OWNER",
+        "how_to_run": "於具備不同 supplementary group 的 Linux 主機執行 "
+                      "python3 scripts/rust/cargo_l1_results.py --platform linux --out "
+                      "<run>/linux_cap_posix_distinct_supplementary_group/l1-results.json --caps-only "
+                      "--caps posix_distinct_supplementary_group -- --workspace --features test-fakes -- "
+                      "--ignored cap_posix_distinct_supplementary_group__（能力不足時記 EVIDENCE_MISSING，"
+                      "不得將 skipped 計為通過；gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
     "windows_cap_windows_native": {
         "cap": "windows_native", "needs": "原生 Windows 本機（PowerShell、Job Object、PE Subsystem）", "disposition": "LOCAL-WINDOWS-TODO",
         "how_to_run": "於擁有者原生 Windows host（環境比照 scripts/rust/win-test.sh）執行 python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_windows_native/l1-results.json --caps-only --caps windows_native -- <s21_gate:cap_windows_native.windows selector argv>，再以 SW_GATE_LOCAL_WINDOWS_DIR=<dir> 匯入 gate；缺 LOCAL-WINDOWS 證據檔記 EVIDENCE_MISSING，不得 PASS（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
@@ -107,7 +118,7 @@ NON_TEST_SECTIONS: tuple[str, ...] = (
 )
 SECTION_ORDER: tuple[str, ...] = (
     "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_posix_pty_workspace", "linux_cap_sys_admin",
-    "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
+    "linux_cap_supervisor_runtime", "linux_cap_posix_distinct_supplementary_group", "windows_native_l1", "windows_cap_windows_com",
     "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",
     "case_uptake", "py_parity", "py_parity_windows", "py_parity_76_80", "pytest_full", "policy_check",
