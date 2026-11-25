@@ -188,6 +188,21 @@ M6 後 → M3 選配工具 4～7；Canary 累積時間另列，不擋預設 1.0.
 
 **Windows 原生 COM 逐案傳輸契約（R12-01；只適用 `S3-L15-RELEASE-AB-WINDOWS`）**：沿既有映射逐案標明 `requires_native_com`、runner、實際執行平台、允許的 `transport`、核准 pair／實體替代的去識別端點 ID 與 decision_ref；是否需要 COM 依案例／規格決定，不得由報告改成 false。映射以 T3 的 FrozenFile 納入既有工具凍結，須等於 tool_revision 指定版本；完整 ID 集合仍等於 T1 該出口分母。需 COM 的案例只接受 `windows-native-com`（核准 com0com DUT-side pair）或 `od08-physical`（OD-08 核准、直接連到 Windows 的實體替代）；兩側原始報告須證明當側原生 serial backend 實際開啟所選埠，並與凍結映射、manifest 預定 transport、逐案執行 context、當側 artifact 及共同輪次一致。只有外層 `platform: windows`／evidence_layer、完整 ID 或 hash 不能證成開埠。映射明定不需 COM 的案例按其 runner／平台／transport 驗證，不一概強加 COM；其他 L1.5 出口的合法傳輸與分母不變。公開端點只用穩定去識別 ID，實際埠與 ID 的對照、開埠紀錄及原始 context 留非公開包並以 hash 對應；hosted 所需公開替代仍受 BO-P9-19 約束，不能只憑私有 hash 放行。此來源拒收不降級已獨立核實的產品／安全 FAIL。
 
+**SPEC-GAP（R12-01 逐案映射；2026-11-25 盤點，擁有者裁決權威映射由 T5B 建立、內容由編排者負責）**：
+- 上段所稱「既有映射」在 repo 中不存在：M0 沒有產出逐案映射檔，`requires_native_com` 只出現在本計畫文字中。
+- **依據**：`requires_native_com` 以 `tests/acceptance/cases.yaml` 該案例的 `capabilities` 是否含 `windows_com` 為準。這份檔案有凍結與 revision 鏈保護。不得以 case ID 前綴推斷；依前綴推斷，15 案中只會抓到 7 案。
+- **現況**：`S3-L15-RELEASE-AB-WINDOWS` 共 50 案，其中 15 案需要原生 COM。
+  - 這 50 案在 `contracts/coverage_map.yaml` 中，除 4 個 s24 案例外（`s24-mcu-rpc-shapes` 有 2 個 nodeid，`s24-ho-windows-com`、`s24-sup-wintask-runtime`、`s24-xfer-no-retry-side-effect` 各 1 個），`nodeids` 都是空的。實際 runner 是 func-test 的 `func-test/cases/<id>.yaml`、`func-test/scenarios/<id>.yaml`，或 `scripts/rust/win-spike3.sh`、`scripts/rust/stage1a_gate.py`。
+  - 盤點時找不到 runner 來源的有 15 案；其中需要 COM 的 9 案為：`cap-windows-com--p7-event-fire`、`cap-windows-com--p7-login-ready`、`cap-windows-com--p7-quiet-banner-zero-tx`、`s24-ho-windows-com`、`sc29-com0com-serial-console`、`win-telnet-deferred`、`win-telnet-linebuffer`、`win-telnet-raw-owner`、`win-telnet-suspend-resume`。逐案現況見本文件末的附錄。
+- **負責與時點**：
+  - T3 只做映射的格式與驗證（schema、loader、verify_frozen）。測試用的合成映射只能讀 capabilities，並註明不是權威規則。
+  - 權威映射檔由 T5B 建立，內容由編排者負責。gb10 沒有 COM port。逐案的 runner、實際平台、允許的 transport、核准 pair 或實體替代的去識別端點 ID、decision_ref，都由編排者在 T5B 依原生 COM 實機盤點後填入，並經擁有者核准。
+  - 找不到 runner 來源的案例，要先補上 runner 或另行裁決處置，才能凍結映射。
+- **可信的實際 pair 對照（T3 第 2 輪 R2-03，同樣交編排者）**：
+  - 現況：T3 會逐案核對 `port_id` 是否等於映射中核准 pair 的 DUT 側去識別 ID，但 manifest 的實際 `dut.com_pair`（例如 COM20／COM21）只和同一份 manifest 自填的 `test_device_allowlist` 比對，缺少可信的「實際埠 ↔ 去識別 ID」對照。把兩邊同步改成 COM400／COM401，仍可通過載入與 `verify_frozen`。
+  - 處置：T3 在 `load_manifest`／`verify_frozen` 提供可注入的可信 pair 對照介面。對 `S3-L15-RELEASE-AB-WINDOWS`，沒有注入可信對照時一律 fail closed，回 BLOCKED-OWNER（同 BO-P9-01），不得視為通過。
+  - 可信對照由編排者在 T5B 的原生 COM 實機盤點時建立。實際埠名只存放於擁有者可控的非公開位置；公開證據只放去識別 ID 與該對照檔的 sha256，並由 manifest context 凍結這個 sha256。
+
 **公開證據契約（R7-01；適用全部 kind、歷史沿用及下文所有複製／封存要求）**：
 
 - 原始 WAL（含可逆的 `payload_b64`）、wire、命令／裝置輸出、CLI stdout／stderr、完整主機／環境資訊及可能含敏感內容的附件，只存擁有者可控的非公開位置，保全原位元組及原始 SHA256。私有位置、帳號與存取資訊不寫進 repo；相對路徑或 base64 並不使資料可公開。T8 的「不複製 payload」指收割帳本，T9 的完整原始封存則限非公開來源根，兩者不互相取代。
@@ -4412,3 +4427,60 @@ R12-01 亦屬完成條件：M4 須完成 T3／T5B／T14B／hosted 的 Windows CO
 | M6 退役與正式發布 | 擁有者裁決、編排者執行 hosted 流程 | 同位元組與必要證據／完整引用檔重驗 |
 
 舊 Task 步驟括號內模型名只為歷史測試草圖，實際路由統一以上表；不得據此跳過紅燈 commit、獨立審查或原生／實機驗收。額度按 OD-113 A6，主機分工按 OD-114。
+
+## 附錄 R12-01：`S3-L15-RELEASE-AB-WINDOWS` 逐案現況（2026-11-25 盤點，非權威映射）
+
+來源：`tests/acceptance/stage3_required_cases.lock.json`、`tests/acceptance/cases.yaml`（capabilities、windows_status）、`contracts/coverage_map.yaml`（nodeids）、`func-test/` 與 `scripts/` 的引用。這只是盤點結果，不是凍結映射；權威內容由 T5B 填入，見 R12-01 的 SPEC-GAP。
+
+| case_id | 需原生 COM | windows_status | coverage nodeids | 盤點到的 runner 來源 |
+|---|---|---|---|---|
+| `bc02-deferred-context-switch-clear` | 否 | ported | 0 | （未找到） |
+| `bc02-normal-replay-53` | 否 | ported | 0 | （未找到） |
+| `brcm-01-login-flow` | 否 | ported | 0 | `func-test/cases/brcm-01-login-flow.yaml` |
+| `cap-windows-com--p7-event-fire` | 是 | native | 0 | （未找到） |
+| `cap-windows-com--p7-login-ready` | 是 | native | 0 | （未找到） |
+| `cap-windows-com--p7-quiet-banner-zero-tx` | 是 | native | 0 | （未找到） |
+| `co-01-line-buffering` | 否 | ported | 0 | `func-test/cases/co-01-line-buffering.yaml` |
+| `cowork-01-agent-bad-cmd` | 否 | ported | 0 | `func-test/cases/cowork-01-agent-bad-cmd.yaml` |
+| `ev-01-spawn-handler` | 否 | ported | 0 | `func-test/cases/ev-01-spawn-handler.yaml` |
+| `ha-01-human-then-agent` | 否 | ported | 0 | `func-test/cases/ha-01-human-then-agent.yaml` |
+| `ha-05-concurrent-submit` | 否 | native | 0 | `func-test/cases/ha-05-concurrent-submit.yaml` |
+| `hk-01-special-keys-raw` | 否 | ported | 0 | `func-test/cases/hk-01-special-keys-raw.yaml` |
+| `hk-02-agent-preempt-human` | 否 | ported | 0 | `func-test/cases/hk-02-agent-preempt-human.yaml` |
+| `hk-03-deferred-input-flush` | 否 | ported | 0 | `func-test/cases/hk-03-deferred-input-flush.yaml` |
+| `hk-04-minicom-exit-cleanup` | 否 | ported | 0 | `func-test/cases/hk-04-minicom-exit-cleanup.yaml` |
+| `l15-context-switch-deferred-input` | 否 | ported | 0 | `func-test/scenarios/l15-context-switch-deferred-input.yaml` |
+| `l15-delayed-reply` | 否 | ported | 0 | `func-test/scenarios/l15-delayed-reply.yaml` |
+| `l15-dut-reboot-port-alive` | 否 | ported | 0 | `func-test/scenarios/l15-dut-reboot-port-alive.yaml` |
+| `l15-dut-silent` | 否 | ported | 0 | `func-test/scenarios/l15-dut-silent.yaml` |
+| `l15-exclusive-open` | 否 | gap | 0 | `func-test/scenarios/l15-exclusive-open.yaml` |
+| `l15-half-prompt` | 否 | ported | 0 | `func-test/scenarios/l15-half-prompt.yaml` |
+| `l15-multi-source-contention-cli` | 否 | ported | 0 | `func-test/scenarios/l15-multi-source-contention-cli.yaml` |
+| `l15-multi-source-contention-console` | 否 | ported | 0 | `func-test/scenarios/l15-multi-source-contention-console.yaml` |
+| `l15-reboot-min-guard` | 否 | ported | 0 | `func-test/scenarios/l15-reboot-min-guard.yaml` |
+| `l15-reject-zero-tx` | 否 | ported | 0 | `func-test/scenarios/l15-reject-zero-tx.yaml` |
+| `l15-release-inflight` | 否 | gap | 0 | `func-test/scenarios/l15-release-inflight.yaml` |
+| `l15-slow-reader-backpressure` | 否 | ported | 0 | `func-test/scenarios/l15-slow-reader-backpressure.yaml` |
+| `l15-stale-event-delay` | 否 | ported | 0 | `func-test/scenarios/l15-stale-event-delay.yaml` |
+| `l15-transport-disconnect` | 否 | gap | 0 | `func-test/scenarios/l15-transport-disconnect.yaml` |
+| `l15-wal-interference` | 否 | ported | 0 | `func-test/scenarios/l15-wal-interference.yaml` |
+| `rc-01-interactive-mode-switch` | 否 | ported | 0 | `func-test/cases/rc-01-interactive-mode-switch.yaml` |
+| `s24-ho-windows-com` | 是 | native | 1 | （未找到） |
+| `s24-mcu-rpc-shapes` | 否 | native | 2 | `scripts/rust/contract_coverage.py` |
+| `s24-sup-wintask-runtime` | 否 | native | 1 | （未找到） |
+| `s24-xfer-no-retry-side-effect` | 否 | native | 1 | （未找到） |
+| `sc13-lease-expiry-tick` | 否 | ported | 0 | （未找到） |
+| `sc16-console-line-reject-log` | 否 | ported | 0 | （未找到） |
+| `sc29-com0com-serial-console` | 是 | native | 0 | （未找到） |
+| `sm-01-attach-to-ready` | 否 | native | 0 | `func-test/cases/sm-01-attach-to-ready.yaml` |
+| `sm-04-device-unplug` | 否 | gap | 0 | `func-test/cases/sm-04-device-unplug.yaml` |
+| `win-com-cancel-close` | 是 | native | 0 | `func-test/scenarios/win-com-cancel-close.yaml` |
+| `win-com-open-exclusive` | 是 | native | 0 | `func-test/scenarios/win-com-open-exclusive.yaml` |
+| `win-com-txrx-bridge` | 是 | native | 0 | `func-test/scenarios/win-com-txrx-bridge.yaml` |
+| `win-telnet-deferred` | 是 | native | 0 | （未找到） |
+| `win-telnet-linebuffer` | 是 | native | 0 | （未找到） |
+| `win-telnet-raw-owner` | 是 | native | 0 | （未找到） |
+| `win-telnet-suspend-resume` | 是 | native | 0 | （未找到） |
+| `win-wal-av-reader-handle` | 是 | native | 0 | `scripts/rust/stage1a_gate.py`、`scripts/rust/win-spike3.sh`、`scripts/stage0/spike3_evidence.schema.json` |
+| `win-wal-av-rotate` | 是 | native | 0 | `scripts/rust/stage1a_gate.py`、`scripts/rust/win-spike3.sh`、`scripts/stage0/spike3_evidence.schema.json` |
+| `win-wal-av-unlink` | 是 | native | 0 | `scripts/rust/stage1a_gate.py`、`scripts/rust/win-spike3.sh`、`scripts/stage0/spike3_evidence.schema.json` |
