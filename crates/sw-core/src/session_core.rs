@@ -7146,6 +7146,20 @@ impl SessionCore {
         now: Mono,
         mirror_client_lifetime: Option<u64>,
     ) -> String {
+        let mirror_client_lifetime = mirror_client_lifetime.or_else(|| {
+            let client_id = owner.strip_prefix("human:")?;
+            self.human
+                .consoles
+                .get(client_id)
+                .filter(|console| console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet)
+                .map(|console| console.client_lifetime)
+        });
+        if let (Some(lifetime), Some(client_id)) =
+            (mirror_client_lifetime, owner.strip_prefix("human:"))
+        {
+            // interactive_open 等既有授權路徑重新授予此 TCP client 時，沿原行為記 mirror lease。
+            self.clear_tcp_mirror_revocation_for_client_lifetime(client_id, lifetime);
+        }
         let id = self.next_uuid();
         let mut lease = InteractiveLease::new(
             id.clone(),

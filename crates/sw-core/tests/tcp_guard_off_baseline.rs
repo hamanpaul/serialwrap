@@ -284,6 +284,115 @@ fn explicit_console_detach_during_self_test() {
     trace_common("console-detach-after-probe-complete", &h);
 }
 
+fn close_scan_self_heal_then_self_test() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    align_human_lease_precondition(&mut h);
+    h.set_auto_complete_human_tx(false);
+
+    let id = h.core.active_lease().expect("TCP human lease").interactive_id.clone();
+    let closed = h.rpc(close_req(&id)).expect("明確 close TCP human lease");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    trace_common("close-scan-self-test-after-close", &h);
+
+    let scanned = h.scan(None);
+    assert_no_start_op(&scanned);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-self-test-after-hub-scan", &h);
+
+    let probe = start_self_test(&mut h);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-self-test-after-probe-start", &h);
+
+    let input = h.input("a", b"r9-self-test-deferred");
+    assert_no_start_op(&input);
+    assert!(input.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"r9-self-test-deferred".len());
+    trace_common("close-scan-self-test-during-probe", &h);
+
+    let resumed = finish_self_test(&mut h, probe);
+    assert_eq!(
+        resumed.iter().filter(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. }
+            if permit.class == TxClass::HumanReplay && payload == b"r9-self-test-deferred")).count(),
+        1,
+        "self-test 完成後 deferred bytes 恰回放一次",
+    );
+    assert_eq!(h.deferred_len("a"), 0);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-self-test-after-resume", &h);
+    h.complete_human_tx(TxOutcome::Completed(b"r9-self-test-deferred".len()), None);
+
+    let raw = h.input("a", b"r9-self-test-raw");
+    assert_no_start_op(&raw);
+    assert_eq!(
+        raw.iter().filter(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. }
+            if permit.class == TxClass::HumanRaw && payload == b"r9-self-test-raw")).count(),
+        1,
+        "self-test 完成後 TCP 輸入回到 raw 路由",
+    );
+    trace_common("close-scan-self-test-after-raw-input", &h);
+}
+
+fn close_scan_self_heal_then_agent_command() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    align_human_lease_precondition(&mut h);
+    h.set_auto_complete_human_tx(false);
+
+    let id = h.core.active_lease().expect("TCP human lease").interactive_id.clone();
+    let closed = h.rpc(close_req(&id)).expect("明確 close TCP human lease");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    trace_common("close-scan-agent-command-after-close", &h);
+
+    let scanned = h.scan(None);
+    assert_no_start_op(&scanned);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-agent-command-after-hub-scan", &h);
+
+    let command = h.start_foreground_command("echo r9-agent-command");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-agent-command-after-start", &h);
+
+    let input = h.input("a", b"r9-agent-deferred");
+    assert_no_start_op(&input);
+    assert!(input.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"r9-agent-deferred".len());
+    trace_common("close-scan-agent-command-during-command", &h);
+
+    let resumed = h.feed(ControlEvent::OpFinished {
+        op_id: command.op_id,
+        epoch: h.epoch(),
+        outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        resumed.iter().filter(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. }
+            if permit.class == TxClass::HumanReplay && payload == b"r9-agent-deferred")).count(),
+        1,
+        "agent command 完成後 deferred bytes 恰回放一次",
+    );
+    assert_eq!(h.deferred_len("a"), 0);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    trace_common("close-scan-agent-command-after-resume", &h);
+    h.complete_human_tx(TxOutcome::Completed(b"r9-agent-deferred".len()), None);
+
+    let raw = h.input("a", b"r9-agent-raw");
+    assert_no_start_op(&raw);
+    assert_eq!(
+        raw.iter().filter(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. }
+            if permit.class == TxClass::HumanRaw && payload == b"r9-agent-raw")).count(),
+        1,
+        "agent command 完成後 TCP 輸入回到 raw 路由",
+    );
+    trace_common("close-scan-agent-command-after-raw-input", &h);
+}
+
 #[test]
 fn guard_off_tcp_raw_matches_pre_package_baseline() {
     // mirror 簿記的套件專屬斷言位於 tcp_console_lease.rs；以下共同觀測必須在 cc1746d8 與 HEAD 逐行相同。
@@ -292,4 +401,10 @@ fn guard_off_tcp_raw_matches_pre_package_baseline() {
     handoff_freezes_before_close_eof_and_replacement_accept();
     explicit_close_during_self_test();
     explicit_console_detach_during_self_test();
+}
+
+#[test]
+fn guard_off_tcp_self_heal_preserves_suspend_and_agent_baseline() {
+    close_scan_self_heal_then_self_test();
+    close_scan_self_heal_then_agent_command();
 }

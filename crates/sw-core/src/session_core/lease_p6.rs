@@ -126,9 +126,10 @@ impl SessionCore {
             } else {
                 !stash.expired(now) && self.human_peer_present(&cid)
             };
-            if stash_alive && stash.mirror_client_lifetime.is_some() {
+            if let Some(lifetime) = stash.mirror_client_lifetime.filter(|_| stash_alive) {
                 // TCP mirror 只作簿記；raw handback 與回放沿既有 PostClose／resume 路徑。
                 // resume 後的 sync 依當下存活 client 重建鏡像，guard 關閉時則只撤簿記。
+                self.clear_tcp_mirror_revocation_for_client_lifetime(&cid, lifetime);
                 self.forget_stashed_tcp_mirror();
             } else if stash_alive {
                 self.stashed_human.take();
@@ -250,6 +251,7 @@ impl SessionCore {
 
     /// TCP raw owner 的 session lease 鏡像。只更新 Lease／LeaseIndex，不授 raw owner、不改 owner_gen。
     pub(super) fn sync_tcp_console_lease(&mut self, now: Mono) {
+        self.prune_tcp_mirror_revocations();
         if !self.tcp_mirror_guard_allows_new() {
             if self.lease.as_ref().is_some_and(|lease| lease.mirror_client_lifetime.is_some()) {
                 self.forget_active_tcp_mirror();
@@ -411,6 +413,22 @@ impl SessionCore {
             .remove(&(client_id.to_string(), lifetime));
     }
 
+    /// 撤權只對仍登記中的精確 client lifetime 有效；主動 close 後不送 EOF 的連線也在此回收。
+    pub(super) fn prune_tcp_mirror_revocations(&mut self) {
+        let consoles = &self.human.consoles;
+        self.tcp_mirror_revocations.retain(|(client_id, lifetime)| {
+            consoles
+                .get(client_id)
+                .is_some_and(|console| console.client_lifetime == *lifetime)
+        });
+    }
+
+    /// 測試專用：目前記錄的 TCP mirror 撤權 lifetime 數量。
+    #[cfg(feature = "test-fakes")]
+    pub fn tcp_mirror_revocation_count_for_test(&self) -> usize {
+        self.tcp_mirror_revocations.len()
+    }
+
     /// 自 EOF／owner 替換移除指定 client lifetime 的 mirror；不呼叫 human_set_owner。
     pub(super) fn forget_tcp_console_mirror_for_client(&mut self, client_id: &str, lifetime: u64) {
         let owner = format!("human:{client_id}");
@@ -511,6 +529,7 @@ impl SessionCore {
         let removed = self.human.lane.remove_client(client_id);
         self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
+        self.prune_tcp_mirror_revocations();
         self.fx_buf.push(Effect::ConsoleClose {
             client_id: client_id.to_string(),
         });
@@ -562,15 +581,14 @@ impl SessionCore {
         }
         // grant 屬 owner 變更（arch §5.3）；lease 只補記錄，不再 set_interactive_owner（`_record_self_heal_lease_locked`）。
         self.bump_owner_gen();
-        if self
+        let tcp_lifetime = self
             .human
             .live_tcp_raw_owner()
-            .is_some_and(|(live_owner, lifetime)| {
-                live_owner == owner && self.tcp_mirror_is_revoked(&live_owner, lifetime)
-            })
-        {
-            // 自癒仍依原路徑補 raw owner；明確撤權只阻止該 lifetime 的 mirror lease 簿記。
-            return;
+            .filter(|(live_owner, _)| live_owner == &owner)
+            .map(|(_, lifetime)| lifetime);
+        if let Some(lifetime) = tcp_lifetime {
+            // self-heal 是既有的 raw owner 授權路徑；重新授予後沿修前行為補記 human lease。
+            self.clear_tcp_mirror_revocation_for_client_lifetime(&primary, lifetime);
         }
         let id = self.next_uuid();
         let timeout = self
@@ -579,11 +597,7 @@ impl SessionCore {
             .hard_timeout_s
             .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
         let mut lease = InteractiveLease::new(id.clone(), owner.clone(), self.wall_iso(), timeout, now, false);
-        if let Some((_, lifetime)) = self
-            .human
-            .live_tcp_raw_owner()
-            .filter(|(live_owner, _)| live_owner == &owner)
-        {
+        if let Some(lifetime) = tcp_lifetime {
             lease.mirror_client_lifetime = Some(lifetime);
             self.lease = Some(lease.clone());
             self.insert_lease_index(&lease);
@@ -789,6 +803,17 @@ impl SessionCore {
         };
         if retained_tcp_lifetime.is_some() {
             // Recover 後依 live TCP ownership 同步建鏡；不以 retained 快照在 guard 關閉時重授。
+            if let (Some(lifetime), Some(client_id)) =
+                (retained_tcp_lifetime, owner.strip_prefix("human:"))
+            {
+                if self.tcp_mirror_guard_allows_new()
+                    && self.human.live_tcp_raw_owner().is_some_and(|(live_owner, live_lifetime)| {
+                        live_owner == owner && live_lifetime == lifetime
+                    })
+                {
+                    self.clear_tcp_mirror_revocation_for_client_lifetime(client_id, lifetime);
+                }
+            }
             self.sync_tcp_console_lease(now);
             return;
         }
@@ -938,6 +963,7 @@ impl SessionCore {
             let removed = self.human.lane.remove_client(&cid);
             self.settle_removed_replays(&removed);
             self.human.remove_console(&cid);
+            self.prune_tcp_mirror_revocations();
             self.fx_buf.push(Effect::ConsoleClose { client_id: cid });
         }
         let owner = self.human.ownership.interactive_owner.clone();

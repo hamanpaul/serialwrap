@@ -457,6 +457,72 @@ fn tcp_mirror_console_detach_revokes_through_self_test_resume() {
 }
 
 #[test]
+fn tcp_mirror_revocation_records_pruned_after_active_detach_without_eof() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+
+    for client_id in ["detach-a", "detach-b", "detach-c"] {
+        h.connect_stream_console(client_id, ConsoleTransportKind::TcpTelnet);
+        assert_eq!(
+            h.core.active_lease().map(|lease| lease.owner.as_str()),
+            Some(format!("human:{client_id}").as_str()),
+            "每個新連線都經 ConsoleConnected 登記其 TCP raw owner",
+        );
+
+        let (reply, effects) = h.rpc_full(SessionRequest::ConsoleDetach {
+            client_id: client_id.to_string(),
+        });
+        let reply = reply.expect("ConsoleDetach RPC");
+        assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{reply:?}");
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::ConsoleClose { client_id: closed }
+                if closed == client_id)),
+            "主動 detach 必須送出 ConsoleClose 給 Hub",
+        );
+        assert!(
+            !h.core.human_console().consoles.contains_key(client_id),
+            "ConsoleDetach 已從 actor console table 移除 client",
+        );
+        assert_eq!(
+            h.core.tcp_mirror_revocation_count_for_test(),
+            0,
+            "ConsoleClose 不產生 EOF；已移出 console table 的 lifetime 撤權記錄須立即清除",
+        );
+        // 刻意不呼叫 h.disconnect：Hub 的 ConsoleClose 以 notify=false 移除連線。
+    }
+}
+
+#[test]
+fn tcp_mirror_existing_interactive_open_clears_revocation() {
+    let mut h = tcp_ready(&["a"]);
+    let lifetime = h.lifetime("a");
+    close_mirror_publicly(&mut h, "a");
+    assert!(h.core.active_lease().is_none(), "明確 close 先撤除舊 mirror");
+    assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 1);
+
+    let opened = h
+        .rpc(open_req("human:a", 60.0, "", false))
+        .expect("既有 interactive_open 路徑重新授予同一 TCP client");
+    assert_eq!(opened.get("ok"), Some(&PyValue::Bool(true)));
+    let lease = h.core.active_lease().expect("interactive_open 已授予 human lease");
+    assert_eq!(lease.owner, "human:a");
+    assert_eq!(
+        lease.mirror_client_lifetime,
+        Some(lifetime),
+        "既有路徑重授同一 TCP client 時 lease 保留 lifetime mirror 標記",
+    );
+    assert_eq!(h.core.tcp_mirror_revocation_count_for_test(), 0);
+
+    let id = lease.interactive_id.clone();
+    h.scan(None);
+    assert_eq!(
+        h.core.active_lease().map(|current| current.interactive_id.as_str()),
+        Some(id.as_str()),
+        "後續 sync 保留既有 interactive_open mirror",
+    );
+}
+
+#[test]
 fn tcp_mirror_new_lifetime_clears_explicit_revocation() {
     let mut h = tcp_ready(&["a"]);
     let original_id = active_id(&h);

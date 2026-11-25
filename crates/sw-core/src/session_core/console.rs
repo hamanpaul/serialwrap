@@ -761,6 +761,7 @@ impl SessionCore {
         let removed = self.human.lane.remove_client(client_id);
         self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
+        self.prune_tcp_mirror_revocations();
         self.sync_tcp_console_lease(self.now_cache);
         Vec::new()
     }
@@ -828,6 +829,7 @@ impl SessionCore {
             let removed = self.human.lane.remove_client(&cid);
             self.settle_removed_replays(&removed);
             self.human.remove_console(&cid);
+            self.prune_tcp_mirror_revocations();
             self.human.peer_present.remove(&cid);
             fx.push(Effect::ConsoleClose { client_id: cid });
         }
@@ -1007,6 +1009,7 @@ impl SessionCore {
             fx.push(Effect::ConsoleCloseAll);
             self.human.close_gen += 1;
             self.human.consoles.clear();
+            self.prune_tcp_mirror_revocations();
             self.human.peer_present.clear();
             self.human.primary_client_id = None;
             self.retained_human = None;

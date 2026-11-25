@@ -127,7 +127,7 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 
 - `session self-test` 回報 `human_attached: true`；最後一次鍵入在 60 秒內時 `human_active: true`。agent 送命令前可據此判斷人類是否正在打字。
 - 人類閒置時，agent `interactive-open` 會 soft preempt；人類仍在打字時回 `SESSION_INTERACTIVE_BUSY`。
-- agent interactive lease 會沿用 suspend／resume 與 deferred input 回放；TCP client EOF 只撤除該 client lifetime 的鏡像 lease。
+- agent interactive lease 會沿用 suspend／resume 與 deferred input 回放；TCP client EOF 會撤除該 client lifetime 的鏡像 lease。明確 `interactive_close` 只抑制同步路徑為仍登記 lifetime 新建 mirror；self-heal、retained／stash 還原或 `interactive_open` 等既有路徑依修前條件重新授予該 client 時會清除撤權並記錄 lifetime mirror。detach、EOF、stale prune 與 release close-all 會在 lifetime 離開 console table 時立即清除撤權，不等待 EOF。
 - 已有 human lease 時，預設 line mode 的 bare `--source human` `cmd submit` 在執行 gate 回 `SESSION_INTERACTIVE_BUSY` 且零 UART TX：人類請直接在 Tera Term 裡打字。
 - `file.push`／`file.pull` 仍走 agent 執行政策與既有傳輸 gate；不因 bare human `source` 而改成 human lease 命令。
 
