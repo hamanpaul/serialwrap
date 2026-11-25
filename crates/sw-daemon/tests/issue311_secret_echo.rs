@@ -2238,6 +2238,39 @@ fn issue312_password_prompt_barrier() -> (Arc<dyn RxObserver>, Receiver<()>, Sen
     )
 }
 
+struct IsolatedCrBarrier {
+    armed: Arc<AtomicBool>,
+    seen: Sender<()>,
+    release: Receiver<()>,
+}
+
+impl RxObserver for IsolatedCrBarrier {
+    fn on_rx(&self, _com: &str, data: &[u8], _wal_seq: u64) {
+        if data == b"\r" && self.armed.swap(false, Ordering::SeqCst) {
+            let _ = self.seen.send(());
+            self.release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放 isolated CR reader barrier");
+        }
+    }
+}
+
+fn issue312_isolated_cr_barrier() -> (Arc<dyn RxObserver>, Arc<AtomicBool>, Receiver<()>, Sender<()>) {
+    let (seen_tx, seen_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let armed = Arc::new(AtomicBool::new(false));
+    (
+        Arc::new(IsolatedCrBarrier {
+            armed: armed.clone(),
+            seen: seen_tx,
+            release: release_rx,
+        }),
+        armed,
+        seen_rx,
+        release_tx,
+    )
+}
+
 fn issue312_attach_console(
     rig: &Issue312HumanRig,
 ) -> (String, sw_pal::fakes::console::FakeConsoleRef) {
@@ -2793,6 +2826,71 @@ fn issue312_split_utf8_prompt_and_isolated_cr_masking() {
         "送到 UART 的位元組不得改變"
     );
     issue312_assert_secret_wal(&rig, secret, &client_id, b"before-312\rafter-utf8");
+}
+
+#[test]
+fn issue312_reader_cr_clears_prompt_before_actor_and_preserves_general_tx() {
+    let (observer, armed, cr_seen, release_cr) = issue312_isolated_cr_barrier();
+    let rig = build_issue312_human_rig_with_observers(false, false, vec![observer]);
+    let log_path = start_log(&rig.service);
+    let (client_id, console) = issue312_attach_console(&rig);
+    issue312_set_event_probes(&rig, &[ISSUE312_HUMAN_SECRET]);
+
+    let mut rx_seen = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPassword: ");
+    rx_seen += b"\r\nPassword: ".len();
+    wait_controlled_rx(&rig.device, rx_seen, "reader 收到第一個 password prompt");
+    rig.service.settle();
+
+    let tx_start = rig.device.tx_len();
+    console.push_input(&[ISSUE312_HUMAN_SECRET.as_bytes(), b"\r"].concat());
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + ISSUE312_HUMAN_SECRET.len() + 1,
+        "第一個 prompt 的 secret 輸入",
+    );
+    issue312_push_secret_echo(&rig, ISSUE312_HUMAN_SECRET);
+    rx_seen += ISSUE312_HUMAN_SECRET.len() + 2;
+    wait_controlled_rx(&rig.device, rx_seen, "reader 收到第一個 secret echo");
+    rig.service.settle();
+    issue312_wait_secret_event(&rig);
+
+    rig.device.push_rx(b"\r\nPassword: ");
+    rx_seen += b"\r\nPassword: ".len();
+    wait_controlled_rx(&rig.device, rx_seen, "reader 收到第二個 password prompt");
+    rig.service.settle();
+
+    armed.store(true, Ordering::SeqCst);
+    rig.device.push_rx(b"\r");
+    cr_seen
+        .recv_timeout(Duration::from_secs(3))
+        .expect("reader 已清除提示狀態；actor 尚未收到獨立 CR event");
+    let ordinary = b"ordinary-after-reader-cr";
+    console.push_input(ordinary);
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + ISSUE312_HUMAN_SECRET.len() + 1 + ordinary.len(),
+        "reader 已清提示後的一般 raw TX",
+    );
+    release_cr
+        .send(())
+        .expect("釋放 isolated CR reader barrier");
+    rx_seen += 1;
+    wait_controlled_rx(&rig.device, rx_seen, "actor 收到獨立 CR event");
+    rig.service.settle();
+
+    assert_eq!(
+        rig.device.tx_since(tx_start),
+        [ISSUE312_HUMAN_SECRET.as_bytes(), b"\r", ordinary].concat(),
+        "UART 上的 secret 與提示窗外一般 TX 位元組都不得改變"
+    );
+    issue312_assert_secret_wal(
+        &rig,
+        ISSUE312_HUMAN_SECRET,
+        &client_id,
+        &[b"\r".as_slice(), ordinary].concat(),
+    );
+    issue312_assert_all_sinks_masked(&rig, &[ISSUE312_HUMAN_SECRET], &[&console], &log_path);
 }
 
 #[test]

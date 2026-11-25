@@ -68,6 +68,7 @@ entries:
     - cargo:sw-daemon::issue311_secret_echo::issue312_reader_actor_console_interleave_masks_line_buffer_password_before_rx_delivery
     - cargo:sw-daemon::issue311_secret_echo::issue312_invalid_utf8_before_password_prompt_does_not_disable_masking
     - cargo:sw-daemon::issue311_secret_echo::issue312_buffered_crlf_cannot_revoke_human_echo_mask
+    - cargo:sw-daemon::issue311_secret_echo::issue312_reader_cr_clears_prompt_before_actor_and_preserves_general_tx
     - cargo:sw-daemon::issue311_secret_echo::issue312_detaching_second_console_does_not_settle_raw_owner_secret
     - cargo:sw-daemon::issue311_secret_echo::issue312_natural_disconnect_settles_meta_with_human_source
     owner_phase: P6
