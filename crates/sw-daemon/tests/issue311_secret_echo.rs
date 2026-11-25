@@ -3032,7 +3032,8 @@ fn issue312_reader_actor_console_interleave_masks_line_buffer_password_before_rx
 
 #[test]
 fn issue312_invalid_utf8_before_password_prompt_does_not_disable_masking() {
-    let rig = build_issue312_human_rig(false);
+    let (observer, prompt_seen, release_reader) = issue312_password_prompt_barrier();
+    let rig = build_issue312_human_rig_with_observers(false, false, vec![observer]);
     let log_path = start_log(&rig.service);
     let (client_id, console) = issue312_attach_console(&rig);
     issue312_set_event_probes(&rig, &[ISSUE312_HUMAN_SECRET]);
@@ -3041,12 +3042,9 @@ fn issue312_invalid_utf8_before_password_prompt_does_not_disable_masking() {
     let rx_start = rig.device.rx_bytes_read();
     let prompt = b"\xffPassword: ";
     rig.device.push_rx(prompt);
-    wait_controlled_rx(
-        &rig.device,
-        rx_start + prompt.len(),
-        "同一 RX chunk 的無效 byte 與 password prompt",
-    );
-    rig.service.settle();
+    prompt_seen
+        .recv_timeout(Duration::from_secs(3))
+        .expect("reader 已讀取含無效 byte 的提示；actor 尚未收到該 RX event");
     console.push_input(&[ISSUE312_HUMAN_SECRET.as_bytes(), b"\r"].concat());
     issue312_wait_tx(
         &rig.device,
@@ -3054,6 +3052,9 @@ fn issue312_invalid_utf8_before_password_prompt_does_not_disable_masking() {
         "無效 UTF-8 後逐鍵送出 human password",
     );
     issue312_push_secret_echo(&rig, ISSUE312_HUMAN_SECRET);
+    release_reader
+        .send(())
+        .expect("釋放含無效 byte 的 password prompt reader");
     wait_controlled_rx(
         &rig.device,
         rx_start + prompt.len() + ISSUE312_HUMAN_SECRET.len() + 2,
