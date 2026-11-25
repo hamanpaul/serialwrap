@@ -284,6 +284,11 @@ fn daemon_reports_absolute_path_for_relative_environment_wal_dir() {
 
 #[test]
 fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
+    if std::env::var_os("SW_I304_DOCTOR_CHILD_EXPECTED").is_some() {
+        run_doctor_child();
+        return;
+    }
+
     let mut env = isolated_env_with_pty_target();
     env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
     let daemon_cwd = env.root.join("daemon-cwd");
@@ -350,11 +355,10 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     );
     let doctor_cwd = env.root.join("doctor-cwd");
     fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
-    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
-    assert_eq!(
-        doctor_wal_dir_ok(&doctor.stdout),
-        Some(true),
-        "doctor 必須依複本保存的來源基準比對 daemon 實際 WAL 目錄；stdout={} stderr={}",
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd, true);
+    assert!(
+        doctor.status.success(),
+        "隔離 doctor process 必須比對通過；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -460,11 +464,10 @@ fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restar
     );
     let doctor_cwd = env.root.join("doctor-cwd");
     fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
-    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
-    assert_eq!(
-        doctor_wal_dir_ok(&doctor.stdout),
-        Some(true),
-        "改回原字串後 doctor 必須與 daemon 實際使用目錄一致；stdout={} stderr={}",
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd, true);
+    assert!(
+        doctor.status.success(),
+        "改回原字串後隔離 doctor process 必須比對通過；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -494,11 +497,10 @@ fn daemon_and_doctor_in_different_working_directories_do_not_match_relative_wal_
         "SERIALWRAP_WAL_DIR".to_string(),
         doctor_wal.display().to_string(),
     );
-    let doctor = run_isolated_doctor(&env, &doctor_vars, &doctor_cwd);
-    assert_eq!(
-        doctor_wal_dir_ok(&doctor.stdout),
-        Some(false),
-        "doctor 不得把 daemon 的相對 wal_path 依自身 cwd 解析成相同目錄；stdout={} stderr={}",
+    let doctor = run_isolated_doctor(&env, &doctor_vars, &doctor_cwd, false);
+    assert!(
+        doctor.status.success(),
+        "隔離 doctor process 必須在不同實體 WAL 目錄下回報不一致；stdout={} stderr={}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -515,32 +517,69 @@ fn run_isolated_doctor(
     env: &IsolatedEnv,
     vars: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
+    expected_ok: bool,
 ) -> std::process::Output {
-    let current_exe = std::env::current_exe().expect("取得 daemon_process 測試執行檔");
-    let cli = current_exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("測試執行檔應位於 target/debug/deps")
-        .join(if cfg!(windows) {
-            "serialwrap.exe"
-        } else {
-            "serialwrap"
-        });
-    assert!(cli.is_file(), "需由工作區建置 serialwrap CLI binary：{}", cli.display());
-    Command::new(&cli)
-        .args(["doctor"])
+    let test_exe = std::env::current_exe().expect("取得 daemon_process 測試執行檔");
+    Command::new(&test_exe)
+        .args([
+            "--exact",
+            "system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart",
+            "--nocapture",
+        ])
         .env_clear()
         .envs(vars)
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env(
+            "SW_I304_DOCTOR_CHILD_EXPECTED",
+            if expected_ok { "true" } else { "false" },
+        )
         .current_dir(cwd)
         .output()
         .unwrap_or_else(|error| {
             panic!(
-                "在隔離 doctor 工作目錄啟動 serialwrap 失敗：{}（{error}）; isolated root={}",
-                cli.display(),
+                "在隔離 doctor 工作目錄啟動 doctor test process 失敗：{}（{error}）; isolated root={}",
+                test_exe.display(),
                 env.root.display()
             )
         })
+}
+
+fn run_doctor_child() {
+    let expected_ok = match std::env::var("SW_I304_DOCTOR_CHILD_EXPECTED").as_deref() {
+        Ok("true") => true,
+        Ok("false") => false,
+        other => panic!("doctor child 缺少有效期望值：{other:?}"),
+    };
+    let fake_env = std::env::vars()
+        .fold(sw_pal::fakes::FakeSysEnv::builder(), |builder, (key, value)| {
+            builder.var(&key, &value)
+        })
+        .in_group("dialout")
+        .build();
+    let mut platform = sw_pal::native();
+    platform.env = fake_env;
+    platform.procs = sw_pal::fakes::FakeProcScan::new(Vec::new());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = sw_cli::run(
+        vec!["serialwrap".into(), "doctor".into()],
+        &platform,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(
+        status,
+        0,
+        "doctor CLI 失敗：stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        doctor_wal_dir_ok(&stdout),
+        Some(expected_ok),
+        "doctor WAL 比對結果不符；stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
 }
 
 fn doctor_wal_dir_ok(output: &[u8]) -> Option<bool> {
