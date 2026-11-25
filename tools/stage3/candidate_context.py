@@ -26,6 +26,11 @@ _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 def load_run_context(path: Path) -> Mapping[str, Any]:
     """載入精確的七欄位 context；不補值，也不依賴證據索引。"""
     raw = Path(path).read_bytes()
+    return load_run_context_bytes(raw)
+
+
+def load_run_context_bytes(raw: bytes) -> Mapping[str, Any]:
+    """驗證呼叫端已讀取的 context 位元組，避免解析與摘要使用不同內容。"""
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:

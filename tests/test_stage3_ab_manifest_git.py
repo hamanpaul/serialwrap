@@ -7,6 +7,7 @@ import hashlib
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -87,7 +88,7 @@ def _make_committed_fake_repo(root: Path) -> tuple[Path, str]:
     return manifest_path, revision
 
 
-def _make_real_git_fake_repo(root: Path) -> tuple[Path, str]:
+def _make_real_git_fake_repo(root: Path, *, untracked_bundles: bool = False) -> tuple[Path, str]:
     """將 fake repo 的版本受控輸入提交到隔離真 Git repo。"""
     manifest_path = fakes.write_ab_manifest(root, platform="linux", layer="l1.5", stage="3")
     _install_test_schemas(root)
@@ -105,12 +106,19 @@ def _make_real_git_fake_repo(root: Path) -> tuple[Path, str]:
     stage3_tree["tree_sha256"] = fakes.tree_sha256(target_tools)
     _write_json(manifest_path, doc)
 
+    bundle_backup = None
+    if untracked_bundles:
+        bundle_backup = root.parent / f"{root.name}-untracked-bundles"
+        shutil.move(root / "bundles", bundle_backup)
+
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "t3-test@example.invalid")
     _git(root, "config", "user.name", "T3 test")
     _git(root, "add", "-A")
     _git(root, "rm", "--cached", "-q", "--", "ab-manifest.json")
     _git(root, "commit", "-q", "-m", "trusted tool revision")
+    if bundle_backup is not None:
+        shutil.move(bundle_backup, root / "bundles")
     revision = _git(root, "rev-parse", "HEAD")
     doc["contract_revision"] = _git(root, "rev-parse", f"{revision}:contracts")
     _write_json(manifest_path, doc)
@@ -130,10 +138,13 @@ def _verify_with_revision(
         tool_revision=revision,
         source_reader=_trusted_source_reader(root),
     )
-    options["executing_tools_root"] = executing_tools_root or root
-    return ab_manifest.verify_frozen(
-        **options,
-    )
+    identity_root = Path(executing_tools_root or root)
+    try:
+        identity_sha = ab_manifest._tree_sha256(identity_root / "tools" / "stage3")
+    except (OSError, ab_manifest.HarnessError):
+        identity_sha = None
+    with patch.object(ab_manifest, "_executing_tools_identity", lambda: (identity_root, identity_sha)):
+        return ab_manifest.verify_frozen(**options)
 
 
 def test_real_git_accepts_complete_frozen_manifest(tmp_path):
@@ -142,14 +153,7 @@ def test_real_git_accepts_complete_frozen_manifest(tmp_path):
     root.mkdir()
     manifest_path, revision = _make_real_git_fake_repo(root)
     manifest = ab_manifest.load_manifest(manifest_path, repo_root=root)
-    assert ab_manifest.verify_frozen(
-        manifest,
-        repo_root=root,
-        run=run_cmd,
-        tool_revision=revision,
-        source_reader=_trusted_source_reader(root),
-        executing_tools_root=root,
-    ) == []
+    assert _verify_with_revision(manifest_path, root, revision) == []
 
 
 def test_real_git_resolves_tool_revision_from_head(tmp_path):
@@ -172,10 +176,7 @@ def test_real_git_rejects_missing_frozen_tools_stage3_tree(tmp_path):
     manifest = ab_manifest.load_manifest(manifest_path, repo_root=root)
     shutil.rmtree(root / "tools" / "stage3")
 
-    violations = ab_manifest.verify_frozen(
-        manifest, repo_root=root, run=run_cmd, tool_revision=revision,
-        source_reader=_trusted_source_reader(root), executing_tools_root=root,
-    )
+    violations = _verify_with_revision(manifest_path, root, revision)
     assert "tool revision tree mismatch: tools/stage3 missing tree" in violations
 
 
@@ -187,10 +188,7 @@ def test_real_git_rejects_modified_frozen_tools_stage3_file(tmp_path):
     target = root / "tools" / "stage3" / "ab_manifest.py"
     target.write_bytes(target.read_bytes() + b"\n# post-commit drift\n")
 
-    violations = ab_manifest.verify_frozen(
-        manifest, repo_root=root, run=run_cmd, tool_revision=revision,
-        source_reader=_trusted_source_reader(root), executing_tools_root=root,
-    )
+    violations = _verify_with_revision(manifest_path, root, revision)
     assert "tool revision mismatch: tools/stage3/ab_manifest.py" in violations
 
 
@@ -202,11 +200,170 @@ def test_real_git_rejects_deleted_file_inside_frozen_tools_stage3_tree(tmp_path)
     relative = "tools/stage3/ab_manifest.py"
     (root / relative).unlink()
 
-    violations = ab_manifest.verify_frozen(
-        manifest, repo_root=root, run=run_cmd, tool_revision=revision,
-        source_reader=_trusted_source_reader(root), executing_tools_root=root,
-    )
+    violations = _verify_with_revision(manifest_path, root, revision)
     assert f"tool revision tree mismatch: tools/stage3 missing {relative}" in violations
+
+
+def test_untracked_bundle_sidecar_drift_is_rejected_when_restored_after_load(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    manifest_path, revision = _make_real_git_fake_repo(root, untracked_bundles=True)
+    top_doc = _read_json(manifest_path)
+    side = top_doc["sides"][1]
+    sidecar = root / side["release_manifest"]["path"]
+    original_sidecar = sidecar.read_bytes()
+    release = json.loads(original_sidecar.decode("utf-8"))
+    launcher = root / side["bundle_dir"] / release["components"]["daemon"]["launcher"]["path"]
+    launcher.write_bytes(launcher.read_bytes() + b"\n# component matches temporary sidecar\n")
+    release["components"]["daemon"]["launcher"]["sha256"] = hashlib.sha256(
+        launcher.read_bytes()
+    ).hexdigest()
+    _write_json(sidecar, release)
+
+    try:
+        manifest = ab_manifest.load_manifest(manifest_path, repo_root=root)
+    except Exception as exc:
+        assert "release manifest sha256 mismatch" in str(exc)
+        return
+
+    sidecar.write_bytes(original_sidecar)
+    identity_sha = ab_manifest._tree_sha256(root / "tools" / "stage3")
+    with patch.object(ab_manifest, "_executing_tools_identity", lambda: (root, identity_sha)):
+        violations = ab_manifest.verify_frozen(
+            manifest, repo_root=root, run=run_cmd, tool_revision=revision,
+            source_reader=_trusted_source_reader(root),
+        )
+    assert any("release manifest sha256 mismatch: side B" in item for item in violations)
+
+
+def _refresh_sidecar_and_manifest(root: Path, manifest_path: Path, side_index: int = 0) -> tuple[str, Path]:
+    """重算指定 bundle 套件樹與 sidecar 引用，讓測試只檢驗路徑分類。"""
+    top_doc = _read_json(manifest_path)
+    side = top_doc["sides"][side_index]
+    bundle = root / side["bundle_dir"]
+    sidecar = root / side["release_manifest"]["path"]
+    release = _read_json(sidecar)
+    components = release["components"]
+    daemon = components.get("daemon", {})
+    package = daemon.get("package")
+    delegate = components.get("python_cli_delegate")
+    package_root = bundle / "py"
+    if isinstance(package, dict):
+        package["tree_sha256"] = fakes.package_tree_sha256(package_root)
+    if isinstance(delegate, dict):
+        delegate["tree_sha256"] = fakes.package_tree_sha256(package_root)
+    _write_json(sidecar, release)
+    side["release_manifest"]["sha256"] = fakes.sha256_file(sidecar)
+    _write_json(manifest_path, top_doc)
+    return side["bundle_dir"], package_root / "sw_core"
+
+
+@pytest.mark.parametrize(
+    ("relative_name", "expected"),
+    [
+        ("staged_extra.py", "tool revision mismatch"),
+        ("éxtra.py", "tool revision path contains non-ASCII characters"),
+    ],
+    ids=["staged-ascii-package-member", "staged-non-ascii-package-member"],
+)
+def test_repo_package_tree_members_use_execution_path_classifier(tmp_path, relative_name, expected):
+    root = tmp_path / "repo"
+    root.mkdir()
+    manifest_path, revision = _make_real_git_fake_repo(root, untracked_bundles=True)
+    bundle_rel, package = _refresh_sidecar_and_manifest(root, manifest_path)
+    member = package / relative_name
+    member.write_text("# staged package member\n", encoding="utf-8")
+    relative = f"{bundle_rel}/py/sw_core/{relative_name}"
+    _git(root, "add", "--", relative)
+    _refresh_sidecar_and_manifest(root, manifest_path)
+
+    violations = _verify_with_revision(manifest_path, root, revision)
+
+    assert any(expected in item and relative in item for item in violations)
+
+
+def test_repo_package_tree_case_alias_of_committed_member_is_rejected(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    manifest_path, _revision = _make_real_git_fake_repo(root, untracked_bundles=True)
+    bundle_rel, package = _refresh_sidecar_and_manifest(root, manifest_path)
+    committed_name = "Committed.py"
+    committed = package / committed_name
+    committed.write_text("# committed package member\n", encoding="utf-8")
+    committed_relative = f"{bundle_rel}/py/sw_core/{committed_name}"
+    _git(root, "add", "--", committed_relative)
+    _git(root, "commit", "-q", "-m", "commit package tree member")
+    revision = _git(root, "rev-parse", "HEAD")
+
+    alias_name = "committed.py"
+    alias = package / alias_name
+    alias.write_text("# case alias package member\n", encoding="utf-8")
+    relative = f"{bundle_rel}/py/sw_core/{alias_name}"
+    _refresh_sidecar_and_manifest(root, manifest_path)
+
+    violations = _verify_with_revision(manifest_path, root, revision)
+
+    assert f"tool revision path case mismatch: {relative} (tracked as {committed_relative})" in violations
+
+
+def test_genuinely_untracked_package_tree_member_is_classified_and_allowed(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    manifest_path, revision = _make_real_git_fake_repo(root, untracked_bundles=True)
+    bundle_rel, package = _refresh_sidecar_and_manifest(root, manifest_path)
+    member = package / "untracked_extra.py"
+    member.write_text("# untracked package member\n", encoding="utf-8")
+    relative = f"{bundle_rel}/py/sw_core/untracked_extra.py"
+    _refresh_sidecar_and_manifest(root, manifest_path)
+    commands = []
+
+    def tracing_runner(argv, *, env=None, timeout=None, cwd=None):
+        commands.append(list(argv))
+        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd)
+
+    classified = []
+    original_classifier = ab_manifest._tool_revision_input_errors
+
+    def tracing_classifier(**kwargs):
+        classified.append(kwargs["relative"])
+        return original_classifier(**kwargs)
+
+    with patch.object(ab_manifest, "_tool_revision_input_errors", tracing_classifier):
+        violations = _verify_with_revision(manifest_path, root, revision, runner=tracing_runner)
+
+    assert not any("tool revision" in item and relative in item for item in violations)
+    assert relative in classified
+    assert any("ls-files" in command and "--" not in command for command in commands)
+
+
+def test_external_bundle_members_are_not_classified_as_repo_paths(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    manifest_path, revision = _make_real_git_fake_repo(root, untracked_bundles=True)
+    external_bundles = tmp_path / "external-bundles"
+    shutil.move(root / "bundles", external_bundles)
+    top_doc = _read_json(manifest_path)
+    for side in top_doc["sides"]:
+        bundle = external_bundles / side["label"]
+        release = bundle / "release-manifest.json"
+        release_doc = _read_json(release)
+        side["bundle_dir"] = str(bundle)
+        side["release_manifest"]["path"] = str(release)
+        side["cli_exe"] = str(bundle / release_doc["components"]["cli"]["path"])
+        daemon = release_doc["components"]["daemon"]
+        daemon_path = daemon.get("launcher", daemon.get("runtime"))["path"]
+        side["daemon_exe"] = str(bundle / daemon_path)
+    _write_json(manifest_path, top_doc)
+    commands = []
+
+    def tracing_runner(argv, *, env=None, timeout=None, cwd=None):
+        commands.append(list(argv))
+        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd)
+
+    violations = _verify_with_revision(manifest_path, root, revision, runner=tracing_runner)
+
+    assert not any("external-bundles" in " ".join(command) for command in commands)
+    assert not any("external-bundles" in item for item in violations)
 
 
 def test_func_test_checkout_preserves_git_blob_bytes_with_autocrlf_true(tmp_path):
