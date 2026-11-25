@@ -1560,14 +1560,41 @@ def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_pa
     configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
     configured_cli.parent.mkdir(parents=True)
     configured_cli.write_text("not the bundle candidate", encoding="utf-8")
-    (driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name).unlink(missing_ok=True)
     driver.new_cli = configured_cli
 
     result = driver.verify_candidate_p290_asset(target)
 
     assert result["verdict"] == "FAIL", result
     assert result["id"] == "candidate_cli_p290_asset", result
+    assert result["reason"] == "目前 CLI 並非本次候選版本", result
     assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+    assert result["detail"]["candidate_cli_path"] == str(
+        (driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name).resolve()
+    ), result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_candidate_cli_missing_path_returns_configured_path_evidence(fake_driver, tmp_path):
+    """bundle 候選 CLI 缺失時，FAIL 列仍須帶回設定 CLI 路徑與解析錯誤。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
+    configured_cli.parent.mkdir(parents=True)
+    configured_cli.write_text("configured CLI", encoding="utf-8")
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name
+    candidate_cli.unlink()
+    driver.new_cli = configured_cli
+
+    result = driver.verify_candidate_p290_asset(target)
+
+    assert result["verdict"] == "FAIL", result
+    assert result["id"] == "candidate_cli_p290_asset", result
+    assert result["reason"] == "無法確認候選 CLI 路徑", result
+    assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+    assert result["detail"]["path_resolution_errors"]["candidate_cli"] == {
+        "path": str(candidate_cli), "error": "FileNotFoundError",
+    }, result
 
 
 @pytest.mark.core_portable
@@ -1770,11 +1797,11 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, 
     windows_bundle = tmp_path / "windows-bundle"
     windows_version = windows_bundle / "versions" / NEW_VERSION
     shutil.copytree(source_version, windows_version)
-    windows_candidate = windows_version / "bin" / "serialwrap"
+    windows_candidate = windows_version / "bin" / "serialwrap.exe"
     windows_candidate.write_bytes(driver.new_cli.read_bytes())
     windows_installed_version = tmp_path / "windows-installed" / "versions" / NEW_VERSION
     shutil.copytree(windows_version, windows_installed_version)
-    windows_installed_cli = windows_installed_version / "bin" / "serialwrap"
+    windows_installed_cli = windows_installed_version / "bin" / "serialwrap.exe"
     driver.bundle = windows_bundle
     driver.new_cli = windows_candidate
     driver.env["PATH"] = os.pathsep.join((
@@ -1800,7 +1827,7 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, 
     monkeypatch.setattr(
         driver_module.shutil,
         "which",
-        lambda command, **_kwargs: str(windows_installed_cli) if command == "serialwrap" else None,
+        lambda *_args, **_kwargs: None,
     )
     temp_result = driver.judge_doctor(
         "doctor_green_new", "Windows 平台預設暫存根", require_pairing=True,
