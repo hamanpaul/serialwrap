@@ -97,7 +97,10 @@ entries:
     - cargo:sw-core::timeout_recovery_keys::stale_mailbox_input_after_recovery_is_not_replayed
     - cargo:sw-core::timeout_recovery_keys::successful_key_recovery_invalidates_deferred_input_before_resume
     - cargo:sw-core::timeout_recovery_keys::target_override_replaces_template_keys
+    - cargo:sw-daemon::dispatch::p290_rpc_pinned_dynamic_recover_uses_pin_keys_for_uart_and_wal
     - cargo:sw-daemon::dispatch::p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal
+    - cargo:sw-daemon::dispatch::p290_rpc_unpinned_dynamic_command_and_recover_use_template_keys_for_uart_and_wal
+    - cargo:sw-pal::fs_ops_p7::atomic_replace_preserves_named_access_acl_for_other_user
     - cargo:sw-proto::timeout_recovery_keys::invalid_keys_are_rejected_without_fallback
     - cargo:sw-proto::timeout_recovery_keys::language_default_and_null_use_ctrl_c_only
     - cargo:sw-proto::timeout_recovery_keys::rust_only_contract_matrix_matches_generated_golden
