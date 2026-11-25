@@ -1358,8 +1358,8 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09", "BC-10", "BC-13", "BC-23"})
-_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25", "BC-10": "2026-11-24", "BC-13": "2026-11-22", "BC-23": "2026-11-24"}
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09", "BC-10", "BC-13", "BC-17", "BC-23"})
+_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25", "BC-10": "2026-11-24", "BC-13": "2026-11-22", "BC-17": "2026-11-25", "BC-23": "2026-11-24"}
 
 
 def test_bc_real_five_bcs_registered() -> None:

@@ -43,7 +43,11 @@ use sw_proto::pycompat::{decode_utf8_strict, py_strip, PyOsError};
 use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::release_manifest::parse_current_release;
-use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
+use sw_proto::runtime_paths::{
+    resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot, NativeTraits, PathsError,
+    RuntimePaths,
+};
+use sw_proto::yaml11::YValue;
 
 use crate::code_identity::{capture as capture_code_identity, CodeIdentity};
 use crate::framing::{RpcHandler, RpcServer, RpcStopAccept};
@@ -1136,7 +1140,7 @@ fn run_guarded(argv: Vec<String>, platform: Platform, hooks: Hooks) -> i32 {
 fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // main.rs 已在建立任何 thread 之前呼叫 p.signals.install()。
     let env = snapshot_of(&p.caps, p.env.vars());
-    let paths = match resolve_paths(&p) {
+    let mut paths = match resolve_paths(&p) {
         Ok(x) => x,
         Err(msg) => {
             eprint!("{msg}");
@@ -1168,7 +1172,8 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         eprint!("{PROG}: 無法解析預設隔離路徑\n");
         return 1;
     };
-    let (cfg, cfg_error) = load_config_for_allowlist(&config_read_path(&env, &paths, &p), &*p.fs); // #47
+    let config_path = config_read_path(&env, &paths, &p);
+    let (cfg, cfg_error) = load_config_for_allowlist(&config_path, &*p.fs); // #47
     let allow = match &cfg_error {
         None => resolve_allowlist_with_caps(&*p.env, &p.caps, Some(&cfg), &iso_defaults),
         Some(err) => decide_on_unreadable_config(&*p.env, &p.caps, &iso_defaults, err),
@@ -1176,6 +1181,19 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     if let Some(reason) = &allow.rejected_reason {
         eprint!("{PROG}: TEST_DEVICE_ALLOWLIST_REJECTED: {reason}\n"); // 未建目錄、未取鎖
         return 2;
+    }
+    paths.wal_dir = resolve_wal_dir(
+        &env,
+        flavor_of(&p.caps),
+        &SysEnvHome(&*p.env),
+        &paths.state_dir,
+        &config_path,
+        &cfg,
+    );
+    if let Some(wal_dir) =
+        sw_pal::path_norm::absolute_path_from_cwd(&paths.wal_dir, p.caps.path_flavor)
+    {
+        paths.wal_dir = wal_dir;
     }
 
     if let Err(e) = ensure_runtime_dirs(&paths, &dirs, &*p.fs) {
@@ -1586,6 +1604,27 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
         } else {
             RuntimeConfig::from_text(None).map_err(|e| e.to_string())?
         };
+        let flavor = flavor_of(&p.caps);
+        // system fallback 複製成 user config 時固化路徑；複製後的相對設定由目前 config 路徑解析。
+        if read_path != write_path {
+            let raw_wal_dir = match cfg.wal_dir() {
+                Some(YValue::Str(raw)) => Some(raw.clone()),
+                _ => None,
+            };
+            if let Some(raw) = raw_wal_dir {
+                let copied_wal_dir = system_config_copy_wal_dir(
+                    &raw,
+                    &read_path,
+                    flavor,
+                    env,
+                    &home,
+                    |path| sw_pal::path_norm::absolute_path_from_cwd(path, p.caps.path_flavor),
+                )?;
+                if let Some(resolved) = copied_wal_dir {
+                    cfg.set_wal_dir(&resolved);
+                }
+            }
+        }
         cfg.set_socket(endpoint);
         let wp = PathBuf::from(&write_path);
         if let Some(parent) = wp.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -1598,6 +1637,40 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
     if let Err(msg) = result {
         eprint!("{PROG}: 寫入 config.yaml endpoint 失敗（非致命）: {msg}\n");
     }
+}
+
+/// 解析 system fallback 複本中的 `wal_dir`；複本建立後不再追溯來源 config。
+fn system_config_copy_wal_dir(
+    raw: &str,
+    config_path: &str,
+    flavor: PathFlavor,
+    env: &EnvSnapshot,
+    home: &dyn HomeLookup,
+    absolute_path_from_cwd: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    let expanded = pypath::expanduser(flavor, raw, env, home);
+    if py_strip(raw).is_empty() || (pypath::isabs(flavor, raw) && !raw.contains('~')) {
+        return Ok(None);
+    }
+
+    let resolved = if pypath::isabs(flavor, &expanded) {
+        expanded
+    } else {
+        let absolute_config_path = absolute_path_from_cwd(config_path)
+            .ok_or_else(|| format!("無法解析 system config 的絕對路徑：{config_path}"))?;
+        let config_dir = pypath::dirname(flavor, &absolute_config_path);
+        pypath::join(flavor, &config_dir, &[&expanded])
+    };
+    if pypath::isabs(flavor, &resolved) {
+        return Ok(Some(resolved));
+    }
+
+    let absolute = absolute_path_from_cwd(&resolved)
+        .ok_or_else(|| format!("無法解析複製後 wal_dir 的絕對路徑：{resolved}"))?;
+    if !pypath::isabs(flavor, &absolute) {
+        return Err(format!("複製後 wal_dir 仍不是絕對路徑：{absolute}"));
+    }
+    Ok(Some(absolute))
 }
 
 // ---------------------------------------------------------------------------
@@ -1876,6 +1949,83 @@ mod stall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoTestHome;
+
+    impl HomeLookup for NoTestHome {
+        fn current_user_home(&self) -> Option<String> {
+            None
+        }
+
+        fn user_home(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn system_config_copy_resolves_cross_drive_wal_dir_before_restart() {
+        let env = EnvSnapshot::from_pairs(Vec::<(String, String)>::new());
+        let home = NoTestHome;
+        let copied_wal_dir = system_config_copy_wal_dir(
+            r"D:archive\wal",
+            r"C:\ProgramData\serialwrap\config.yaml",
+            PathFlavor::Windows,
+            &env,
+            &home,
+            |path| match path {
+                r"D:archive\wal" => Some(r"D:\one\archive\wal".to_string()),
+                _ => Some(path.to_string()),
+            },
+        )
+        .expect("解析 system fallback 的 WAL 路徑");
+        assert_eq!(
+            copied_wal_dir.as_deref(),
+            Some(r"D:\one\archive\wal"),
+            "跨磁碟的 Windows drive-relative wal_dir 必須在複製時解析成絕對路徑"
+        );
+
+        let user_config = RuntimeConfig::from_text(Some(&format!(
+            "wal_dir: '{}'\n",
+            copied_wal_dir.expect("system config wal_dir 應被固化")
+        )))
+        .expect("解析持久化的 user config");
+        let first_start = resolve_wal_dir(
+            &env,
+            PathFlavor::Windows,
+            &home,
+            r"D:\one\service-state",
+            r"C:\Users\operator\.config\serialwrap\config.yaml",
+            &user_config,
+        );
+        let second_start = resolve_wal_dir(
+            &env,
+            PathFlavor::Windows,
+            &home,
+            r"D:\two\service-state",
+            r"C:\Users\operator\.config\serialwrap\config.yaml",
+            &user_config,
+        );
+        assert_eq!(first_start, r"D:\one\archive\wal");
+        assert_eq!(
+            second_start, first_start,
+            "重啟時工作目錄改變也不得讓 WAL 目錄分流"
+        );
+        assert!(
+            system_config_copy_wal_dir(
+                r"D:archive\wal",
+                r"C:\ProgramData\serialwrap\config.yaml",
+                PathFlavor::Windows,
+                &env,
+                &home,
+                |path| match path {
+                    r"C:\ProgramData\serialwrap\config.yaml" => Some(path.to_string()),
+                    _ => None,
+                },
+            )
+            .is_err(),
+            "無法解析 drive-relative 路徑時不得回傳可寫入複本的相對值"
+        );
+    }
 
     #[test]
     fn usage_wraps_like_argparse() {

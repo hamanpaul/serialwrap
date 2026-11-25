@@ -304,7 +304,7 @@ fn supervision_set_idle_uses_handoff_not_daemon_stop() {
     let base = TestEnv::posix()
         .with_systemd(true)
         .with_var("USER", "alice")
-        .with_config("supervision_mode: on-demand\n");
+        .with_config("supervision_mode: on-demand\nwal_dir: ../audit/wal\n");
     let ep = base.default_socket();
     let t = base.with_idle_daemon(&ep, 4321);
     let (rc, out, _) = t.run(&["supervision-mode", "set", "systemd-user"]);
@@ -315,6 +315,11 @@ fn supervision_set_idle_uses_handoff_not_daemon_stop() {
     assert!(methods(&t).iter().all(|m| m != "daemon.stop"));
     assert_eq!(handoffs(&t), 1);
     assert_eq!(rpc_params(&t, "daemon.handoff_stop")["reason"], "supervision_set");
+    let config = String::from_utf8(t.config_bytes()).expect("config 必須是 UTF-8");
+    assert!(
+        config.contains("wal_dir: ../audit/wal"),
+        "supervision-mode set 不得改掉 wal_dir：{config}"
+    );
     let o = t.event_order();
     assert!(o.index_of("rpc:daemon.handoff_stop") < o.index_of("run:systemctl --user start serialwrap"));
 }

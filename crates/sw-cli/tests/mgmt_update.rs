@@ -2438,6 +2438,7 @@ fn update_release_then_rollback_keeps_released() {
         .with_current("0.4.0", None)
         .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
+        .with_config("supervision_mode: windows-task\nwal_dir: ../audit/wal\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version(CURRENT_VERSION);
     let released_state = b"{\"released\":{\"COM1\":{\"released_by\":\"test\"}}}\n";
@@ -2445,12 +2446,24 @@ fn update_release_then_rollback_keeps_released() {
     let (update_rc, update_out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(update_rc, 0, "{update_out}");
     assert_eq!(json(&update_out)["update"]["to_version"], CURRENT_VERSION);
+    assert!(
+        t.config_bytes().windows(b"wal_dir: ../audit/wal".len()).any(
+            |window| window == b"wal_dir: ../audit/wal"
+        ),
+        "update 不得改掉 wal_dir"
+    );
     assert_eq!(std::fs::read(t.state_dir().join("state.json")).unwrap(), released_state);
     let (rollback_rc, rollback_out, _) = t.run(&["setup", "--rollback"]);
     assert_eq!(rollback_rc, 0, "{rollback_out}");
     assert_eq!(json(&rollback_out)["rollback"]["to_version"], "0.4.0");
     assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
     assert_eq!(std::fs::read(t.state_dir().join("state.json")).unwrap(), released_state);
+    assert!(
+        t.config_bytes().windows(b"wal_dir: ../audit/wal".len()).any(
+            |window| window == b"wal_dir: ../audit/wal"
+        ),
+        "rollback 不得改掉 wal_dir"
+    );
 }
 
 #[test]

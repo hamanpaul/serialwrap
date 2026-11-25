@@ -52,7 +52,7 @@ fn runtime_config_to_yaml_matches_pyyaml_golden() {
 
 #[test]
 fn runtime_config_set_mode_keeps_other_keys() {
-    let initial = "windows:\n  exclude_coms:\n  - COM3\n  - COM10\nsocket_path: /run/existing.sock\nsupervision_mode: on-demand\n";
+    let initial = "wal_dir: ../audit/wal\nwindows:\n  exclude_coms:\n  - COM3\n  - COM10\nsocket_path: /run/existing.sock\nsupervision_mode: on-demand\n";
     let mut cfg = RuntimeConfig::from_text(Some(initial)).expect("初始 config 解析失敗");
 
     // set_mode 保留原有 windows: 與未覆寫的 socket_path（socket_path 為 None 時不動）
@@ -75,6 +75,14 @@ fn runtime_config_set_mode_keeps_other_keys() {
     assert!(
         cfg.data.get_str("windows").is_some(),
         "原有 windows: 欄位必須保留"
+    );
+    assert_eq!(
+        cfg.wal_dir().and_then(|v| match v {
+            YValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        Some("../audit/wal"),
+        "wal_dir 必須由 set_mode 原樣保留"
     );
 
     // socket_path Some 才覆寫
@@ -113,6 +121,14 @@ fn runtime_config_set_mode_keeps_other_keys() {
             _ => None,
         }),
         Some("windows-task")
+    );
+    assert_eq!(
+        cfg.wal_dir().and_then(|v| match v {
+            YValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        Some("../audit/wal"),
+        "set_socket 必須保留 wal_dir"
     );
 }
 

@@ -189,7 +189,8 @@ fn s1m241_installed_setup_env(installed_fingerprint: Option<&str>) -> TestEnv {
 #[test]
 fn s1m241_assessment_matching_ping_is_reported_once() {
     const FINGERPRINT: &str = "a1b2c3d4e5f6";
-    let t = s1m241_installed_setup_env(Some(FINGERPRINT));
+    let t = s1m241_installed_setup_env(Some(FINGERPRINT))
+        .with_config("supervision_mode: on-demand\nwal_dir: ../audit/wal\n");
     let endpoint = t.default_socket();
     let t = t
         .with_rpc_ok(
@@ -221,6 +222,11 @@ fn s1m241_assessment_matching_ping_is_reported_once() {
     assert!(t.calls().iter().all(|argv| {
         !argv.iter().any(|arg| arg == "is-active" || arg == "restart")
     }));
+    let config = String::from_utf8(t.config_bytes()).expect("config 必須是 UTF-8");
+    assert!(
+        config.contains("wal_dir: ../audit/wal"),
+        "setup 不得改掉 wal_dir：{config}"
+    );
 }
 
 #[test]

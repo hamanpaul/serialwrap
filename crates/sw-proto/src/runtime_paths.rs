@@ -1,9 +1,11 @@
 //! 執行期路徑與環境變數快照（P3-T4／P3-T7）。
 //!
 //! 路徑計算逐條承接 `sw_core/constants.py` 模組層邏輯（07 §0、01 §4.1），以 `contracts/golden/runtime_paths.*.tsv` 比對。
+use crate::config_types::RuntimeConfig;
 use crate::pycompat::{py_int_parse, py_strip};
 use crate::pyjson::PyInt;
 use crate::pypath::{self, HomeLookup, PathFlavor};
+use crate::yaml11::YValue;
 use std::collections::BTreeMap;
 
 // 以 NUL 結尾保留二進位中的環境變數 token 邊界，供 release bundle 逐名掃描。
@@ -173,6 +175,50 @@ fn env_path(
         _ => default.to_string(),
     };
     pypath::expanduser(f, &raw, env, home)
+}
+
+/// 解析 config.yaml 的 `wal_dir`；相對路徑以實際讀取的 config 檔所在目錄為基準。
+///
+/// 不以字串 `normpath` 消去 `..`：檔案系統必須先解析路徑中的 symlink，再套用後續 `..`。
+pub fn resolve_config_wal_dir(
+    env: &EnvSnapshot,
+    f: PathFlavor,
+    home: &dyn HomeLookup,
+    config_path: &str,
+    cfg: &RuntimeConfig,
+) -> Option<String> {
+    let configured = match cfg.wal_dir() {
+        Some(YValue::Str(raw)) if !py_strip(raw).is_empty() => raw,
+        _ => return None,
+    };
+    let expanded = pypath::expanduser(f, configured, env, home);
+    if pypath::isabs(f, &expanded) {
+        return Some(expanded);
+    }
+    let config_dir = pypath::dirname(f, config_path);
+    Some(pypath::join(f, &config_dir, &[&expanded]))
+}
+
+/// 解析有效 WAL 目錄：環境變數 > config.yaml `wal_dir` > `<state_dir>/wal`。
+///
+/// `wal_dir` 的相對路徑以實際讀取的 config 檔所在目錄為基準；`~` 依平台路徑風格展開。
+/// 環境變數維持既有 `_env_path` 語意：strip 後為空時視為未設定、採用原值並展開 `~`。
+pub fn resolve_wal_dir(
+    env: &EnvSnapshot,
+    f: PathFlavor,
+    home: &dyn HomeLookup,
+    state_dir: &str,
+    config_path: &str,
+    cfg: &RuntimeConfig,
+) -> String {
+    if let Some(raw) = env
+        .get("SERIALWRAP_WAL_DIR")
+        .filter(|value| !py_strip(value).is_empty())
+    {
+        return pypath::expanduser(f, raw, env, home);
+    }
+    resolve_config_wal_dir(env, f, home, config_path, cfg)
+        .unwrap_or_else(|| pypath::join(f, state_dir, &["wal"]))
 }
 
 /// `_xdg(name, fallback_rel)`：`os.environ.get(name) or os.path.join(expanduser("~"), fallback_rel)`；空字串視為未設且不 expanduser。

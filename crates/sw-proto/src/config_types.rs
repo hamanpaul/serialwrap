@@ -1013,6 +1013,11 @@ impl RuntimeConfig {
         self.data.get_str("socket_path")
     }
 
+    /// `data.get("wal_dir")`（不驗型別；非字串由路徑解析端視為未設定）。
+    pub fn wal_dir(&self) -> Option<&YValue> {
+        self.data.get_str("wal_dir")
+    }
+
     /// 07 §5.1：socket_path Some 才覆寫。
     ///
     /// 對應 `sw_core/runtime_config.py` `set_mode`：`supervision_mode` 必寫；`socket_path` 只在 `Some` 時覆寫，
@@ -1029,6 +1034,11 @@ impl RuntimeConfig {
         upsert_str_key(&mut self.data, "socket_path", endpoint);
     }
 
+    /// 僅更新頂層 `wal_dir`；其餘設定原樣保留。
+    pub fn set_wal_dir(&mut self, path: &str) {
+        upsert_str_key(&mut self.data, "wal_dir", path);
+    }
+
     /// `yaml.safe_dump(data, allow_unicode=True)`（PyYAML 預設 `sort_keys=True`）的位元組等價輸出。
     ///
     /// 已知殘差（非契約，見 plan P4-T6）：PyYAML 對「同一物件被多處參照」會輸出 anchor／alias（`&id001`／`*id001`），
@@ -1040,7 +1050,10 @@ impl RuntimeConfig {
 
 /// 以字串 key 覆寫值（既有 key 原位取代，否則附加於尾端；對應 Python `dict.__setitem__`）。
 fn upsert_str_key(map: &mut YMap, key: &str, value: &str) {
-    let value = YValue::Str(value.to_string());
+    upsert_value_key(map, key, YValue::Str(value.to_string()));
+}
+
+fn upsert_value_key(map: &mut YMap, key: &str, value: YValue) {
     match map
         .0
         .iter_mut()
