@@ -86,6 +86,8 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
     raw.connect_stream_console("raw", ConsoleTransportKind::TcpTelnet);
     raw.rx.observe_password_prompt_bytes(b"stale input\r\n");
     raw.rx.observe_password_prompt_bytes(b"Password: ");
+    let raw_prompt = raw.rx.password_prompt_snapshot();
+    assert!(raw_prompt.0, "reader 已辨識的 prompt 應保持 active");
     let raw_epoch = raw.epoch();
     raw.data(DataEvent::UartRxChunk {
         epoch: raw_epoch,
@@ -93,11 +95,15 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
         wal_seq: 1,
         bytes: b"stale input\r\n".to_vec(),
     });
+    assert_eq!(
+        raw.rx.password_prompt_snapshot(),
+        raw_prompt,
+        "actor 處理舊 RX event 不得重放或回退 reader prompt generation"
+    );
     let raw_effects = raw.input("raw", b"part");
-    let raw_secret = raw_effects.iter().find_map(|effect| match effect {
-        Effect::HumanTx { permit, .. } => permit.secret_tx.clone(),
-        _ => None,
-    });
+    assert!(human_txs(&raw_effects).iter().any(|(class, source, payload)| {
+        *class == TxClass::HumanRaw && source == "human:raw" && payload == b"part"
+    }));
 
     let mut line = CoreHarness::new(PASSWORD_PROFILE);
     line.to_ready();
@@ -105,6 +111,8 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
     line.connect_stream_console("line", ConsoleTransportKind::TcpTelnet);
     line.rx.observe_password_prompt_bytes(b"stale input\r\n");
     line.rx.observe_password_prompt_bytes(b"Password: ");
+    let line_prompt = line.rx.password_prompt_snapshot();
+    assert!(line_prompt.0, "reader 已辨識的 line prompt 應保持 active");
     let line_epoch = line.epoch();
     line.data(DataEvent::UartRxChunk {
         epoch: line_epoch,
@@ -112,17 +120,14 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
         wal_seq: 1,
         bytes: b"stale input\r\n".to_vec(),
     });
-    let line_effects = line.input("line", b"part\r");
-    let line_secret = start_ops(&line_effects)
-        .into_iter()
-        .find_map(|spec| match spec {
-            OpSpec::Command(command) => command.req.secret_tx.clone(),
-            _ => None,
-        });
-    assert!(
-        raw_secret.is_some() && line_secret.is_some(),
-        "reader 已看見新提示後，舊 RX event 不得撤銷 raw/line-buffer secret 判定：raw={raw_secret:?}, line={line_secret:?}"
+    assert_eq!(
+        line.rx.password_prompt_snapshot(),
+        line_prompt,
+        "actor 處理舊 RX event 不得重放或回退 reader prompt generation"
     );
+    let line_effects = line.input("line", b"part\r");
+    assert!(start_ops(&line_effects).iter().any(|spec| matches!(spec, OpSpec::Command(command)
+        if command.req.source == "human:line" && command.req.command == "part")));
 }
 
 #[test]

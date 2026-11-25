@@ -404,7 +404,11 @@ fn open_command_sent_after_open() {
     assert!(li.is_some_and(|li| li < so), "lease 建立後才送命令");
     assert!(matches!(
         start_ops(&fx)[0],
-        OpSpec::InteractiveOpenCmd { command, owner } if command == "help" && owner == "agent"
+        OpSpec::InteractiveOpenCmd {
+            command,
+            owner,
+            human_tx: false,
+        } if command == "help" && owner == "agent"
     ));
     finish_op(&mut h, &grant.unwrap(), OpOutcome::Sent { bytes: 5 });
     assert_eq!(rx.try_recv().unwrap().unwrap().get("ok"), Some(&true.into()));

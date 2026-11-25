@@ -70,8 +70,7 @@ fn pycompat_signatures() {
     let _: fn(&[u8]) -> String = decode_utf8_replace;
 }
 
-/// P5 06 T9：TxClass 13 個 variant（P8 只消費 Flash／FlashProbe／FileTransfer，不新增；`HumanLine` 由整合線
-/// WP5-5 對齊包新增，OD-74／DF-02）。
+/// P5 06 T9：TxClass variant 集合；`HumanLine` 由 WP5-5 對齊包新增，OD-74／DF-02；`HumanInteractiveOpen` 由 i311 新增。
 fn tx_class_variants(c: TxClass) -> &'static str {
     match c {
         TxClass::Flash => "flash",
@@ -87,6 +86,7 @@ fn tx_class_variants(c: TxClass) -> &'static str {
         TxClass::SystemRecoverKey => "system_recover_key",
         TxClass::SelfTestProbe => "self_test_probe",
         TxClass::InteractiveOpenCmd => "interactive_open_cmd",
+        TxClass::HumanInteractiveOpen => "human_interactive_open",
     }
 }
 
@@ -366,6 +366,7 @@ fn service_action_named(s: &dyn ServiceCtl, mode: &SupervisionMode, action: Serv
 fn compiles() {
     // 本檔的核對全在編譯期；執行期只確認幾個純函式的值，避免整檔被當成空測試。
     assert_eq!(tx_class_variants(TxClass::FileTransfer), "file_transfer");
+    assert_eq!(tx_class_variants(TxClass::HumanInteractiveOpen), "human_interactive_open");
     assert_eq!(flash_mode_variants(FlashMode::Probe(7)), Some(7));
     assert_eq!(fence_reject_variants(FenceReject::FsmMismatch), "fsm_mismatch");
     assert_eq!(wait_outcome_variants(WaitOutcome::Cancelled), 2);

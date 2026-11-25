@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 16
+revision: 17
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -213,14 +213,14 @@ changes:
       rust:
         stage: "stage-1b"
     approved_at_revision: 15
-    spec_refs: ["OD-111", "OD-112", "v051.md issue 312"]
+    spec_refs: ["OD-111", "OD-112", "v051.md issue 312 編排者定案 2026-11-25"]
     reconciliation_refs: []
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P6"]
     case_ids: ["bc16-human-password-raw", "bc16-human-password-line-buffer", "bc16-console-unlock-prompt"]
-    compatibility_impact: "reader 依 RX 位元組順序作為 password prompt tracker 的唯一寫入者；actor 只讀取 reader 發布的狀態與提示世代，不重放 RX。raw 與 line-buffer console 以 client_id 和連線 lifetime 綁定 secret 輸入行：取得提示世代後，該行維持 secret 至該輸入者送出 CR/LF；TX payload 不記錄，每行只寫含 secret byte 長度及 human source 的 META，CR/LF 與 UART 位元組照常保留。自然斷線、明確 detach、session stop 會結算該輸入者未完成的 secret META；其他 console 的生命週期不清除其狀態。secret human echo 由 reader 在發布前依輸入內容遮罩；提示前綴含無效 UTF-8 時仍會繼續處理同一 RX chunk 的有效文字。若 profile 沒有符合的 password_regex，且 console unlock 提示不符合辨識條件，密碼仍會明文記錄。Python 基線維持不變。"
-    approval_conditions: "依 OD-111 只改 Rust、保留 Python 基線；依 v051 issue 312 裁決，raw 逐鍵與 line-buffer 都須以 ServiceRig 驗證 WAL、mirror、log.tail_raw、log.tail_text、wal.range 與 UART 位元組，並明列 prompt 未匹配時的明文限制。"
+    compatibility_impact: "password prompt 窗口屬 session，依 UART 寫出順序判定，不綁 console lifetime。reader 是提示世代與 RX 結束世代的唯一寫入者；TxWriter 是已消耗提示世代的唯一寫入者；提示世代大於 RX 結束及 TX 消耗世代時窗口 active，bridge epoch 重開時歸零。reader 先更新窗口再發布提示 bytes。human TX 在每次 UART 寫出時分類；窗口 active 的 secret TX chunk 在同一寫出點記一筆不含 payload 的 META，含實際寫出長度與 human source；CR/LF 照常記 TX，不保存待結算行或 client lifetime 狀態。secret bytes 在寫 UART 前登記給 reader 做增量 echo 比對；每個窗口最多保留 1024 bytes，超出時不再保存，並將該 RX 行其餘內容遮罩到行尾。沒有未決 echo 前綴時，登記在後續 RX 行尾清除；未決前綴遇到較早 RX 行尾時保留 matcher，完整 echo 的行尾或 bridge epoch 結束時清除登記。提示前輸入屬窗口外，照常記錄與顯示。raw 逐鍵輸入會依每次實際寫出各記一筆 META；line-buffer 以整段提交記一筆。提示送到 console 前已輸入的 bytes 無法追溯遮罩；沒有匹配 password_regex 的 profile 且沒有可辨識 console unlock prompt 時，輸入仍可能明文記錄。提示前綴含無效 UTF-8 時仍會繼續處理同一 RX chunk 的有效文字。Python 基線維持不變。"
+    approval_conditions: "依 OD-111 只改 Rust、保留 Python 基線；依 2026-11-25 v051 編排者定案撤回整行延後分類與 lifetime 結算，改為 session prompt generation window、TX 寫出當下分類與 WAL/META 同點寫入。raw 逐鍵、line-buffer、提示前已輸入、超過 1024 bytes、在途 TX 遇斷線／detach／stop、普通未換行 WAL 與各輸出 sink 均須由 ServiceRig、CoreHarness 或隔離 daemon 驗證。"
     related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"

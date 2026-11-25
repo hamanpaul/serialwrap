@@ -37,7 +37,11 @@ pub enum OpSpec {
     Command(QueuedCommand),
     Recover { timeout_s: f64, force: bool },
     SelfTestProbe { timeout_s: f64, probe: String, nonce: String },
-    InteractiveOpenCmd { command: String, owner: String },
+    InteractiveOpenCmd {
+        command: String,
+        owner: String,
+        human_tx: bool,
+    },
     InteractiveSend { payload: Vec<u8>, owner: String },
     RebootRecovery { hard_timeout_s: f64 },
     DetectTemplate { templates: Vec<ProfileTemplate> },
@@ -402,10 +406,19 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
             probe,
             nonce,
         } => run_self_test_probe(ctx, grant, timeout_s, &probe, &nonce),
-        OpSpec::InteractiveOpenCmd { command, owner } => {
+        OpSpec::InteractiveOpenCmd {
+            command,
+            owner,
+            human_tx,
+        } => {
             let payload = command_payload(&command);
             // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
-            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner, grant.cmd_id.as_deref())
+            let class = if human_tx {
+                TxClass::HumanInteractiveOpen
+            } else {
+                TxClass::InteractiveOpenCmd
+            };
+            lease_send(ctx, grant, payload, class, &owner, grant.cmd_id.as_deref())
         }
         OpSpec::InteractiveSend { payload, owner } => {
             lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner, None)

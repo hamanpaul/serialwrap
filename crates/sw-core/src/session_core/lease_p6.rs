@@ -234,16 +234,10 @@ impl SessionCore {
 
     /// `bridge.detach_console`（#78）＋關閉該 console。
     pub(super) fn detach_console_p6(&mut self, client_id: &str) -> bool {
-        let Some(lifetime) = self
-            .human
-            .consoles
-            .get(client_id)
-            .map(|record| record.client_lifetime)
-        else {
+        if !self.human.consoles.contains_key(client_id) {
             return false;
-        };
+        }
         let before = self.human.ownership.interactive_owner.clone();
-        self.settle_incomplete_human_password_for(client_id, lifetime);
         self.human.ownership.on_detach(client_id);
         self.after_owner_change(before);
         self.human.deferred_mut().remove_client(client_id);

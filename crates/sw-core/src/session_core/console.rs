@@ -19,7 +19,7 @@ use crate::human_console::line_mode::human_console_mode;
 use crate::human_console::ownership::InputRoute;
 use crate::human_console::{ConsoleRecord, ConsoleScanSnapshot, ConsoleTransportKind, ReplayHold};
 use crate::human_console::line_editor::LineEditor;
-use crate::tx_writer::{SecretTx, TxClass, TxReport};
+use crate::tx_writer::{TxClass, TxReport};
 
 /// D-19 限速表上限（超過時整批清空；只影響 WARNING 次數）。
 const DROP_WARN_KEYS_MAX: usize = 1024;
@@ -402,16 +402,6 @@ impl SessionCore {
 
     fn emit_human_tx(&mut self, tag: HumanTxTag, hold: Option<u64>, payload: Vec<u8>, fx: &mut Vec<Effect>) {
         self.next_op_id = self.next_op_id.saturating_add(1);
-        let raw_input = tag.class == TxClass::HumanRaw;
-        let secret_tx = if raw_input {
-            self.classify_human_raw_secret_tx(&tag.client_id, tag.client_lifetime, &payload)
-        } else {
-            self.classify_human_secret_tx(&tag.client_id, tag.client_lifetime, &payload)
-        };
-        // 有 password prompt 來源的 raw 輸入需等行界線決定整行分類；UART 仍逐段即時寫入。
-        let log = secret_tx
-            .as_ref()
-            .is_none_or(|secret| secret.log_skip_prefix < payload.len());
         let permit = TxPermit {
             op_id: OpId(self.next_op_id),
             epoch: self.generations.conn_epoch.unwrap_or_default(),
@@ -420,8 +410,8 @@ impl SessionCore {
             class: tag.class,
             source: format!("human:{}", tag.client_id),
             cmd_id: None,
-            log,
-            secret_tx,
+            log: true,
+            secret_tx: None,
             input_epoch: Some(tag.input_epoch),
             replay_hold: hold,
             probe_id: None,
@@ -433,179 +423,6 @@ impl SessionCore {
             ledger: (permit.op_id, permit.epoch),
         });
         fx.push(Effect::HumanTx { tag, permit, payload });
-    }
-
-    fn latch_password_prompt_for_console(&mut self, client_id: &str, lifetime: u64) -> bool {
-        let (active, generation) = self.deps.rx.password_prompt_snapshot();
-        let Some(record) = self.human.consoles.get_mut(client_id) else {
-            return false;
-        };
-        if record.client_lifetime != lifetime {
-            return false;
-        }
-        let line_open = record.raw_line_open || !record.raw_line.is_empty() || record.line.buffered_len() > 0;
-        if !line_open && !record.secret_line_latched {
-            record.secret_line_start_generation = generation;
-        }
-        let prompt_seen_during_line = active || generation > record.secret_line_start_generation;
-        let can_claim = if prompt_seen_during_line && generation > self.password_prompt_consumed_generation {
-            match self.password_prompt_claim.as_ref() {
-                None => {
-                    self.password_prompt_claim =
-                        Some((generation, client_id.to_string(), lifetime));
-                    true
-                }
-                Some((_, owner, owner_lifetime))
-                    if owner == client_id && *owner_lifetime == lifetime =>
-                {
-                    self.password_prompt_claim =
-                        Some((generation, client_id.to_string(), lifetime));
-                    true
-                }
-                _ => false,
-            }
-        } else {
-            false
-        };
-        let Some(record) = self.human.consoles.get_mut(client_id) else { return false; };
-        if can_claim {
-            record.secret_line_latched = true;
-            record.secret_line_generation = generation;
-            record.secret_line_len = record.raw_line.len().max(record.line.buffered_len());
-        }
-        record.secret_line_latched
-    }
-
-    fn finish_password_prompt_line(&mut self, client_id: &str, lifetime: u64) {
-        let Some(record) = self.human.consoles.get_mut(client_id) else {
-            return;
-        };
-        if record.client_lifetime != lifetime {
-            return;
-        }
-        let generation = if record.secret_line_latched {
-            record.secret_line_generation
-        } else {
-            0
-        };
-        record.secret_line_latched = false;
-        record.secret_line_len = 0;
-        record.secret_line_generation = 0;
-        record.secret_echo_started = false;
-        if generation > 0 {
-            self.password_prompt_consumed_generation =
-                self.password_prompt_consumed_generation.max(generation);
-            if self
-                .password_prompt_claim
-                .as_ref()
-                .is_some_and(|(claimed, owner, owner_lifetime)| {
-                    *claimed <= generation && owner == client_id && *owner_lifetime == lifetime
-                })
-            {
-                self.password_prompt_claim = None;
-            }
-        }
-    }
-
-    /// 依 reader 提示狀態把該 console 的整行鎖定為 secret，直到它送出行終止符。
-    fn classify_human_secret_tx(
-        &mut self,
-        client_id: &str,
-        lifetime: u64,
-        payload: &[u8],
-    ) -> Option<SecretTx> {
-        if payload.is_empty() {
-            return None;
-        }
-        let _ = self.latch_password_prompt_for_console(client_id, lifetime);
-        let record = self.human.consoles.get_mut(client_id)?;
-        if record.client_lifetime != lifetime || !record.secret_line_latched {
-            return None;
-        }
-        let prior_len = record.secret_line_len;
-        let line_end = payload.iter().position(|byte| matches!(byte, b'\r' | b'\n'));
-        let secret_len = line_end.unwrap_or(payload.len());
-        let total_len = prior_len.saturating_add(secret_len);
-        let generation = record.secret_line_generation;
-        if secret_len > 0 {
-            record.secret_line_len = total_len;
-        }
-        if line_end.is_some() {
-            record.secret_line_latched = false;
-            record.secret_line_len = 0;
-            record.secret_line_generation = 0;
-        }
-        let secret_tx = (total_len > 0).then_some(SecretTx {
-            log_skip_prefix: secret_len,
-            meta_len: line_end.is_some().then_some(total_len),
-            echo_start: prior_len == 0 && secret_len > 0,
-            echo_prior_len: prior_len,
-            echo_seed: Vec::new(),
-            echo_finish: line_end.is_some(),
-        });
-        if line_end.is_some() && generation > 0 {
-            self.password_prompt_consumed_generation =
-                self.password_prompt_consumed_generation.max(generation);
-            if self
-                .password_prompt_claim
-                .as_ref()
-                .is_some_and(|(claimed, owner, owner_lifetime)| {
-                    *claimed <= generation && owner == client_id && *owner_lifetime == lifetime
-                })
-            {
-                self.password_prompt_claim = None;
-            }
-        }
-        secret_tx
-    }
-
-    fn classify_human_raw_secret_tx(
-        &mut self,
-        client_id: &str,
-        lifetime: u64,
-        payload: &[u8],
-    ) -> Option<SecretTx> {
-        if payload.is_empty() {
-            return None;
-        }
-        let has_unlock_prompt = self
-            .profile
-            .template
-            .console_unlock_env
-            .as_deref()
-            .is_some_and(|env| !env.is_empty());
-        if self.password_regex.is_none() && !has_unlock_prompt {
-            return None;
-        }
-        let secret_line = self.latch_password_prompt_for_console(client_id, lifetime);
-        let record = self.human.consoles.get_mut(client_id)?;
-        if record.client_lifetime != lifetime {
-            return None;
-        }
-        record.raw_line_open = true;
-        if !secret_line || !record.secret_line_latched {
-            return Some(SecretTx::default());
-        }
-        let prior_len = record.raw_line.len();
-        let line_end = payload.iter().position(|byte| matches!(byte, b'\r' | b'\n'));
-        let secret_len = line_end.unwrap_or(payload.len());
-        let total_len = prior_len.saturating_add(secret_len);
-        let echo_start = total_len > 0 && !record.secret_echo_started;
-        let echo_seed = if echo_start {
-            record.secret_echo_started = true;
-            record.raw_line.clone()
-        } else {
-            Vec::new()
-        };
-        let echo_finish = line_end.is_some() && record.secret_echo_started;
-        Some(SecretTx {
-            log_skip_prefix: secret_len,
-            meta_len: None,
-            echo_start,
-            echo_prior_len: prior_len,
-            echo_seed,
-            echo_finish,
-        })
     }
 
     /// backlog 依序：Replay 直接送出、Input 重新路由；直到有在途者或 backlog 清空。
@@ -666,15 +483,6 @@ impl SessionCore {
                 op_id: report.op_id,
             });
         }
-        let confirmed = match &report.result.outcome {
-            TxOutcome::Completed(n) => *n,
-            TxOutcome::Unknown { confirmed } => *confirmed,
-            TxOutcome::NotSubmitted => 0,
-        }
-        .min(job.payload.len());
-        if job.tag.class == TxClass::HumanRaw && confirmed > 0 {
-            self.complete_human_raw_tx(&job, &job.payload[..confirmed]);
-        }
         let cid = job.tag.client_id.clone();
         let len = job.tag.len;
         match report.result.outcome {
@@ -722,102 +530,6 @@ impl SessionCore {
             fx.extend(self.start_next(now));
         }
         fx
-    }
-
-    fn complete_human_raw_tx(&mut self, job: &InFlightJob, confirmed: &[u8]) {
-        let client_id = job.tag.client_id.as_str();
-        let lifetime = job.tag.client_lifetime;
-        let _ = self.latch_password_prompt_for_console(client_id, lifetime);
-        let Some(record) = self.human.consoles.get_mut(client_id) else {
-            return;
-        };
-        if record.client_lifetime != lifetime || !record.raw_line_open {
-            return;
-        }
-        let line_end = confirmed
-            .iter()
-            .position(|byte| matches!(byte, b'\r' | b'\n'));
-        let Some(line_end) = line_end else {
-            record.raw_line.extend_from_slice(confirmed);
-            record.raw_line_chunks.push(confirmed.to_vec());
-            if record.secret_line_latched {
-                record.secret_line_len = record.raw_line.len();
-            }
-            return;
-        };
-
-        record.raw_line.extend_from_slice(&confirmed[..line_end]);
-        let secret_len = record.raw_line.len();
-        let secret = record.secret_line_latched;
-        let mut tx_payloads = std::mem::take(&mut record.raw_line_chunks);
-        if secret {
-            for chunk in &mut tx_payloads {
-                chunk.fill(0);
-            }
-            tx_payloads.clear();
-            tx_payloads.push(confirmed[line_end..].to_vec());
-        } else {
-            tx_payloads.push(confirmed.to_vec());
-        }
-        let source = format!("human:{client_id}");
-        let secret_generation = if secret {
-            record.secret_line_generation
-        } else {
-            0
-        };
-        record.raw_line.fill(0);
-        record.raw_line.clear();
-        record.raw_line_open = false;
-        record.secret_line_len = 0;
-        record.secret_echo_started = false;
-        if secret {
-            record.secret_line_latched = false;
-            record.secret_line_generation = 0;
-        }
-
-        if secret && secret_len > 0 {
-            let mut meta = PyDict::new();
-            meta.insert("event", PyValue::from("secret_tx"));
-            meta.insert("secret_len", PyValue::Int(PyInt::Small(secret_len as i128)));
-            self.deps.wal.append(crate::wal::WalAppendReq {
-                com: &self.profile.com,
-                dir: "META",
-                source: &source,
-                payload: &[],
-                cmd_id: None,
-                loss_flag: false,
-                meta: Some(meta),
-            });
-        }
-        for payload in &mut tx_payloads {
-            if !payload.is_empty() {
-                self.deps.wal.append(crate::wal::WalAppendReq {
-                    com: &self.profile.com,
-                    dir: "TX",
-                    source: &source,
-                    payload,
-                    cmd_id: None,
-                    loss_flag: false,
-                    meta: None,
-                });
-                payload.fill(0);
-            }
-        }
-        if secret_generation > 0 {
-            self.password_prompt_consumed_generation =
-                self.password_prompt_consumed_generation.max(secret_generation);
-            if self
-                .password_prompt_claim
-                .as_ref()
-                .is_some_and(|(claimed, owner, owner_lifetime)| {
-                    *claimed <= secret_generation
-                        && owner == client_id
-                        && *owner_lifetime == lifetime
-                })
-            {
-                self.password_prompt_claim = None;
-            }
-        }
     }
 
     fn tx_incomplete_warn(&self, cid: &str, outcome: &str, written: usize, len: usize) -> Effect {
@@ -964,15 +676,20 @@ impl SessionCore {
         fx: &mut Vec<Effect>,
     ) {
         let mut start = 0;
+        let mut hide_local_echo = self.deps.rx.human_password_window_active();
         while start < bytes.len() {
             let end = console_input_segment_end(bytes, start);
-            self.console_line_input_segment(
+            let submitted = self.console_line_input_segment(
                 client_id,
                 lifetime,
                 &bytes[start..end],
                 now,
                 fx,
+                hide_local_echo,
             );
+            if submitted {
+                hide_local_echo = false;
+            }
             start = end;
         }
     }
@@ -980,27 +697,24 @@ impl SessionCore {
     fn console_line_input_segment(
         &mut self,
         client_id: &str,
-        lifetime: u64,
+        _lifetime: u64,
         bytes: &[u8],
         now: Mono,
         fx: &mut Vec<Effect>,
-    ) {
-        let line_latched = self.latch_password_prompt_for_console(client_id, lifetime);
+        hide_local_echo: bool,
+    ) -> bool {
         let Some(rec) = self.human.consoles.get_mut(client_id) else {
-            return;
+            return false;
         };
         let out = rec.line.consume(bytes);
         let overflow = rec.line.take_overflow_started();
-        if rec.secret_line_latched {
-            rec.secret_line_len = rec.line.buffered_len();
-        }
         for _ in 0..overflow {
             fx.push(Effect::Warn(format!(
                 "console line 超過 16385 bytes，整行丟棄（com={} client_id={client_id}）",
                 self.profile.com
             )));
         }
-        let echo = if line_latched {
+        let echo = if hide_local_echo {
             out.echo.into_iter().filter(|byte| *byte == b'\r').collect()
         } else {
             out.echo
@@ -1014,43 +728,21 @@ impl SessionCore {
                 },
             });
         }
+        let mut submitted = false;
         for line in out.lines {
-            let secret = line_latched && !line.is_empty();
-            self.submit_console_line(client_id, line, secret, now, fx);
-            if line_latched {
-                self.finish_password_prompt_line(client_id, lifetime);
-            }
+            submitted |= self.submit_console_line(client_id, line, now, fx);
         }
-        if let Some(rec) = self.human.consoles.get_mut(client_id) {
-            rec.secret_line_len = if rec.secret_line_latched {
-                rec.line.buffered_len()
-            } else {
-                0
-            };
-        }
+        submitted
     }
 
     fn submit_console_line(
         &mut self,
         client_id: &str,
         line: String,
-        secret: bool,
         now: Mono,
         fx: &mut Vec<Effect>,
-    ) {
-        let secret_tx = (secret && !line.is_empty()).then_some(SecretTx {
-            log_skip_prefix: line.len(),
-            meta_len: Some(line.len()),
-            echo_start: true,
-            echo_prior_len: 0,
-            echo_seed: Vec::new(),
-            echo_finish: true,
-        });
-        let mode = if secret_tx.is_some() {
-            "command".to_string()
-        } else {
-            human_console_mode(&line, self.path_flavor).as_str().to_string()
-        };
+    ) -> bool {
+        let mode = human_console_mode(&line, self.path_flavor).as_str().to_string();
         let bytes = line.len();
         let req = SubmitReq {
             session_id: self.sid.clone(),
@@ -1063,7 +755,7 @@ impl SessionCore {
             completion_regex: None,
             expect_reboot: false,
             trusted_human: true,
-            secret_tx,
+            secret_tx: None,
             origin: SubmitOrigin::HumanConsole {
                 client_id: client_id.to_string(),
             },
@@ -1078,6 +770,7 @@ impl SessionCore {
                 self.note_tick_close_interactive(&admitted.queued);
                 self.queue.push(admitted.queued, &self.deps.registry);
                 fx.extend(self.start_next(now));
+                true
             }
             Err(result) => {
                 let code = result.get("error_code").and_then(PyValue::as_str).unwrap_or("");
@@ -1087,6 +780,7 @@ impl SessionCore {
                         self.profile.com
                     )));
                 }
+                false
             }
         }
     }
@@ -1119,14 +813,6 @@ impl SessionCore {
                 internal: false,
                 attached_at: now,
                 line: LineEditor::new(),
-                raw_line: Vec::new(),
-                raw_line_chunks: Vec::new(),
-                raw_line_open: false,
-                secret_line_start_generation: 0,
-                secret_line_latched: false,
-                secret_line_len: 0,
-                secret_line_generation: 0,
-                secret_echo_started: false,
             },
         );
         if self.human.primary_client_id.is_none() {
@@ -1139,110 +825,12 @@ impl SessionCore {
         Vec::new()
     }
 
-    pub(super) fn settle_incomplete_human_password(&mut self) {
-        let clients: Vec<(String, u64)> = self
-            .human
-            .consoles
-            .values()
-            .map(|record| (record.client_id.clone(), record.client_lifetime))
-            .collect();
-        for (client_id, lifetime) in clients {
-            self.settle_incomplete_human_password_for(&client_id, lifetime);
-        }
-    }
-
-    pub(super) fn settle_incomplete_human_password_for(&mut self, client_id: &str, lifetime: u64) {
-        let _ = self.latch_password_prompt_for_console(client_id, lifetime);
-        let Some(record) = self.human.consoles.get_mut(client_id) else {
-            return;
-        };
-        if record.client_lifetime != lifetime {
-            return;
-        }
-        let raw = record.raw_line_open || !record.raw_line.is_empty();
-        let secret = record.secret_line_latched;
-        let len = if secret {
-            if raw { record.raw_line.len() } else { record.secret_line_len }
-        } else {
-            0
-        };
-        let mut normal_pending = if raw && !secret {
-            std::mem::take(&mut record.raw_line_chunks)
-        } else {
-            let mut discarded = std::mem::take(&mut record.raw_line_chunks);
-            for chunk in &mut discarded {
-                chunk.fill(0);
-            }
-            discarded.clear();
-            Vec::new()
-        };
-        let generation = if record.secret_line_latched {
-            record.secret_line_generation
-        } else {
-            0
-        };
-        record.raw_line.fill(0);
-        record.raw_line.clear();
-        record.raw_line_open = false;
-        record.secret_line_latched = false;
-        record.secret_line_len = 0;
-        record.secret_line_generation = 0;
-        record.secret_echo_started = false;
-        if generation > 0 {
-            self.password_prompt_consumed_generation =
-                self.password_prompt_consumed_generation.max(generation);
-            if self
-                .password_prompt_claim
-                .as_ref()
-                .is_some_and(|(claimed, owner, owner_lifetime)| {
-                    *claimed <= generation && owner == client_id && *owner_lifetime == lifetime
-                })
-            {
-                self.password_prompt_claim = None;
-            }
-        }
-        let source = format!("human:{client_id}");
-        if len > 0 {
-            self.deps.rx.finish_human_secret_echo();
-            let mut meta = sw_proto::pyjson::PyDict::new();
-            meta.insert("event", sw_proto::pyjson::PyValue::from("secret_tx"));
-            meta.insert(
-                "secret_len",
-                sw_proto::pyjson::PyValue::Int(sw_proto::pyjson::PyInt::Small(len as i128)),
-            );
-            self.deps.wal.append(crate::wal::WalAppendReq {
-                com: &self.profile.com,
-                dir: "META",
-                source: &source,
-                payload: b"",
-                cmd_id: None,
-                loss_flag: false,
-                meta: Some(meta),
-            });
-        }
-        for payload in &mut normal_pending {
-            if !payload.is_empty() {
-                self.deps.wal.append(crate::wal::WalAppendReq {
-                    com: &self.profile.com,
-                    dir: "TX",
-                    source: &source,
-                    payload,
-                    cmd_id: None,
-                    loss_flag: false,
-                    meta: None,
-                });
-                payload.fill(0);
-            }
-        }
-    }
-
     /// `DataEvent::ConsoleDisconnected`（`_drop_console_client`，#136；與同 client 輸入同一條 data lane）。
     pub(super) fn console_disconnected(&mut self, client_id: &str, lifetime: u64) -> Vec<Effect> {
         if !self.human.is_live(client_id, lifetime) {
             return Vec::new();
         }
         let before = self.human.ownership.interactive_owner.clone();
-        self.settle_incomplete_human_password_for(client_id, lifetime);
         self.human.ownership.on_drop(client_id);
         self.after_owner_change(before);
         self.human.deferred_mut().remove_client(client_id);
@@ -1389,14 +977,6 @@ impl SessionCore {
                 internal: false,
                 attached_at: now,
                 line: LineEditor::new(),
-                raw_line: Vec::new(),
-                raw_line_chunks: Vec::new(),
-                raw_line_open: false,
-                secret_line_start_generation: 0,
-                secret_line_latched: false,
-                secret_line_len: 0,
-                secret_line_generation: 0,
-                secret_echo_started: false,
             },
         );
         if self.human.primary_client_id.is_none() {
@@ -1453,14 +1033,6 @@ impl SessionCore {
                 internal: true,
                 attached_at: now,
                 line: LineEditor::new(),
-                raw_line: Vec::new(),
-                raw_line_chunks: Vec::new(),
-                raw_line_open: false,
-                secret_line_start_generation: 0,
-                secret_line_latched: false,
-                secret_line_len: 0,
-                secret_line_generation: 0,
-                secret_echo_started: false,
             },
         );
         self.human.primary_client_id = Some(client_id.clone());

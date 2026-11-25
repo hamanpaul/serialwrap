@@ -575,7 +575,7 @@ pub struct PublicCtx {
 /// sans-IO session 狀態機（05 §1.6 `SessionRuntime` 對應；bridge 物件改為 `conn_epoch`）。
 pub struct SessionCore {
     profile: SessionProfile,
-    password_regex: Option<PyRegex>,
+    password_regex: Option<Arc<PyRegex>>,
     /// 最近一次發布到 fence 的 `foreground_busy`（P7 Task 16-wire）。
     published_foreground_busy: bool,
     sid: String,
@@ -731,10 +731,6 @@ pub struct SessionCore {
     self_test_probes: SelfTestProbes,
     /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
     last_rx_wal_seq: u64,
-    /// 已被 human 行消耗的 reader prompt generation；TX/console lifecycle 不改寫 reader tracker。
-    password_prompt_consumed_generation: u64,
-    /// 目前取得此 prompt 的 human 輸入者與連線世代。
-    password_prompt_claim: Option<(u64, String, u64)>,
     pending_release: Option<PendingRelease>,
     pending_auto_login: bool,
     shutdown_requested: bool,
@@ -993,7 +989,8 @@ impl SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
         let password_regex = (!profile.template.password_regex.is_empty())
             .then(|| compile(&profile.template.password_regex, PyFlags(0)).ok())
-            .flatten();
+            .flatten()
+            .map(Arc::new);
         deps.rx.set_password_prompt_matcher(
             password_regex.clone(),
             profile.template.console_unlock_env.clone(),
@@ -1092,8 +1089,6 @@ impl SessionCore {
             force_poll_after_clear: Vec::new(),
             self_test_probes: SelfTestProbes::default(),
             last_rx_wal_seq: 0,
-            password_prompt_consumed_generation: 0,
-            password_prompt_claim: None,
             pending_release: None,
             pending_auto_login: false,
             shutdown_requested: false,
@@ -2001,7 +1996,6 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
-        self.settle_incomplete_human_password();
         if kind != StopKind::Clear {
             self.custody_clear_retry_token = None;
         }
@@ -3297,12 +3291,12 @@ impl SessionCore {
                 self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
                 self.password_regex = (!profile.template.password_regex.is_empty())
                     .then(|| compile(&profile.template.password_regex, PyFlags(0)).ok())
-                    .flatten();
+                    .flatten()
+                    .map(Arc::new);
                 self.deps.rx.set_password_prompt_matcher(
                     self.password_regex.clone(),
                     profile.template.console_unlock_env.clone(),
                 );
-                self.settle_incomplete_human_password();
                 self.profile = profile;
                 self.profile_source = profile_source;
                 let mut effects = Vec::new();
@@ -7140,7 +7134,11 @@ impl SessionCore {
         self.foreground = Some(grant.clone());
         effects.push(Effect::StartOp {
             grant,
-            spec: OpSpec::InteractiveOpenCmd { command, owner },
+            spec: OpSpec::InteractiveOpenCmd {
+                command,
+                owner,
+                human_tx: false,
+            },
         });
         effects
     }
@@ -7467,6 +7465,7 @@ impl SessionCore {
                     spec: OpSpec::InteractiveOpenCmd {
                         command: command.req.command.clone(),
                         owner,
+                        human_tx: command.req.is_trusted_human(),
                     },
                 });
                 return effects;

@@ -49,6 +49,8 @@ pub enum TxClass {
     SystemRecoverKey,
     SelfTestProbe,
     InteractiveOpenCmd,
+    /// Human console 透過 `mode=interactive` 開互動程式時的首筆 TX。
+    HumanInteractiveOpen,
 }
 
 #[derive(Clone, Debug)]
@@ -573,7 +575,11 @@ impl Fence {
                     return Err(FenceReject::ReplayRevoked);
                 }
             }
-            TxClass::LeaseOwner | TxClass::InteractiveOpenCmd if p.owner_gen != st.owner_gen => {
+            TxClass::LeaseOwner
+            | TxClass::InteractiveOpenCmd
+            | TxClass::HumanInteractiveOpen
+                if p.owner_gen != st.owner_gen =>
+            {
                 return Err(FenceReject::OwnerMismatch);
             }
             TxClass::LoginProbe | TxClass::ReadyReconfirm if p.fsm_gen != st.fsm_gen => {
@@ -1080,13 +1086,14 @@ impl TxWriter {
                     Ok(()) => Precheck::Admitted,
                 },
             };
-            let (result, reject) = match precheck {
+            let (result, reject, human_secret_len) = match precheck {
                 Precheck::AggregateOverflow(error) => (
                     TxResult {
                         outcome: TxOutcome::NotSubmitted,
                         error: Some(error),
                     },
                     None,
+                    0,
                 ),
                 Precheck::Refused(reason) => (
                     TxResult {
@@ -1094,34 +1101,51 @@ impl TxWriter {
                         error: None,
                     },
                     Some(reason),
+                    0,
                 ),
                 Precheck::Admitted => {
-                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
-                        if secret.echo_start {
-                            rx.begin_human_secret_echo();
-                            rx.extend_human_secret_echo(&secret.echo_seed);
-                        }
-                        let secret_len = secret.log_skip_prefix.min(job.payload.len());
-                        if secret_len > 0 {
-                            rx.extend_human_secret_echo(&job.payload[..secret_len]);
-                        }
-                    }
                     let gate = FenceSubmitGate {
                         fence: &self.fence,
                         permit: &job.permit,
                         last_reject: Cell::new(None),
                     };
-                    let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
-                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
-                        let requested_secret_len = secret.log_skip_prefix.min(job.payload.len());
-                        let is_unknown = matches!(result.outcome, TxOutcome::Unknown { .. });
-                        if !is_unknown {
-                            let sent_secret_len = confirmed_bytes(&result.outcome).min(requested_secret_len);
-                            if sent_secret_len < requested_secret_len {
-                                rx.truncate_human_secret_echo(secret.echo_prior_len + sent_secret_len);
-                            }
+                    let human_tx = matches!(
+                        job.permit.class,
+                        TxClass::HumanRaw
+                            | TxClass::HumanReplay
+                            | TxClass::HumanLine
+                            | TxClass::HumanInteractiveOpen
+                    );
+                    let (result, human_secret_len, _) = if human_tx {
+                        if let Some(rx) = &self.rx {
+                            rx.with_human_tx_window(&job.payload, |_secret_len| {
+                                let result = self.writer.write_gated(
+                                    &job.payload,
+                                    &self.cancel,
+                                    &gate,
+                                );
+                                let confirmed = confirmed_bytes(&result.outcome);
+                                let unknown = matches!(result.outcome, TxOutcome::Unknown { .. });
+                                (result, confirmed, unknown)
+                            })
+                        } else {
+                            let result = self.writer.write_gated(
+                                &job.payload,
+                                &self.cancel,
+                                &gate,
+                            );
+                            let confirmed = confirmed_bytes(&result.outcome);
+                            (result, 0, confirmed)
                         }
-                    }
+                    } else {
+                        let result = self.writer.write_gated(
+                            &job.payload,
+                            &self.cancel,
+                            &gate,
+                        );
+                        let confirmed = confirmed_bytes(&result.outcome);
+                        (result, 0, confirmed)
+                    };
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
                     let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
                     let (result, reject) =
@@ -1145,12 +1169,21 @@ impl TxWriter {
                             state.reconfirm_pending = true;
                         }
                     });
-                    (result, gate.last_reject.get())
+                    (result, gate.last_reject.get(), human_secret_len)
                 }
             };
 
             let confirmed = confirmed_bytes(&result.outcome);
-            let secret_meta_wal = if let Some(len) = job.permit.secret_tx.as_ref().and_then(|secret| secret.meta_len) {
+            let runtime_secret_meta_len = human_secret_len.min(confirmed).min(job.payload.len());
+            let secret_meta_len = (runtime_secret_meta_len > 0)
+                .then_some(runtime_secret_meta_len)
+                .or_else(|| {
+                    job.permit
+                        .secret_tx
+                        .as_ref()
+                        .and_then(|secret| secret.meta_len)
+                });
+            let secret_meta_wal = if let Some(len) = secret_meta_len {
                 let mut meta = PyDict::new();
                 meta.insert("event", PyValue::from("secret_tx"));
                 meta.insert("secret_len", PyValue::Int(PyInt::Small(len as i128)));
@@ -1166,11 +1199,6 @@ impl TxWriter {
             } else {
                 None
             };
-            if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
-                if secret.echo_finish && confirmed >= job.payload.len() {
-                    rx.finish_human_secret_echo();
-                }
-            }
             // P8 Task 5：`Append` 的確認 bytes 進聚合緩衝（`Finish`／收尾 flush 時一筆落 WAL），不單獨寫 TX。
             if let Some(key) = append_key.as_ref() {
                 if confirmed > 0 {
@@ -1181,20 +1209,19 @@ impl TxWriter {
                         .extend_from_slice(&job.payload[..confirmed_payload_len]);
                 }
             }
-            // 配置了密碼提示來源的 raw console 要等行界線決定整行分類；`log` 仍保留
-            // permit 的既有語意，payload 由 SessionCore 完成行結算後寫入 WAL。
             let tx_wal = if job.permit.log
-                && !(job.permit.class == TxClass::HumanRaw && job.permit.secret_tx.is_some())
                 && append_key.is_none()
                 && confirmed > 0
             {
                 let confirmed_payload_len = confirmed.min(job.payload.len());
-                let log_start = job
+                let explicit_log_start = job
                     .permit
                     .secret_tx
                     .as_ref()
                     .map(|secret| secret.log_skip_prefix.min(confirmed_payload_len))
                     .unwrap_or_default();
+                let log_start = explicit_log_start
+                    .max(human_secret_len.min(confirmed_payload_len));
                 (confirmed_payload_len > log_start).then(|| {
                     self.wal.append(WalAppendReq {
                         com: &self.com,

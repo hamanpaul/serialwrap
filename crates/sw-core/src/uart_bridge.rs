@@ -130,7 +130,11 @@ pub struct RxShared {
 struct SecretEchoWindow {
     armed: Option<ArmedSecretEcho>,
     released: VecDeque<ReleasedSecretByte>,
+    human_generation: Option<u64>,
+    overflow_mask_line: bool,
 }
+
+const HUMAN_SECRET_ECHO_MAX_BYTES: usize = 1024;
 
 struct ReleasedSecretByte {
     byte: u8,
@@ -140,17 +144,19 @@ struct ArmedSecretEcho {
     secret: Vec<u8>,
     pending: Vec<u8>,
     dynamic: bool,
-    expire_on_line_end: bool,
+    after_cr: bool,
 }
 
 #[derive(Default)]
 struct PasswordPromptTracker {
-    password_regex: Option<sw_proto::pyre::PyRegex>,
+    password_regex: Option<Arc<sw_proto::pyre::PyRegex>>,
     unlock_env: Option<String>,
     pending_bytes: Vec<u8>,
     current_line: String,
     active: bool,
     generation: u64,
+    rx_end_generation: u64,
+    tx_consumed_generation: u64,
 }
 
 impl PasswordPromptTracker {
@@ -168,6 +174,7 @@ impl PasswordPromptTracker {
                 self.pending_bytes.clear();
                 self.current_line.clear();
                 self.active = false;
+                self.rx_end_generation = self.rx_end_generation.max(self.generation);
                 slice = &slice[pos + 1..];
             } else {
                 self.append_line_bytes(slice);
@@ -281,7 +288,7 @@ impl RxShared {
 
     pub fn set_password_prompt_matcher(
         &self,
-        password_regex: Option<sw_proto::pyre::PyRegex>,
+        password_regex: Option<Arc<sw_proto::pyre::PyRegex>>,
         unlock_env: Option<String>,
     ) {
         let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
@@ -335,12 +342,14 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut previous);
             previous.secret.fill(0);
         }
+        window.human_generation = None;
+        window.overflow_mask_line = false;
         if !secret.is_empty() {
             window.armed = Some(ArmedSecretEcho {
                 secret: secret.to_vec(),
                 pending: Vec::with_capacity(secret.len().saturating_sub(1)),
                 dynamic: false,
-                expire_on_line_end: false,
+                after_cr: false,
             });
         }
         drop(window);
@@ -349,52 +358,97 @@ impl RxShared {
         SecretEchoGuard { start_from }
     }
 
-    /// 啟動逐鍵 human password 的 echo matcher；後續 TX byte 會在送出前逐段加入。
-    pub(crate) fn begin_human_secret_echo(&self) {
-        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut previous) = window.armed.take() {
-            Self::mask_pending(&mut window, &mut previous);
-            previous.secret.fill(0);
+    /// 依 TX 寫出順序判斷 session 密碼窗口；鎖住 reader tracker 直到 OS write 回報，
+    /// 使提示辨識、echo 登記、TX 寫入與換行消耗形成單一有序區段。
+    pub(crate) fn with_human_tx_window<T>(
+        &self,
+        payload: &[u8],
+        write: impl FnOnce(usize) -> (T, usize, bool),
+    ) -> (T, usize, usize) {
+        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = tracker.generation;
+        let active = generation > tracker.rx_end_generation
+            && generation > tracker.tx_consumed_generation;
+        let line_end = payload
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'));
+        let secret_len = if active {
+            line_end.unwrap_or(payload.len())
+        } else {
+            0
+        };
+        let prior_echo_len = if secret_len > 0 {
+            Some(self.register_human_secret_echo(generation, &payload[..secret_len]))
+        } else {
+            None
+        };
+
+        let (result, confirmed, unknown) = write(secret_len);
+        let confirmed = confirmed.min(payload.len());
+        if !unknown && confirmed < secret_len {
+            if let Some(prior_len) = prior_echo_len {
+                self.truncate_human_secret_echo(generation, prior_len + confirmed);
+            }
         }
-        window.armed = Some(ArmedSecretEcho {
-            secret: Vec::new(),
-            pending: Vec::new(),
-            dynamic: true,
-            expire_on_line_end: true,
-        });
-        drop(window);
-        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
-        self.wake_all();
+        if generation > 0 && line_end.is_some_and(|end| end < confirmed) {
+            tracker.tx_consumed_generation = tracker.tx_consumed_generation.max(generation);
+        }
+        (result, secret_len, confirmed)
     }
 
-    /// 擴充逐鍵輸入的預期 echo；reader 會保留尚可能是密碼的前綴。
-    pub(crate) fn extend_human_secret_echo(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
+    fn register_human_secret_echo(&self, generation: u64, bytes: &[u8]) -> usize {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(armed) = window.armed.as_mut().filter(|armed| armed.dynamic) {
+        if window.human_generation != Some(generation) {
+            if let Some(mut previous) = window.armed.take() {
+                Self::mask_pending(&mut window, &mut previous);
+                previous.secret.fill(0);
+            }
+            window.human_generation = Some(generation);
+            if !window.overflow_mask_line {
+                window.armed = Some(ArmedSecretEcho {
+                    secret: Vec::new(),
+                    pending: Vec::new(),
+                    dynamic: true,
+                    after_cr: false,
+                });
+            }
+        }
+        if window.overflow_mask_line {
+            return 0;
+        }
+        let Some(prior_len) = window
+            .armed
+            .as_ref()
+            .filter(|armed| armed.dynamic)
+            .map(|armed| armed.secret.len())
+        else {
+            return 0;
+        };
+        if prior_len.saturating_add(bytes.len()) > HUMAN_SECRET_ECHO_MAX_BYTES {
+            let mut armed = window.armed.take().expect("dynamic matcher exists");
+            Self::mask_pending(&mut window, &mut armed);
+            armed.secret.fill(0);
+            armed.secret.clear();
+            window.armed = Some(armed);
+            window.overflow_mask_line = true;
+        } else {
+            let armed = window
+                .armed
+                .as_mut()
+                .expect("dynamic matcher remains registered");
             armed.secret.extend_from_slice(bytes);
         }
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
+        prior_len
     }
 
-    /// 若 UART 僅確認了部分 TX，限制 echo matcher 到實際交給裝置的 secret 前綴。
-    pub(crate) fn truncate_human_secret_echo(&self, len: usize) {
+    fn truncate_human_secret_echo(&self, generation: u64, len: usize) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut armed) = window.armed.take() {
-            if armed.dynamic {
+        if window.human_generation == Some(generation) && !window.overflow_mask_line {
+            if let Some(armed) = window.armed.as_mut().filter(|armed| armed.dynamic) {
                 armed.secret.truncate(len);
-                if armed.pending.len() > armed.secret.len() {
-                    Self::mask_pending(&mut window, &mut armed);
-                    armed.secret.fill(0);
-                } else {
-                    window.armed = Some(armed);
-                }
-            } else {
-                window.armed = Some(armed);
             }
         }
         drop(window);
@@ -402,25 +456,10 @@ impl RxShared {
         self.wake_all();
     }
 
-    /// 封存本次 human password 的 echo matcher；行終止符之後不再遮罩。
-    pub(crate) fn finish_human_secret_echo(&self) {
-        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut armed) = window.armed.take() {
-            if armed.dynamic {
-                armed.dynamic = false;
-                if armed.secret.is_empty() {
-                    Self::mask_pending(&mut window, &mut armed);
-                    armed.secret.fill(0);
-                } else {
-                    window.armed = Some(armed);
-                }
-            } else {
-                window.armed = Some(armed);
-            }
-        }
-        drop(window);
-        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
-        self.wake_all();
+    pub(crate) fn human_password_window_active(&self) -> bool {
+        let tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.generation > tracker.rx_end_generation
+            && tracker.generation > tracker.tx_consumed_generation
     }
 
     fn mask_pending(window: &mut SecretEchoWindow, armed: &mut ArmedSecretEcho) {
@@ -443,38 +482,79 @@ impl RxShared {
             visible.push(released.byte);
             rx_window.push(released.byte);
         }
-        let Some(mut armed) = window.armed.take() else {
-            visible.extend_from_slice(data);
-            rx_window.extend_from_slice(data);
-            drop(window);
-            if !data.is_empty() {
-                self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
-                self.wake_all();
-            }
-            return MaskedRxChunk {
-                bytes: visible,
-                rx_window,
-            };
-        };
-
-        let mut matched = false;
-        for (index, byte) in data.iter().enumerate() {
-            if armed.expire_on_line_end && matches!(byte, b'\r' | b'\n') {
-                if !armed.pending.is_empty() {
-                    let pending_len = armed.pending.len();
-                    visible.resize(visible.len().saturating_add(pending_len), b'*');
-                    rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
-                    armed.pending.fill(0);
-                    armed.pending.clear();
-                    visible.push(*byte);
-                    rx_window.push(*byte);
-                    continue;
+        let mut index = 0;
+        while index < data.len() {
+            let byte = data[index];
+            if window.overflow_mask_line {
+                if matches!(byte, b'\r' | b'\n') {
+                    visible.push(byte);
+                    rx_window.push(byte);
+                    window.overflow_mask_line = false;
+                    window.human_generation = None;
+                    if let Some(mut armed) = window.armed.take() {
+                        armed.secret.fill(0);
+                        armed.pending.fill(0);
+                    }
+                } else {
+                    visible.push(b'*');
+                    rx_window.push(b'*');
                 }
-                visible.push(*byte);
-                rx_window.push(*byte);
+                index += 1;
                 continue;
             }
-            armed.pending.push(*byte);
+
+            let Some(mut armed) = window.armed.take() else {
+                visible.extend_from_slice(&data[index..]);
+                rx_window.extend_from_slice(&data[index..]);
+                break;
+            };
+            if armed.dynamic && armed.after_cr {
+                armed.after_cr = false;
+                if byte == b'\n' {
+                    visible.push(byte);
+                    rx_window.push(byte);
+                    index += 1;
+                    window.armed = Some(armed);
+                    continue;
+                }
+            }
+            if armed.dynamic && matches!(byte, b'\r' | b'\n') {
+                let pending_len = armed.pending.len();
+                visible.resize(visible.len().saturating_add(pending_len), b'*');
+                rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
+                armed.pending.fill(0);
+                armed.pending.clear();
+                visible.push(byte);
+                rx_window.push(byte);
+                index += 1;
+                let next_line_start = if byte == b'\r' && data.get(index) == Some(&b'\n') {
+                    index + 1
+                } else {
+                    index
+                };
+                let next_line = &data[next_line_start..];
+                let next_prefix_len = next_line.len().min(armed.secret.len());
+                let next_line_has_secret_prefix = next_prefix_len > 0
+                    && next_line[..next_prefix_len] == armed.secret[..next_prefix_len];
+                if pending_len == armed.secret.len()
+                    || (pending_len == 0 && !next_line_has_secret_prefix)
+                {
+                    armed.secret.fill(0);
+                    window.human_generation = None;
+                    if index < data.len() {
+                        visible.extend_from_slice(&data[index..]);
+                        rx_window.extend_from_slice(&data[index..]);
+                    }
+                    break;
+                }
+                // 未決前綴跨 CR/LF 時保留 matcher；CRLF 是一個行尾，第二個 byte 不得再次清除。
+                // 若同一讀取 chunk 的下一行已以 secret 前綴開始，也要略過此前緩衝的舊行尾。
+                armed.after_cr = byte == b'\r';
+                window.armed = Some(armed);
+                continue;
+            }
+
+            armed.pending.push(byte);
             while !armed.secret.starts_with(&armed.pending) {
                 let released = armed.pending.remove(0);
                 visible.push(released);
@@ -488,12 +568,11 @@ impl RxShared {
                 armed.secret.fill(0);
                 visible.extend_from_slice(&data[index + 1..]);
                 rx_window.extend_from_slice(&data[index + 1..]);
-                matched = true;
-                break;
+                index = data.len();
+                continue;
             }
-        }
-        if !matched {
             window.armed = Some(armed);
+            index += 1;
         }
 
         drop(window);
@@ -533,6 +612,8 @@ impl RxShared {
             armed.secret.fill(0);
             armed.pending.clear();
         }
+        window.human_generation = None;
+        window.overflow_mask_line = false;
         let mut bytes = Vec::new();
         let mut rx_window = Vec::new();
         for released in window.released.drain(..) {
@@ -551,6 +632,8 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut armed);
             armed.secret.fill(0);
         }
+        window.human_generation = None;
+        window.overflow_mask_line = false;
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
@@ -939,6 +1022,8 @@ fn spawn_reader_inner(
                         let raw = &buf[..count.min(buf.len())];
                         let now = ctx.clock.mono_ns();
                         ctx.rx.record_rx_activity(raw.len(), now);
+                        // 先關閉／推進提示世代，再做 echo 遮罩與任何發布，讓 TX writer 看見 UART RX 順序。
+                        ctx.rx.observe_password_prompt_bytes(raw);
                         let visible = ctx.rx.mask_secret_echo(raw);
                         if publisher.publish(&visible) {
                             break;
@@ -1038,8 +1123,6 @@ impl ReaderPublisher<'_> {
 
     fn publish_inner(&mut self, chunk: &MaskedRxChunk) -> bool {
         let data = chunk.bytes.as_slice();
-        // reader 是提示 tracker 的唯一 RX 寫入者；先更新，再通知 observer 或 actor。
-        self.ctx.rx.observe_password_prompt_bytes(data);
         let wal_entry = self.ctx.wal.append(WalAppendReq {
             com: &self.ctx.com,
             dir: "RX",

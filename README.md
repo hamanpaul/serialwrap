@@ -450,12 +450,22 @@ so arrow keys, Tab, and escape sequences behave like a direct minicom session.
 When an agent submits a command, the daemon suspends human raw mode, runs the
 agent command, then resumes the human console and flushes deferred input.
 
-Human password input is omitted from WAL TX payloads while the latest RX line
-matches the profile's `password_regex`, or a recognized console unlock prompt is
-active, through the next CR or LF. The WAL keeps a length META with the human
-source, and records the line terminator normally. If the profile has no matching
-`password_regex` and no recognized unlock prompt, the input remains logged as
-plaintext.
+Human password TX is classified at each UART write while a session-level prompt
+window is active. The reader advances prompt and RX-line generations in UART
+order, and the TX writer consumes the prompt generation when it writes a newline.
+Each secret write immediately records one length-and-source META with no payload;
+the line terminator remains an ordinary TX record. Raw mode records one META per
+write (often one per key), while line-buffer mode records one for the submitted
+line. Secret echo bytes are registered before UART write and masked incrementally.
+At most 1024 bytes are retained for matching in one window; after that limit, the
+rest of the RX line is masked through its terminator without retaining more secret
+bytes. The registration clears at a later RX line terminator when no echo prefix
+is unresolved. An unresolved prefix keeps the matcher armed across an earlier
+terminator; it clears after the complete echo's line terminator or when the bridge
+epoch ends. A prompt that arrives after input has already been
+typed cannot protect those earlier bytes.
+Profiles without a matching `password_regex` or a recognized console unlock
+prompt cannot classify the input as secret, so it may be logged in plaintext.
 
 Foreground commands and file transfers share operation admission: competing direct
 writers receive `SESSION_BUSY`; normal multi-client `command.submit` queue acceptance
@@ -873,6 +883,26 @@ match stops masking. If the secret equals the prompt, or the secret begins with
 the prompt and the DUT does not echo it, the prompt can be masked or held, so
 login ends with the existing prompt-timeout error. Echoed overlapping prompts
 continue to work. WAL metadata records only the secret byte length.
+
+For manual human input, password classification uses a session-level prompt
+window in UART write order. The reader owns prompt and RX-line generations, and
+the TX writer owns the consumed generation; the window is active while the
+prompt generation is newer than both end generations. The reader updates this
+state before publishing prompt bytes to consoles, and a bridge restart resets
+the generations. Each secret TX write immediately produces one payload-free WAL
+META containing its byte length and `human:<client_id>` source. Raw mode can
+therefore produce one META per key, while line-buffer mode normally produces one
+per submitted line. Secret bytes are registered with the reader before UART
+write for incremental echo masking. Matching retains at most 1024 bytes per
+window; after the cap is exceeded, the remainder of that RX line is masked through
+its terminator without retaining more secret data. The registration clears at a
+later RX line terminator when no echo prefix is unresolved. An unresolved prefix
+keeps the matcher armed across an earlier terminator; it clears after the complete
+echo's line terminator or when the bridge epoch ends. Input typed before
+the prompt reaches the console is outside the window and cannot be masked
+retroactively. A profile without a matching
+`password_regex` and without a recognized console unlock prompt cannot identify
+the input as secret, so it may be logged in plaintext.
 
 ### Windows Support
 
@@ -2685,7 +2715,7 @@ serialwrap-minicom -D /dev/ttyUSB0
 - **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**，不需手動 `interactive-open`。所有按鍵（包含方向鍵、Tab、ESC 序列）即時透傳到 UART，操作體感與直接 minicom 一致。
 - 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
-- **手動登入密碼記錄**：RX 最近一行符合 profile 的 `password_regex`，或符合可辨識的 console unlock 提示時，到下一個 CR/LF 為止的 human TX 不寫入 WAL payload，只保留含長度與來源的 META；換行與判定窗外的輸入照常記錄。若 profile 沒有符合的 `password_regex`、也沒有可辨識的 unlock 提示，密碼仍會以明文記錄。
+- **手動登入密碼記錄**：依 UART 寫出順序維護 session 層級提示窗口；reader 單獨更新提示世代與 RX 行結束世代，TxWriter 單獨更新已消耗世代。提示世代較新時，human secret TX 在每次寫出點立即記一筆不含 payload 的長度與 source META；raw 逐鍵通常每鍵一筆，line-buffer 每次整行一筆，換行照常記錄。secret 在 UART 寫出前登記給 reader 增量遮罩回顯；每個窗口最多保留 1024 bytes，超出後不再保存 secret，並遮罩該 RX 行到行尾。沒有未決 echo 前綴時，登記在後續 RX 行尾清除；未決前綴跨過較早的 RX 行尾，並在完整 echo 行尾或 bridge epoch 結束時清除。提示送達 console 前已輸入的 bytes 屬窗口外，不能追溯遮罩；沒有匹配的 `password_regex` 且沒有可辨識 unlock 提示時，輸入仍可能明文記錄。
 - bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
 - **孤兒 console 週期回收（#76）**：daemon 在每次 readiness tick（節流）主動回收「PTY slave 已無外部 reader」的孤兒 console（含死掉的非哨兵 primary；不碰當前 owner 與 agent 命令期間的 suspended owner、不碰內部哨兵 primary），避免 minicom 不乾淨關閉（SIGKILL/crash）後 console 累積拖慢 RX fan-out（卡頓/掉字）。
 - **raw ownership 自癒**：若 human console 的 raw ownership 因故掉失但 console 仍連著，daemon 會在 tick 中自動重授（lease-backed、原子授予），不需重開 minicom 即恢復方向鍵/Tab；agent 命令進行中（含 flash）不自癒、不奪權。
@@ -2868,6 +2898,7 @@ retry，也不等於 daemon 檔案日誌。詳見 [CLI trace 契約](docs/refine
 
 `~/b-log` **不是** WAL——它只存放 agent 觸發式的 on-demand session capture。權威
 WAL 一律落在 `SERIALWRAP_WAL_DIR`（預設 `~/.local/state/serialwrap/wal/`）。
+手動登入密碼使用 session 層級提示窗口，依 UART 寫出順序分類。reader 單獨更新提示世代與 RX 行結束世代，TxWriter 單獨更新已消耗世代；reader 先更新窗口再把提示送到 console，bridge 重開時世代歸零。窗口 active 時每個 secret TX 寫出立即產生一筆不含 payload、含長度與 `human:<client_id>` source 的 META；raw 逐鍵可能每鍵一筆，line-buffer 通常每行一筆。secret bytes 在寫 UART 前登記給 reader 增量遮罩；每個窗口最多保存 1024 bytes，超限後不再保存並遮罩該 RX 行直到行尾。沒有未決 echo 前綴時，登記在後續 RX 行尾清除；未決前綴跨過較早的 RX 行尾，並在完整 echo 行尾或 bridge epoch 結束時清除。提示送到 console 前已輸入的 bytes 無法追溯遮罩；profile 沒有匹配 `password_regex` 且沒有可辨識 unlock prompt 時，無法分類為 secret，仍可能明文記錄。
 每次自動登入密碼或 console unlock secret 送出前，reader 會啟用內容遮罩。RX 中完整符合 secret 的位元組序列會在寫入 WAL 前換成等長 `*`，下游 RX 出口也會看到相同結果。仍可能是 secret 開頭的尾段會先扣住，不發布也不作為 prompt 候選；後續位元組證明不匹配時才原樣放行，絕不因逾時放行。登入流程結束時若仍有未決前綴，會以 `*` 釋出；首次完整命中後停止遮罩。若 secret 等於 prompt，或 secret 以 prompt 開頭且 DUT 不回顯，prompt 可能被遮罩或扣住，登入會回既有的 prompt timeout 錯誤；有回顯的重疊情境仍可正常登入。WAL META 只記 secret 位元組長度。
 在 shell 裡（例如 `.bashrc`）匯出的 `SERIALWRAP_WAL_DIR` 只對從該 shell 啟動的
 行程有效；systemd 託管的 daemon **不會**繼承它（產生的 unit 預設不含對應的
