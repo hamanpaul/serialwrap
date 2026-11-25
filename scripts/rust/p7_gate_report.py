@@ -60,7 +60,7 @@ REQUIRED_ROWS: tuple[str, ...] = (
     WINDOWS_EV01_ROW,
     "regen_lock --check",
     "cases.lock slice_2.3 coverage",
-    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
     "policy_check",
 )
 TEST_ROWS: frozenset[str] = frozenset({
@@ -74,11 +74,12 @@ TEST_ROWS: frozenset[str] = frozenset({
     "contract_blackbox slice22 B",
     "l15 slice21 B",
     "l15 slice23 B",
-    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
 })
 FULL_PYTEST_N3_ROW = (
     "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native "
-    "--deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
+    "--deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence "
+    "--deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close"
 )
 # 能力缺失 → BLOCKED-OWNER 的對應（列名 → (cap, B 編號)）。
 CAP_ROWS: Mapping[str, tuple[str, str]] = {

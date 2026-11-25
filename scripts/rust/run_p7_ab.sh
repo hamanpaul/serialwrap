@@ -42,6 +42,8 @@ mkdir -p "$RUN_DIR"
 mkdir -p "$(dirname "$OUT")"
 cd "$ROOT"
 TESTS=(tests/contract_blackbox/test_p7_*.py)
+OD115_NODE="tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close"
+P7_A_TESTS=("${TESTS[@]}" "--deselect" "$OD115_NODE")
 PY_D="$ROOT/tests/contract_blackbox/bin/py-serialwrapd"
 RUST_ENV=(SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_CLI_EXE="$RUST_CLI")
 
@@ -76,11 +78,12 @@ if alive:
 PY
 }
 
-# 必要節點清單（含參數化）：同一 commit 的 collect-only。
+# 必要節點清單（含參數化）：A／B 各以凍結 selector 的同一 argv 做 collect-only。
+python3 -m pytest -q -p no:cacheprovider --collect-only "${P7_A_TESTS[@]}" >"$RUN_DIR/collected-a.txt" 2>&1 || true
 python3 -m pytest -q -p no:cacheprovider --collect-only "${TESTS[@]}" >"$RUN_DIR/collected.txt" 2>&1 || true
 # A：Python 基線
 run_phase p7-a -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_CLI_EXE -u SERIALWRAP_AB_LABEL SW_AB_PIDLOG="$RUN_DIR/a.pids" \
-  -- "${TESTS[@]}"
+  -- "${P7_A_TESTS[@]}"
 # A 的 daemon 必須全數結束（PTY 釋放）後才開始 B。
 if [[ -f "$RUN_DIR/a.pids" ]]; then
   wait_pidlog_drained "$RUN_DIR/a.pids"
@@ -144,6 +147,7 @@ for case in brcm-01-login-flow ev-01-spawn-handler; do
 done
 
 exec python3 scripts/rust/p7_ab_report.py --run-id "$RUN_ID" --junit-a "$RUN_DIR/p7-a/junit.xml" \
-  --junit-b "$RUN_DIR/p7-b/junit.xml" --collected "$RUN_DIR/collected.txt" \
+  --junit-b "$RUN_DIR/p7-b/junit.xml" --collected-a "$RUN_DIR/collected-a.txt" \
+  --collected "$RUN_DIR/collected.txt" \
   --rc-a "$(cat "$RUN_DIR/p7-a/rc")" --rc-b "$(cat "$RUN_DIR/p7-b/rc")" \
   --regression-dir "$RUN_DIR" --rust-cli "$RUST_CLI" --rust-daemon "$RUST_D" --out "$OUT"

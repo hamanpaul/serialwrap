@@ -12,6 +12,10 @@ pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "tests/acceptance/l1_required.lock.json"
+OD115_NODE = (
+    "tests/contract_blackbox/test_p7_invariants.py::"
+    "test_release_during_login_waits_for_handle_close"
+)
 
 
 def _lock() -> dict:
@@ -39,6 +43,26 @@ def test_p7_gate_frozen_nodes_are_collectable() -> None:
         collected = {line.strip() for line in result.stdout.splitlines() if line.startswith("tests/") and "::" in line}
         missing = sorted(set(spec["nodeids"]) - collected)
         assert not missing, f"{set_id}.linux 凍結 nodeid 未被 selector 收集：{missing}"
+
+    python_sets = (
+        sets["p7_gate:contract-blackbox-p7-a"]["linux"],
+        sets["p7_gate:python3-m-pytest-q-tests"]["linux"],
+        sets["s21_gate:pytest_full"]["linux"],
+    )
+    rust_set = sets["p7_gate:contract-blackbox-p7-b"]["linux"]
+    assert OD115_NODE in rust_set["nodeids"], "OD-115 Rust B 輪必須保留 DF-23 黑箱節點"
+    for spec in python_sets:
+        assert OD115_NODE not in spec["nodeids"], "OD-115 rust_only 節點不得留在 Python 必要集合"
+        argv = spec["selector"]["argv"]
+        deselected = [argv[index + 1] for index, arg in enumerate(argv[:-1]) if arg == "--deselect"]
+        assert OD115_NODE in deselected, f"Python selector 未精確排除 {OD115_NODE}: {argv}"
+
+    owner_sets = {
+        f"{set_id}.linux"
+        for set_id, platforms in sets.items()
+        if "linux" in platforms and OD115_NODE in platforms["linux"]["nodeids"]
+    }
+    assert owner_sets == {"p7_gate:contract-blackbox-p7-b.linux"}, owner_sets
 
     # OD101I-02：同一 Windows 原生 selector 的三個完整 L1 集合必須凍結同一分母。
     sets = _lock()["sets"]

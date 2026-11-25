@@ -1195,7 +1195,7 @@ def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) ->
 
 @pytest.mark.process_rpc
 def test_n3_selector_migration_is_exact_and_owner_scoped(tmp_path: Path) -> None:
-    """2026-11-13 擁有者 N3：只准兩個 pytest_full 集合套用指定 deselect 並逐名移除。"""
+    """N3／OD-115：只准明列集合套用精確 deselect 並逐名移除。"""
     removed = [
         "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
         "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
@@ -1300,6 +1300,68 @@ def test_n3_selector_migration_is_exact_and_owner_scoped(tmp_path: Path) -> None
              json.dumps(bad_selector["paths"]), "--markexpr", "", "--allow-removal", *approvals],
             capture_output=True, text=True, cwd=REPO_ROOT,
         )
+        assert rejected.returncode == 1, rejected.stdout + rejected.stderr
+        assert lock_path.read_bytes() == before_bad
+
+    od115_node = (
+        "tests/contract_blackbox/test_p7_invariants.py::"
+        "test_release_during_login_waits_for_handle_close"
+    )
+    p7_paths = [
+        "tests/contract_blackbox/test_p7_events.py",
+        "tests/contract_blackbox/test_p7_invariants.py",
+        "tests/contract_blackbox/test_p7_latency_noise.py",
+        "tests/contract_blackbox/test_p7_log_capture.py",
+        "tests/contract_blackbox/test_p7_login.py",
+        "tests/contract_blackbox/test_p7_quiet_reconfirm.py",
+        "tests/contract_blackbox/test_p7_selftest_recover.py",
+        "tests/contract_blackbox/test_p7_stall.py",
+    ]
+    od115_migrations = (
+        (
+            "p7_gate:contract-blackbox-p7-a",
+            {"argv": ["-q", "-p", "no:cacheprovider", *p7_paths], "paths": p7_paths, "markexpr": ""},
+        ),
+        ("p7_gate:python3-m-pytest-q-tests", new_selector),
+        ("s21_gate:pytest_full", new_selector),
+    )
+    for index, (set_id, old) in enumerate(od115_migrations):
+        lock_path = tmp_path / f"od115-{index}.json"
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "sets": {set_id: {"linux": {"selector": old, "nodeids": sorted([stable, od115_node])}}},
+        }), encoding="utf-8")
+        collect = tmp_path / f"od115-{index}.collect"
+        collect.write_text(stable + "\n", encoding="utf-8")
+        migrated_selector = {**old, "argv": [*old["argv"], "--deselect", od115_node]}
+        regen = [
+            sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+            "--l1-add-only", "--set", set_id, "--platform", "linux", "--collect", str(collect),
+            "--argv-json", json.dumps(migrated_selector["argv"]),
+            "--paths-json", json.dumps(migrated_selector["paths"]), "--markexpr", "",
+            "--allow-removal", f"{set_id}:linux:{od115_node}",
+        ]
+        result = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(lock_path.read_text(encoding="utf-8"))["sets"][set_id]["linux"] == {
+            "selector": migrated_selector,
+            "nodeids": [stable],
+        }
+
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "sets": {set_id: {"linux": {"selector": old, "nodeids": sorted([stable, od115_node])}}},
+        }), encoding="utf-8")
+        before_bad = lock_path.read_bytes()
+        bad = [
+            *regen[:regen.index("--argv-json")],
+            "--argv-json", json.dumps([
+                *migrated_selector["argv"], "--continue-on-collection-errors",
+            ]),
+            "--paths-json", json.dumps(migrated_selector["paths"]), "--markexpr", "",
+            "--allow-removal", f"{set_id}:linux:{od115_node}",
+        ]
+        rejected = subprocess.run(bad, capture_output=True, text=True, cwd=REPO_ROOT)
         assert rejected.returncode == 1, rejected.stdout + rejected.stderr
         assert lock_path.read_bytes() == before_bad
 

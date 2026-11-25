@@ -850,7 +850,7 @@ if [[ -n "$SHARED_EVIDENCE" ]]; then
     cp "$RUN_DIR/shared-import/s21_gate/pytest-full/junit.xml" "$RUN_DIR/pytest_full/junit.xml"
     cp "$RUN_DIR/shared-import/logs/pytest-full.log" "$RUN_DIR/logs/pytest_full.log"
     LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-pytest-import.json")"
-    record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" \
+    record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close" \
       --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
   else
     SHARED_REASON="$(python3 - "$RUN_DIR/logs/shared-pytest-import.json" "$RUN_DIR/logs/shared-pytest-import.stderr" <<'PY'
@@ -868,8 +868,9 @@ PY
 else
   pytest_l1 pytest_full pytest_full -- -q tests/ \
     --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
-    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
-  record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" \
+    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence \
+    --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close
+  record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close" \
     --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
 fi
 

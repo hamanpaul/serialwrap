@@ -5,7 +5,7 @@
   python3 tests/acceptance/regen_lock.py --check --cases-only
                                                       # 只驗證案例鎖（供 func-test 執行器；不檢查 L1 鎖）
   python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <set_id:platform:nodeid>…]
-                                                      # 另以 <rev> 的 L1 鎖為基準；selector 僅接受 2026-11-13 N3 指定遷移
+                                                      # 另以 <rev> 的 L1 鎖為基準；selector 僅接受明列擁有者裁決的精確遷移
   python3 tests/acceptance/regen_lock.py --add-only   # 重算；既有 ID 從任何集合消失、被延後切片，或分母屬性被改動即 exit 1 且不寫檔，否則寫回
   python3 tests/acceptance/regen_lock.py --add-only --authorize-deferral <case_id>:OD-<n> …
                                                       # 擁有者裁決逐名授權的延後切片（OD-34 起）：只放行該案例 daemon_slice 往後移
@@ -17,7 +17,7 @@
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
-                                                      # 且清單必須與該集合消失集合完全相符；既有 selector 僅 N3 指定遷移可改
+                                                      # 且清單必須與該集合消失集合完全相符；selector 僅能依明列擁有者裁決精確遷移
                                                       # 新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
                                                       # OD-24：collect JSON 的 ignored 列新增時預設排除；明確 `-- --ignored cap_<cap>__` 僅納入同能力列；
                                                       # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
@@ -68,7 +68,7 @@ ATTR_KEYS = ("suite", "layer", "platforms", "expected", "necessity", "daemon_sli
 Approval = tuple[str, str, str]
 
 # 2026-11-13 擁有者裁決 N3：pytest_full 兩集合移出已收過的 Stage 1 證據測試，
-# gate selector 逐字對齊 CI。這是唯一允許改既有 selector 的遷移。
+# gate selector 逐字對齊 CI。
 _N3_REMOVALS = frozenset({
     "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
     "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
@@ -85,6 +85,36 @@ _N3_NEW_SELECTOR = {
     ],
     "paths": ["tests/"],
     "markexpr": "",
+}
+_OD115_NODE = (
+    "tests/contract_blackbox/test_p7_invariants.py::"
+    "test_release_during_login_waits_for_handle_close"
+)
+_OD115_P7_A_SET = "p7_gate:contract-blackbox-p7-a"
+_OD115_P7_A_PATHS = [
+    "tests/contract_blackbox/test_p7_events.py",
+    "tests/contract_blackbox/test_p7_invariants.py",
+    "tests/contract_blackbox/test_p7_latency_noise.py",
+    "tests/contract_blackbox/test_p7_log_capture.py",
+    "tests/contract_blackbox/test_p7_login.py",
+    "tests/contract_blackbox/test_p7_quiet_reconfirm.py",
+    "tests/contract_blackbox/test_p7_selftest_recover.py",
+    "tests/contract_blackbox/test_p7_stall.py",
+]
+_OD115_P7_A_OLD_SELECTOR = {
+    "argv": ["-q", "-p", "no:cacheprovider", *_OD115_P7_A_PATHS],
+    "paths": _OD115_P7_A_PATHS,
+    "markexpr": "",
+}
+_OD115_P7_A_NEW_SELECTOR = {
+    **_OD115_P7_A_OLD_SELECTOR,
+    "argv": [*_OD115_P7_A_OLD_SELECTOR["argv"], "--deselect", _OD115_NODE],
+}
+_OD115_PYTEST_FULL_SETS = _N3_PYTEST_FULL_SETS
+_OD115_PYTEST_OLD_SELECTOR = _N3_NEW_SELECTOR
+_OD115_PYTEST_NEW_SELECTOR = {
+    **_OD115_PYTEST_OLD_SELECTOR,
+    "argv": [*_OD115_PYTEST_OLD_SELECTOR["argv"], "--deselect", _OD115_NODE],
 }
 
 
@@ -520,6 +550,43 @@ def _n3_selector_migration_allowed(
     )
 
 
+def _od115_selector_migration_allowed(
+    set_id: str,
+    platform: str,
+    old_selector: dict[str, Any],
+    new_selector: dict[str, Any],
+    removed: set[str],
+    approved: set[str],
+) -> bool:
+    """僅放行 a8c34bad／OD-115 指定的 Python selector 與單一 nodeid 移除。"""
+    if platform != "linux" or removed != {_OD115_NODE} or approved != {_OD115_NODE}:
+        return False
+    if set_id in _OD115_PYTEST_FULL_SETS:
+        return old_selector == _OD115_PYTEST_OLD_SELECTOR and new_selector == _OD115_PYTEST_NEW_SELECTOR
+    if set_id != _OD115_P7_A_SET:
+        return False
+    return old_selector == _OD115_P7_A_OLD_SELECTOR and new_selector == _OD115_P7_A_NEW_SELECTOR
+
+
+def _approved_selector_migration_allowed(
+    set_id: str,
+    platform: str,
+    old_selector: dict[str, Any],
+    new_selector: dict[str, Any],
+    removed: set[str],
+    approved: set[str],
+    retained: set[str],
+) -> bool:
+    return (
+        _n3_selector_migration_allowed(
+            set_id, platform, old_selector, new_selector, removed, approved, retained
+        )
+        or _od115_selector_migration_allowed(
+            set_id, platform, old_selector, new_selector, removed, approved
+        )
+    )
+
+
 def parse_removal_approval(token: str) -> Approval:
     """解析 `set_id:platform:nodeid` 三元組；不合法或含糊即拋 ValueError。
 
@@ -569,7 +636,7 @@ def cmd_check_l1(lock_path: pathlib.Path, base: str | None, approvals: set[Appro
 
 
 def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set[Approval]) -> int:
-    """基準 nodeid 移除須逐名核准；selector 僅接受 N3 的精確兩集合遷移。"""
+    """基準 nodeid 移除須逐名核准；selector 僅接受明列擁有者裁決的精確遷移。"""
     rc = 0
     head_sets = head.get("sets", {})
     for set_id, plats in sorted(base.get("sets", {}).items()):
@@ -594,11 +661,11 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
                     nid for sid, approval_platform, nid in approvals
                     if sid == set_id and approval_platform == plat
                 }
-                if _n3_selector_migration_allowed(
+                if _approved_selector_migration_allowed(
                     set_id, plat, spec["selector"], new_selector, set(gone), approved_for_set,
                     set(head_spec["nodeids"]) if head_spec is not None else set(),
                 ):
-                    print(f"[regen_lock] selector 依 2026-11-13 N3 核准遷移：{set_id}.{plat}")
+                    print(f"[regen_lock] selector 依明列擁有者裁決核准遷移：{set_id}.{plat}")
                 else:
                     print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
                     rc = 1
@@ -734,11 +801,11 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
             return 1
         added = sorted(set(collected) - set(spec["nodeids"]) - ignored_excluded)
         selector_changed = requested_selector != spec["selector"]
-        if selector_changed and not _n3_selector_migration_allowed(
+        if selector_changed and not _approved_selector_migration_allowed(
             set_id, platform, spec["selector"], requested_selector, set(removed), allowed,
             set(added) | (set(spec["nodeids"]) - set(removed)),
         ):
-            print(f"[regen_lock] REFUSED selector 與鎖檔不同且不符合 2026-11-13 N3：{set_id}.{platform}", file=sys.stderr)
+            print(f"[regen_lock] REFUSED selector 與鎖檔不同且不符合明列擁有者裁決：{set_id}.{platform}", file=sys.stderr)
             return 1
         if not added and not removed and not selector_changed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")

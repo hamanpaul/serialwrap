@@ -3651,7 +3651,6 @@
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx_credentials_unresolved",
-          "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_python_post_login_timeout_stays_detached",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_artifact_selector_resolution",
@@ -3700,7 +3699,9 @@
             "tests/contract_blackbox/test_p7_login.py",
             "tests/contract_blackbox/test_p7_quiet_reconfirm.py",
             "tests/contract_blackbox/test_p7_selftest_recover.py",
-            "tests/contract_blackbox/test_p7_stall.py"
+            "tests/contract_blackbox/test_p7_stall.py",
+            "--deselect",
+            "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close"
           ],
           "markexpr": "",
           "paths": [
@@ -5235,7 +5236,6 @@
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx_credentials_unresolved",
-          "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_python_post_login_timeout_stays_detached",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_artifact_selector_resolution",
@@ -11487,7 +11487,9 @@
             "--deselect",
             "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
             "--deselect",
-            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
+            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+            "--deselect",
+            "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close"
           ],
           "markexpr": "",
           "paths": [
@@ -32167,7 +32169,6 @@
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx_credentials_unresolved",
-          "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_python_post_login_timeout_stays_detached",
           "tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_artifact_selector_resolution",
@@ -38419,7 +38420,9 @@
             "--deselect",
             "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
             "--deselect",
-            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
+            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+            "--deselect",
+            "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close"
           ],
           "markexpr": "",
           "paths": [

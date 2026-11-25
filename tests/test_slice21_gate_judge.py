@@ -46,7 +46,7 @@ TEST_SECTIONS = {
     "blackbox_python": ("linux", "s21_gate:blackbox_python"),
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
-    # N3：gate argv 與 CI 同步排除兩項 Stage 1 證據測試；鎖 selector 由 regen_lock 的核准遷移更新。
+    # N3／OD-115：gate argv 與 CI 的 Python 精確 deselect 同步；鎖 selector 由 regen_lock 核准遷移。
     "pytest_full": ("linux", "s21_gate:pytest_full"),
     # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
     "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
@@ -77,8 +77,14 @@ def test_pytest_full_lock_selector_matches_n3_ci_deselects():
     removed = [
         "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
         "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+        "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
     ]
-    expected = ["-q", "tests/", "--deselect", removed[0], "--deselect", removed[1]]
+    expected = [
+        "-q", "tests/",
+        "--deselect", removed[0],
+        "--deselect", removed[1],
+        "--deselect", removed[2],
+    ]
     s21 = lock["sets"]["s21_gate:pytest_full"]["linux"]
     p7 = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]
     assert s21["selector"]["argv"] == expected

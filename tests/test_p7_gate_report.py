@@ -123,7 +123,7 @@ def test_required_rows_complete(tmp_path):
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
         g.WINDOWS_EV01_ROW,
         "regen_lock --check", "cases.lock slice_2.3 coverage",
-        "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+        "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
         "policy_check"}
     script = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"' in script
@@ -359,7 +359,7 @@ def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
 
 @pytest.mark.core_portable
 def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
-    """N3：兩個 Stage 1 證據 nodeid 移出必要集合後，gate 必須使用裁決核准的新 selector。"""
+    """N3／OD-115：Python 必要集合須使用與 runner 完全相同的精確 selector。"""
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     sid = "p7_gate:python3-m-pytest-q-tests"
     spec = lock["sets"][sid]["linux"]
@@ -367,15 +367,20 @@ def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
     deselected = [
         "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
         "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+        "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
     ]
     assert not set(deselected) & set(frozen)
     assert spec["selector"]["argv"] == [
-        "-q", "tests/", "--deselect", deselected[0], "--deselect", deselected[1],
+        "-q", "tests/",
+        "--deselect", deselected[0],
+        "--deselect", deselected[1],
+        "--deselect", deselected[2],
     ]
     assert len(frozen) > 5000, len(frozen)
     assert "tests/test_p7_gate_win_argv.py::test_gate_snapshots_artifacts_before_cargo_rebuilds" in frozen
     name = (
-        "python3 -m pytest -q tests/ --deselect " + deselected[0] + " --deselect " + deselected[1]
+        "python3 -m pytest -q tests/ --deselect " + deselected[0]
+        + " --deselect " + deselected[1] + " --deselect " + deselected[2]
     )
     judge = g._load_judge()
     for subset, want in ((frozen[:49], "INCOMPLETE"), (frozen, "PASS")):

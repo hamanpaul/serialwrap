@@ -6,9 +6,11 @@
 - 必要節點＝L1 鎖（`--l1-lock`，預設 `tests/acceptance/l1_required.lock.json`）中**預先凍結**的
   `p7_gate:contract-blackbox-p7-b`（B）／`-p7-a`（A；不含 rust_only SC 節點）裡屬於該案例的完整 nodeid（含 `[參數]`）；
   每個節點須在 junit 恰出現一次，缺漏、重複、凍結集合無節點 → INCOMPLETE（審查 P7-c5f0fc9-5、P7-cd7acf0-1）。
-  `--collected`（同一 commit 的 collect-only）只作交叉核對：與凍結 B 集合不同（新增／替代／缺少節點）→ INCOMPLETE。
+  `--collected`／`--collected-a`（同一 commit 的 A／B collect-only）只作交叉核對：與各自凍結集合不同
+  （新增／替代／缺少節點）→ INCOMPLETE。
 - junit 中不屬凍結集合的節點（替代節點）→ INCOMPLETE；slice21 僅 OD-72 逐名移出的 8 個 Linux skip 可不計入，且仍須各恰一次 skip。
-  屬 rust_only SC 的 A 輪節點（A 集合不含）取 B 集合節點，各恰一次 skip 或 passed。
+  屬 rust_only SC 的 A 輪節點（A 集合不含）取 B 集合節點；selector 精確 deselect 者須以 collect-only 證明，
+  其餘各恰一次 skip 或 passed。
 - PASS：所有必要節點皆通過。
 - FAIL：任一 failure／error。
 - SKIP＋原因：全數 skip，且僅限 cases.yaml 已登記的平台限定——A 輪 skip 只在案例的 behavior_changes 含
@@ -180,9 +182,25 @@ def load_frozen(lock_path: Path, set_id: str, platform: str = "linux") -> list[s
         return None
 
 
+def load_deselected(lock_path: Path, set_id: str, platform: str = "linux") -> set[str]:
+    """讀取凍結 selector 明列的 `--deselect` nodeid；無 selector 時不得接受省略證據。"""
+    try:
+        argv = json.loads(Path(lock_path).read_text(encoding="utf-8"))[
+            "sets"
+        ][set_id][platform]["selector"]["argv"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+    return {
+        str(argv[index + 1])
+        for index, token in enumerate(argv[:-1])
+        if token == "--deselect"
+    } if isinstance(argv, list) else set()
+
+
 def judge_side(results, case: dict, side: str, rust_only: set[str], frozen: list[str] | None,
-               frozen_b: list[str] | None = None) -> tuple[str, str]:
-    """`frozen`＝該輪的凍結集合；A 輪另以 `frozen_b` 核對 rust_only SC 節點（A 集合不含、A 輪須 skip）。"""
+               frozen_b: list[str] | None = None, collected: list[str] | None = None,
+               selector_deselected: set[str] | None = None) -> tuple[str, str]:
+    """`frozen`＝該輪的凍結集合；A 輪另以 `frozen_b` 核對 rust_only SC 節點。"""
     if results is None:
         return "INCOMPLETE", "junit 缺檔或不可解析"
     if frozen is None:
@@ -190,10 +208,17 @@ def judge_side(results, case: dict, side: str, rust_only: set[str], frozen: list
     nodes = case_nodes(case, frozen)
     rust_only_case = bool(set(case.get("behavior_changes") or []) & rust_only)
     if side == "A" and rust_only_case and not nodes and frozen_b is not None:
-        # A 集合不含（rust_only 節點於 A 輪登記 skip）→ 以 B 集合的節點核對 A 輪。
+        # selector 未明列 deselect 時仍要求 A JUnit 有 skip／passed；明列 deselect 則以 collect-only 證明。
         b_nodes = case_nodes(case, frozen_b)
         if not b_nodes:
             return "INCOMPLETE", "凍結集合無此案例節點"
+        omitted = collected is not None and not set(b_nodes) & set(collected)
+        explicitly_deselected = set(b_nodes) <= (selector_deselected or set())
+        if omitted and explicitly_deselected:
+            unexpected = [n for n in b_nodes if results.get(n)]
+            if unexpected:
+                return "INCOMPLETE", f"selector 已 deselect 但 JUnit 含節點：{unexpected[0]}"
+            return "SKIP", "Python selector 已明確 deselect rust_only 節點"
         got = [results.get(n) or [] for n in b_nodes]
         if any(len(g) != 1 for g in got):
             return "INCOMPLETE", "rust_only 案例 A 輪節點缺漏或重複"
@@ -291,7 +316,9 @@ def build(args) -> tuple[str, int]:
     rust_only = rust_only_sc(args.behavior_changes)
     ja, jb = parse_junit(args.junit_a), parse_junit(args.junit_b)
     collected = load_collected(args.collected)
+    collected_a = load_collected(args.collected_a) if args.collected_a is not None else collected
     frozen_a, frozen_b = load_frozen(args.l1_lock, SET_A), load_frozen(args.l1_lock, SET_B)
+    deselected_a = load_deselected(args.l1_lock, SET_A)
     lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     s23 = lock["sets"]["slice_2.3"]
     head = [
@@ -320,18 +347,20 @@ def build(args) -> tuple[str, int]:
     rc = 0
     any_fail = any_incomplete = False
     for c in cases:
-        a, ad = judge_side(ja, c, "A", rust_only, frozen_a, frozen_b)
+        a, ad = judge_side(ja, c, "A", rust_only, frozen_a, frozen_b, collected_a, deselected_a)
         b, bd = judge_side(jb, c, "B", rust_only, frozen_b)
         any_fail |= "FAIL" in (a, b)
         any_incomplete |= "INCOMPLETE" in (a, b) or b == "SKIP"
         note = "；".join(x for x in (f"A：{ad}" if a != "PASS" else "", f"B：{bd}" if b != "PASS" else "") if x)
         head.append(f"| {c['case_id']} | {a} | {b} | {note.replace('|', '/')} |")
-    # collect-only 與凍結 B 集合交叉核對（新增／替代／缺少節點 → 證據不足，須先以 regen_lock add-only 登記）。
-    if collected is None or frozen_b is None or sorted(collected) != sorted(frozen_b):
-        any_incomplete = True
-        diff = "缺 collect-only 或凍結集合" if collected is None or frozen_b is None else (
-            f"collect-only 多 {len(set(collected) - set(frozen_b))}、少 {len(set(frozen_b) - set(collected))}")
-        head.append(f"| （collect-only 對凍結集合） | INCOMPLETE | | {diff} |")
+    # collect-only 與各輪凍結集合交叉核對（新增／替代／缺少節點 → 須先以 regen_lock add-only 登記）。
+    for side, selected, frozen in (("A", collected_a, frozen_a), ("B", collected, frozen_b)):
+        if selected is None or frozen is None or sorted(selected) != sorted(frozen):
+            any_incomplete = True
+            diff = "缺 collect-only 或凍結集合" if selected is None or frozen is None else (
+                f"collect-only 多 {len(set(selected) - set(frozen))}、少 {len(set(frozen) - set(selected))}"
+            )
+            head.append(f"| （{side} collect-only 對凍結集合） | INCOMPLETE | | {diff} |")
     for side, res, fz in (("A", ja, frozen_a), ("B", jb, frozen_b)):
         allowed = set(frozen_b or []) if side == "A" else set(fz or [])
         extra = sorted(set(res or {}) - allowed)
@@ -376,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--junit-b", type=Path)
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--collected", type=Path, help="pytest --collect-only -q 輸出（必要節點）")
+    ap.add_argument("--collected-a", type=Path, help="Python A selector 的 pytest --collect-only -q 輸出")
     ap.add_argument("--rc-a", type=int)
     ap.add_argument("--rc-b", type=int)
     ap.add_argument("--regression-dir", type=Path, help="run_p7_ab.sh 的 run 目錄（先前切片必要回歸各階段）")

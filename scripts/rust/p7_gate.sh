@@ -48,7 +48,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "執行：bash scripts/rust/run_p7_ab.sh --run-id <ID> --run-dir <RUN>/ab --out <RUN>/p7-ab.md --rust-cli <CLI> --rust-daemon <DAEMON> --od59-contract。"
     echo "執行：bash scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_。"
     echo "執行：bash scripts/rust/win-test.sh --caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes -- --ignored cap_windows_com__（僅允許已核准 com0com pair）。"
-    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
+    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close。"
   fi
   echo "執行：python3 scripts/rust/check_cfg_boundary.py；python3 tests/acceptance/regen_lock.py --check；python3 scripts/rust/p7_case_coverage.py；python3 -m policy_check --repo .。"
   echo "報告輸出路徑：$OUT_MD"
@@ -422,9 +422,9 @@ if [[ -n "${P7_S22_GATE_JSON:-}" && -f "${P7_S22_GATE_JSON}" ]]; then
 fi
 run_row "cases.lock slice_2.3 coverage" coverage "${COV_EV[@]}" -- \
   python3 scripts/rust/p7_case_coverage.py "${COV_ARGS[@]}"
-# 15. 全套 pytest（N3；依 2026-11-12 rulings/s2.md 第 3 點，比照 CI 排除兩項 Stage 1 證據測試；其他失敗 → FAIL）
+# 15. 全套 pytest（N3＋OD-115；比照 CI 的精確 Python deselect；其他失敗 → FAIL）
 mkdir -p "$RUN/pytest-full"
-FULL_PYTEST_ROW='python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence'
+FULL_PYTEST_ROW='python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close'
 if [[ "$SKIP_FULL" == "1" ]]; then
   echo "--skip-full-pytest：未執行（不得作出口證據）" >"$RUN/logs/pytest-full.log"
 elif [[ -n "$SHARED_EVIDENCE" ]]; then
@@ -440,20 +440,21 @@ elif [[ -n "$SHARED_EVIDENCE" ]]; then
     cp "$RUN/shared-import/logs/pytest-full.log" "$RUN/logs/pytest-full.log"
     SHARED_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$SHARED_PYTEST_JSON")"
     record_existing "$FULL_PYTEST_ROW" "$SHARED_RC" "$RUN/logs/pytest-full.log" \
-      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence)" \
+      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close)" \
       --l1 "$RUN/pytest-full/l1-results.json" --evidence "$RUN/pytest-full/junit.xml"
   else
     echo "EVIDENCE_MISSING：共用 pytest 證據拒收；本段不重跑。" >"$RUN/logs/pytest-full.log"
     cat "$RUN/logs/shared-pytest-import.stderr" >>"$RUN/logs/pytest-full.log" 2>/dev/null || true
     record_existing "$FULL_PYTEST_ROW" - "$RUN/logs/pytest-full.log" \
-      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence)"
+      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close)"
   fi
 else
-  run_row "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" pytest-full --l1 "$RUN/pytest-full/l1-results.json" \
+  run_row "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close" pytest-full --l1 "$RUN/pytest-full/l1-results.json" \
     --evidence "$RUN/pytest-full/junit.xml" -- \
     env SW_RESOURCE_REPORT="$RUN/pytest-full/l1-results.json" python3 -m pytest -q tests/ \
     --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
     --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence \
+    --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close \
     --junitxml="$RUN/pytest-full/junit.xml"
 fi
 # 16. policy check

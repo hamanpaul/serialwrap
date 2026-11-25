@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DESELECT = [
     "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
     "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    "tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close",
 ]
 
 
@@ -21,7 +22,7 @@ def _deselected(argv: list[str]) -> list[str]:
 
 
 def test_three_stage2_gates_and_preflight_match_ci_deselects():
-    """N3：pytest_full 與 preflight 只排除 CI 同樣未提供證據的兩個節點。"""
+    """N3／OD-115：pytest_full 與 preflight 精確排除 CI 不承擔的 Python 節點。"""
     workflows = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8"))
     ci_steps = workflows["jobs"]["pytest"]["steps"]
     ci_commands = [
@@ -37,9 +38,13 @@ def test_three_stage2_gates_and_preflight_match_ci_deselects():
     assert tests_step["argv"] == [
         "python3", "-m", "pytest", "-q", "tests/",
         "--deselect", DESELECT[0], "--deselect", DESELECT[1],
+        "--deselect", DESELECT[2],
     ]
     # 全套實測 6449.73 秒，另加 15% 餘裕並進位至 7500 秒。
     assert tests_step["timeout_seconds"] == 7500
+    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    for nodeid in DESELECT:
+        assert f"--deselect {nodeid}" in release, f"release workflow 未排除 {nodeid}"
 
     sources = {}
     for relative in ("scripts/rust/slice21_gate.sh", "scripts/rust/p7_gate.sh", "scripts/rust/slice24_exit.sh"):

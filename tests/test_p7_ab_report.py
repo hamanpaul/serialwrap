@@ -4,7 +4,8 @@
 - 回歸階段：以預先凍結的必要集合逐節點核對——junit 任一 failure → FAIL；凍結節點缺漏／重複／skip、未授權額外節點、
   無凍結集合、rc 非 0 卻無失敗、缺 junit → INCOMPLETE；`blocked` 標記 → BLOCKED-UPSTREAM；皆不得
   PASS（審查 P7-cd7acf0-1）。func-test 階段：comparison verdict PASS 且 rc 0 才 PASS。
-- 涵蓋：contract-blackbox 案例的必要節點取自凍結 A／B 集合，各恰一次 passed（rust_only SC 的 A 輪為 skip）；
+- 涵蓋：contract-blackbox 案例的必要節點取自凍結 A／B 集合，各恰一次 passed
+  （rust_only SC 的 A 輪為 skip，或由 selector 精確 deselect 並有 collect-only 證明）；
   windows-native／realhw／F1～F6、F8～F12 regression → BLOCKED-OWNER＋B 編號；總表沒有 B 編號的 family → 缺漏；
   2.1／2.2 先前切片案例以匯入的 slice21／s22 gate 逐案證據判定（缺證據 → 缺漏）。
 """
@@ -215,6 +216,16 @@ def test_run_p7_ab_uses_locked_directory_selectors_for_slice21_and_slice22():
     assert 'if [[ -d "$ROOT/$S22_DIR" ]]' in script
     assert '-- "$S22_DIR/"' in script
     assert "test_console_*.py" not in script and "不 merge P6" not in script
+    od115_node = (
+        "tests/contract_blackbox/test_p7_invariants.py::"
+        "test_release_during_login_waits_for_handle_close"
+    )
+    a_selector = lock["p7_gate:contract-blackbox-p7-a"]["linux"]["selector"]
+    b_selector = lock["p7_gate:contract-blackbox-p7-b"]["linux"]["selector"]
+    assert a_selector["argv"][-2:] == ["--deselect", od115_node]
+    assert b_selector["argv"] == ["-q", "-p", "no:cacheprovider", *b_selector["paths"]]
+    assert 'P7_A_TESTS=("${TESTS[@]}" "--deselect" "$OD115_NODE")' in script
+    assert '--collected-a "$RUN_DIR/collected-a.txt"' in script
 
 
 @pytest.mark.parametrize("verdict,rc,want", [("PASS", 0, "PASS"), ("FAIL", 1, "FAIL"), ("PASS", 3, "INCOMPLETE"),
@@ -322,6 +333,47 @@ def test_coverage_requires_pass_or_numbered_owner_block(tmp_path):
     _junit(ab_dir / "p7-a" / "junit.xml", {ref + "[p1]": "passed", sc30: "skipped"})
     rep = cov.build(ab_dir, *_cov_fixture(tmp_path, cases))
     assert {r["case_id"]: r["status"] for r in rep["rows"]}["p7-a"] == "GAP"
+
+    # OD-115：Python A selector 可精確 deselect 唯一 rust_only 節點；B 仍須通過，A 不可因沒有選中而
+    # 變成證據缺漏。若 selector 仍會收集該節點，JUnit 缺漏仍必須是 INCOMPLETE。
+    omitted_case = {
+        "case_id": "p7-df23",
+        "suite": "contract-blackbox",
+        "source_ref": sc30,
+        "behavior_changes": ["SC-30"],
+    }
+    omitted = ab.judge_side(
+        {}, omitted_case, "A", {"SC-30"}, [], [sc30],
+        collected=[], selector_deselected={sc30},
+    )
+    assert omitted == ("SKIP", "Python selector 已明確 deselect rust_only 節點"), omitted
+    still_collected = ab.judge_side(
+        {}, omitted_case, "A", {"SC-30"}, [], [sc30],
+        collected=[sc30], selector_deselected={sc30},
+    )
+    assert still_collected[0] == "INCOMPLETE", still_collected
+    not_authorized = ab.judge_side(
+        {}, omitted_case, "A", {"SC-30"}, [], [sc30],
+        collected=[], selector_deselected=set(),
+    )
+    assert not_authorized[0] == "INCOMPLETE", not_authorized
+
+    fixture = _cov_fixture(tmp_path, [omitted_case])
+    lock = json.loads(fixture[-1].read_text(encoding="utf-8"))
+    lock["sets"][ab.SET_A]["linux"]["selector"] = {
+        "argv": ["-q", "--deselect", sc30],
+        "paths": [],
+        "markexpr": "",
+    }
+    fixture[-1].write_text(json.dumps(lock), encoding="utf-8")
+    _junit(ab_dir / "p7-a" / "junit.xml", {})
+    _junit(ab_dir / "p7-b" / "junit.xml", {sc30: "passed"})
+    rep = cov.build(ab_dir, *fixture)
+    assert rep["rows"] == [{
+        "case_id": "p7-df23",
+        "status": "PASS",
+        "detail": "B 1／A selector 已明確 deselect rust_only 節點",
+    }], rep["rows"]
     xml = '<testcase classname="tests.contract_blackbox.test_p7_x" name="test_a[p1]"></testcase>'
     _junit(ab_dir / "p7-b" / "junit.xml", {ref + "[p1]": "passed", ref + "[p2]": "passed", sc30: "passed"})
     bx = ab_dir / "p7-b" / "junit.xml"

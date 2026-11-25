@@ -70,7 +70,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "執行：cargo build --workspace --bins；python3 scripts/rust/check_cfg_boundary.py。"
     echo "執行：cargo test --workspace --features test-fakes；cargo test --workspace；env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu。"
     echo "執行：python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux --include-cap posix_pty --include-cap process_rpc -- --workspace --features test-fakes。"
-    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
+    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close。"
     echo "執行：env SERIALWRAP_CLI_EXE=<CLI> SERIALWRAP_DAEMON_EXE=<DAEMON> SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py。"
   fi
   echo "正式流程不帶 --windows-run：BO #5 維持 BLOCKED-OWNER；slice24.md 列出凍結 lock 中各 windows_l1:* 判定，缺段列 EVIDENCE_MISSING。"
@@ -377,7 +377,8 @@ else
     SERIALWRAP_COVERAGE_LABEL=python-linux \
     python3 -m pytest -q tests/ \
     --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
-    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence \
+    --deselect tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close
 fi
 
 # Rust label 的 pytest 收集範圍：凡需 rust-linux 證據的 pytest nodeid（含 rust-l1 凍結案例的 pytest 節點），

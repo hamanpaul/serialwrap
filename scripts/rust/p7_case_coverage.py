@@ -9,8 +9,9 @@
 - 必要節點一律取自 L1 鎖（`--l1-lock`）**預先凍結**的 `p7_gate:*` 集合，不採信當輪 junit 出現哪些節點；每個必要
   節點須在 junit 恰出現一次（缺漏、重複皆為缺漏；審查 P7-cd7acf0-1）。
 - `contract-blackbox`：凍結 `p7_gate:contract-blackbox-p7-b` 中 nodeid 為 `source_ref` 或 `source_ref[參數]` 的節點須在
-  `<ab>/p7-b/junit.xml` 各恰一次 passed；A 輪取 `-p7-a` 的同名節點各恰一次 passed（rust_only SC 案例：A 集合不含、
-  A 輪 junit 中 B 的節點須各恰一次 skip 或 passed）。OD-59 控制延遲案例改由 `od59-contract-a`／`od59-contract-b` 專屬
+  `<ab>/p7-b/junit.xml` 各恰一次 passed；A 輪取 `-p7-a` 的同名節點各恰一次 passed（rust_only SC 案例：A 集合不含，
+  selector 精確 deselect 者不要求 JUnit 列，其餘仍須各恰一次 skip 或 passed）。OD-59 控制延遲案例改由
+  `od59-contract-a`／`od59-contract-b` 專屬
   契約量測階段承擔，不採用小樣本 p7-a／p7-b 結果。
 - `l15-scenario`／`func-test`：daemon_slice 2.1 的 l15 情境取 `<ab>/l15-slice21-b/junit.xml` 的
   `test_case[<id>-rust-…]`；2.3 的取 `<ab>/l15-slice23/junit.xml` 的 `test_*_rust[<id>]`；func-test 的
@@ -183,12 +184,32 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
         if why:
             return "GAP", f"B 輪：{why}"
         if set(case.get("behavior_changes") or []) & rust_only and not a_nodes:
-            why = _once(junit("p7-a"), b_nodes, ("skipped", "passed"))
+            a_selector = (
+                lock.get("sets", {})
+                .get("p7_gate:contract-blackbox-p7-a", {})
+                .get("linux", {})
+                .get("selector", {})
+            )
+            argv = a_selector.get("argv") if isinstance(a_selector, dict) else None
+            deselected = (
+                {argv[index + 1] for index, token in enumerate(argv[:-1]) if token == "--deselect"}
+                if isinstance(argv, list)
+                else set()
+            )
+            if b_nodes and all(node in deselected for node in b_nodes):
+                unexpected = [node for node in b_nodes if junit("p7-a").get(node)]
+                why = f"selector 已 deselect 但 JUnit 含節點 {unexpected[0]}" if unexpected else None
+                a_detail = "A selector 已明確 deselect rust_only 節點"
+            else:
+                why = _once(junit("p7-a"), b_nodes, ("skipped", "passed"))
+                a_detail = f"A {len(a_nodes) or len(b_nodes)} 節點"
         elif sorted(a_nodes) != sorted(b_nodes):
             why = "凍結 A／B 集合節點不一致"
+            a_detail = f"A {len(a_nodes) or len(b_nodes)} 節點"
         else:
             why = _once(junit("p7-a"), a_nodes, "passed")
-        return ("GAP", f"A 輪：{why}") if why else ("PASS", f"B {len(b_nodes)}／A {len(a_nodes) or len(b_nodes)} 節點")
+            a_detail = f"A {len(a_nodes) or len(b_nodes)} 節點"
+        return ("GAP", f"A 輪：{why}") if why else ("PASS", f"B {len(b_nodes)}／{a_detail}")
     if suite in ("l15-scenario", "func-test"):
         if suite == "func-test" and (ab / f"func-{cid}").is_dir():
             found = next(iter(sorted((ab / f"func-{cid}" / "report").rglob("comparison.json"))), None)
