@@ -89,6 +89,23 @@ pub struct SecretTx {
     pub echo_seed: Vec<u8>,
     /// 本行已結束，停止擴充 matcher。
     pub echo_finish: bool,
+    /// human console 命令在出列時拍下的密碼窗口快照；writer 不重做與 lease 不同時點的分類。
+    pub(crate) window_snapshot: Option<HumanTxWindowSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HumanTxWindowSnapshot {
+    generation: Option<u64>,
+}
+
+impl HumanTxWindowSnapshot {
+    pub(crate) fn new(generation: Option<u64>) -> Self {
+        Self { generation }
+    }
+
+    pub(crate) fn generation(self) -> Option<u64> {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1118,16 +1135,24 @@ impl TxWriter {
                     );
                     let (result, human_secret_len, _) = if human_tx {
                         if let Some(rx) = &self.rx {
-                            rx.with_human_tx_window(&job.payload, |_secret_len| {
-                                let result = self.writer.write_gated(
-                                    &job.payload,
-                                    &self.cancel,
-                                    &gate,
-                                );
-                                let confirmed = confirmed_bytes(&result.outcome);
-                                let unknown = matches!(result.outcome, TxOutcome::Unknown { .. });
-                                (result, confirmed, unknown)
-                            })
+                            rx.with_human_tx_window_snapshot(
+                                &job.payload,
+                                job.permit
+                                    .secret_tx
+                                    .as_ref()
+                                    .and_then(|secret| secret.window_snapshot),
+                                |_secret_len| {
+                                    let result = self.writer.write_gated(
+                                        &job.payload,
+                                        &self.cancel,
+                                        &gate,
+                                    );
+                                    let confirmed = confirmed_bytes(&result.outcome);
+                                    let unknown =
+                                        matches!(result.outcome, TxOutcome::Unknown { .. });
+                                    (result, confirmed, unknown)
+                                },
+                            )
                         } else {
                             let result = self.writer.write_gated(
                                 &job.payload,

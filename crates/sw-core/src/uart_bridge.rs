@@ -19,7 +19,8 @@ use sw_proto::pyre::PyRegex;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
 use crate::tx_writer::{
-    spawn_tx_writer, EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop,
+    spawn_tx_writer, EvidenceGap, Fence, HumanTxWindowSnapshot, TxLedger, TxWriterHandle,
+    TxWriterStop,
 };
 use crate::wal::{WalAppendReq, WalWriter};
 use crate::Mono;
@@ -131,6 +132,7 @@ struct SecretEchoWindow {
     armed: Option<ArmedSecretEcho>,
     released: VecDeque<ReleasedSecretByte>,
     human_generation: Option<u64>,
+    human_writes_in_flight: usize,
     overflow_mask_line: bool,
 }
 
@@ -343,6 +345,7 @@ impl RxShared {
             previous.secret.fill(0);
         }
         window.human_generation = None;
+        window.human_writes_in_flight = 0;
         window.overflow_mask_line = false;
         if !secret.is_empty() {
             window.armed = Some(ArmedSecretEcho {
@@ -360,20 +363,37 @@ impl RxShared {
 
     /// 依 TX 寫出順序判斷 session 密碼窗口；只持鎖完成分類與 echo 登記，OS write
     /// 與任何可能阻塞的等待一律以當下取得的世代快照執行。
+    #[cfg(test)]
     pub(crate) fn with_human_tx_window<T>(
         &self,
         payload: &[u8],
         write: impl FnOnce(usize) -> (T, usize, bool),
     ) -> (T, usize, usize) {
+        self.with_human_tx_window_snapshot(payload, None, write)
+    }
+
+    pub(crate) fn with_human_tx_window_snapshot<T>(
+        &self,
+        payload: &[u8],
+        snapshot: Option<HumanTxWindowSnapshot>,
+        write: impl FnOnce(usize) -> (T, usize, bool),
+    ) -> (T, usize, usize) {
         let (generation, line_end, secret_len, prior_echo_len) = {
-            let tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
-            let generation = tracker.generation;
-            let active = generation > tracker.rx_end_generation
-                && generation > tracker.tx_consumed_generation;
+            let generation = match snapshot {
+                Some(snapshot) => snapshot.generation(),
+                None => {
+                    let tracker =
+                        self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+                    let active = tracker.generation > tracker.rx_end_generation
+                        && tracker.generation > tracker.tx_consumed_generation;
+                    active.then_some(tracker.generation)
+                }
+            }
+            .unwrap_or(0);
             let line_end = payload
                 .iter()
                 .position(|byte| matches!(byte, b'\r' | b'\n'));
-            let secret_len = if active {
+            let secret_len = if generation > 0 {
                 line_end.unwrap_or(payload.len())
             } else {
                 0
@@ -392,6 +412,9 @@ impl RxShared {
             if let Some(prior_len) = prior_echo_len {
                 self.truncate_human_secret_echo(generation, prior_len + confirmed);
             }
+        }
+        if prior_echo_len.is_some() {
+            self.finish_human_secret_echo_write();
         }
         if generation > 0 && line_end.is_some_and(|end| end < confirmed) {
             let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
@@ -417,6 +440,7 @@ impl RxShared {
                 });
             }
         }
+        window.human_writes_in_flight = window.human_writes_in_flight.saturating_add(1);
         if window.overflow_mask_line {
             return 0;
         }
@@ -448,6 +472,11 @@ impl RxShared {
         prior_len
     }
 
+    fn finish_human_secret_echo_write(&self) {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        window.human_writes_in_flight = window.human_writes_in_flight.saturating_sub(1);
+    }
+
     fn truncate_human_secret_echo(&self, generation: u64, len: usize) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if window.human_generation == Some(generation) && !window.overflow_mask_line {
@@ -461,9 +490,16 @@ impl RxShared {
     }
 
     pub(crate) fn human_password_window_active(&self) -> bool {
+        self.human_password_window_snapshot()
+            .generation()
+            .is_some()
+    }
+
+    pub(crate) fn human_password_window_snapshot(&self) -> HumanTxWindowSnapshot {
         let tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
-        tracker.generation > tracker.rx_end_generation
-            && tracker.generation > tracker.tx_consumed_generation
+        let active = tracker.generation > tracker.rx_end_generation
+            && tracker.generation > tracker.tx_consumed_generation;
+        HumanTxWindowSnapshot::new(active.then_some(tracker.generation))
     }
 
     fn mask_pending(window: &mut SecretEchoWindow, armed: &mut ArmedSecretEcho) {
@@ -493,11 +529,13 @@ impl RxShared {
                 if matches!(byte, b'\r' | b'\n') {
                     visible.push(byte);
                     rx_window.push(byte);
-                    window.overflow_mask_line = false;
-                    window.human_generation = None;
-                    if let Some(mut armed) = window.armed.take() {
-                        armed.secret.fill(0);
-                        armed.pending.fill(0);
+                    if window.human_writes_in_flight == 0 {
+                        window.overflow_mask_line = false;
+                        window.human_generation = None;
+                        if let Some(mut armed) = window.armed.take() {
+                            armed.secret.fill(0);
+                            armed.pending.fill(0);
+                        }
                     }
                 } else {
                     visible.push(b'*');
@@ -524,6 +562,14 @@ impl RxShared {
             }
             if armed.dynamic && matches!(byte, b'\r' | b'\n') {
                 let pending_len = armed.pending.len();
+                if window.human_writes_in_flight > 0 && pending_len < armed.secret.len() {
+                    visible.push(byte);
+                    rx_window.push(byte);
+                    index += 1;
+                    armed.after_cr = byte == b'\r';
+                    window.armed = Some(armed);
+                    continue;
+                }
                 visible.resize(visible.len().saturating_add(pending_len), b'*');
                 rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
                 armed.pending.fill(0);
@@ -541,7 +587,9 @@ impl RxShared {
                 let next_line_has_secret_prefix = next_prefix_len > 0
                     && next_line[..next_prefix_len] == armed.secret[..next_prefix_len];
                 if pending_len == armed.secret.len()
-                    || (pending_len == 0 && !next_line_has_secret_prefix)
+                    || (window.human_writes_in_flight == 0
+                        && pending_len == 0
+                        && !next_line_has_secret_prefix)
                 {
                     armed.secret.fill(0);
                     window.human_generation = None;
@@ -617,6 +665,7 @@ impl RxShared {
             armed.pending.clear();
         }
         window.human_generation = None;
+        window.human_writes_in_flight = 0;
         window.overflow_mask_line = false;
         let mut bytes = Vec::new();
         let mut rx_window = Vec::new();
@@ -637,6 +686,7 @@ impl RxShared {
             armed.secret.fill(0);
         }
         window.human_generation = None;
+        window.human_writes_in_flight = 0;
         window.overflow_mask_line = false;
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
@@ -1776,10 +1826,18 @@ mod issue311_window_tests {
     #[test]
     fn issue311_human_secret_echo_registration_storage_is_bounded() {
         let rx = RxShared::new(1024, 0);
+        rx.set_password_prompt_matcher(None, Some("SW_I311_UNLOCK".into()));
+        rx.observe_password_prompt_bytes(b"Password:");
         let stream = vec![b'Z'; HUMAN_SECRET_ECHO_MAX_BYTES * 2 + 37];
 
         for chunk in stream.chunks(113) {
-            rx.register_human_secret_echo(1, chunk);
+            let ((), secret_len, confirmed) =
+                rx.with_human_tx_window(chunk, |classified| {
+                    assert_eq!(classified, chunk.len());
+                    ((), chunk.len(), false)
+                });
+            assert_eq!(secret_len, chunk.len());
+            assert_eq!(confirmed, chunk.len());
             assert!(
                 rx.issue311_test_human_secret_echo_storage_len()
                     <= HUMAN_SECRET_ECHO_MAX_BYTES,

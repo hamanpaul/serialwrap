@@ -470,6 +470,32 @@ fn do_pause(inner: &FakeDeviceInner) {
     *p = false;
 }
 
+fn do_pause_or_cancel(inner: &FakeDeviceInner, cancel: &CancelToken) -> bool {
+    let mut paused = inner.paused.lock().unwrap_or_else(|e| e.into_inner());
+    *paused = true;
+    inner.paused_cond.notify_all();
+    drop(paused);
+
+    let mut released = inner
+        .pause_released
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while !*released && !cancel.is_cancelled() {
+        let (guard, _) = inner
+            .pause_released_cond
+            .wait_timeout(released, Duration::from_millis(10))
+            .unwrap_or_else(|e| e.into_inner());
+        released = guard;
+    }
+    let cancelled = !*released && cancel.is_cancelled();
+    *released = false;
+    drop(released);
+
+    let mut paused = inner.paused.lock().unwrap_or_else(|e| e.into_inner());
+    *paused = false;
+    cancelled
+}
+
 /// 記憶體序列埠後端：以路徑鍵控的虛擬裝置表。
 pub struct FakeSerialBackend {
     devices: Mutex<HashMap<String, Arc<FakeDeviceInner>>>,
@@ -1267,7 +1293,12 @@ impl SerialWriter for FakeSerialWriter {
                     };
                 }
 
-                do_pause(&self.inner);
+                if do_pause_or_cancel(&self.inner, cancel) {
+                    return TxResult {
+                        outcome: TxOutcome::Completed(committed),
+                        error: Some(PalError::cancelled()),
+                    };
+                }
 
                 let remaining = &data[committed..];
                 if remaining.is_empty() {

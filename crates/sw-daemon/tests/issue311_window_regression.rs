@@ -527,9 +527,10 @@ fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
 
     let manager = rig.service.mgr.clone();
     let stop = thread::spawn(move || manager.shutdown(Duration::from_secs(3)));
-    thread::sleep(Duration::from_millis(20));
-    rig.device.release_pause();
     let drained = stop.join().expect("shutdown thread 不應 panic");
+    if !drained.iter().all(|(_, ok)| *ok) {
+        rig.device.release_pause();
+    }
 
     assert!(
         published_during_pause,
@@ -539,6 +540,49 @@ fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
         drained.iter().all(|(_, ok)| *ok),
         "TX would-block 後 shutdown 應收斂：{drained:?}"
     );
+}
+
+#[test]
+fn issue312_rx_line_end_during_human_tx_would_block_keeps_secret_matcher() {
+    let (rig, client_id, console, log_path) = prompted_secret_rig();
+    rig.device.set_loopback(false);
+    rig.device
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
+
+    let tx_start = rig.device.tx_len();
+    console.push_input(&[RAW_SECRET.as_bytes(), b"\r"].concat());
+    assert!(
+        rig.device.wait_paused(Duration::from_secs(3)),
+        "human TX 應停在前 3 bytes 已接受、剩餘可重試"
+    );
+
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\n");
+    wait_console_contains(&console, b"\r\n", "writer 阻塞時 RX 行尾仍發布");
+    assert!(
+        rig.device.rx_bytes_read() >= rx_start + 2,
+        "reader 必須先消費先於 TX 完成的行尾"
+    );
+
+    rig.device.release_pause();
+    wait_tx(
+        &rig,
+        tx_start + RAW_SECRET.len() + 1,
+        "would-block 解除後 secret TX 完成",
+    );
+    wait_secret_meta_count(&rig, &client_id, 1);
+
+    let echo_start = rig.device.rx_bytes_read();
+    for (index, byte) in RAW_SECRET.bytes().chain(b"\r\n".iter().copied()).enumerate() {
+        rig.device.push_rx(&[byte]);
+        support::wait_until_within(
+            "writer 返回後逐 byte DUT echo 經 reader",
+            Duration::from_secs(3),
+            || rig.device.rx_bytes_read() > echo_start + index,
+        );
+    }
+    wait_for_masked_echo(&log_path);
+    assert_secret_sinks_clear(&rig, &console, &log_path, RAW_SECRET.as_bytes());
 }
 
 #[test]

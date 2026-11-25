@@ -742,11 +742,9 @@ impl SessionCore {
         now: Mono,
         fx: &mut Vec<Effect>,
     ) -> bool {
-        let mode = if self.deps.rx.human_password_window_active() {
-            "line".to_string()
-        } else {
-            human_console_mode(&line, self.path_flavor).as_str().to_string()
-        };
+        let mode = human_console_mode(&line, self.path_flavor)
+            .as_str()
+            .to_string();
         let bytes = line.len();
         let req = SubmitReq {
             session_id: self.sid.clone(),

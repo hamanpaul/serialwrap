@@ -665,14 +665,6 @@ fn map_send_failure(
     pydict! { "ok" => false, "error_code" => code }
 }
 
-fn normalized_mode(mode: &str) -> &str {
-    match mode {
-        "fg" => "line",
-        "bg" => "background",
-        other => other,
-    }
-}
-
 /// passthrough 完成條件（`_passthrough_completion_pattern`）：completion_regex → 可用 prompt → None。
 fn passthrough_completion_pattern(t: &ProfileTemplate, completion: Option<&str>) -> Option<String> {
     if let Some(pattern) = completion {
@@ -694,7 +686,7 @@ fn command_tx_class(q: &QueuedCommand) -> TxClass {
 
 fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let t = &ctx.profile.template;
-    let mode = normalized_mode(&q.req.mode).to_string();
+    let mode = q.req.execution_mode().to_string();
     let command = q.req.command.as_str();
     let cmd_id = q.cmd_id.as_str();
     let timeout_s = q.req.timeout_s;

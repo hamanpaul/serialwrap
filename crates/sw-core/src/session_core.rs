@@ -7325,7 +7325,7 @@ impl SessionCore {
 
     /// execute-time 順序的 lease 段（`_refresh_interactive_locked` → 非 interactive 遇 lease：agent 遇 human lease 放行）。
     fn execute_time_lease_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
-        let mode = normalized_mode(&command.req.mode);
+        let mode = command.req.execution_mode();
         // 與 `execute_time_gate_reject` 共用可信 human 判定（OD-74、rulings s2 D5；Python `session_manager.py:6573-6588`
         // 的 quiet gate 與 lease 判斷同一個 `human`）：RPC 的 `trusted_human` OR HumanConsole，永不看 `source` 字首。
         let human = command.req.is_trusted_human();
@@ -7361,14 +7361,14 @@ impl SessionCore {
             return effects;
         }
         loop {
-            let command = if let Some(parked) = self.replay_parked.take() {
+            let (mut command, was_parked) = if let Some(parked) = self.replay_parked.take() {
                 if self.parked_terminal(&parked.cmd_id) {
                     // 已取消（Python `revoke_tx_op` 使其零 TX）：仍須結算 `mark_running` 登記的在途指標，
                     // 否則 canceled＋in_flight 永久占用 pending 額度（sol P6-e9b5c61-2）。
                     self.settle_parked_terminal(&parked.cmd_id);
                     continue;
                 }
-                parked
+                (parked, true)
             } else {
                 let Some(command) = self.queue.pop() else {
                     return effects;
@@ -7381,6 +7381,20 @@ impl SessionCore {
                 ) {
                     continue;
                 }
+                (command, false)
+            };
+            if matches!(
+                &command.req.origin,
+                SubmitOrigin::HumanConsole { .. }
+            ) {
+                let snapshot = self.deps.rx.human_password_window_snapshot();
+                command
+                    .req
+                    .secret_tx
+                    .get_or_insert_with(Default::default)
+                    .window_snapshot = Some(snapshot);
+            }
+            if !was_parked {
                 if let Some(reject) = self.execute_time_reject(&command, now) {
                     self.deps.registry.complete(
                         &command.cmd_id,
@@ -7395,9 +7409,11 @@ impl SessionCore {
                     self.replay_parked = Some(command);
                     return effects;
                 }
-                command
-            };
-            let mode = normalized_mode(&command.req.mode).to_string();
+            }
+            let mode = command.req.execution_mode().to_string();
+            if mode != "interactive" {
+                self.tick_close_interactive.remove(&command.cmd_id);
+            }
             // #45 D-44：同 session 非 background 命令開始前，終結既有 background capture。
             if mode != "background" {
                 for id in self.background_cmd_ids.clone() {

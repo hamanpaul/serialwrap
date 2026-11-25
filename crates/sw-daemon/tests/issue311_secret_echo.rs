@@ -2987,6 +2987,110 @@ fn issue312_line_buffer_command_shaped_password_is_meta_only() {
 }
 
 #[test]
+fn issue312_line_buffer_batched_vim_after_secret_reopens_interactive_at_execution() {
+    let rig = build_issue312_human_rig(true);
+    let (raw_id, raw_console) = issue312_attach_console(&rig);
+    let (_line_id, line_console) = issue312_attach_console(&rig);
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{raw_id}"}}"#),
+    );
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    rig.device
+        .on_tx_match("^vim$", Box::new(|_| b"vim\r\nroot@t:/# ".to_vec()));
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\nPassword: ");
+    wait_controlled_rx(
+        &rig.device,
+        rx_before + b"\r\nPassword: ".len(),
+        "reader 收到批次 vim prompt",
+    );
+    issue312_wait_console_prompt(&line_console, b"Password: ");
+
+    let tx_start = rig.device.tx_len();
+    line_console.push_input(b"vim\rvim\r");
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + b"vim\nvim\n".len(),
+        "secret 後普通 vim 直接送出並開 lease",
+    );
+    rig.service.settle();
+
+    let state = rig.service.call("session.get_state", r#"{"selector":"COM0"}"#);
+    let session = match state.get("session") {
+        Some(PyValue::Dict(session)) => session,
+        other => panic!("batch vim session state: {other:?}"),
+    };
+    assert!(
+        session
+            .get("interactive_session_id")
+            .and_then(PyValue::as_str)
+            .is_some(),
+        "第一行消耗 secret 窗口後，第二個 vim 必須以執行當下模式建立 lease：{session:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&raw_console.written()).contains("vim"),
+        "已 detach 的 console 不得收到後續 vim：{:?}",
+        raw_console.written()
+    );
+}
+
+#[test]
+fn issue312_line_buffer_vim_queued_before_prompt_is_secret_at_execution() {
+    let rig = build_issue312_human_rig(true);
+    rig.device.clear_replies();
+    let (raw_id, raw_console) = issue312_attach_console(&rig);
+    let (_line_id, line_console) = issue312_attach_console(&rig);
+    let detached = rig.service.call(
+        "session.console_detach",
+        &format!(r#"{{"selector":"COM0","client_id":"{raw_id}"}}"#),
+    );
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    rig.device
+        .on_tx_match("^vim$", Box::new(|_| b"vim\r\nroot@t:/# ".to_vec()));
+
+    let tx_start = rig.device.tx_len();
+    line_console.push_input(b"hold-312\rvim\r");
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + b"hold-312\n".len(),
+        "同批第一行占住執行槽、vim 留在佇列",
+    );
+    rig.service.settle();
+
+    let rx_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"root@t:/# Password: ");
+    wait_controlled_rx(
+        &rig.device,
+        rx_before + b"root@t:/# Password: ".len(),
+        "reader 發布前景完成提示與新密碼窗口",
+    );
+    issue312_wait_tx(
+        &rig.device,
+        tx_start + b"hold-312\nvim\n".len(),
+        "secret 窗口開啟後的排隊 vim 送出",
+    );
+    rig.service.settle();
+
+    let state = rig.service.call("session.get_state", r#"{"selector":"COM0"}"#);
+    let session = match state.get("session") {
+        Some(PyValue::Dict(session)) => session,
+        other => panic!("queued vim session state: {other:?}"),
+    };
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "入列時普通、實際 TX 時已成 secret 的 vim 不得建立 lease：{session:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&raw_console.written()).contains("hold-312"),
+        "已 detach 的 console 不得收到排隊命令：{:?}",
+        raw_console.written()
+    );
+}
+
+#[test]
 fn issue312_split_utf8_prompt_and_isolated_cr_masking() {
     let log_dir = tempfile::tempdir().expect("agent log 目錄");
     let profile = format!(

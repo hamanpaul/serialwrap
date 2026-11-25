@@ -88,7 +88,7 @@ impl SessionCore {
             ) {
                 continue;
             }
-            let interactive = normalized_mode(&command.req.mode) == "interactive";
+            let interactive = command.req.execution_mode() == "interactive";
             let reject = self
                 .execute_time_gate_reject(&command, now)
                 .or_else(|| {

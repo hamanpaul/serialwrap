@@ -44,6 +44,22 @@ impl SubmitReq {
     pub fn is_trusted_human(&self) -> bool {
         self.trusted_human || matches!(&self.origin, SubmitOrigin::HumanConsole { .. })
     }
+
+    pub fn execution_mode(&self) -> &str {
+        let secret_at_execution = self
+            .secret_tx
+            .as_ref()
+            .and_then(|secret| secret.window_snapshot)
+            .is_some_and(|snapshot| snapshot.generation().is_some());
+        if secret_at_execution {
+            return "line";
+        }
+        match self.mode.as_str() {
+            "fg" => "line",
+            "bg" => "background",
+            other => other,
+        }
+    }
 }
 
 /// 已進入佇列的命令；排序鍵為 `(priority, counter)`，數值小者先出列。
