@@ -682,11 +682,17 @@ def write_fake_repo(root: Path, *, layer: str = "l1.5", acceptance_state: str = 
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8", newline="\n")
-    bridge_src = REPO_ROOT / "tools" / "uart_stdio_bridge" / "src"
-    if str(bridge_src) not in sys.path:
-        sys.path.insert(0, str(bridge_src))
-    from uart_stdio_bridge import TOOL_NAME, __version__
-    from uart_stdio_bridge.selftest.checks import CHECK_IDS
+    # 只在匯入 bridge 套件期間暫時加入 sys.path，匯入後還原，避免影響同一 process 後續測試的匯入順序。
+    bridge_src = str(REPO_ROOT / "tools" / "uart_stdio_bridge" / "src")
+    inserted = bridge_src not in sys.path
+    if inserted:
+        sys.path.insert(0, bridge_src)
+    try:
+        from uart_stdio_bridge import TOOL_NAME, __version__
+        from uart_stdio_bridge.selftest.checks import CHECK_IDS
+    finally:
+        if inserted and bridge_src in sys.path:
+            sys.path.remove(bridge_src)
 
     approved = json.loads((REPO_ROOT / "tools" / "uart_stdio_bridge" / "APPROVED_REVISION.json")
                           .read_text(encoding="utf-8"))

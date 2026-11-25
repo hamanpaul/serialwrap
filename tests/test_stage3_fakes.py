@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import stat
+import sys
 import tarfile
 from datetime import datetime
 from pathlib import Path
@@ -139,6 +140,18 @@ def test_fake_repo_preserves_current_acceptance_bytes(tmp_path):
         assert item["status"] == "frozen"
         assert all(value is not None for value in _leaf_values(item["per_platform"]))
     assert _protected_source_bytes() == source_bytes
+
+
+def test_fake_repo_restores_sys_path(tmp_path, monkeypatch):
+    """write_fake_repo 匯入 bridge 套件後必須還原 sys.path，不得影響同一 process 後續測試的匯入順序。"""
+    fakes = _fakes()
+    bridge_src = str(REPO_ROOT / "tools" / "uart_stdio_bridge" / "src")
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry != bridge_src])
+    before = list(sys.path)
+
+    fakes.write_fake_repo(tmp_path / "repo")
+
+    assert sys.path == before
 
 
 def test_historical_deferred_fixture_is_isolated(tmp_path):
