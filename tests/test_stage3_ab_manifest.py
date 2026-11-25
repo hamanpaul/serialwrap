@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
+import io
 import json
 from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path
@@ -68,16 +70,16 @@ def _load(path: Path, *, repo_root: Path | None = None):
 
 
 def _verify(manifest, repo_root: Path):
-    runner = _runner(manifest.contract_revision)
-    map_ref = manifest.platform_settings.get("case_transport_map")
-    if isinstance(map_ref, Mapping) and isinstance(map_ref.get("path"), str):
-        try:
-            map_bytes = (repo_root / map_ref["path"]).read_bytes()
-        except OSError:
-            map_bytes = b""
-        object_id = hashlib.sha1(b"blob " + str(len(map_bytes)).encode("ascii") + b"\0" + map_bytes).hexdigest()
-        runner.script["git:rev-parse"] = [{"rc": 0, "stdout": object_id, "stderr": ""}]
-        runner.script["git:hash-object"] = [{"rc": 0, "stdout": object_id, "stderr": ""}]
+    runner = _ToolRevisionRecordingRunner(
+        repo_root,
+        _repo_snapshot(repo_root),
+        contract_revision=manifest.contract_revision,
+        tool_revision="1" * 40,
+    )
+    trusted_pair_map = (
+        _synthetic_trusted_pair_map(repo_root)
+        if manifest.exit_item_id == EXIT_WINDOWS_L15 else None
+    )
     return ab_manifest.verify_frozen(
         manifest,
         repo_root=repo_root,
@@ -85,6 +87,7 @@ def _verify(manifest, repo_root: Path):
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(repo_root),
+        trusted_pair_map=trusted_pair_map,
     )
 
 
@@ -607,7 +610,13 @@ def test_render_argv_wraps_all_template_errors(template):
 def test_contract_revision_mismatch(tmp_path):
     manifest = _load(fakes.write_ab_manifest(tmp_path))
     other = "1" * 40 if manifest.contract_revision != "1" * 40 else "2" * 40
-    violations = ab_manifest.verify_frozen(manifest, repo_root=tmp_path, run=_runner(other))
+    runner = _ToolRevisionRecordingRunner(
+        tmp_path, _repo_snapshot(tmp_path), contract_revision=other, tool_revision="1" * 40,
+    )
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+        base_revision="t3-trusted-base", source_reader=_trusted_source_reader(tmp_path),
+    )
     assert f"contract_revision mismatch: manifest {manifest.contract_revision} repo {other}" in violations
 
 
@@ -617,8 +626,21 @@ def test_docker_digest_mismatch(tmp_path):
         **{"dut.kind": "docker", "dut.image": "serialwrap-dut:test", "dut.image_digest": "sha256:" + "a" * 64},
     )
     manifest = _load(path)
-    runner = _runner(manifest.contract_revision, "sha256:" + "b" * 64)
-    assert "dut image digest mismatch" in ab_manifest.verify_frozen(manifest, repo_root=tmp_path, run=runner)
+    runner = _ToolRevisionRecordingRunner(
+        tmp_path,
+        _repo_snapshot(tmp_path),
+        contract_revision=manifest.contract_revision,
+        tool_revision="1" * 40,
+        docker_result={"rc": 0, "stdout": "sha256:" + "b" * 64 + "\n", "stderr": ""},
+    )
+    assert "dut image digest mismatch" in ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
 
 
 def test_tool_file_sha_drift_detected(tmp_path):
@@ -1633,4 +1655,429 @@ def test_windows_non_l15_exit_does_not_require_l15_transport_map(tmp_path):
     manifest = _load(fakes.write_ab_manifest(tmp_path, platform="windows", layer="l2", stage="3"))
     assert manifest.exit_item_id == "S3-L2-AB-WINDOWS"
     assert manifest.platform_settings.get("case_transport_map") is None
+
+
+def _git_blob_oid(data: bytes) -> str:
+    return hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+
+
+def _repo_snapshot(root: Path) -> dict[str, bytes]:
+    schema = root / "tests" / "acceptance" / "stage3_required_cases.schema.json"
+    if not schema.exists():
+        schema.parent.mkdir(parents=True, exist_ok=True)
+        schema.write_bytes((Path(__file__).resolve().parent / "acceptance" / schema.name).read_bytes())
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    }
+
+
+class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
+    """以記憶體中的 Git blob 快照模擬可信版本與工作樹位元組。"""
+
+    def __init__(self, root: Path, blobs: Mapping[str, bytes], *, contract_revision: str = "0" * 40,
+                 tool_revision: str = "1" * 40, docker_result: dict | None = None) -> None:
+        super().__init__()
+        self.root = root.resolve()
+        self.blobs = dict(blobs)
+        self.contract_revision = contract_revision
+        self.tool_revision = tool_revision
+        self.docker_result = docker_result or {"rc": 0, "stdout": "", "stderr": ""}
+
+    def __call__(self, argv, *, env=None, timeout=None, cwd=None):
+        args = list(argv)
+        if args and args[0] == "git":
+            if "rev-parse" in args and args[-1] == "HEAD:contracts":
+                stdout, rc = self.contract_revision + "\n", 0
+            elif "rev-parse" in args and args[-1] == "HEAD":
+                stdout, rc = self.tool_revision + "\n", 0
+            elif "rev-parse" in args and ":" in args[-1]:
+                relative = args[-1].split(":", 1)[1]
+                data = self.blobs.get(relative)
+                stdout, rc = (_git_blob_oid(data) + "\n", 0) if data is not None else ("", 1)
+            elif "hash-object" in args:
+                candidate = Path(args[-1])
+                if not candidate.is_absolute():
+                    candidate = self.root / candidate
+                try:
+                    data = candidate.read_bytes()
+                except OSError:
+                    stdout, rc = "", 1
+                else:
+                    stdout, rc = _git_blob_oid(data) + "\n", 0
+            else:
+                stdout, rc = "{}", 0
+            return fakes.CmdResult(rc=rc, stdout=stdout, stderr="", elapsed_s=0.0, timed_out=False)
+        if args and args[0] == "docker":
+            return fakes.CmdResult(
+                rc=int(self.docker_result.get("rc", 0)),
+                stdout=str(self.docker_result.get("stdout", "")),
+                stderr=str(self.docker_result.get("stderr", "")),
+                elapsed_s=0.0,
+                timed_out=bool(self.docker_result.get("timed_out", False)),
+            )
+        return super().__call__(args, env=env, timeout=timeout, cwd=cwd)
+
+
+def _synthetic_trusted_pair_map(root: Path, *, include_alternate: bool = False) -> dict:
+    manifest_doc = _read_json(root / "ab-manifest.json")
+    map_ref = manifest_doc["platform_settings"]["case_transport_map"]
+    mapping = _read_json(root / map_ref["path"])
+    pair_id, public_pair = next(iter(mapping["approved_pairs"].items()))
+    pairs = {
+        pair_id: {
+            "dut_port": "COM20",
+            "daemon_port": "COM21",
+            "dut_side_port_id": public_pair["dut_side_port_id"],
+            "daemon_side_port_id": public_pair["daemon_side_port_id"],
+            "decision_ref": public_pair["decision_ref"],
+        }
+    }
+    if include_alternate:
+        pairs["T3-OTHER-APPROVED-PAIR"] = {
+            "dut_port": "COM400",
+            "daemon_port": "COM401",
+            "dut_side_port_id": "T3-OTHER-DUT-ID",
+            "daemon_side_port_id": "T3-OTHER-DAEMON-ID",
+            "decision_ref": "T3-OTHER-PAIR-AUTH",
+        }
+    return {
+        "schema_version": 1,
+        "exit_item_id": EXIT_WINDOWS_L15,
+        "platform": "windows",
+        "selected_pair_id": pair_id,
+        "pairs": pairs,
+    }
+
+
+@pytest.mark.parametrize("attribute", ["invariants", "destructive"], ids=["invariants", "destructive"])
+def test_tool_revision_rejects_self_hashed_canonical_case_attribute_changes(tmp_path, attribute):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest_doc = _read_json(path)
+    case_path = tmp_path / manifest_doc["case_list"]["path"]
+    cases_doc = yaml.safe_load(case_path.read_text(encoding="utf-8"))
+    if attribute == "invariants":
+        target = next(row for row in cases_doc["cases"] if row["case_id"] == "cowork-01-agent-bad-cmd")
+        target[attribute] = []
+    else:
+        target = next(
+            row for row in cases_doc["cases"]
+            if row.get("destructive") is True
+        )
+        target[attribute] = False
+    case_path.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    manifest_doc["case_list"]["sha256"] = fakes.sha256_file(case_path)
+    _write_json(path, manifest_doc)
+    manifest = _load(path)
+    revision_blobs = _repo_snapshot(tmp_path)
+    revision_blobs["tests/acceptance/cases.yaml"] = b"trusted canonical cases bytes\n"
+    runner = _ToolRevisionRecordingRunner(tmp_path, revision_blobs)
+    violations = ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert "tool revision mismatch: tests/acceptance/cases.yaml" in violations
+
+
+def test_tool_revision_accepts_repo_frozen_inputs_when_raw_bytes_match(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    assert ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    ) == []
+
+
+def test_required_cases_and_verify_frozen_keep_plan_interface_without_base_revision(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    from tools.stage3 import required_cases
+
+    required, _rows = ab_manifest.required_cases(
+        manifest,
+        repo_root=tmp_path,
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert required == set(manifest.case_ids)
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    assert ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        source_reader=_trusted_source_reader(tmp_path),
+    ) == []
+
+
+@pytest.mark.parametrize("stage", ["1A", "1B"], ids=["stage-1a", "stage-1b"])
+@pytest.mark.parametrize("component", ["cli", "daemon.runtime"], ids=["python-cli", "python-daemon-runtime"])
+@pytest.mark.parametrize(
+    "defect",
+    ["missing_sha", "sha_type", "path_type"],
+    ids=["missing-sha", "sha-wrong-type", "path-wrong-type"],
+)
+def test_python_stage1_baseline_still_requires_component_file_identity(tmp_path, stage, component, defect):
+    path = fakes.write_ab_manifest(tmp_path, stage=stage)
+    doc = _read_json(path)
+    release_path = tmp_path / doc["sides"][0]["release_manifest"]["path"]
+    release_doc = _read_json(release_path)
+    selected = release_doc["components"]["cli"] if component == "cli" else release_doc["components"]["daemon"]["runtime"]
+    if defect == "missing_sha":
+        selected.pop("sha256")
+    elif defect == "sha_type":
+        selected["sha256"] = 17
+    else:
+        selected["path"] = 17
+    _write_json(release_path, release_doc)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("component", ["cli", "daemon.runtime"], ids=["python-cli", "python-daemon-runtime"])
+def test_python_stage1_baseline_verify_bundle_rehashes_selected_files(tmp_path, component):
+    path = fakes.write_ab_manifest(tmp_path, stage="1A")
+    manifest = _load(path)
+    baseline = manifest.sides[0]
+    component_doc = baseline.manifest_doc
+    if component == "cli":
+        selected = component_doc["components"]["cli"]
+    else:
+        selected = component_doc["components"]["daemon"]["runtime"]
+    executable = baseline.bundle_dir / selected["path"]
+    executable.write_bytes(executable.read_bytes() + b"\n# replaced after manifest freeze\n")
+    violations = ab_manifest.verify_bundle(baseline.bundle_dir, component_doc, label="side A")
+    assert f"release component sha256 mismatch: side A {component if component == 'cli' else 'daemon.runtime'}" in violations
+
+
+def test_python_stage1_baseline_verify_bundle_accepts_valid_component_identities(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, stage="1B")
+    manifest = _load(path)
+    assert ab_manifest.verify_bundle(
+        manifest.sides[0].bundle_dir,
+        manifest.sides[0].manifest_doc,
+        label="side A",
+    ) == []
+
+
+@pytest.mark.parametrize("image", [None, ""], ids=["null-image", "empty-image"])
+def test_docker_dut_requires_nonempty_image_at_load(tmp_path, image):
+    path = fakes.write_ab_manifest(
+        tmp_path,
+        **{"dut.kind": "docker", "dut.image": image, "dut.image_digest": "sha256:" + "a" * 64},
+    )
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "docker" in caught.value.detail.casefold() and "image" in caught.value.detail.casefold()
+
+
+def test_verify_frozen_reports_missing_docker_inspect_input(tmp_path):
+    path = fakes.write_ab_manifest(
+        tmp_path,
+        **{"dut.kind": "docker", "dut.image": "serialwrap-dut:test", "dut.image_digest": "sha256:" + "a" * 64},
+    )
+    manifest = _load(path)
+    manifest = replace(manifest, dut=replace(manifest.dut, image=None))
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    violations = ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert any("docker" in item.casefold() and "image" in item.casefold() for item in violations)
+
+
+def test_verify_frozen_rejects_docker_inspect_failure_and_accepts_matching_digest(tmp_path):
+    digest = "sha256:" + "a" * 64
+    path = fakes.write_ab_manifest(
+        tmp_path,
+        **{"dut.kind": "docker", "dut.image": "serialwrap-dut:test", "dut.image_digest": digest},
+    )
+    manifest = _load(path)
+    failed_runner = _ToolRevisionRecordingRunner(
+        tmp_path,
+        _repo_snapshot(tmp_path),
+        docker_result={"rc": 1, "stdout": "", "stderr": "not found"},
+    )
+    violations = ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=failed_runner,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert "dut image digest mismatch" in violations
+
+    good_runner = _ToolRevisionRecordingRunner(
+        tmp_path,
+        _repo_snapshot(tmp_path),
+        docker_result={"rc": 0, "stdout": digest + "\n", "stderr": ""},
+    )
+    assert ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=good_runner,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    ) == []
+
+
+def test_windows_l15_verify_frozen_requires_injected_trusted_pair_map(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    manifest = _load(path)
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    violations = ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+    assert "trusted pair map missing: BLOCKED-OWNER BO-P9-01" in violations
+
+
+def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_changes(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    trusted = _synthetic_trusted_pair_map(tmp_path, include_alternate=True)
+    manifest = ab_manifest.load_manifest(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
+    assert ab_manifest.verify_frozen(
+        manifest,
+        repo_root=tmp_path,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+        trusted_pair_map=trusted,
+    ) == []
+
+    changed_path = _windows_l15_transport_fixture(tmp_path / "changed")
+    changed_doc = _read_json(changed_path)
+    changed_doc["dut"]["com_pair"] = {"daemon_side": "COM400", "bridge_side": "COM401"}
+    changed_doc["test_device_allowlist"] = ["COM400", "COM401"]
+    _write_json(changed_path, changed_doc)
+    with pytest.raises(HarnessError) as caught:
+        ab_manifest.load_manifest(changed_path, repo_root=changed_path.parent, trusted_pair_map=trusted)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+    swapped_path = _windows_l15_transport_fixture(tmp_path / "swapped")
+    swapped_doc = _read_json(swapped_path)
+    swapped_doc["dut"]["com_pair"] = {"daemon_side": "COM20", "bridge_side": "COM21"}
+    _write_json(swapped_path, swapped_doc)
+    with pytest.raises(HarnessError):
+        ab_manifest.load_manifest(swapped_path, repo_root=swapped_path.parent, trusted_pair_map=trusted)
+
+    alternate_path = _windows_l15_transport_fixture(tmp_path / "alternate")
+    alternate_doc = _read_json(alternate_path)
+    map_ref = alternate_doc["platform_settings"]["case_transport_map"]
+    map_path = alternate_path.parent / map_ref["path"]
+    mapping = _read_json(map_path)
+    native_id = next(case_id for case_id, row in mapping["cases"].items() if row["requires_native_com"])
+    mapping["approved_pairs"]["T3-OTHER-APPROVED-PAIR"] = {
+        "dut_side_port_id": "T3-OTHER-DUT-ID",
+        "daemon_side_port_id": "T3-OTHER-DAEMON-ID",
+        "decision_ref": "T3-OTHER-PAIR-AUTH",
+    }
+    mapping["cases"][native_id]["pair_id"] = "T3-OTHER-APPROVED-PAIR"
+    _write_json(map_path, mapping)
+    map_sha = fakes.sha256_file(map_path)
+    map_ref["sha256"] = map_sha
+    next(item for item in alternate_doc["tools"] if item["path"] == map_ref["path"])["sha256"] = map_sha
+    alternate_doc["platform_settings"]["case_transports"][native_id]["port_id"] = "T3-OTHER-DUT-ID"
+    alternate_doc["platform_settings"]["case_transports"][native_id]["decision_ref"] = "T3-OTHER-PAIR-AUTH"
+    _write_json(alternate_path, alternate_doc)
+    with pytest.raises(HarnessError):
+        ab_manifest.load_manifest(alternate_path, repo_root=alternate_path.parent, trusted_pair_map=trusted)
+
+
+def test_windows_l15_trusted_pair_map_schema_is_closed_and_validates_synthetic_pair():
+    import jsonschema
+
+    schema_path = Path(__file__).resolve().parent / "acceptance" / "stage3_trusted_pair_map.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    value = {
+        "schema_version": 1,
+        "exit_item_id": EXIT_WINDOWS_L15,
+        "platform": "windows",
+        "selected_pair_id": "T3-COM0COM-PAIR",
+        "pairs": {
+            "T3-COM0COM-PAIR": {
+                "dut_port": "COM20",
+                "daemon_port": "COM21",
+                "dut_side_port_id": "T3-PAIR-DUT",
+                "daemon_side_port_id": "T3-PAIR-DAEMON",
+                "decision_ref": "T3-COM-PAIR-AUTH",
+            }
+        },
+    }
+    jsonschema.validate(value, schema)
+    invalid = copy.deepcopy(value)
+    invalid["pairs"]["T3-COM0COM-PAIR"].pop("daemon_port")
+    assert list(jsonschema.Draft202012Validator(schema).iter_errors(invalid))
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_stderr"),
+    [
+        (
+            "schema-seed-family-lock",
+            "Stage 3 分母鎖檢查失敗：分母鎖根物件 的 schema 欄位集合不符（缺少欄位：exits）\n",
+        ),
+        (
+            "seed-family-lock",
+            "Stage 3 分母鎖檢查失敗：seed.cases SHA 與來源 manifest 不同\n",
+        ),
+        (
+            "family-lock",
+            "Stage 3 分母鎖檢查失敗：分母鎖小於固定 seed 基準 S3-L3-P0P1-REMOTE-WINDOWS/windows：p0-blog-clean；案例 family 不可重分類（固定 seed）：win-task-logon-trigger；S3-L3-P0P1-REMOTE-WINDOWS/windows 缺少適用案例：p0-blog-clean\n",
+        ),
+        (
+            "lock-only",
+            "Stage 3 分母鎖檢查失敗：分母鎖小於固定 seed 基準 S3-L3-P0P1-REMOTE-WINDOWS/windows：p0-blog-clean；S3-L3-P0P1-REMOTE-WINDOWS/windows 缺少適用案例：p0-blog-clean\n",
+        ),
+    ],
+    ids=["schema-short-circuits", "seed-short-circuits", "family-before-lock-diagnostic", "lock-diagnostic"],
+)
+def test_required_cases_check_preserves_4b71d2db_complete_output_and_exit_code(tmp_path, damage, expected_stderr):
+    from tools.stage3 import required_cases
+
+    root = tmp_path / "repo"
+    fakes.write_fake_repo(root)
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    lock = _read_json(lock_path)
+    if damage == "schema-seed-family-lock":
+        lock.pop("exits")
+        lock["seed"]["cases"]["sha256"] = "0" * 64
+    elif damage == "seed-family-lock":
+        lock["seed"]["cases"]["sha256"] = "0" * 64
+    if damage in {"schema-seed-family-lock", "seed-family-lock", "family-lock"}:
+        cases_path = root / "tests" / "acceptance" / "cases.yaml"
+        cases_doc = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+        row = next(item for item in cases_doc["cases"] if item.get("case_id") == "win-task-logon-trigger")
+        row["family"] = "P0"
+        cases_path.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    lock_ids = lock.get("exits", {}).get("S3-L3-P0P1-REMOTE-WINDOWS", {}).get("windows", {}).get("case_ids", [])
+    if "p0-blog-clean" in lock_ids:
+        lock_ids.remove("p0-blog-clean")
+    _write_json(lock_path, lock)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    reader = _trusted_source_reader(root)
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        rc = required_cases.main(["--check"], repo_root=root, source_reader=reader)
+    assert rc == 1
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == expected_stderr
 

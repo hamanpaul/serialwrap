@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/stage3_trusted_pair_map",
+  "title": "Stage 3 Windows L1.5 trusted COM pair map",
+  "description": "由編排者於 T5B 依原生 COM 實機盤點建立的私下對照。實際埠名不可放入公開資料；公開證據只保留去識別端點 ID 與本檔 SHA-256。T3 測試只使用合成資料。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "exit_item_id",
+    "platform",
+    "selected_pair_id",
+    "pairs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "exit_item_id": {
+      "const": "S3-L15-RELEASE-AB-WINDOWS"
+    },
+    "platform": {
+      "const": "windows"
+    },
+    "selected_pair_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pairs": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/TrustedPair"
+      }
+    }
+  },
+  "$defs": {
+    "TrustedPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dut_port",
+        "daemon_port",
+        "dut_side_port_id",
+        "daemon_side_port_id",
+        "decision_ref"
+      ],
+      "properties": {
+        "dut_port": {
+          "type": "string",
+          "minLength": 1
+        },
+        "daemon_port": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dut_side_port_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "daemon_side_port_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -674,8 +674,14 @@ def validate_current_lock(
     reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
     try:
         cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root)
+        # 與 4b71d2db 的 `--check` 順序一致：鎖 schema 失敗時立即停止，
+        # seed 來源失敗時也不繼續累加出口、family 或分母診斷。
         errors = _lock_schema_errors(lock)
-        errors.extend(_seed_errors(manifest, root, reader))
+        if errors:
+            return errors
+        errors = _seed_errors(manifest, root, reader)
+        if errors:
+            return errors
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
         seed_required = _seed_required_cases_by_initial_exit(root / EVIDENCE_RELATIVE)
         errors.extend(_validate_initial_exit_catalog(catalog))
