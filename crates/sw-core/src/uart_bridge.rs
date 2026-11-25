@@ -130,14 +130,18 @@ pub struct RxShared {
 #[derive(Default)]
 struct SecretEchoWindow {
     armed: Option<ArmedSecretEcho>,
-    /// 已確認 actor 邊界的後續 secret 行，等目前 RX 行結束或下一段前綴失配後啟用。
+    /// 已分類的後續 secret 行；目前項目完整回顯或安全結算後才啟用。
     queued_human: VecDeque<ArmedSecretEcho>,
     released: VecDeque<ReleasedSecretByte>,
     human_generation: Option<u64>,
     human_writes_in_flight: usize,
     /// 最近一筆 TX matcher 尚未確認該 actor 輸入的行尾。
     human_line_open: bool,
+    /// 尚未由 RX 安全結算的 actor secret 輸入行數；超限時用來避免第一個行尾解除後續遮罩。
+    human_echo_lines_pending: usize,
     overflow_mask_line: bool,
+    /// 超限遮罩狀態下，CRLF 的 LF 已隨前一個 CR 結算過行數。
+    overflow_after_cr: bool,
 }
 
 const HUMAN_SECRET_ECHO_MAX_BYTES: usize = 1024;
@@ -367,7 +371,9 @@ impl RxShared {
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
+        window.human_echo_lines_pending = 0;
         window.overflow_mask_line = false;
+        window.overflow_after_cr = false;
         if !secret.is_empty() {
             window.armed = Some(ArmedSecretEcho {
                 secret: secret.to_vec(),
@@ -454,19 +460,26 @@ impl RxShared {
             }
             window.human_generation = Some(generation);
             window.human_line_open = false;
+            window.human_echo_lines_pending = 0;
+            window.overflow_mask_line = false;
+            window.overflow_after_cr = false;
         }
         window.human_writes_in_flight = window.human_writes_in_flight.saturating_add(1);
-        if window.overflow_mask_line {
-            return 0;
-        }
         if !window.human_line_open {
-            let next = empty_human_secret_echo();
-            if window.armed.is_none() {
-                window.armed = Some(next);
-            } else {
-                window.queued_human.push_back(next);
+            if !window.overflow_mask_line {
+                let next = empty_human_secret_echo();
+                if window.armed.is_none() {
+                    window.armed = Some(next);
+                } else {
+                    window.queued_human.push_back(next);
+                }
             }
             window.human_line_open = true;
+            window.human_echo_lines_pending =
+                window.human_echo_lines_pending.saturating_add(1);
+        }
+        if window.overflow_mask_line {
+            return 0;
         }
         let prior_len = window
             .queued_human
@@ -581,13 +594,25 @@ impl RxShared {
         while index < data.len() {
             let byte = data[index];
             if window.overflow_mask_line {
+                let crlf_tail = window.overflow_after_cr && byte == b'\n';
+                window.overflow_after_cr = false;
                 if matches!(byte, b'\r' | b'\n') {
                     visible.push(byte);
                     rx_window.push(byte);
-                    if window.human_writes_in_flight == 0 {
+                    if !crlf_tail {
+                        if window.human_writes_in_flight == 0 {
+                            window.human_echo_lines_pending =
+                                window.human_echo_lines_pending.saturating_sub(1);
+                        }
+                        window.overflow_after_cr = byte == b'\r';
+                    }
+                    if window.human_echo_lines_pending == 0
+                        && window.human_writes_in_flight == 0
+                    {
                         window.overflow_mask_line = false;
                         window.human_generation = None;
                         window.human_line_open = false;
+                        window.overflow_after_cr = false;
                         if let Some(mut armed) = window.armed.take() {
                             armed.secret.fill(0);
                             armed.pending.fill(0);
@@ -631,30 +656,39 @@ impl RxShared {
                 } else {
                     index
                 };
-                if let Some(mut next) = window.queued_human.pop_front() {
-                    armed.secret.fill(0);
-                    armed.pending.fill(0);
-                    next.after_cr = byte == b'\r';
-                    window.armed = Some(next);
-                    continue;
-                }
                 let next_line = &data[next_line_start..];
                 let next_prefix_len = next_line.len().min(armed.secret.len());
                 let next_line_has_secret_prefix = next_prefix_len > 0
                     && next_line[..next_prefix_len] == armed.secret[..next_prefix_len];
-                if pending_len == armed.secret.len()
+                let full_match = pending_len == armed.secret.len();
+                let safe_to_advance = full_match
                     || (window.human_writes_in_flight == 0
                         && pending_len == 0
-                        && !next_line_has_secret_prefix)
-                {
-                    armed.secret.fill(0);
-                    window.human_generation = None;
-                    window.human_line_open = false;
-                    if index < data.len() {
-                        visible.extend_from_slice(&data[index..]);
-                        rx_window.extend_from_slice(&data[index..]);
+                        && !next_line_has_secret_prefix);
+                if safe_to_advance {
+                    window.human_echo_lines_pending =
+                        window.human_echo_lines_pending.saturating_sub(1);
+                    if let Some(mut next) = window.queued_human.pop_front() {
+                        armed.secret.fill(0);
+                        armed.pending.fill(0);
+                        next.after_cr = byte == b'\r';
+                        window.armed = Some(next);
+                        continue;
                     }
-                    break;
+                    armed.secret.fill(0);
+                    if window.human_echo_lines_pending == 0 {
+                        window.human_generation = None;
+                        window.human_line_open = false;
+                        if index < data.len() {
+                            visible.extend_from_slice(&data[index..]);
+                            rx_window.extend_from_slice(&data[index..]);
+                        }
+                        break;
+                    }
+                    window.overflow_mask_line = true;
+                    window.overflow_after_cr = byte == b'\r';
+                    window.armed = Some(empty_human_secret_echo());
+                    continue;
                 }
                 // 未決前綴跨 CR/LF 時保留 matcher；CRLF 是一個行尾，第二個 byte 不得再次清除。
                 // 若同一讀取 chunk 的下一行已以 secret 前綴開始，也要略過此前緩衝的舊行尾。
@@ -675,6 +709,8 @@ impl RxShared {
             {
                 let pending = std::mem::take(&mut armed.pending);
                 armed.secret.fill(0);
+                window.human_echo_lines_pending =
+                    window.human_echo_lines_pending.saturating_sub(1);
                 let mut next = window
                     .queued_human
                     .pop_front()
@@ -755,7 +791,9 @@ impl RxShared {
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
+        window.human_echo_lines_pending = 0;
         window.overflow_mask_line = false;
+        window.overflow_after_cr = false;
         let mut bytes = Vec::new();
         let mut rx_window = Vec::new();
         for released in window.released.drain(..) {
@@ -781,7 +819,9 @@ impl RxShared {
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
+        window.human_echo_lines_pending = 0;
         window.overflow_mask_line = false;
+        window.overflow_after_cr = false;
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();

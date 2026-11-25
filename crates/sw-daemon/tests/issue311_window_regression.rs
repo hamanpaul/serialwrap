@@ -188,6 +188,24 @@ fn wait_controlled_rx(
     });
 }
 
+fn wait_event_rule_completed(rig: &WindowRig, rule_id: &str, expected: usize) {
+    support::wait_until_within("event sink 完成指定數量的遮罩輸出", Duration::from_secs(3), || {
+        let tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+        let Some(PyValue::List(rows)) = tail.get("entries") else {
+            return false;
+        };
+        let count = |event_type| {
+            rows.iter()
+                .filter(|row| {
+                    row.get("type").and_then(PyValue::as_str) == Some(event_type)
+                        && row.get("rule_id").and_then(PyValue::as_str) == Some(rule_id)
+                })
+                .count()
+        };
+        count("match_recorded") >= expected && count("fire_completed") >= expected
+    });
+}
+
 fn wait_tx(rig: &WindowRig, expected: usize, label: &str) {
     support::wait_until_within(label, Duration::from_secs(3), || rig.device.tx_len() >= expected);
     assert_eq!(rig.device.tx_len(), expected, "{label} 不得多送 UART bytes");
@@ -1005,6 +1023,249 @@ fn issue312_f7_partial_echo_line_end_masks_prefix_in_rx_order() {
         ],
         "event sink 必須先看到遮罩前綴行，再看到失配後資料行"
     );
+}
+
+#[test]
+fn issue312_f7_overflow_keeps_masking_across_registered_secret_lines() {
+    const SECRET_LEN: usize = 600;
+
+    let (rig, client_id, console, log_path) = prompted_secret_rig();
+    rig.device.set_loopback(false);
+    install_event_probe(&rig, "overflow-first-secret-plain", &"A".repeat(16));
+    install_event_probe(&rig, "overflow-second-secret-plain", &"B".repeat(16));
+    install_event_probe(&rig, "overflow-secret-masked", "***");
+
+    let first = vec![b'A'; SECRET_LEN];
+    let second = vec![b'B'; SECRET_LEN];
+    let input = [first.as_slice(), b"\r", second.as_slice()].concat();
+    let tx_start = rig.device.tx_len();
+    console.push_input(&input);
+    wait_tx(&rig, tx_start + input.len(), "兩筆已分類 secret 依序送入 UART");
+    wait_secret_meta_count(&rig, &client_id, 2);
+    let meta_lengths = secret_meta_rows_for(&rig, &client_id)
+        .iter()
+        .filter_map(|row| {
+            row.get("meta")
+                .and_then(|meta| meta.get("secret_len"))
+                .and_then(PyValue::as_i64)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(meta_lengths, vec![SECRET_LEN as i64, SECRET_LEN as i64]);
+    assert_eq!(human_tx_payload(&rig, &client_id), b"\r");
+
+    let console_start = console.written().len();
+    let wal_start = decode_rx_wal(&read_wal(&rig)).len();
+    let mirror_start = rig
+        .service
+        .wfs
+        .contents(&rig.service.wal.mirror_path())
+        .expect("raw.mirror.log")
+        .len();
+    let log_start = std::fs::read_to_string(Path::new(&log_path))
+        .unwrap_or_default()
+        .len();
+
+    let first_echo = [first.as_slice(), b"\r\n"].concat();
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(&first_echo);
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + first_echo.len(),
+        "第一筆超限 secret echo 與行尾已由 reader 消耗",
+    );
+    wait_event_rule_completed(&rig, "o.overflow-secret-masked", 1);
+    let second_echo = [second.as_slice(), b"\r\n"].concat();
+    rig.device.push_rx(&second_echo);
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + first_echo.len() + second_echo.len(),
+        "第一個行尾後仍須遮罩第二筆超限 secret echo",
+    );
+    wait_event_rule_completed(&rig, "o.overflow-secret-masked", 2);
+    rig.service.settle();
+
+    let expected_rx = [
+        vec![b'*'; SECRET_LEN],
+        b"\r\n".to_vec(),
+        vec![b'*'; SECRET_LEN],
+        b"\r\n".to_vec(),
+    ]
+    .concat();
+    let expected_log = [
+        vec![b'*'; SECRET_LEN],
+        b"\n".to_vec(),
+        vec![b'*'; SECRET_LEN],
+        b"\n".to_vec(),
+    ]
+    .concat();
+    assert_eq!(
+        decode_rx_wal(&read_wal(&rig))[wal_start..],
+        expected_rx,
+        "RX WAL 必須跨已登記的多筆 secret 行維持 fail-safe 遮罩"
+    );
+    assert_eq!(
+        &rig
+            .service
+            .wfs
+            .contents(&rig.service.wal.mirror_path())
+            .expect("raw.mirror.log")[mirror_start..],
+        expected_rx,
+        "raw.mirror.log 必須跨已登記的多筆 secret 行維持 fail-safe 遮罩"
+    );
+    assert_eq!(
+        console.written()[console_start..],
+        expected_rx,
+        "human console 必須跨已登記的多筆 secret 行維持 fail-safe 遮罩"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&log_path))
+            .expect("agent log")
+            .as_bytes()[log_start..],
+        expected_log,
+        "agent log 必須跨已登記的多筆 secret 行維持 fail-safe 遮罩"
+    );
+    let event_tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+    let events = match event_tail.get("entries") {
+        Some(PyValue::List(events)) => events,
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    assert!(
+        !events.iter().any(|event| {
+            event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                && matches!(
+                    event.get("rule_id").and_then(PyValue::as_str),
+                    Some("o.overflow-first-secret-plain" | "o.overflow-second-secret-plain")
+                )
+        }),
+        "event sink 不得收到超限 secret 明文：{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                    && event.get("rule_id").and_then(PyValue::as_str)
+                        == Some("o.overflow-secret-masked")
+            })
+            .count(),
+        2,
+        "event sink 必須收到兩行遮罩輸出：{events:?}"
+    );
+    assert_secret_sinks_clear(&rig, &console, &log_path, &first);
+    assert_secret_sinks_clear(&rig, &console, &log_path, &second);
+}
+
+#[test]
+fn issue312_f7_queued_matcher_preserves_partial_secret_for_later_echo() {
+    let (rig, client_id, console, log_path) = prompted_secret_rig();
+    rig.device.set_loopback(false);
+    install_event_probe(&rig, "queued-first-secret-plain", "alpha");
+    install_event_probe(&rig, "queued-second-secret-plain", "bravo");
+    install_event_probe(&rig, "queued-secret-masked", "**");
+
+    let input = b"alpha\rbravo";
+    let tx_start = rig.device.tx_len();
+    console.push_input(input);
+    wait_tx(&rig, tx_start + input.len(), "已分類 alpha 與 bravo 依序送入 UART");
+    wait_secret_meta_count(&rig, &client_id, 2);
+    let meta_lengths = secret_meta_rows_for(&rig, &client_id)
+        .iter()
+        .filter_map(|row| {
+            row.get("meta")
+                .and_then(|meta| meta.get("secret_len"))
+                .and_then(PyValue::as_i64)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(meta_lengths, vec![5, 5]);
+    assert_eq!(human_tx_payload(&rig, &client_id), b"\r");
+
+    let console_start = console.written().len();
+    let wal_start = decode_rx_wal(&read_wal(&rig)).len();
+    let mirror_start = rig
+        .service
+        .wfs
+        .contents(&rig.service.wal.mirror_path())
+        .expect("raw.mirror.log")
+        .len();
+    let log_start = std::fs::read_to_string(Path::new(&log_path))
+        .unwrap_or_default()
+        .len();
+    let echoes: [&[u8]; 3] = [b"al\r\n", b"alpha\r\n", b"bravo\r\n"];
+    let rx_start = rig.device.rx_bytes_read();
+    let mut expected_read = rx_start;
+    for (index, echo) in echoes.iter().enumerate() {
+        rig.device.push_rx(echo);
+        expected_read += echo.len();
+        wait_controlled_rx(
+            &rig.device,
+            expected_read,
+            [
+                "reader 收到第一筆 secret 的部分 echo 與行尾",
+                "reader 收到第一筆 secret 延後的完整重繪",
+                "reader 收到第二筆 secret echo",
+            ][index],
+        );
+        wait_event_rule_completed(&rig, "o.queued-secret-masked", index + 1);
+    }
+    rig.service.settle();
+
+    let expected_rx = b"**\r\n*****\r\n*****\r\n".to_vec();
+    let expected_log = b"**\n*****\n*****\n".to_vec();
+    assert_eq!(
+        decode_rx_wal(&read_wal(&rig))[wal_start..],
+        expected_rx,
+        "RX WAL 必須保留部分 echo 前綴遮罩，並依序辨識 alpha、bravo"
+    );
+    assert_eq!(
+        &rig
+            .service
+            .wfs
+            .contents(&rig.service.wal.mirror_path())
+            .expect("raw.mirror.log")[mirror_start..],
+        expected_rx,
+        "raw.mirror.log 必須維持遮罩後的 RX 位元組順序"
+    );
+    assert_eq!(
+        console.written()[console_start..],
+        expected_rx,
+        "human console 必須維持遮罩後的 RX 位元組順序"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&log_path))
+            .expect("agent log")
+            .as_bytes()[log_start..],
+        expected_log,
+        "agent log 必須維持遮罩後的行序"
+    );
+    let event_tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+    let events = match event_tail.get("entries") {
+        Some(PyValue::List(events)) => events,
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    assert!(
+        !events.iter().any(|event| {
+            event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                && matches!(
+                    event.get("rule_id").and_then(PyValue::as_str),
+                    Some("o.queued-first-secret-plain" | "o.queued-second-secret-plain")
+                )
+        }),
+        "event sink 不得收到未遮罩的 secret：{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                    && event.get("rule_id").and_then(PyValue::as_str)
+                        == Some("o.queued-secret-masked")
+            })
+            .count(),
+        3,
+        "event sink 必須依序看到三行遮罩輸出：{events:?}"
+    );
+    assert_secret_sinks_clear(&rig, &console, &log_path, b"alpha");
+    assert_secret_sinks_clear(&rig, &console, &log_path, b"bravo");
 }
 
 #[test]
