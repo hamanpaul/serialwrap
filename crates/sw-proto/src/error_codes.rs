@@ -27,7 +27,7 @@ pub enum ErrorCode {
     CmdNotCancelable,
     /// cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果
     CmdNotFound,
-    /// 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交
+    /// 命令的 UTF-8 長度超過硬上限 16384 bytes，或超過 session profile 的 max_console_line_chars（console 單行上限，不含結尾換行），拒絕提交；limit 為實際套用的上限
     CmdTooLong,
     /// 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止；file.push／file.pull 為傳輸已寫出至少 1 byte 後，因 drain、世代過期或取消而中止（OD-62）
     CommandAbortedInFlight,

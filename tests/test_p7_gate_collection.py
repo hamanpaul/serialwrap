@@ -106,3 +106,35 @@ def test_od78_replacement_preserves_continue_on_error_coverage() -> None:
     assert "tests/test_release_workflow.py::test_workflow_does_not_build_windows_bundle_and_has_no_continue_on_error" not in nodes
     source = (ROOT / "tests/test_release_workflow.py").read_text(encoding="utf-8")
     assert "def test_no_job_or_step_uses_continue_on_error(" in source
+
+
+def test_rust_only_console_line_limit_is_owned_by_rust_p7_set() -> None:
+    """Python 凍結集合不得要求 rust_only 節點，P7 Rust gate 必須逐名收集並執行它。"""
+    lock = _lock()["sets"]
+    nodeid = (
+        "tests/contract_blackbox/test_bb_console_line_limit.py::"
+        "test_submit_over_profile_line_limit_rejected_zero_tx"
+    )
+    for set_id in ("p7_gate:python3-m-pytest-q-tests", "s21_gate:pytest_full"):
+        assert nodeid not in lock[set_id]["linux"]["nodeids"], (
+            f"{set_id}.linux 是 Python 基線必要集合，不得要求必定 skip 的 rust_only 節點"
+        )
+
+    rust_set_id = "p7_gate:rust-only-console-line-limit"
+    assert lock[rust_set_id]["linux"]["nodeids"] == [nodeid]
+    selector = lock[rust_set_id]["linux"]["selector"]
+    assert selector == {
+        "argv": [
+            "-q", "-p", "no:cacheprovider", "-m", "rust_only",
+            "tests/contract_blackbox/test_bb_console_line_limit.py",
+        ],
+        "paths": ["tests/contract_blackbox/test_bb_console_line_limit.py"],
+        "markexpr": "rust_only",
+    }
+
+    gate = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    assert 'run_row "Rust-only console line limit" rust-only-console-line-limit' in gate
+    assert 'SERIALWRAP_CLI_EXE="$RUST_CLI"' in gate
+    assert 'SERIALWRAP_DAEMON_EXE="$RUST_D"' in gate
+    assert "SERIALWRAP_AB_LABEL=rust-p7" in gate
+    assert 'SW_RESOURCE_REPORT="$LINE_LIMIT_DIR/l1-results.json"' in gate
