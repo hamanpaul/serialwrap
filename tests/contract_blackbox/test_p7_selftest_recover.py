@@ -349,7 +349,7 @@ def test_recover_force_timeout_attached(p7, tmp_path):
 
 
 def test_recover_force_on_ready_runs_keys_first(p7, tmp_path):
-    """READY、target 靜默：`recover --force` 先跑救援按鍵（`\\x03`、`\\x04`），回 PROMPT_TIMEOUT＋partial，14～17 s。"""
+    """READY、target 靜默：`recover --force` 依實作預設救援鍵後回 PROMPT_TIMEOUT＋partial。"""
     tgt = FakeTarget(tmp_path / "t0")
     p7.start("shell", [tgt])
     wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
@@ -361,9 +361,14 @@ def test_recover_force_on_ready_runs_keys_first(p7, tmp_path):
     assert rc == 2, (rc, j)
     assert {k: j[k] for k in ("ok", "error_code", "partial", "recovery_action")} == {
         "ok": False, "error_code": "PROMPT_TIMEOUT", "partial": True, "recovery_action": "NONE"}, j
-    assert 14.0 <= elapsed <= 17.0, f"耗時 {elapsed:.2f} s"
+    if is_rust():
+        assert 12.0 <= elapsed <= 15.0, f"Rust 單一 CTRL_C 耗時 {elapsed:.2f} s"
+    else:
+        assert 14.0 <= elapsed <= 17.0, f"Python CTRL_C／CTRL_D 耗時 {elapsed:.2f} s"
     sent = tgt.rx_log_since(mark)
-    assert sent.startswith(b"\x03\x04"), sent
+    recovery_keys = b"\x03" if is_rust() else b"\x03\x04"
+    # prompt timeout 後既有 Force fallback 會重開 bridge，attach 另送一個 LF probe。
+    assert sent == recovery_keys + b"\n", sent
 
 
 def test_recover_ready_ctrl_c(p7, tmp_path):

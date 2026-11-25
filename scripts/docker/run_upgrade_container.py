@@ -386,8 +386,10 @@ class Driver:
         """驗證安裝中的 CLI 與 bundle 候選位元組一致，再用該 CLI 確認內嵌 p290 key。"""
         field = "timeout_recovery_keys"
         candidate_version = self.bundle / "versions" / NEW_VERSION
-        candidate_cli = candidate_version / "bin" / "serialwrap"
-        active_cli = shutil.which("serialwrap", path=self.env.get("PATH", ""))
+        cli_name = self.new_cli.name
+        cli_command = pathlib.Path(cli_name).stem
+        candidate_cli = candidate_version / "bin" / cli_name
+        active_cli = shutil.which(cli_command, path=self.env.get("PATH", ""))
         evidence: dict[str, Any] = {
             "candidate_cli_path": str(candidate_cli),
             "target_asset_path": str(target_asset),
@@ -416,7 +418,7 @@ class Driver:
             return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
                           **evidence)
         if active_real is None or installed_version_real is None \
-                or active_real != installed_version_real / "bin" / "serialwrap" \
+                or active_real != installed_version_real / "bin" / cli_name \
                 or installed_version_real.name != NEW_VERSION \
                 or installed_version_real == candidate_version_real:
             return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次安裝的候選版本",

@@ -18,6 +18,7 @@ from bb_harness import (
     isolated_env,
     python_baseline_prefix,
     repo_root,
+    rust_daemon_code_fingerprint,
 )
 from bb_l15 import in_isolated_pidns
 
@@ -90,7 +91,7 @@ def _bundle_has_python_oracle(bundle_root: Path) -> bool:
     py = bundle_root / "py" / "bin" / "python3"
     if not py.exists():
         return False
-    res = subprocess.run([str(py), "-I", "-c", "import sw_core"], capture_output=True, text=True, timeout=30)
+    res = subprocess.run([str(py), "-I", "-B", "-c", "import sw_core"], capture_output=True, text=True, timeout=30)
     return res.returncode == 0
 
 
@@ -276,7 +277,7 @@ def test_doctor_profile_template_fields_exact_payload(tmp_path: Path) -> None:
         for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
     } == {
         "comparison_status": "missing_fields",
-        "missing_fields": {"prpl-template": ["boot_done_regex", "bootloader_prompts"]},
+        "missing_fields": {"prpl-template": ["boot_done_regex", "bootloader_prompts", "timeout_recovery_keys"]},
         "compared_templates": ["prpl-template"],
         "reason": None,
     }
@@ -333,7 +334,7 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
     # 則以凍結的 Python 基線對同一份 manifest 與檔案執行（version_pairing 只比對 manifest 目錄內的檔案）。
     full_oracle = _bundle_has_python_oracle(bundle_root)
     if full_oracle:
-        py_doctor = [str(bundle_root / "py" / "bin" / "python3"), "-I", "-m", "sw_core.cli", "doctor"]
+        py_doctor = [str(bundle_root / "py" / "bin" / "python3"), "-I", "-B", "-m", "sw_core.cli", "doctor"]
     else:
         py_doctor = python_baseline_prefix() + ["doctor"]
 
@@ -358,6 +359,27 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
         assert [c["check"] for c in shared_rust_checks] == [c["check"] for c in py_checks], f"{state}: Python 19 項順序或集合不一致（證據 {evidence}）"
         for py_item, rust_item in zip(py_checks, shared_rust_checks):
             name = py_item["check"]
+            if name == "daemon_code_current":
+                # 此 advisory 比對各 CLI 與目前 daemon 的實作指紋；Stage 2 Rust daemon 的指紋不等於 Python 基線。
+                assert py_item["advisory"] is True and rust_item["advisory"] is True, state
+                if state == "daemon_down":
+                    expected = {
+                        "advisory": True,
+                        "check": "daemon_code_current",
+                        "detail": "daemon 未在跑或無法連線，略過",
+                        "fix": "",
+                        "ok": True,
+                    }
+                    assert py_item == rust_item == expected, (state, py_item, rust_item)
+                elif is_rust():
+                    daemon_fp = rust_daemon_code_fingerprint()
+                    assert rust_item["ok"] is True, (state, rust_item, evidence)
+                    assert rust_item["detail"] == f"daemon 與目前安裝的程式碼相同（code {daemon_fp}）", rust_item
+                    assert py_item["ok"] is False, (state, py_item, evidence)
+                    assert f"code {daemon_fp}" in py_item["detail"], py_item
+                else:
+                    assert py_item["ok"] is True and rust_item["ok"] is True, (state, py_item, rust_item)
+                continue
             if not full_oracle and name in _RUNTIME_CHECK_NAMES:
                 # 基線 interpreter 與 artifact 內的 runtime 可能不同，只比名稱與 advisory。
                 assert rust_item["advisory"] == py_item["advisory"], f"{state}: check={name} advisory mismatch"
@@ -390,6 +412,7 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
 
     from bb_daemon import PyDaemon
 
+    # A 輪以 Python daemon、B 輪以候選 daemon；daemon_code_current 是依實作指紋判定的 advisory。
     daemon = PyDaemon(env2, profile_dir=profile2, socket=str(run2 / "serialwrapd.sock"), lock=work2 / "daemon.lock")
     daemon.start()
     try:

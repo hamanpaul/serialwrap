@@ -497,7 +497,7 @@ class _FakeContainer:
             if argv[1:2] == ["install"]:
                 self.cli = "0.3.2"
             return self._done(argv, 0)
-        if argv and argv[0].endswith("/bin/serialwrap") and argv[1:2] == ["setup"]:
+        if argv and Path(argv[0]).stem == "serialwrap" and Path(argv[0]).parent.name == "bin" and argv[1:2] == ["setup"]:
             self.cli = NEW_VERSION if not self.old_alive() else self.cli
             return self._guarded(f"{NEW_VERSION} setup", argv, {"ok": True, "install": {
                 "op": "install", "from_version": "0.3.2", "to_version": NEW_VERSION, "steps": []}})
@@ -551,14 +551,15 @@ def fake_driver(tmp_path, monkeypatch):
         target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
                         / "default.yaml")
         _write_p290_profile_fixtures(driver, target_asset, driver.doctor_profile_dir / "default.yaml")
-        candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+        cli_name = "serialwrap.exe" if os.name == "nt" else "serialwrap"
+        candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
         candidate_cli.parent.mkdir(parents=True, exist_ok=True)
         candidate_cli.write_bytes(b"candidate CLI embedded profile asset\n" + target_asset.read_bytes())
         candidate_cli.chmod(0o755)
         driver.new_cli = candidate_cli
         installed_version = tmp_path / f"installed-{len(made)}" / "versions" / NEW_VERSION
         shutil.copytree(candidate_cli.parent.parent, installed_version)
-        installed_cli = installed_version / "bin" / "serialwrap"
+        installed_cli = installed_version / "bin" / cli_name
         driver.env["PATH"] = str(installed_cli.parent)
 
         candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
@@ -575,7 +576,7 @@ def fake_driver(tmp_path, monkeypatch):
         monkeypatch.setattr(subprocess, "run", run_profile_probe)
 
         def run(argv, *, timeout=300.0, label=""):
-            if argv and Path(argv[0]).name == "serialwrap" and argv[1:] == ["doctor"]:
+            if argv and Path(argv[0]).stem == "serialwrap" and argv[1:] == ["doctor"]:
                 probed_cli = Path(argv[0]).resolve()
                 reports_p290 = b"timeout_recovery_keys" in probed_cli.read_bytes()
                 profile_check = {
@@ -633,7 +634,7 @@ def test_fake_driver_setup_without_symlink_permission(request, monkeypatch):
     driver, fake = make_driver(cli_version=NEW_VERSION)
 
     assert driver.new_cli.is_file()
-    assert (Path(driver.env["PATH"]) / "serialwrap").is_file()
+    assert (Path(driver.env["PATH"]) / driver.new_cli.name).is_file()
     assert fake.proc.is_dir()
 
 
@@ -1443,11 +1444,11 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
     del stale_document["profiles"]["prpl-template"]["timeout_recovery_keys"]
     stale_asset = yaml.safe_dump(stale_document, sort_keys=False, allow_unicode=True).encode("utf-8")
     assert "boot_done_regex" in stale_document["profiles"]["prpl-template"]
-    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / driver.new_cli.name
     candidate_cli.write_bytes(b"candidate CLI with stale embedded asset\n" + stale_asset)
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(candidate_cli.parent.parent, installed_version)
-    installed_cli = installed_version / "bin" / "serialwrap"
+    installed_cli = installed_version / "bin" / driver.new_cli.name
     driver.env["PATH"] = str(installed_cli.parent)
     doctor_before_probe = driver.parse(driver.sw("doctor"))
     profile_before_probe = next(check for check in doctor_before_probe["checks"]
@@ -1743,7 +1744,7 @@ def test_profile_template_migration_decodes_escaped_quoted_key(fake_driver, monk
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path):
+def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, monkeypatch):
     """安裝後 CLI 位於版本目錄副本時，須驗證副本後再執行內嵌資產 probe。"""
     import shutil
 
@@ -1751,7 +1752,7 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path):
     source_version = driver.bundle / "versions" / NEW_VERSION
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(source_version, installed_version)
-    installed_cli = installed_version / "bin" / "serialwrap"
+    installed_cli = installed_version / "bin" / driver.new_cli.name
     driver.env["PATH"] = str(installed_cli.parent)
 
     result = driver.judge_doctor(
@@ -1763,6 +1764,37 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path):
     assert embedded["verdict"] == "PASS", embedded
     assert embedded["detail"]["active_cli_path"] == str(installed_cli.resolve())
     assert embedded["detail"]["candidate_cli_sha256"] == embedded["detail"]["active_cli_sha256"]
+
+    # 在 Linux 注入 Windows 的可執行檔名稱與 PATH 查找結果，重現 Windows CI 的 PATHEXT 路徑。
+    windows_bundle = tmp_path / "windows-bundle"
+    windows_version = windows_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, windows_version)
+    windows_candidate = windows_version / "bin" / "serialwrap.exe"
+    windows_candidate.write_bytes(driver.new_cli.read_bytes())
+    windows_installed_version = tmp_path / "windows-installed" / "versions" / NEW_VERSION
+    shutil.copytree(windows_version, windows_installed_version)
+    windows_installed_cli = windows_installed_version / "bin" / "serialwrap.exe"
+    driver.bundle = windows_bundle
+    driver.new_cli = windows_candidate
+    driver.env["PATH"] = str(windows_installed_cli.parent)
+    driver_module = driver._driver_module
+    original_which = driver_module.shutil.which
+
+    def windows_which(command, mode=os.F_OK | os.X_OK, path=None):
+        if command == "serialwrap":
+            candidate = Path(path) / "serialwrap.exe"
+            return str(candidate) if candidate.is_file() else None
+        return original_which(command, mode=mode, path=path)
+
+    monkeypatch.setattr(driver_module.shutil, "which", windows_which)
+    windows_result = driver.judge_doctor(
+        "doctor_green_new", "Windows .exe 安裝副本", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert windows_result["verdict"] == "PASS", windows_result
+    windows_embedded = windows_result["detail"]["candidate_cli_p290_asset"]
+    assert windows_embedded["verdict"] == "PASS", windows_embedded
+    assert windows_embedded["detail"]["active_cli_path"] == str(windows_installed_cli.resolve())
 
 
 @pytest.mark.core_portable
@@ -1776,7 +1808,7 @@ def test_upgrade_rejects_stale_embedded_asset_in_installed_copy(fake_driver, tmp
     source_version = driver.bundle / "versions" / NEW_VERSION
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(source_version, installed_version)
-    installed_cli = installed_version / "bin" / "serialwrap"
+    installed_cli = installed_version / "bin" / driver.new_cli.name
     target_asset = source_version / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
     parsed = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
     del parsed["profiles"]["prpl-template"]["timeout_recovery_keys"]
@@ -2179,7 +2211,7 @@ def test_p290_system_profile_overwrite_without_bytes_is_insufficient():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_p290_long_comment_profile_comparison_is_iterative():
+def test_p290_long_comment_profile_comparison_is_iterative(monkeypatch):
     """超過 Python 遞迴上限的合法插入與非法改寫都要得到結構化判定。"""
     import hashlib
 
@@ -2196,6 +2228,15 @@ def test_p290_long_comment_profile_comparison_is_iterative():
             before_bytes={path: before},
             after_bytes={path: candidate},
         )
+
+    # Windows pipe stdin may use a legacy code page. Wrap the child probe's decoder
+    # portably so UTF-8 bytes for Chinese comments fail under CP-1252 on either host.
+    monkeypatch.setattr(
+        uc,
+        "_P290_YAML_PROBE",
+        "import io, sys\nsys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='cp1252')\n"
+        + uc._P290_YAML_PROBE,
+    )
 
     assert judge(after)["verdict"] == "PASS"
     illegal = after.replace("# 保留註解 1\n".encode("utf-8"), b"# changed\n", 1)

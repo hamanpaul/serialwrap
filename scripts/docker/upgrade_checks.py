@@ -420,7 +420,8 @@ def _p290_yaml_migration_probe(before: bytes, after: bytes, *,
     for value in (candidate_python, fallback_python, sys.executable):
         if value is not None and str(value) not in interpreters:
             interpreters.append(str(value))
-    payload = json.dumps({"before": before_text, "after": after_text}, ensure_ascii=False).encode("utf-8")
+    # JSON 在 pipe 上只使用 ASCII，避免 Windows 非 UTF-8 stdin locale 破壞 YAML Unicode 內容。
+    payload = json.dumps({"before": before_text, "after": after_text}, ensure_ascii=True).encode("ascii")
     attempts: list[dict[str, Any]] = []
     for interpreter in interpreters:
         try:
