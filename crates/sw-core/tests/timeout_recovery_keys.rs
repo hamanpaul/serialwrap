@@ -387,10 +387,19 @@ fn cancel_after_first_key_blocks_remaining_keys() {
     let h = ActorRig::new(&shell_profile(Some("[CTRL_C, CTRL_D]"), None)).ready();
     let id = h.submit_with("cat", |req| req.timeout_s = 1.0);
     h.wait_for("命令 TX 寫出", |h| wal_tx_has(h, b"cat\n"));
-    h.advance(Duration::from_secs(1));
-    h.wait_for("第一個救援鍵 TX", |h| {
-        recovery_keys_sent(h) == vec![0x03]
-    });
+    // 命令期限可能在 WAL 記下命令 TX 之後才設好；只推一次 1 s 會早於期限而永遠等不到救援鍵。
+    // 改為小步推進 FakeClock，每步以實際時間等 WAL 跟上；看到第一個鍵即停，最多多推 100 ms，
+    // 第二個鍵還需再 1 s，不會在取消前送出。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while recovery_keys_sent(&h).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "等待逾時：第一個救援鍵 TX");
+        h.advance(Duration::from_millis(100));
+        let settle = std::time::Instant::now() + Duration::from_millis(200);
+        while recovery_keys_sent(&h).is_empty() && std::time::Instant::now() < settle {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert_eq!(recovery_keys_sent(&h), vec![0x03], "取消前只能送出第一個救援鍵");
 
     let cancelled = h.request(SessionRequest::CancelQueued { cmd_id: id.clone() });
     assert_eq!(cancelled["ok"], PyValue::Bool(true));
