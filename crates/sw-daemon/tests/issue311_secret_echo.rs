@@ -2967,15 +2967,11 @@ fn issue312_line_buffer_command_shaped_password_is_meta_only() {
         Some(PyValue::Dict(session)) => session,
         other => panic!("interactive command session state: {other:?}"),
     };
-    let interactive_id = session
-        .get("interactive_session_id")
-        .and_then(PyValue::as_str)
-        .expect("vim 命令開啟 interactive lease");
-    let closed = rig.service.call(
-        "session.interactive_close",
-        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "密碼行即使文字像互動命令，也不得建立 interactive lease：{session:?}"
     );
-    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)), "{closed:?}");
 
     line_console.push_input(b"after-cmd\r");
     issue312_wait_tx(

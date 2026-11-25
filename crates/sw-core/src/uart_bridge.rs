@@ -358,29 +358,32 @@ impl RxShared {
         SecretEchoGuard { start_from }
     }
 
-    /// 依 TX 寫出順序判斷 session 密碼窗口；鎖住 reader tracker 直到 OS write 回報，
-    /// 使提示辨識、echo 登記、TX 寫入與換行消耗形成單一有序區段。
+    /// 依 TX 寫出順序判斷 session 密碼窗口；只持鎖完成分類與 echo 登記，OS write
+    /// 與任何可能阻塞的等待一律以當下取得的世代快照執行。
     pub(crate) fn with_human_tx_window<T>(
         &self,
         payload: &[u8],
         write: impl FnOnce(usize) -> (T, usize, bool),
     ) -> (T, usize, usize) {
-        let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
-        let generation = tracker.generation;
-        let active = generation > tracker.rx_end_generation
-            && generation > tracker.tx_consumed_generation;
-        let line_end = payload
-            .iter()
-            .position(|byte| matches!(byte, b'\r' | b'\n'));
-        let secret_len = if active {
-            line_end.unwrap_or(payload.len())
-        } else {
-            0
-        };
-        let prior_echo_len = if secret_len > 0 {
-            Some(self.register_human_secret_echo(generation, &payload[..secret_len]))
-        } else {
-            None
+        let (generation, line_end, secret_len, prior_echo_len) = {
+            let tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
+            let generation = tracker.generation;
+            let active = generation > tracker.rx_end_generation
+                && generation > tracker.tx_consumed_generation;
+            let line_end = payload
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'));
+            let secret_len = if active {
+                line_end.unwrap_or(payload.len())
+            } else {
+                0
+            };
+            let prior_echo_len = if secret_len > 0 {
+                Some(self.register_human_secret_echo(generation, &payload[..secret_len]))
+            } else {
+                None
+            };
+            (generation, line_end, secret_len, prior_echo_len)
         };
 
         let (result, confirmed, unknown) = write(secret_len);
@@ -391,6 +394,7 @@ impl RxShared {
             }
         }
         if generation > 0 && line_end.is_some_and(|end| end < confirmed) {
+            let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
             tracker.tx_consumed_generation = tracker.tx_consumed_generation.max(generation);
         }
         (result, secret_len, confirmed)
@@ -642,6 +646,17 @@ impl RxShared {
     #[cfg(test)]
     pub(crate) fn issue311_test_mask_secret_echo(&self, data: &[u8]) -> Vec<u8> {
         self.mask_secret_echo(data).bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue311_test_human_secret_echo_storage_len(&self) -> usize {
+        let window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let armed = window
+            .armed
+            .as_ref()
+            .map(|armed| armed.secret.len().saturating_add(armed.pending.len()))
+            .unwrap_or_default();
+        window.released.len().saturating_add(armed)
     }
 
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
@@ -1752,4 +1767,37 @@ pub fn wait_for_rx_dispatch_with_timeout_for_test(
     timeout: Duration,
 ) -> Result<(), PalError> {
     wait_for_rx_dispatch_with_timeout(safety, epoch, rx_seq, timeout)
+}
+
+#[cfg(test)]
+mod issue311_window_tests {
+    use super::{RxShared, HUMAN_SECRET_ECHO_MAX_BYTES};
+
+    #[test]
+    fn issue311_human_secret_echo_registration_storage_is_bounded() {
+        let rx = RxShared::new(1024, 0);
+        let stream = vec![b'Z'; HUMAN_SECRET_ECHO_MAX_BYTES * 2 + 37];
+
+        for chunk in stream.chunks(113) {
+            rx.register_human_secret_echo(1, chunk);
+            assert!(
+                rx.issue311_test_human_secret_echo_storage_len()
+                    <= HUMAN_SECRET_ECHO_MAX_BYTES,
+                "secret 登記量不得跨越每窗口 1024-byte 上限"
+            );
+        }
+
+        for byte in stream {
+            assert_eq!(
+                rx.issue311_test_mask_secret_echo(&[byte]),
+                b"*".to_vec(),
+                "跨上限後無換行 RX 每個 byte 都必須遮罩"
+            );
+            assert!(
+                rx.issue311_test_human_secret_echo_storage_len()
+                    <= HUMAN_SECRET_ECHO_MAX_BYTES,
+                "連續 RX 不得讓 secret 登記再次增長"
+            );
+        }
+    }
 }

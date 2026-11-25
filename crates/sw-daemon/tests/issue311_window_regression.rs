@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use support::{RigSpec, ServiceRig, BY_ID_A, REAL_A};
@@ -491,6 +492,56 @@ fn issue312_line_buffer_loopback_masks_each_secret_echo_byte() {
 }
 
 #[test]
+fn issue312_would_block_human_tx_keeps_rx_and_shutdown_moving() {
+    let (rig, _client_id, console, _log_path) = prompted_secret_rig();
+    rig.device
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
+
+    let tx_start = rig.device.tx_len();
+    console.push_input(&[RAW_SECRET.as_bytes(), b"\r"].concat());
+    assert!(
+        rig.device.wait_paused(Duration::from_secs(3)),
+        "human TX 應在接受前綴後停在 would-block"
+    );
+    assert_eq!(
+        rig.device.tx_since(tx_start),
+        RAW_SECRET.as_bytes()[..3],
+        "would-block 前只能確認前三個 bytes"
+    );
+
+    let progress = b"rx-progress-while-tx-waits";
+    rig.device.push_rx(progress);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut published_during_pause = false;
+    while Instant::now() < deadline {
+        if console
+            .written()
+            .windows(progress.len())
+            .any(|window| window == progress)
+        {
+            published_during_pause = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let manager = rig.service.mgr.clone();
+    let stop = thread::spawn(move || manager.shutdown(Duration::from_secs(3)));
+    thread::sleep(Duration::from_millis(20));
+    rig.device.release_pause();
+    let drained = stop.join().expect("shutdown thread 不應 panic");
+
+    assert!(
+        published_during_pause,
+        "TX writer 等待可寫期間，reader 不得被 password tracker 鎖停止發布"
+    );
+    assert!(
+        drained.iter().all(|(_, ok)| *ok),
+        "TX would-block 後 shutdown 應收斂：{drained:?}"
+    );
+}
+
+#[test]
 fn issue312_echo_registration_over_1024_masks_the_entire_rx_line() {
     let rig = build_window_rig();
     let (client_id, console) = attach_console(&rig);
@@ -501,9 +552,9 @@ fn issue312_echo_registration_over_1024_masks_the_entire_rx_line() {
         .and_then(PyValue::as_str)
         .expect("log_path")
         .to_string();
-    let secret = vec![b'Z'; 1025];
-    let secret_text = String::from_utf8(secret.clone()).expect("ASCII secret");
-    install_event_probe(&rig, "over-cap-secret-plain", &secret_text);
+    rig.device.set_loopback(false);
+    let secret = vec![b'Z'; 1024 + 37];
+    install_event_probe(&rig, "over-cap-secret-plain", "Z");
     install_event_probe(&rig, "over-cap-secret-masked", "***");
     let enabled = rig
         .service
@@ -517,15 +568,85 @@ fn issue312_echo_registration_over_1024_masks_the_entire_rx_line() {
     wait_console_contains(&console, b"Password: ", "over-cap 輸入 prompt barrier");
 
     let tx_start = rig.device.tx_len();
-    console.push_input(&[secret.as_slice(), b"\r"].concat());
-    wait_tx(&rig, tx_start + secret.len() + 1, "超過 1024 bytes 的 secret TX");
-    support::wait_until_within("over-cap loopback echo 經 reader", Duration::from_secs(5), || {
-        rig.device.rx_bytes_read() > rx_start + b"Password: ".len() + secret.len()
+    let chunks = secret
+        .chunks(137)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let mut sent = 0;
+    for chunk in &chunks {
+        console.push_input(chunk);
+        sent += chunk.len();
+        wait_tx(
+            &rig,
+            tx_start + sent,
+            "超限後仍持續送出沒有換行的 secret stream",
+        );
+    }
+    console.push_input(b"\r");
+    wait_tx(&rig, tx_start + secret.len() + 1, "secret stream 最後換行");
+
+    let console_start = console.written().len();
+    let wal_start = decode_wal(&read_wal(&rig)).len();
+    let log_start = std::fs::read_to_string(Path::new(&log_path))
+        .unwrap_or_default()
+        .len();
+    let mut expected_rx = Vec::with_capacity(secret.len() + 2);
+    for (index, byte) in secret.iter().enumerate() {
+        rig.device.push_rx(&[*byte]);
+        expected_rx.push(b'*');
+        support::wait_until_within(
+            "over-cap echo 的每個 RX byte 經所有持久 sink",
+            Duration::from_secs(3),
+            || {
+                let console_bytes = console.written();
+                let wal_bytes = decode_wal(&read_wal(&rig));
+                let log_bytes = std::fs::read_to_string(Path::new(&log_path)).unwrap_or_default();
+                console_bytes.get(console_start..).is_some_and(|tail| tail == expected_rx)
+                    && wal_bytes.get(wal_start..).is_some_and(|tail| tail == expected_rx)
+                    && log_bytes
+                        .as_bytes()
+                        .get(log_start..)
+                        .is_some_and(|tail| tail == expected_rx)
+            },
+        );
+        let event_text = format!("{:?}", rig.service.call("event.tail", r#"{"n":-1}"#));
+        assert!(
+            !event_text.contains('Z'),
+            "event 在 RX byte {index} 前不得看到未遮罩 secret：{event_text}"
+        );
+    }
+    rig.device.push_rx(b"\r\n");
+    expected_rx.extend_from_slice(b"\r\n");
+    let mut expected_log = expected_rx[..secret.len()].to_vec();
+    expected_log.push(b'\n');
+    let line_end_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let console_bytes = console.written();
+        let wal_bytes = decode_wal(&read_wal(&rig));
+        let log_bytes = std::fs::read_to_string(Path::new(&log_path)).unwrap_or_default();
+        let console_tail = console_bytes.get(console_start..);
+        let wal_tail = wal_bytes.get(wal_start..);
+        let log_tail = log_bytes.as_bytes().get(log_start..);
+        if console_tail == Some(expected_rx.as_slice())
+            && wal_tail == Some(expected_rx.as_slice())
+            && log_tail == Some(expected_log.as_slice())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < line_end_deadline,
+            "over-cap 行尾未同步到所有 sink：console_len={} WAL_len={} log_len={} expected_len={}",
+            console_tail.map_or(0, <[u8]>::len),
+            wal_tail.map_or(0, <[u8]>::len),
+            log_tail.map_or(0, <[u8]>::len),
+            expected_rx.len()
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    support::wait_until_within("over-cap masked line 進 event", Duration::from_secs(3), || {
+        format!("{:?}", rig.service.call("event.tail", r#"{"n":-1}"#)).contains("***")
     });
-    support::wait_until_within("over-cap echo 進 agent log", Duration::from_secs(3), || {
-        std::fs::read_to_string(Path::new(&log_path))
-            .is_ok_and(|text| text.contains("***"))
-    });
+
     let rows = read_wal(&rig)
         .lines()
         .filter_map(|line| sw_proto::pyjson::loads(line).ok())
@@ -543,14 +664,28 @@ fn issue312_echo_registration_over_1024_masks_the_entire_rx_line() {
                     == Some("secret_tx")
         })
         .collect::<Vec<_>>();
-    assert_eq!(metas.len(), 1, "over-cap secret TX 只寫一筆 META");
     assert_eq!(
-        metas[0]
-            .get("meta")
-            .and_then(|meta| meta.get("secret_len"))
-            .and_then(PyValue::as_i64),
-        Some(secret.len() as i64),
-        "META 仍記錄實際寫出的完整 secret 長度"
+        metas.len(),
+        chunks.len(),
+        "每個 over-cap secret TX job 恰有一筆 META"
+    );
+    for (meta, chunk) in metas.iter().zip(&chunks) {
+        assert_eq!(
+            meta.get("meta")
+                .and_then(|meta| meta.get("secret_len"))
+                .and_then(PyValue::as_i64),
+            Some(chunk.len() as i64),
+            "META 仍記錄每個 job 實際寫出的 secret 長度"
+        );
+    }
+    let event_text = format!("{:?}", rig.service.call("event.tail", r#"{"n":-1}"#));
+    assert!(
+        !event_text.contains('Z'),
+        "event 完整行不得包含任何明文 secret byte：{event_text}"
+    );
+    assert!(
+        event_text.contains("***"),
+        "event 應收到逐行遮罩結果：{event_text}"
     );
     assert_secret_sinks_clear(&rig, &console, &log_path, &secret);
 }
