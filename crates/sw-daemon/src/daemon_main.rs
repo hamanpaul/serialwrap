@@ -1604,6 +1604,7 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
         } else {
             RuntimeConfig::from_text(None).map_err(|e| e.to_string())?
         };
+        cfg.invalidate_wal_dir_origin_if_mismatched();
         let flavor = flavor_of(&p.caps);
         if read_path != write_path {
             let raw_wal_dir = match cfg.wal_dir() {

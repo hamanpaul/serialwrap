@@ -12,6 +12,10 @@ use crate::pypath::PathFlavor;
 use crate::yaml11::emit;
 use crate::yaml11::{py_str_of, py_truthy_of, safe_load, YMap, YValue, YamlError};
 
+const WAL_DIR_ORIGIN_KEY_PREFIX: &str = "__serialwrap_wal_dir_origin_v1";
+const WAL_DIR_ORIGIN_OWNER_KEY: &str = "__serialwrap_owner";
+const WAL_DIR_ORIGIN_OWNER: &str = "serialwrap";
+
 /// `sw_core/config.py` `UartProfile`（09 §2.1）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct UartProfile {
@@ -937,26 +941,72 @@ impl RuntimeConfig {
 
     /// Endpoint 寫回複製 system config 時保留 `wal_dir` 的原值與來源檔案。
     ///
-    /// 當使用者修改 `wal_dir` 後，來源記錄內的值不再相符，解析端會改用目前 config 檔的目錄。
+    /// 讀取新格式的獨立來源欄位，並相容先前版本寫入的 `__serialwrap_internal` 格式。
     pub fn wal_dir_origin(&self) -> Option<(&str, &str)> {
+        if let Some(origin) = self.data.0.iter().find_map(|(key, value)| {
+            let YValue::Str(key) = key else {
+                return None;
+            };
+            if !key.starts_with(WAL_DIR_ORIGIN_KEY_PREFIX) {
+                return None;
+            }
+            let YValue::Map(origin) = value else {
+                return None;
+            };
+            let owned = matches!(
+                origin.get_str(WAL_DIR_ORIGIN_OWNER_KEY),
+                Some(YValue::Str(owner)) if owner == WAL_DIR_ORIGIN_OWNER
+            );
+            owned.then(|| wal_dir_origin_fields(origin)).flatten()
+        }) {
+            return Some(origin);
+        }
+
         let YValue::Map(metadata) = self.data.get_str("__serialwrap_internal")? else {
             return None;
         };
         let YValue::Map(origin) = metadata.get_str("wal_dir_origin")? else {
             return None;
         };
-        let YValue::Str(value) = origin.get_str("value")? else {
-            return None;
-        };
-        let YValue::Str(config_path) = origin.get_str("config_path")? else {
-            return None;
-        };
-        Some((value, config_path))
+        wal_dir_origin_fields(origin)
     }
 
-    /// 記錄複製前的 config 來源；`wal_dir` 本身仍保留原始字串。
+    /// 記錄複製前的 config 來源；`wal_dir` 本身仍保留原始字串，且不覆寫任何既有頂層鍵。
     pub fn set_wal_dir_origin(&mut self, value: &str, config_path: &str) {
+        let key = self
+            .data
+            .0
+            .iter()
+            .find_map(|(key, metadata)| {
+                let YValue::Str(key) = key else {
+                    return None;
+                };
+                if !key.starts_with(WAL_DIR_ORIGIN_KEY_PREFIX) {
+                    return None;
+                }
+                let YValue::Map(metadata) = metadata else {
+                    return None;
+                };
+                let owned = matches!(
+                    metadata.get_str(WAL_DIR_ORIGIN_OWNER_KEY),
+                    Some(YValue::Str(owner)) if owner == WAL_DIR_ORIGIN_OWNER
+                ) && wal_dir_origin_fields(metadata).is_some();
+                owned.then(|| key.clone())
+            })
+            .unwrap_or_else(|| {
+                let mut key = WAL_DIR_ORIGIN_KEY_PREFIX.to_string();
+                let mut suffix = 1_usize;
+                while self.data.contains_str(&key) {
+                    suffix += 1;
+                    key = format!("{WAL_DIR_ORIGIN_KEY_PREFIX}_{suffix}");
+                }
+                key
+            });
         let mut origin = YMap::default();
+        origin.0.push((
+            YValue::Str(WAL_DIR_ORIGIN_OWNER_KEY.to_string()),
+            YValue::Str(WAL_DIR_ORIGIN_OWNER.to_string()),
+        ));
         origin.0.push((
             YValue::Str("value".to_string()),
             YValue::Str(value.to_string()),
@@ -965,16 +1015,50 @@ impl RuntimeConfig {
             YValue::Str("config_path".to_string()),
             YValue::Str(config_path.to_string()),
         ));
-        let mut metadata = match self.data.get_str("__serialwrap_internal") {
-            Some(YValue::Map(map)) => map.clone(),
-            _ => YMap::default(),
+        upsert_value_key(&mut self.data, &key, YValue::Map(origin));
+    }
+
+    /// 清除已過期來源記錄，避免 `wal_dir` 日後改回舊字串時重新採用舊基準。
+    pub fn invalidate_wal_dir_origin_if_mismatched(&mut self) -> bool {
+        let Some((origin_value, _)) = self.wal_dir_origin() else {
+            return false;
         };
-        upsert_value_key(&mut metadata, "wal_dir_origin", YValue::Map(origin));
-        upsert_value_key(
-            &mut self.data,
-            "__serialwrap_internal",
-            YValue::Map(metadata),
-        );
+        let configured_value = match self.wal_dir() {
+            Some(YValue::Str(value)) => Some(value.as_str()),
+            _ => None,
+        };
+        if configured_value == Some(origin_value) {
+            return false;
+        }
+
+        self.data.0.retain(|(key, value)| {
+            let YValue::Str(key) = key else {
+                return true;
+            };
+            if !key.starts_with(WAL_DIR_ORIGIN_KEY_PREFIX) {
+                return true;
+            }
+            let YValue::Map(origin) = value else {
+                return true;
+            };
+            !matches!(
+                origin.get_str(WAL_DIR_ORIGIN_OWNER_KEY),
+                Some(YValue::Str(owner)) if owner == WAL_DIR_ORIGIN_OWNER
+            ) || wal_dir_origin_fields(origin).is_none()
+        });
+        if let Some((_, YValue::Map(metadata))) = self
+            .data
+            .0
+            .iter_mut()
+            .find(|(key, _)| matches!(key, YValue::Str(key) if key == "__serialwrap_internal"))
+        {
+            metadata.0.retain(|(key, value)| {
+                let is_legacy_origin = matches!(key, YValue::Str(key) if key == "wal_dir_origin")
+                    && matches!(value, YValue::Map(origin) if wal_dir_origin_fields(origin).is_some());
+                !is_legacy_origin
+            });
+        }
+        true
     }
 
     /// 07 §5.1：socket_path Some 才覆寫。
@@ -1005,6 +1089,16 @@ impl RuntimeConfig {
     pub fn to_yaml(&self) -> String {
         emit::safe_dump(&YValue::Map(self.data.clone()), true, true)
     }
+}
+
+fn wal_dir_origin_fields(origin: &YMap) -> Option<(&str, &str)> {
+    let YValue::Str(value) = origin.get_str("value")? else {
+        return None;
+    };
+    let YValue::Str(config_path) = origin.get_str("config_path")? else {
+        return None;
+    };
+    Some((value, config_path))
 }
 
 /// 以字串 key 覆寫值（既有 key 原位取代，否則附加於尾端；對應 Python `dict.__setitem__`）。
