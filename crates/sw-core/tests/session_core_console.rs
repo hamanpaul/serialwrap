@@ -23,9 +23,9 @@ fn human_txs(effects: &[Effect]) -> Vec<(TxClass, String, Vec<u8>)> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::HumanTx { permit, payload, .. } => {
-                Some((permit.class, permit.source.clone(), payload.clone()))
-            }
+            Effect::HumanTx {
+                permit, payload, ..
+            } => Some((permit.class, permit.source.clone(), payload.clone())),
             _ => None,
         })
         .collect()
@@ -61,7 +61,9 @@ fn raw_input_becomes_human_tx() {
     let txs: Vec<_> = fx
         .iter()
         .filter_map(|e| match e {
-            Effect::HumanTx { permit, payload, .. } => Some((permit.clone(), payload.clone())),
+            Effect::HumanTx {
+                permit, payload, ..
+            } => Some((permit.clone(), payload.clone())),
             _ => None,
         })
         .collect();
@@ -106,8 +108,14 @@ fn unknown_or_old_lifetime_dropped() {
     assert!(human_txs(&fx).is_empty());
     let fx = h.input_with("c1", life + 1000, epoch, b"x");
     assert!(human_txs(&fx).is_empty());
-    assert!(h.warns().iter().any(|w| w.contains("client_id=ghost") && w.contains("reason=unknown_client")));
-    assert!(h.warns().iter().any(|w| w.contains("client_id=c1") && w.contains("reason=unknown_client")));
+    assert!(h
+        .warns()
+        .iter()
+        .any(|w| w.contains("client_id=ghost") && w.contains("reason=unknown_client")));
+    assert!(h
+        .warns()
+        .iter()
+        .any(|w| w.contains("client_id=c1") && w.contains("reason=unknown_client")));
     assert_eq!(h.tx_effect_count(), before);
 }
 
@@ -124,13 +132,28 @@ fn line_input_echo_then_submit_order() {
         .expect("先回顯");
     let start = fx
         .iter()
-        .position(|e| matches!(e, Effect::StartOp { spec: OpSpec::Command(_), .. }))
+        .position(|e| {
+            matches!(
+                e,
+                Effect::StartOp {
+                    spec: OpSpec::Command(_),
+                    ..
+                }
+            )
+        })
         .expect("後提交並出列");
     assert!(echo < start);
-    let Some(OpSpec::Command(q)) = start_ops(&fx).into_iter().next() else { unreachable!() };
+    let Some(OpSpec::Command(q)) = start_ops(&fx).into_iter().next() else {
+        unreachable!()
+    };
     assert_eq!(q.req.command, "ls");
     assert_eq!(q.req.source, "human:c2");
-    assert_eq!(q.req.origin, SubmitOrigin::HumanConsole { client_id: "c2".into() });
+    assert_eq!(
+        q.req.origin,
+        SubmitOrigin::HumanConsole {
+            client_id: "c2".into()
+        }
+    );
     assert_eq!(q.req.mode, "line");
     assert_eq!(q.req.timeout_s, 30.0);
     assert_eq!(q.req.priority, 100);
@@ -167,7 +190,10 @@ fn agent_command_suspends_and_resume_replays() {
     let fx = h.input("c1", b"x");
     assert!(human_txs(&fx).is_empty(), "fg 期間無 HumanRaw");
     let fx = h.fg_finish(adm);
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]);
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]
+    );
     let permit = h.last_human_permit().expect("回放 permit");
     assert_eq!(permit.input_epoch, Some(h.core.generations().input_epoch));
     let hold = permit.replay_hold.expect("D-22 hold");
@@ -189,7 +215,10 @@ fn gate_closed_input_replayed_on_finish() {
     assert!(human_txs(&fx).is_empty());
     assert_eq!(h.deferred_len("c1"), 1);
     let fx = h.fg_finish(adm);
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"y".to_vec())]);
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"y".to_vec())]
+    );
 }
 
 #[test]
@@ -199,10 +228,17 @@ fn admission_toggle_does_not_bump_owner_gen() {
     let (adm, _) = h.fg_begin(false);
     h.input("c1", b"y");
     let fx = h.fg_finish(adm);
-    assert_eq!(h.core.generations().owner_gen, g, "D-02：admission 切換不遞增 owner_gen");
+    assert_eq!(
+        h.core.generations().owner_gen,
+        g,
+        "D-02：admission 切換不遞增 owner_gen"
+    );
     assert_eq!(h.fence.with(|f| f.owner_gen), g);
     assert_eq!(human_txs(&fx).len(), 1);
-    assert!(!h.warns().iter().any(|w| w.contains("human TX")), "回放未被 OwnerMismatch 擋下");
+    assert!(
+        !h.warns().iter().any(|w| w.contains("human TX")),
+        "回放未被 OwnerMismatch 擋下"
+    );
     assert_eq!(h.deferred_len("c1"), 0);
 }
 
@@ -248,8 +284,16 @@ fn release_phase1_closes_all_consoles() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
     h.attach_pty_console("c1", true);
-    let (rx, fx) = h.rpc_deferred(SessionRequest::Release { source: "agent".into(), reason: PyValue::Null });
-    assert_eq!(fx.iter().filter(|e| matches!(e, Effect::ConsoleCloseAll)).count(), 1);
+    let (rx, fx) = h.rpc_deferred(SessionRequest::Release {
+        source: "agent".into(),
+        reason: PyValue::Null,
+    });
+    assert_eq!(
+        fx.iter()
+            .filter(|e| matches!(e, Effect::ConsoleCloseAll))
+            .count(),
+        1
+    );
     assert!(h.core.human_console().consoles.is_empty());
     let (epoch, stop) = h.pending_stop();
     h.receipt(epoch, stop).feed();
@@ -266,7 +310,10 @@ fn input_without_active_epoch_dropped_sc31() {
     let fx = h.input("c1", b"R");
     assert!(human_txs(&fx).is_empty());
     assert_eq!(h.deferred_len("c1"), 0);
-    assert!(h.warns().iter().any(|w| w.contains("client_id=c1") && w.contains("reason=no_active_epoch")));
+    assert!(h
+        .warns()
+        .iter()
+        .any(|w| w.contains("client_id=c1") && w.contains("reason=no_active_epoch")));
     assert_eq!(h.tx_effect_count(), before);
 }
 
@@ -312,7 +359,10 @@ fn flash_drops_input_diagnosed() {
     let before = h.tx_effect_count();
     let fx = h.input("c1", b"b");
     assert!(human_txs(&fx).is_empty());
-    assert!(h.warns().iter().any(|w| w.contains("client_id=c1") && w.contains("reason=flash")));
+    assert!(h
+        .warns()
+        .iter()
+        .any(|w| w.contains("client_id=c1") && w.contains("reason=flash")));
     assert_eq!(h.deferred_len("c1"), 1, "flash 輸入不進 deferred");
     h.invalidate(InvalidateReason::Flash);
     assert_eq!(h.deferred_len("c1"), 0);
@@ -324,28 +374,46 @@ fn self_test_probe_suspends_human_without_admission() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
     h.attach_pty_console("c1", true);
-    let (_rx, fx) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let (_rx, fx) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
     let grant = fx
         .iter()
         .find_map(|e| match e {
-            Effect::StartOp { grant, spec: OpSpec::SelfTestProbe { .. } } => Some(grant.clone()),
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::SelfTestProbe { .. },
+            } => Some(grant.clone()),
             _ => None,
         })
         .expect("StartOp(SelfTestProbe)");
     let fx = h.input("c1", b"k");
     assert!(human_txs(&fx).is_empty(), "probe 期間無 HumanRaw");
-    assert!(!h.fence.with(|f| f.human_admission_blocked), "self-test 只 suspend、不動 admission");
+    assert!(
+        !h.fence.with(|f| f.human_admission_blocked),
+        "self-test 只 suspend、不動 admission"
+    );
     let epoch = h.epoch();
     let fx = h.feed(ControlEvent::OpFinished {
         op_id: grant.op_id,
         epoch,
-        outcome: OpOutcome::SelfTest(pydict! { "probe_ok" => true, "rx_bytes_last_10s" => 0 }),
+        outcome: self_test_ok(),
         after_rx_seq: None,
     });
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]);
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]
+    );
     let order = h.tx_order();
-    let probe = order.iter().position(|(c, _)| *c == TxClass::SelfTestProbe).expect("probe");
-    let replay = order.iter().position(|(c, _)| *c == TxClass::HumanReplay).expect("replay");
+    let probe = order
+        .iter()
+        .position(|(c, _)| *c == TxClass::SelfTestProbe)
+        .expect("probe");
+    let replay = order
+        .iter()
+        .position(|(c, _)| *c == TxClass::HumanReplay)
+        .expect("replay");
     assert!(probe < replay, "回放位於 SelfTestProbe 之後");
 }
 
@@ -380,7 +448,10 @@ fn queued_command_waits_for_replay_settle() {
         outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "a" }),
         after_rx_seq: None,
     });
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]);
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]
+    );
     assert!(start_ops(&fx).is_empty(), "回放結算前 B 不出列");
     assert_eq!(h.reg.get(&b).unwrap()["status"], PyValue::from("accepted"));
     assert!(h.foreground_busy());
@@ -421,14 +492,29 @@ fn file_transfer_busy_during_replay_hold_not_queued() {
         outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "a" }),
         after_rx_seq: None,
     });
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]);
-    let hold = h.last_human_permit().unwrap().replay_hold.expect("回放帶 replay_hold");
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]
+    );
+    let hold = h
+        .last_human_permit()
+        .unwrap()
+        .replay_hold
+        .expect("回放帶 replay_hold");
     assert_eq!(h.fence_replay_auth(), Some(hold));
     assert!(h.foreground_busy(), "回放未結算：前景仍忙");
     let file_ops = |effects: &[Effect]| {
         effects
             .iter()
-            .filter(|e| matches!(e, Effect::StartOp { spec: OpSpec::FileTransfer(_), .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Effect::StartOp {
+                        spec: OpSpec::FileTransfer(_),
+                        ..
+                    }
+                )
+            })
             .count()
     };
     for req in [push_req("/l", "/r"), pull_req("/r", None)] {
@@ -460,7 +546,10 @@ fn file_transfer_busy_during_replay_hold_not_queued() {
     );
     assert_eq!(
         h.tx_order(),
-        vec![(TxClass::Command, b"echo a\n".to_vec()), (TxClass::HumanReplay, b"x".to_vec())],
+        vec![
+            (TxClass::Command, b"echo a\n".to_vec()),
+            (TxClass::HumanReplay, b"x".to_vec())
+        ],
         "UART 上只有命令與回放"
     );
 }
@@ -501,7 +590,11 @@ fn reboot_command_invalidates_before_send() {
     let e0 = h.core.generations().input_epoch;
     let started = h.start_foreground_command("reboot");
     let _ = started;
-    assert_eq!(h.core.generations().input_epoch, e0 + 1, "StartOp(reboot) 時 input_epoch 已遞增");
+    assert_eq!(
+        h.core.generations().input_epoch,
+        e0 + 1,
+        "StartOp(reboot) 時 input_epoch 已遞增"
+    );
     assert_eq!(h.fence.with(|f| f.input_epoch), e0 + 1);
     let life = h.lifetime("c1");
     let fx = h.input_with("c1", life, e0, b"k");
@@ -530,7 +623,11 @@ fn reboot_tx_settled_invalidates_again_on_quiet_arm() {
         confirmed_bytes: 7,
         unknown: false,
     });
-    assert_eq!(h.core.generations().input_epoch, e0 + 2, "arm quiet 為第二個失效點");
+    assert_eq!(
+        h.core.generations().input_epoch,
+        e0 + 2,
+        "arm quiet 為第二個失效點"
+    );
     assert_eq!(h.fence.with(|f| f.input_epoch), e0 + 2);
     assert_eq!(h.deferred_len("c1"), 0, "reboot 在途期間的按鍵被清掉");
     let fx = h.feed(ControlEvent::OpFinished {
@@ -583,7 +680,11 @@ fn interactive_line_command_does_not_steal_raw_owner() {
     // c1 的按鍵仍以 raw 路徑處理（admission 關 → defer），不會走 line editor 成為命令。
     let before = h.reg.records_for_test().len();
     h.input("c1", b"ls\r");
-    assert_eq!(h.reg.records_for_test().len(), before, "c1 的輸入不得被當成命令送出");
+    assert_eq!(
+        h.reg.records_for_test().len(),
+        before,
+        "c1 的輸入不得被當成命令送出"
+    );
 }
 
 /// Medium（2f4f76a）：空命令的 interactive 也要成對 begin／finish（admission 恢復開放）。
@@ -596,7 +697,10 @@ fn empty_interactive_command_reopens_admission() {
         r
     }));
     assert_eq!(resp.unwrap().get("ok"), Some(&PyValue::Bool(true)));
-    assert!(!h.fence.with(|f| f.human_admission_blocked), "admission 應恢復開放");
+    assert!(
+        !h.fence.with(|f| f.human_admission_blocked),
+        "admission 應恢復開放"
+    );
     assert!(!h.core.human_console().ownership.admission_blocked);
 }
 
@@ -611,7 +715,8 @@ fn phase1_in_flight_human_tx_still_settles_ledger() {
     assert_eq!(h.epoch(), permit.epoch, "Phase 1 期間 conn_epoch 仍為舊值");
     let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
     assert!(
-        fx.iter().any(|e| matches!(e, Effect::SettleTx { op_id, .. } if *op_id == permit.op_id)),
+        fx.iter()
+            .any(|e| matches!(e, Effect::SettleTx { op_id, .. } if *op_id == permit.op_id)),
         "晚到結算仍須結算帳本"
     );
     assert!(human_txs(&fx).is_empty(), "不得因此送出新的 human TX");
@@ -646,7 +751,9 @@ fn reap_stale_console_without_holder() {
     assert_eq!(closes(&fx), ["c2"]);
     assert!(!h.core.human_console().consoles.contains_key("c2"));
     let st = h.rpc(SessionRequest::GetState).unwrap();
-    let PyValue::Dict(session) = &st["session"] else { panic!("session") };
+    let PyValue::Dict(session) = &st["session"] else {
+        panic!("session")
+    };
     assert_eq!(session.get("console_count"), Some(&PyValue::from(1i64)));
 }
 
@@ -676,12 +783,22 @@ fn reap_dead_primary_transfers_primary() {
     h.attach_pty_console("c1", true);
     let b = h.attach_pty_console("c2", true);
     h.connect_stream_console("t1", ConsoleTransportKind::TcpTelnet);
-    assert_eq!(h.core.human_console().primary_client_id.as_deref(), Some("c1"));
+    assert_eq!(
+        h.core.human_console().primary_client_id.as_deref(),
+        Some("c1")
+    );
     h.advance_s(2.1);
     let fx = h.scan(Some(&[vtty_of(&b).as_str()]));
     assert_eq!(closes(&fx), ["c1"]);
-    assert_eq!(h.core.human_console().primary_client_id.as_deref(), Some("c2"), "primary 轉移");
-    assert!(h.core.human_console().consoles.contains_key("t1"), "TCP console 不受 reaper");
+    assert_eq!(
+        h.core.human_console().primary_client_id.as_deref(),
+        Some("c2"),
+        "primary 轉移"
+    );
+    assert!(
+        h.core.human_console().consoles.contains_key("t1"),
+        "TCP console 不受 reaper"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -703,9 +820,13 @@ fn sentinel_registered_in_same_event_as_adopt() {
         slave_path: "/dev/pts/77".into(),
         client_id: "sentinel0001".into(),
     });
-    let fx = h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Ok(opened) });
+    let fx = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
     assert!(
-        fx.iter().any(|e| matches!(e, Effect::ConsoleAdopt { token: 77, .. })),
+        fx.iter()
+            .any(|e| matches!(e, Effect::ConsoleAdopt { token: 77, .. })),
         "同一事件 adopt 哨兵"
     );
     let hc = h.core.human_console();
@@ -723,7 +844,9 @@ fn release_clears_public_vtty() {
     h.attach_pty_console("c1", true);
     h.begin_stop(StopKind::Release);
     let st = h.rpc(SessionRequest::GetState).unwrap();
-    let PyValue::Dict(session) = &st["session"] else { panic!("session") };
+    let PyValue::Dict(session) = &st["session"] else {
+        panic!("session")
+    };
     assert_eq!(session.get("vtty"), Some(&PyValue::Null));
 }
 
@@ -735,9 +858,14 @@ fn late_console_connected_after_release_is_rejected() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
     let stale_gen = h.core.human_console().close_gen;
-    let (_rx, fx) = h.rpc_deferred(SessionRequest::Release { source: "agent".into(), reason: PyValue::Null });
+    let (_rx, fx) = h.rpc_deferred(SessionRequest::Release {
+        source: "agent".into(),
+        reason: PyValue::Null,
+    });
     assert_eq!(
-        fx.iter().filter(|e| matches!(e, Effect::ConsoleCloseAll)).count(),
+        fx.iter()
+            .filter(|e| matches!(e, Effect::ConsoleCloseAll))
+            .count(),
         1,
         "release 一律送 close-all（撤銷 hub 已 accept、尚未登記的連線）"
     );
@@ -750,10 +878,14 @@ fn late_console_connected_after_release_is_rejected() {
         kind: ConsoleTransportKind::TcpTelnet,
         close_gen: stale_gen,
     });
-    assert!(h.core.human_console().consoles.is_empty(), "已關閉的 console 不得復活");
+    assert!(
+        h.core.human_console().consoles.is_empty(),
+        "已關閉的 console 不得復活"
+    );
     assert_eq!(owner(&h), None, "幽靈 owner");
     assert!(
-        fx.iter().any(|e| matches!(e, Effect::ConsoleClose { client_id } if client_id == "t1")),
+        fx.iter()
+            .any(|e| matches!(e, Effect::ConsoleClose { client_id } if client_id == "t1")),
         "要求 hub 關閉該 client"
     );
     // 帶現行世代的連線（release 之後才 accept）照常登記並取得 raw owner。
@@ -762,7 +894,7 @@ fn late_console_connected_after_release_is_rejected() {
     assert_eq!(owner(&h).as_deref(), Some("human:t2"));
 }
 
-/// 取 rpc_deferred 回傳效果中的 SelfTestProbe／Recover StartOp grant。
+/// 取 rpc_deferred 回傳效果中的前景 SelfTestProbe／side-lane Recover grant。
 fn side_grant(fx: &[Effect]) -> OpGrant {
     fx.iter()
         .find_map(|e| match e {
@@ -776,34 +908,82 @@ fn side_grant(fx: &[Effect]) -> OpGrant {
 }
 
 fn self_test_ok() -> OpOutcome {
-    OpOutcome::SelfTest(pydict! { "probe_ok" => true, "rx_bytes_last_10s" => 0 })
+    OpOutcome::SelfTest(pydict! {
+        "probe_ok" => true,
+        "probe_evidence" => pydict! {
+            "tx_complete" => true,
+            "execution_marker" => true,
+            "probe_rc_zero" => true,
+            "prompt_after_marker" => true,
+        },
+        "rx_bytes_last_10s" => 0,
+    })
 }
 
-/// sol P6-e9b5c61-1（High）：並行 self-test 各自保留 suspend 旗標並於各自完成時配對 resume
-/// （Python `self_test` 的區域變數 `suspend_human_interactive`＋`finally: bridge.resume_interactive()`，
-/// `session_manager.py:7599,7622,7693`）。修正前共用單一布林：S2 覆寫 S1 的旗標，S1 完成時不再 resume，
-/// suspend_depth 留在 1、後續按鍵永久 deferred。
+/// OD-114 核准：第二次 self-test 被動回覆，不再 suspend 或送 probe；第一次結束後 deferred human bytes 恰回放一次。
 #[test]
 fn overlapping_self_tests_each_resume_their_own_suspend() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
     h.attach_pty_console("c1", true);
-    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
     let s1 = side_grant(&fx1);
-    let (_r2, fx2) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
-    let s2 = side_grant(&fx2);
-    assert_ne!(s1.op_id, s2.op_id);
+    let (r2, fx2) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    assert!(
+        !fx2.iter().any(|effect| matches!(
+            effect,
+            Effect::StartOp {
+                spec: OpSpec::SelfTestProbe { .. },
+                ..
+            }
+        )),
+        "第二次 self-test 不得建立第二個 probe"
+    );
+    let r2 = r2
+        .try_recv()
+        .expect("busy 回覆應立即完成")
+        .expect("busy 回覆為字典");
+    assert_eq!(r2["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(r2["recommended_action"], PyValue::from("wait"));
+    assert!(r2.get("probe_ok").is_none());
+    assert_eq!(
+        h.core.human_console().ownership.suspend_depth,
+        1,
+        "第二次不得增加 suspend"
+    );
     let fx = h.input("c1", b"k");
-    assert!(human_txs(&fx).is_empty(), "兩個 probe 期間無 HumanRaw");
+    assert!(
+        human_txs(&fx).is_empty(),
+        "probe 期間 human input 必須 deferred"
+    );
     let epoch = h.epoch();
-    let fx = h.feed(ControlEvent::OpFinished { op_id: s2.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
-    assert!(human_txs(&fx).is_empty(), "S1 仍在 probe：S2 完成不得回放");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "S2 只結算自己的 suspend");
-    let fx = h.feed(ControlEvent::OpFinished { op_id: s1.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]);
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "兩次 suspend 都已配對 resume");
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: s1.op_id,
+        epoch,
+        outcome: self_test_ok(),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]
+    );
+    assert_eq!(
+        h.core.human_console().ownership.suspend_depth,
+        0,
+        "第一次 suspend 已配對 resume"
+    );
     let fx = h.input("c1", b"z");
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanRaw, "human:c1".to_string(), b"z".to_vec())], "resume 後按鍵直送");
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanRaw, "human:c1".to_string(), b"z".to_vec())],
+        "resume 後按鍵直送"
+    );
 }
 
 /// sol P6-e9b5c61-1（High）：READY recover 並行 side op 完成時不得解除另一個 self-test probe 的 suspend
@@ -813,21 +993,45 @@ fn recover_side_op_does_not_resume_self_test_suspend() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
     h.attach_pty_console("c1", true);
-    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
     let s1 = side_grant(&fx1);
     h.input("c1", b"k");
-    let (_rr, fxr) = h.rpc_deferred(SessionRequest::Recover { timeout_s: 2.0, force: false });
+    let (_rr, fxr) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
     let rec = side_grant(&fxr);
     let epoch = h.epoch();
     let fx = h.feed(ControlEvent::OpFinished {
         op_id: rec.op_id,
         epoch,
-        outcome: OpOutcome::Recovered { key: "CTRL_C", stdout: String::new() },
+        outcome: OpOutcome::Recovered {
+            key: "CTRL_C",
+            stdout: String::new(),
+        },
         after_rx_seq: None,
     });
-    assert!(human_txs(&fx).is_empty(), "self-test probe 仍在途：recover 完成不得回放");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "recover 不解除 self-test 的 suspend");
-    let fx = h.feed(ControlEvent::OpFinished { op_id: s1.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
-    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]);
+    assert!(
+        human_txs(&fx).is_empty(),
+        "self-test probe 仍在途：recover 完成不得回放"
+    );
+    assert_eq!(
+        h.core.human_console().ownership.suspend_depth,
+        1,
+        "recover 不解除 self-test 的 suspend"
+    );
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: s1.op_id,
+        epoch,
+        outcome: self_test_ok(),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        human_txs(&fx),
+        vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]
+    );
     assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
 }

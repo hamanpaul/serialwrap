@@ -107,6 +107,8 @@ pub struct FenceState {
     pub replay_auth: Option<u64>,
     /// P7 Task 16-wire：SessionCore 發布的 `foreground_busy`（`BridgeQueries::active_cmd_id_for` 不經 actor mailbox 讀取）。
     pub foreground_busy: bool,
+    /// Self-test 的獨立提交授權；只有持有該 op 身分與世代的 probe 可通過 Fence。
+    pub self_test_probe_owner: Option<OpId>,
     /// 前景 reboot 命令的 op（#55）：其 Command TX 已提交（confirmed>0）或結果不明時，TxWriter 在記錄結果的同一次
     /// `Fence::with` 內設 `quiet_active`／`reconfirm_pending` 並清除本欄——對齊 Python `_handle_reboot_command` 在
     /// `_write_lock` 內 arm，下一個 TX job 的出列檢查前 quiet 已生效（審查 F14）。actor 之後只同步 `QuietState`／世代。
@@ -215,7 +217,13 @@ impl FenceState {
 /// TX fence：`0` 為 fence 狀態（OS 提交在其鎖內進行，見 [`FenceSubmitGate`]）；`1` 為 `handoff_frozen` 的不取鎖鏡像
 /// （每次 [`Fence::with`]／[`Fence::try_with`] 結束前於鎖內發布，見 [`Fence::handoff_frozen_published`]）；`4` 是 issue 282
 /// 待凍結時用來喚醒傳輸行持有者的軟旗標。
-pub struct Fence(Mutex<FenceState>, AtomicBool, AtomicBool, Mutex<()>, Mutex<Option<RunCancel>>);
+pub struct Fence(
+    Mutex<FenceState>,
+    AtomicBool,
+    AtomicBool,
+    Mutex<()>,
+    Mutex<Option<RunCancel>>,
+);
 
 #[cfg(test)]
 mod shutdown_publication_tests {
@@ -288,6 +296,7 @@ impl Fence {
                 input_epoch: 0,
                 replay_auth: None,
                 foreground_busy: false,
+                self_test_probe_owner: None,
                 reboot_arm_op: None,
                 flash_critical: false,
                 bridge_passthrough: false,
@@ -520,13 +529,27 @@ impl Fence {
                     return Err(FenceReject::WalUnhealthy);
                 }
             }
-            TxClass::SystemRecoverKey | TxClass::SelfTestProbe => {
-                // R5-F2：SelfTestProbe／救援鍵一律以 quiet_active 擋（console unlock 的 arm 也擋）。
+            TxClass::SystemRecoverKey => {
+                // R5-F2：救援鍵一律以 quiet_active 擋（console unlock 的 arm 也擋）。
                 if st.quiet_active {
                     return Err(FenceReject::Quiet);
                 }
                 if st.wal_unhealthy {
                     return Err(FenceReject::WalUnhealthy);
+                }
+            }
+            TxClass::SelfTestProbe => {
+                if st.quiet_active {
+                    return Err(FenceReject::Quiet);
+                }
+                if st.wal_unhealthy {
+                    return Err(FenceReject::WalUnhealthy);
+                }
+                if st.self_test_probe_owner != Some(p.op_id) || p.owner_gen != st.owner_gen {
+                    return Err(FenceReject::OwnerMismatch);
+                }
+                if p.fsm_gen != st.fsm_gen {
+                    return Err(FenceReject::FsmMismatch);
                 }
             }
             _ => {}
@@ -950,7 +973,8 @@ impl TxWriter {
                 op_id: Some(key.op_id),
                 dir: "TX",
                 len: buffer.len(),
-                error: error.unwrap_or_else(|| PalError::plain(PalErrorKind::Io, "WAL append failed")),
+                error: error
+                    .unwrap_or_else(|| PalError::plain(PalErrorKind::Io, "WAL append failed")),
             }),
             None => {}
         }
@@ -963,7 +987,10 @@ impl TxWriter {
             return;
         };
         let error = (!job.payload.is_empty()).then(|| {
-            PalError::plain(PalErrorKind::InvalidInput, "TX aggregate Finish 不得帶 payload（未提交）")
+            PalError::plain(
+                PalErrorKind::InvalidInput,
+                "TX aggregate Finish 不得帶 payload（未提交）",
+            )
         });
         let wal = self.write_aggregate(key, ledger);
         let outcome = if error.is_some() {

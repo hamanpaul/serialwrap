@@ -258,7 +258,17 @@ def test_selftest_classifications(p7, tmp_path, case):
     time.sleep(1.0)
     sent = tgt.rx_log_since(mark)
     if case == "ready":
-        assert sent.startswith(b"echo __READY__") and sent.endswith(b"\n") and sent.count(b"\n") == 1, sent
+        if is_rust():
+            # BC-13（issue 306／307）：Rust 以執行標記框架包住 ready_probe，TX 形狀與 Python 不同；
+            # 仍須是單行、含原 ready_probe 與框架的 marker printf。
+            assert (
+                sent.startswith(b"( echo __READY__")
+                and b") && printf '\\n__SW_ST_%s_OK__\\n' '" in sent
+                and sent.endswith(b"\n")
+                and sent.count(b"\n") == 1
+            ), sent
+        else:
+            assert sent.startswith(b"echo __READY__") and sent.endswith(b"\n") and sent.count(b"\n") == 1, sent
     else:
         assert sent == b"", f"{case}：self-test 期間 target 不得收到任何 byte：{sent!r}"
 

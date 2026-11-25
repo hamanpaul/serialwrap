@@ -729,6 +729,15 @@ impl SessionQueue {
         self.queued.len()
     }
 
+    /// 佇列內仍為 accepted 的有效命令（不依物理長度判斷，避免 stale heap 非同步造成假 busy）。
+    pub fn has_accepted(&self, registry: &CommandRegistry) -> bool {
+        self.queued.values().any(|command| {
+            registry
+                .get(&command.cmd_id)
+                .is_some_and(|record| record.get("status").and_then(PyValue::as_str) == Some("accepted"))
+        })
+    }
+
     /// heap 的實體項目數，包含尚未 compact 的惰性項目。
     pub fn physical_len(&self) -> usize {
         self.heap.len()

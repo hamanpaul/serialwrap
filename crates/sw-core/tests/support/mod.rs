@@ -1644,6 +1644,27 @@ impl ActorRig {
             .fail_next_writes(&self.wal.wal_path(), WAL_FAIL_FOREVER, err);
     }
 
+    /// 只讓下一筆 WAL append 失敗，供暫時健康狀態回復的交錯測試使用。
+    pub fn fail_next_wal_write(&self, err: PalError) {
+        // WalWriter 首次失敗會關閉並重開 handle 重試；兩次失敗才代表同一 append 失敗。
+        self.wfs.fail_next_writes(&self.wal.wal_path(), 2, err);
+    }
+
+    /// 直接追加測試用 WAL 記錄，以驗證 WAL health sink 的失敗與恢復通知。
+    pub fn append_wal_for_test(&self, dir: &str, source: &str, payload: &[u8]) -> bool {
+        self.wal
+            .append(WalAppendReq {
+                com: "COM0",
+                dir,
+                source,
+                payload,
+                cmd_id: None,
+                loss_flag: false,
+                meta: Some(PyDict::new()),
+            })
+            .ok
+    }
+
     /// WAL 累計寫入失敗次數（`WalWriter::health().write_failures`；Review Focus 3 同步點）。
     pub fn wal_write_failures(&self) -> u64 {
         self.wal.health().write_failures
@@ -1726,8 +1747,23 @@ impl ActorRig {
                     .split("__READY__")
                     .nth(1)
                     .unwrap_or("")
-                    .trim()
-                    .to_string();
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect::<String>();
+                if let Some(marker_nonce) = text
+                    .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                    .and_then(|(_, rest)| rest.split('\'').next())
+                {
+                    let expected = format!(
+                        "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                    );
+                    if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                        return format!(
+                            "__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# "
+                        )
+                        .into_bytes();
+                    }
+                }
                 format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
             }),
         );
@@ -1970,9 +2006,22 @@ pub fn install_shell_replies(dev: &FakeDevice) {
                 .split("__READY__")
                 .nth(1)
                 .unwrap_or("")
-                .trim()
-                .to_string();
-            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect::<String>();
+            let marker_nonce = text
+                .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                .and_then(|(_, rest)| rest.split('\'').next())
+                .unwrap_or("");
+            let expected = format!(
+                "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+            );
+            if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                format!("__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# ")
+                    .into_bytes()
+            } else {
+                format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+            }
         }),
     );
 }
