@@ -502,22 +502,48 @@ impl DaemonProc {
             .unwrap_or_else(|message| panic!("{message}"))
     }
 
+    /// 在指定工作目錄啟動隔離 daemon 行程。
+    pub fn spawn_with_cwd(
+        env: &IsolatedEnv,
+        vars: &BTreeMap<String, String>,
+        args: &[&str],
+        cwd: &Path,
+    ) -> DaemonProc {
+        Self::try_spawn_with_caps_at(env, vars, args, sw_pal::native().caps, Some(cwd))
+            .unwrap_or_else(|message| panic!("{message}"))
+    }
+
     pub fn try_spawn_with_caps(
         env: &IsolatedEnv,
         vars: &BTreeMap<String, String>,
         args: &[&str],
         caps: sw_pal::Capabilities,
     ) -> Result<DaemonProc, String> {
+        Self::try_spawn_with_caps_at(env, vars, args, caps, None)
+    }
+
+    fn try_spawn_with_caps_at(
+        env: &IsolatedEnv,
+        vars: &BTreeMap<String, String>,
+        args: &[&str],
+        caps: sw_pal::Capabilities,
+        cwd: Option<&Path>,
+    ) -> Result<DaemonProc, String> {
         require_test_daemon_allowlist(caps, vars)?;
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stderr_path = env.root.join(format!("daemon-{n}.stderr"));
         let file = File::create(&stderr_path).map_err(|error| format!("建立 stderr 檔失敗：{error}"))?;
-        let child = Command::new(daemon_binary())
+        let mut command = Command::new(daemon_binary());
+        command
             .args(args)
             .envs(vars)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(file))
+            .stderr(Stdio::from(file));
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let child = command
             .spawn()
             .map_err(|error| format!("啟動 serialwrapd 失敗：{error}"))?;
         Ok(DaemonProc { child, stderr_path })

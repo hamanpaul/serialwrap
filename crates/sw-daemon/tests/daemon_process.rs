@@ -260,6 +260,29 @@ fn config_wal_dir_is_used_by_daemon_startup_and_writes() {
 }
 
 #[test]
+fn daemon_reports_absolute_path_for_relative_environment_wal_dir() {
+    let mut env = isolated_env_with_pty_target();
+    let daemon_cwd = env.root.join("daemon-cwd");
+    fs::create_dir_all(&daemon_cwd).expect("建立 daemon 工作目錄");
+    let actual_dir = daemon_cwd.join("wal");
+    env.vars
+        .insert("SERIALWRAP_WAL_DIR".to_string(), "wal".to_string());
+
+    let mut daemon = DaemonProc::spawn_with_cwd(&env, &env.vars, &[], &daemon_cwd);
+    wait_ready(&env, "COM0");
+    let expected_wal = actual_dir.join("raw.wal.ndjson");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        expected_wal.display().to_string(),
+        "daemon.status 必須回報相對 WAL_DIR 依 daemon 工作目錄解析後的絕對路徑"
+    );
+    assert!(expected_wal.is_file(), "WAL 必須寫在 daemon 工作目錄下的實際目錄");
+
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+#[test]
 fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     let mut env = isolated_env_with_pty_target();
     env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
@@ -286,6 +309,24 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     assert!(
         env.config_dir.join("config.yaml").is_file(),
         "daemon 綁定 endpoint 後必須複製 system config 到 user config"
+    );
+    let copied_config = fs::read_to_string(env.config_dir.join("config.yaml"))
+        .expect("讀取 user config 複本");
+    assert!(
+        copied_config.lines().any(|line| line.trim() == "wal_dir: archive/wal"),
+        "複製 config 時必須保留 wal_dir 原字串，不得改成絕對路徑：{copied_config}"
+    );
+    assert!(
+        copied_config.contains("__serialwrap_internal:")
+            && copied_config.contains("wal_dir_origin:")
+            && copied_config.contains(
+                env.system_config
+                    .parent()
+                    .expect("system config parent")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+        "複本須保留原 config 的相對路徑基準：{copied_config}"
     );
     let mut second = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");

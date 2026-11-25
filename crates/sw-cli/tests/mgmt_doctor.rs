@@ -2,6 +2,7 @@
 mod support;
 
 use std::fs;
+use std::process::Command;
 use std::time::Duration;
 
 use support::*;
@@ -10,6 +11,7 @@ use sw_pal::fakes::FakeRegistry;
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 use sw_pal::PalErrorKind;
 use sw_proto::pyjson::{PyDict, PyValue};
+use tempfile::tempdir;
 
 /// 固定修復提示（07 §7.3／Task 13 步驟 1：runtime 無法定位或無法執行）。
 const FIX_REINSTALL: &str = "重新安裝發佈組合（serialwrap setup）";
@@ -703,6 +705,65 @@ fn wal_dir_comparison_resolves_symlink_before_dotdot() {
         b(check, "ok"),
         link_kind == sw_pal::fs_ops::LinkKind::Copied,
         "symlink 必須先解析再套用 `..`；純複本才可能與詞法正規化路徑相同"
+    );
+}
+
+#[test]
+fn wal_dir_relative_daemon_path_is_not_resolved_from_doctor_cwd() {
+    const CHILD: &str = "SW_I304_DOCTOR_CWD_CHILD";
+    const DAEMON_WAL: &str = "SW_I304_DAEMON_WAL_DIR";
+    if std::env::var_os(CHILD).is_none() {
+        let daemon_root = tempdir().expect("建立 daemon 隔離目錄");
+        let doctor_root = tempdir().expect("建立 doctor 隔離目錄");
+        let daemon_wal = daemon_root.path().join("wal");
+        let doctor_wal = doctor_root.path().join("wal");
+        fs::create_dir_all(&daemon_wal).expect("建立 daemon 實際 WAL 目錄");
+        fs::create_dir_all(&doctor_wal).expect("建立 doctor cwd 下的同名目錄");
+        assert_ne!(daemon_wal, doctor_wal, "兩個隔離 WAL 目錄必須是不同實體路徑");
+
+        let output = Command::new(std::env::current_exe().expect("取得測試執行檔"))
+            .args([
+                "--exact",
+                "wal_dir_relative_daemon_path_is_not_resolved_from_doctor_cwd",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(DAEMON_WAL, &daemon_wal)
+            .current_dir(doctor_root.path())
+            .output()
+            .expect("在 doctor 工作目錄啟動隔離測試行程");
+        assert!(
+            output.status.success(),
+            "doctor 必須拒絕以自身 cwd 解讀 daemon 的相對 WAL 路徑；stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let daemon_wal = std::path::PathBuf::from(
+        std::env::var_os(DAEMON_WAL).expect("daemon 實際 WAL 目錄"),
+    );
+    let doctor_wal = std::env::current_dir()
+        .expect("取得 doctor 工作目錄")
+        .join("wal");
+    assert_ne!(daemon_wal, doctor_wal, "daemon 與 doctor cwd 的 WAL 目錄必須不同");
+
+    let t = TestEnv::posix().with_config(&format!("wal_dir: {}\n", doctor_wal.display()));
+    let ep = t.default_socket();
+    let t = t.with_rpc_ok(
+        &ep,
+        "health.status",
+        r#"{"ok":true,"wal_path":"wal/raw.wal.ndjson"}"#,
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "wal_dir");
+    assert!(
+        !b(check, "ok"),
+        "daemon 相對 wal_path 不得依 doctor cwd 比對成相同目錄：{}",
+        s(check, "detail")
     );
 }
 
