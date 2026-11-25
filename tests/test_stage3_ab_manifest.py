@@ -85,7 +85,7 @@ def _load(
     )
 
 
-def _verify(manifest, repo_root: Path):
+def _verify(manifest, repo_root: Path, *, executing_tools_root: Path | None = None):
     runner = _ToolRevisionRecordingRunner(
         repo_root,
         _repo_snapshot(repo_root),
@@ -96,14 +96,18 @@ def _verify(manifest, repo_root: Path):
         _synthetic_trusted_pair_map(repo_root)
         if manifest.exit_item_id == EXIT_WINDOWS_L15 else None
     )
-    return ab_manifest.verify_frozen(
-        manifest,
+    options = dict(
+        m=manifest,
         repo_root=repo_root,
         run=runner,
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(repo_root),
         trusted_pair_map=trusted_pair_map,
+    )
+    options["executing_tools_root"] = executing_tools_root or repo_root
+    return ab_manifest.verify_frozen(
+        **options,
     )
 
 
@@ -632,6 +636,7 @@ def test_contract_revision_mismatch(tmp_path):
     violations = ab_manifest.verify_frozen(
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
         base_revision="t3-trusted-base", source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert f"contract_revision mismatch: manifest {manifest.contract_revision} repo {other}" in violations
 
@@ -656,6 +661,7 @@ def test_docker_digest_mismatch(tmp_path):
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
 
 
@@ -1579,6 +1585,7 @@ def test_windows_l15_mapping_cannot_replace_the_tool_revision_with_self_filled_s
     runner = _ToolRevisionRecordingRunner(tmp_path, revision_blobs)
     violations = ab_manifest.verify_frozen(
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+        executing_tools_root=tmp_path,
     )
     assert any("case transport map" in value and "tool revision" in value for value in violations)
 
@@ -1669,6 +1676,11 @@ def _git_blob_oid(data: bytes) -> str:
     return hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
 
 
+def _git_tree_oid(members: list[str]) -> str:
+    payload = "\0".join(sorted(members)).encode("utf-8")
+    return hashlib.sha1(b"tree-members\0" + payload).hexdigest()
+
+
 def _repo_snapshot(root: Path) -> dict[str, bytes]:
     _install_test_schemas(root)
     schema = root / "tests" / "acceptance" / "stage3_required_cases.schema.json"
@@ -1693,6 +1705,7 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
         self.contract_revision = contract_revision
         self.tool_revision = tool_revision
         self.docker_result = docker_result or {"rc": 0, "stdout": "", "stderr": ""}
+        self.object_types: dict[str, str] = {}
 
     def __call__(self, argv, *, env=None, timeout=None, cwd=None):
         args = list(argv)
@@ -1704,14 +1717,28 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
             elif "rev-parse" in args and args[-1].endswith("^{commit}"):
                 revision = args[-1][:-len("^{commit}")]
                 stdout, rc = (revision + "\n", 0) if revision == self.tool_revision else ("", 1)
-            elif "rev-parse" in args and args[-1].endswith("^{tree}") and ":" in args[-1]:
-                tree = args[-1].split(":", 1)[1][:-len("^{tree}")]
-                members = [relative for relative in self.blobs if relative.startswith(tree.rstrip("/") + "/")]
-                stdout, rc = (_git_blob_oid("\n".join(sorted(members)).encode("utf-8")) + "\n", 0) if members else ("", 1)
+            elif "cat-file" in args and "-t" in args:
+                object_type = self.object_types.get(args[-1])
+                stdout, rc = (object_type + "\n", 0) if object_type else ("", 128)
             elif "rev-parse" in args and ":" in args[-1]:
-                relative = args[-1].split(":", 1)[1]
-                data = self.blobs.get(relative)
-                stdout, rc = (_git_blob_oid(data) + "\n", 0) if data is not None else ("", 1)
+                revision, relative = args[-1].split(":", 1)
+                if revision != self.tool_revision:
+                    stdout, rc = "", 1
+                elif relative in self.blobs:
+                    oid = _git_blob_oid(self.blobs[relative])
+                    self.object_types[oid] = "blob"
+                    stdout, rc = oid + "\n", 0
+                else:
+                    members = [
+                        path for path in self.blobs
+                        if path.startswith(relative.rstrip("/") + "/")
+                    ]
+                    if members:
+                        oid = _git_tree_oid(members)
+                        self.object_types[oid] = "tree"
+                        stdout, rc = oid + "\n", 0
+                    else:
+                        stdout, rc = "", 1
             elif "ls-tree" in args:
                 revision = args[args.index("-z") + 1]
                 if revision != self.tool_revision:
@@ -1731,8 +1758,11 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
             elif "ls-files" in args:
                 if args[-1].startswith(":(icase,literal)"):
                     requested = args[-1].removeprefix(":(icase,literal)")
+                    ascii_fold = lambda value: "".join(
+                        chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value
+                    )
                     matches = sorted(relative for relative in self.blobs
-                                     if relative.casefold() == requested.casefold())
+                                     if ascii_fold(relative) == ascii_fold(requested))
                 else:
                     relative = args[-1].removeprefix(":(literal)")
                     matches = [relative] if relative in self.blobs else []
@@ -1748,8 +1778,9 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
                 else:
                     stdout, rc = _git_blob_oid(data) + "\n", 0
             else:
-                stdout, rc = "{}", 0
-            return fakes.CmdResult(rc=rc, stdout=stdout, stderr="", elapsed_s=0.0, timed_out=False)
+                stdout, rc = "", 128
+            stderr = "unsupported or unresolved test Git command" if rc == 128 else ""
+            return fakes.CmdResult(rc=rc, stdout=stdout, stderr=stderr, elapsed_s=0.0, timed_out=False)
         if args and args[0] == "docker":
             return fakes.CmdResult(
                 rc=int(self.docker_result.get("rc", 0)),
@@ -1821,6 +1852,7 @@ def test_tool_revision_rejects_self_hashed_canonical_case_attribute_changes(tmp_
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert "tool revision mismatch: tests/acceptance/cases.yaml" in violations
 
@@ -1836,6 +1868,7 @@ def test_tool_revision_accepts_repo_frozen_inputs_when_raw_bytes_match(tmp_path)
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     ) == []
 
 
@@ -1856,6 +1889,7 @@ def test_required_cases_and_verify_frozen_keep_plan_interface_without_base_revis
         repo_root=tmp_path,
         run=runner,
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     ) == []
 
 
@@ -1936,6 +1970,7 @@ def test_verify_frozen_reports_missing_docker_inspect_input(tmp_path):
         run=runner,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert any("docker" in item.casefold() and "image" in item.casefold() for item in violations)
 
@@ -1958,6 +1993,7 @@ def test_verify_frozen_rejects_docker_inspect_failure_and_accepts_matching_diges
         run=failed_runner,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert "dut image digest mismatch" in violations
 
@@ -1972,6 +2008,7 @@ def test_verify_frozen_rejects_docker_inspect_failure_and_accepts_matching_diges
         run=good_runner,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     ) == []
 
 
@@ -1986,6 +2023,7 @@ def test_windows_l15_verify_frozen_requires_injected_trusted_pair_map(tmp_path):
         tool_revision="1" * 40,
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert "trusted pair map missing: BLOCKED-OWNER BO-P9-01" in violations
 
@@ -2003,6 +2041,7 @@ def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_c
         base_revision="t3-trusted-base",
         source_reader=_trusted_source_reader(tmp_path),
         trusted_pair_map=trusted,
+        executing_tools_root=tmp_path,
     ) == []
 
     changed_path = _windows_l15_transport_fixture(tmp_path / "changed")
@@ -2094,6 +2133,7 @@ def test_tool_revision_rejects_deleted_file_from_frozen_tool_tree(tmp_path, rela
     violations = ab_manifest.verify_frozen(
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert f"tool revision tree mismatch: {tree} missing {relative}" in violations
 
@@ -2175,6 +2215,7 @@ def test_windows_l15_mapping_outside_repo_is_rejected_even_with_refreshed_hashes
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
         trusted_pair_map=trusted,
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert any("case transport map" in item and "repo" in item for item in violations)
 
@@ -2207,6 +2248,7 @@ def test_windows_l15_mapping_content_cannot_be_self_hashed_outside_repo(tmp_path
         run=_ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path)),
         tool_revision="1" * 40, trusted_pair_map=trusted,
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     assert any("case transport map" in item and "repo" in item for item in violations)
 
@@ -2220,6 +2262,7 @@ def test_windows_l15_mapping_inside_repo_is_version_controlled(tmp_path):
         run=_ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path)),
         tool_revision="1" * 40, trusted_pair_map=trusted,
         source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     ) == []
 
 
@@ -2422,9 +2465,117 @@ def test_manifest_and_trusted_pair_schemas_are_checked_against_tool_revision(tmp
     violations = ab_manifest.verify_frozen(
         manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
         trusted_pair_map=trusted, source_reader=_trusted_source_reader(tmp_path),
+        executing_tools_root=tmp_path,
     )
     for relative in schema_paths:
         assert f"tool revision mismatch: {relative}" in violations
+
+
+@pytest.mark.parametrize(
+    "schema_relative",
+    [
+        "tests/acceptance/ab_manifest.schema.json",
+        "tests/acceptance/stage3_trusted_pair_map.schema.json",
+    ],
+    ids=["manifest-schema", "trusted-pair-schema"],
+)
+def test_schema_changed_during_load_then_restored_is_rejected(tmp_path, schema_relative):
+    if schema_relative.endswith("stage3_trusted_pair_map.schema.json"):
+        path = _windows_l15_transport_fixture(tmp_path)
+        trusted = _synthetic_trusted_pair_map(tmp_path)
+    else:
+        path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+        trusted = None
+    _install_test_schemas(tmp_path)
+    schema_path = tmp_path / schema_relative
+    trusted_bytes = schema_path.read_bytes()
+    schema_path.write_bytes(b"{}\n")
+    manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    schema_path.write_bytes(trusted_bytes)
+
+    violations = _verify(manifest, tmp_path)
+    assert f"schema sha256 mismatch: {schema_relative}" in violations
+
+
+@pytest.mark.parametrize(
+    "schema_relative",
+    [
+        "tests/acceptance/ab_manifest.schema.json",
+        "tests/acceptance/stage3_trusted_pair_map.schema.json",
+    ],
+    ids=["manifest-schema", "trusted-pair-schema"],
+)
+def test_schema_drift_after_load_is_rejected(tmp_path, schema_relative):
+    if schema_relative.endswith("stage3_trusted_pair_map.schema.json"):
+        path = _windows_l15_transport_fixture(tmp_path)
+        trusted = _synthetic_trusted_pair_map(tmp_path)
+    else:
+        path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+        trusted = None
+    manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    schema_path = tmp_path / schema_relative
+    schema_path.write_bytes(b"{}\n")
+
+    violations = _verify(manifest, tmp_path)
+    assert f"schema sha256 mismatch: {schema_relative}" in violations
+
+
+def test_schema_loaded_bytes_match_current_file_and_tool_revision(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path, repo_root=tmp_path)
+    assert _verify(manifest, tmp_path) == []
+
+
+def _copy_fake_stage3_checkout(source_root: Path, destination_root: Path) -> Path:
+    import shutil
+
+    destination = destination_root / "tools" / "stage3"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_root / "tools" / "stage3", destination)
+    return destination
+
+
+def test_verify_frozen_rejects_executing_tools_stage3_changed_file(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path, repo_root=tmp_path)
+    executing_root = tmp_path / "other-checkout"
+    executing_tree = _copy_fake_stage3_checkout(tmp_path, executing_root)
+    (executing_tree / "__init__.py").write_text("# changed executor\n", encoding="utf-8")
+
+    violations = _verify(manifest, tmp_path, executing_tools_root=executing_root)
+    assert any(item.startswith("executing tools/stage3 tree mismatch:") for item in violations)
+
+
+def test_verify_frozen_rejects_executing_tools_stage3_extra_file(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path, repo_root=tmp_path)
+    executing_root = tmp_path / "other-checkout"
+    executing_tree = _copy_fake_stage3_checkout(tmp_path, executing_root)
+    (executing_tree / "unreviewed.py").write_text("# extra executor code\n", encoding="utf-8")
+
+    violations = _verify(manifest, tmp_path, executing_tools_root=executing_root)
+    assert any(item.startswith("executing tools/stage3 tree mismatch:") for item in violations)
+
+
+def test_verify_frozen_accepts_identical_executing_tools_stage3_checkout(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path, repo_root=tmp_path)
+    executing_root = tmp_path / "same-checkout"
+    _copy_fake_stage3_checkout(tmp_path, executing_root)
+
+    assert _verify(manifest, tmp_path, executing_tools_root=executing_root) == []
+
+
+def test_task6_original_load_order_cannot_verify_another_repo_root(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    try:
+        manifest = ab_manifest.load_manifest(path)
+    except HarnessError as exc:
+        assert exc.code == "HARNESS_MANIFEST_INVALID"
+        return
+
+    violations = ab_manifest.verify_frozen(manifest, repo_root=tmp_path, executing_tools_root=tmp_path)
+    assert violations == [f"manifest repo_root mismatch: loaded {manifest.repo_root} supplied {tmp_path.resolve()}"]
 
 
 def test_absolute_external_profile_is_sha_frozen_and_rechecked(tmp_path):

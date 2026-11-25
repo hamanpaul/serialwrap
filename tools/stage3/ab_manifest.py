@@ -135,6 +135,8 @@ class AbManifest:
     repo_root: Path
     source_path: Path
     source_sha256: str
+    manifest_schema_sha256: str
+    trusted_pair_map_schema_sha256: str | None
 
 
 def _invalid(detail: str) -> HarnessError:
@@ -260,22 +262,39 @@ def _schema_errors(value: Any, schema: Mapping[str, Any], root_schema: Mapping[s
     return errors
 
 
-def _validate_schema_document(value: Any, schema_path: Path, *, label: str) -> None:
+def _read_schema_document(schema_path: Path, *, label: str) -> tuple[bytes, Mapping[str, Any]]:
     try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        raw = schema_path.read_bytes()
+        schema = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _invalid(f"cannot read {label} schema: {exc}") from exc
     if not isinstance(schema, Mapping):
         raise _invalid(f"{label} schema must be an object")
+    return raw, schema
+
+
+def _validate_schema_document(
+    value: Any, schema_path: Path, *, label: str, schema_bytes: bytes | None = None,
+) -> str:
+    if schema_bytes is None:
+        schema_bytes, schema = _read_schema_document(schema_path, label=label)
+    else:
+        try:
+            schema = json.loads(schema_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise _invalid(f"cannot read {label} schema: {exc}") from exc
+        if not isinstance(schema, Mapping):
+            raise _invalid(f"{label} schema must be an object")
     errors = _schema_errors(value, schema, schema)
     if errors:
         raise _invalid(f"{label} schema validation failed: " + "; ".join(errors[:8]))
+    return hashlib.sha256(schema_bytes).hexdigest()
 
 
-def _validate_manifest_schema(value: Any, *, repo_root: Path) -> None:
-    """只從明確的 repo_root 載入 schema；該檔由 tool_revision 統一核對。"""
+def _validate_manifest_schema(value: Any, *, repo_root: Path) -> str:
+    """從明確的 repo_root 讀 schema，回傳實際驗證位元組的 SHA-256。"""
     schema_path = Path(repo_root) / "tests" / "acceptance" / "ab_manifest.schema.json"
-    _validate_schema_document(value, schema_path, label="A/B manifest")
+    return _validate_schema_document(value, schema_path, label="A/B manifest")
 
 
 def _deep_freeze(value: Any) -> Any:
@@ -387,7 +406,10 @@ def load_manifest(
     """讀取並驗證 A/B manifest。
 
     Schema 一律從呼叫端的 ``repo_root/tests/acceptance`` 讀取，不從本模組所在 checkout 取用；
-    ``verify_frozen`` 再以相同 repo_root 和 ``tool_revision`` 核對實際讀取的 schema bytes。
+    載入時保存實際驗證之 schema 原始位元組的 SHA-256；``verify_frozen`` 比對載入摘要、目前檔案
+    與 ``tool_revision`` 的原始 blob。Task 6 必須呼叫 ``load_manifest(path, repo_root=repo_root)``，
+    讓載入與凍結檢查使用同一 checkout；省略 ``repo_root`` 時會綁定本模組 checkout，後續傳入別的
+    ``repo_root`` 會明確拒絕，不會推測呼叫端想用哪一份 repo。
     因此程式 checkout 與目標 repo 不同時，讀取與版本比對仍指向同一檔案。即使 schema 被弱化，
     ``tools`` 必須包含 ``tools/stage3`` 的信任邊界仍由 loader 程式獨立強制。
 
@@ -402,7 +424,7 @@ def load_manifest(
         doc = json.loads(source_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise _invalid(f"cannot read manifest: {exc}") from exc
-    _validate_manifest_schema(doc, repo_root=root_path)
+    manifest_schema_sha256 = _validate_manifest_schema(doc, repo_root=root_path)
     root = _mapping(doc, "manifest")
     run_id = _string(root.get("run_id"), "run_id")
     layer = _string(root.get("layer"), "layer")
@@ -411,6 +433,14 @@ def load_manifest(
     exit_item_id = root.get("exit_item_id")
     if exit_item_id is not None and not isinstance(exit_item_id, str):
         raise _invalid("exit_item_id must be a string or null")
+    trusted_pair_schema_bytes: bytes | None = None
+    trusted_pair_map_schema_sha256: str | None = None
+    if exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
+        trusted_pair_schema_path = root_path / "tests" / "acceptance" / "stage3_trusted_pair_map.schema.json"
+        trusted_pair_schema_bytes, _trusted_schema_doc = _read_schema_document(
+            trusted_pair_schema_path, label="trusted pair map",
+        )
+        trusted_pair_map_schema_sha256 = hashlib.sha256(trusted_pair_schema_bytes).hexdigest()
     contract_revision = _string(root.get("contract_revision"), "contract_revision")
     if not re.fullmatch(r"[0-9a-f]{40}", contract_revision):
         raise _invalid("contract_revision must be 40 lowercase hex characters")
@@ -661,11 +691,16 @@ def load_manifest(
         repo_root=root_path,
         source_path=source,
         source_sha256=sha256_file(source),
+        manifest_schema_sha256=manifest_schema_sha256,
+        trusted_pair_map_schema_sha256=trusted_pair_map_schema_sha256,
     )
     if stage == "3":
         _validate_stage3_identity(manifest, root_path)
     if exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
-        _validate_windows_l15_transport(manifest, root_path, trusted_pair_map=trusted_pair_map)
+        _validate_windows_l15_transport(
+            manifest, root_path, trusted_pair_map=trusted_pair_map,
+            trusted_pair_schema_bytes=trusted_pair_schema_bytes,
+        )
     return manifest
 
 
@@ -900,12 +935,12 @@ def _com_pair_allowlist_matches(manifest: AbManifest, actual_pair: Mapping[str, 
 
 
 def _trusted_pair_map(
-    value: Mapping[str, Any], *, repo_root: Path | None = None,
+    value: Mapping[str, Any], *, repo_root: Path | None = None, schema_bytes: bytes | None = None,
 ) -> Mapping[str, Any]:
     """驗證呼叫端私下提供的 pair 對照，schema 從同一 repo_root 讀取並凍結。"""
     if repo_root is not None:
         schema_path = Path(repo_root) / "tests" / "acceptance" / "stage3_trusted_pair_map.schema.json"
-        _validate_schema_document(value, schema_path, label="trusted pair map")
+        _validate_schema_document(value, schema_path, label="trusted pair map", schema_bytes=schema_bytes)
     root = _closed_object(value, _TRUSTED_PAIR_MAP_FIELDS, set(), "trusted_pair_map")
     if (root.get("schema_version") != 1 or isinstance(root.get("schema_version"), bool)
             or root.get("exit_item_id") != "S3-L15-RELEASE-AB-WINDOWS"
@@ -932,6 +967,7 @@ def _validate_windows_l15_transport(
     repo_root: Path,
     *,
     trusted_pair_map: Mapping[str, Any] | None = None,
+    trusted_pair_schema_bytes: bytes | None = None,
 ) -> None:
     """驗 Windows L1.5 映射及可信 pair。
 
@@ -979,7 +1015,10 @@ def _validate_windows_l15_transport(
     case_rows = {item.get("case_id"): item for item in rows if isinstance(item, Mapping)}
     approved_pairs = mapping["approved_pairs"]
     physical_substitutes = mapping["physical_substitutes"]
-    trusted = _trusted_pair_map(trusted_pair_map, repo_root=repo_root) if trusted_pair_map is not None else None
+    trusted = (
+        _trusted_pair_map(trusted_pair_map, repo_root=repo_root, schema_bytes=trusted_pair_schema_bytes)
+        if trusted_pair_map is not None else None
+    )
     selected_pair_id = trusted.get("selected_pair_id") if trusted is not None else None
     trusted_pair = trusted["pairs"].get(selected_pair_id) if trusted is not None else None
     if trusted is not None:
@@ -1660,6 +1699,10 @@ def _tool_revision_input_errors(
     map_path: str | None = None, execution_artifact: bool = False,
 ) -> list[str]:
     """以唯一的原始 blob 比對入口核對單檔版本輸入或執行產物。"""
+    if execution_artifact and not relative.isascii():
+        # Windows 檔案系統的 Unicode 大小寫表無法在 Linux 可靠重現；保守拒絕
+        # 才不會把非 ASCII 大小寫別名誤認成未追蹤執行產物。ASCII 路徑仍走 icase 查詢。
+        return [f"tool revision path contains non-ASCII characters: {relative}"]
     path = repo_root.joinpath(*PurePosixPath(relative).parts)
     prefix = "case transport map tool revision" if relative == map_path else "tool revision"
     tracked_in_index = True
@@ -1748,15 +1791,20 @@ def _tool_revision_tree_errors(
         return [f"{prefix} non-directory tree"]
     try:
         tree_oid = run([
-            "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}:{tree}^{{tree}}",
+            "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}:{tree}",
         ])
+        tree_type = run([
+            "git", "-C", str(repo_root), "cat-file", "-t", tree_oid.stdout.strip(),
+        ]) if tree_oid.rc == 0 and not tree_oid.timed_out else None
         listed = run([
             "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
             "--", f":(literal){tree}",
         ])
     except OSError:
         return [f"tool revision unavailable: {tree}"]
-    if (tree_oid.rc != 0 or tree_oid.timed_out or not tree_oid.stdout.strip()
+    if (tree_oid.rc != 0 or tree_oid.timed_out
+            or not re.fullmatch(r"[0-9a-f]{40,64}", tree_oid.stdout.strip())
+            or tree_type is None or tree_type.rc != 0 or tree_type.timed_out or tree_type.stdout.strip() != "tree"
             or listed.rc != 0 or listed.timed_out):
         return [f"tool revision unavailable: {tree}"]
     revision_members = {
@@ -1830,10 +1878,30 @@ def _tool_revision_frozen_errors(
     return violations
 
 
+def _executing_tools_stage3_errors(m: AbManifest, executing_tools_root: Path) -> list[str]:
+    """要求目前執行中的 Stage 3 工具樹符合 manifest 已凍結的工具樹。"""
+    declared = [
+        item for item in m.tools
+        if isinstance(item, FrozenTree) and item.path == "tools/stage3"
+    ]
+    if len(declared) != 1:
+        return ["executing tools/stage3 tree declaration missing or ambiguous"]
+    expected = declared[0].tree_sha256
+    tree_root = Path(executing_tools_root) / "tools" / "stage3"
+    try:
+        actual = _tree_sha256(tree_root)
+    except (OSError, HarnessError):
+        return ["executing tools/stage3 tree unavailable"]
+    if actual != expected:
+        return [f"executing tools/stage3 tree mismatch: expected {expected} actual {actual}"]
+    return []
+
+
 def verify_frozen(
     m: AbManifest, *, repo_root: Path, run: Runner = run_cmd, tool_revision: str | None = None,
     base_revision: str | None = None, source_reader: Any = None,
     trusted_pair_map: Mapping[str, Any] | None = None,
+    executing_tools_root: Path | None = None,
 ) -> list[str]:
     """重算凍結輸入、bundle 元件及案例涵蓋。
 
@@ -1856,9 +1924,16 @@ def verify_frozen(
 
     ``tool_revision`` 是唯一可信版本錨點；省略時由 Git 讀取執行時 HEAD，Task 6 可固定傳入。
     單檔使用 ``git hash-object --no-filters`` 比較工作樹 bytes 和同路徑 revision blob；樹使用相同
-    排除規則比對 revision 與工作樹的完整成員集合，再逐檔比 bytes。執行產物只有在 ``git ls-files
-    --error-unmatch`` 明確確認不在 index、且指定 revision 也沒有該路徑時才豁免；Git 查詢失敗一律拒絕。
+    排除規則比對 revision 與工作樹的完整成員集合，再逐檔比 bytes。執行產物會以
+    ``git ls-files -z -- :(icase,literal)<path>`` 查 index，並用 ``git ls-tree`` 查指定 revision；
+    只有兩者都確認沒有大小寫等價路徑時才豁免版本比對，Git 查詢失敗一律拒絕。
+    Windows 檔案系統的 Unicode 大小寫表無法在 Linux 可靠重現，因此 repo 內含非 ASCII 字元的執行產物路徑
+    保守拒絕，避免誤放行大小寫別名；ASCII 路徑仍使用 ``:(icase,literal)`` 查詢。
     T1 CI `--base` 治理該 revision 的只增歷史；``base_revision`` 僅為呼叫端提供時的額外檢查。
+
+    ``executing_tools_root`` 預設取本模組所在 checkout。執行中的 ``tools/stage3`` 樹摘要必須等於
+    manifest 宣告的 FrozenTree；該宣告已另與 ``tool_revision`` 核對。Task 6 的報告必須記錄此摘要
+    為 ``tools_stage3_tree_sha256``，供 Task 14 對照。
 
     `trusted_pair_map` 是呼叫端注入的執行期權威對照，不是 repo 凍結檔；它經結構驗證後與公開映射、manifest pair、逐案 ID 及 allowlist 交叉綁定。
 
@@ -1871,6 +1946,26 @@ def verify_frozen(
     if root != m.repo_root:
         return [f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}"]
     violations: list[str] = []
+
+    def loaded_schema_bytes(relative: str, expected_sha256: str | None) -> bytes | None:
+        schema_path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            raw = schema_path.read_bytes()
+        except OSError:
+            violations.append(f"schema sha256 unavailable: {relative}")
+            return None
+        actual = hashlib.sha256(raw).hexdigest()
+        if expected_sha256 is None or actual != expected_sha256:
+            violations.append(f"schema sha256 mismatch: {relative}")
+        return raw
+
+    loaded_schema_bytes("tests/acceptance/ab_manifest.schema.json", m.manifest_schema_sha256)
+    trusted_pair_schema_bytes = None
+    if m.exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
+        trusted_pair_schema_bytes = loaded_schema_bytes(
+            "tests/acceptance/stage3_trusted_pair_map.schema.json",
+            m.trusted_pair_map_schema_sha256,
+        )
 
     try:
         source_sha256 = sha256_file(m.source_path)
@@ -1915,13 +2010,21 @@ def verify_frozen(
     violations.extend(_tool_revision_frozen_errors(
         m, repo_root=root, run=run, tool_revision=tool_revision,
     ))
+    executing_root = (
+        Path(executing_tools_root).resolve()
+        if executing_tools_root is not None else Path(__file__).resolve().parents[2]
+    )
+    violations.extend(_executing_tools_stage3_errors(m, executing_root))
 
     if m.exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
         if trusted_pair_map is None:
             violations.append("trusted pair map missing: BLOCKED-OWNER BO-P9-01")
         else:
             try:
-                _validate_windows_l15_transport(m, root, trusted_pair_map=trusted_pair_map)
+                _validate_windows_l15_transport(
+                    m, root, trusted_pair_map=trusted_pair_map,
+                    trusted_pair_schema_bytes=trusted_pair_schema_bytes,
+                )
             except HarnessError as exc:
                 violations.append(f"trusted pair map invalid: {exc.detail}")
 

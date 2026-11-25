@@ -1680,7 +1680,7 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
 
 **執行序（逐字實作；任何 abort 都寫出 `out_dir/ab-report.json` 後回傳）：**
 
-1. `m = load_manifest(manifest_path)`；`out_dir.mkdir(parents=True, exist_ok=False)`（已存在 → `HARNESS_MANIFEST_INVALID`，避免覆寫舊證據）。
+1. `m = load_manifest(manifest_path, repo_root=repo_root)`；`out_dir.mkdir(parents=True, exist_ok=False)`（已存在 → `HARNESS_MANIFEST_INVALID`，避免覆寫舊證據）。載入與後續 `verify_frozen` 必須使用同一個 `repo_root`；不傳根目錄會綁定執行模組所在 checkout，之後會被 fail closed 拒絕。
 2. `violations = verify_frozen(m, repo_root=repo_root, run=run)`；非空 → verdict `INFRA_ERROR`，reason 依第一筆違規類別：案例涵蓋類 → `HARNESS_CASE_SET_INCOMPLETE`、授權類 → `HARNESS_AUTHORIZATION_MISSING`、其他 → `HARNESS_MANIFEST_DRIFT`；此時**不得**執行任何 `activate`、suite、`cli` 命令。通過後對兩側各記一次受測內容指紋（R3-F2）：`trees[label] = {"bundle_tree_sha256": ab_manifest.bundle_tree_sha256(side.bundle_dir), "runtime_tree_sha256": ab_manifest.runtime_tree_sha256(side.bundle_dir)}`；拋 `HARNESS_ARTIFACT_MISMATCH`（非一般檔）→ `INFRA_ERROR`、`HARNESS_MANIFEST_DRIFT`，同樣不執行任何命令。
 3. Stage 3 非長跑（含 P0＋P1＋remote）不呼叫候選長跑 registration。只有歷史／未來另經裁決的長跑路徑，才先核對 acceptance 已凍結，並在第一次 B 前向 §0.4-2 的受控外部帳本登記一次；run context 固定帳本與歷史錨點，複驗不重複，登記失敗不啟動 B。不得替 1.0.0 恢復已撤銷的長跑 item。
 4. `rounds = [("A","B")] + ([("B","A")] if m.reverify.enabled else [])`。複驗是否執行在 manifest 預先決定，不看第一輪結果。

@@ -33,6 +33,8 @@ scripts/rust/goldens/pyre_corpus.txt text eol=lf
 docs/architecture/** -text
 tools/architecture_overlay.py -text
 
+# Stage 3 L1.5 將 func-test 全樹列為凍結工具；Windows checkout 保留 Git blob 原始位元組。
+func-test/** -text
 # Stage 3 凍結工具、公開證據與退役 metadata 以原始位元組計算雜湊；Windows checkout 不做任何 EOL 轉換。
 tools/stage3/** -text
 docs/rust-refactor/evidence/** -text
