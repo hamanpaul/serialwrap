@@ -463,25 +463,27 @@ def _p290_only_inserted_fields(before: bytes, after: bytes, count: int) -> bool:
 
     for base in bases:
         before_lines = base.splitlines(keepends=True)
-        memo: dict[tuple[int, int, int], bool] = {}
-
-        def matches(i: int, j: int, removed: int) -> bool:
-            key = (i, j, removed)
-            if key in memo:
-                return memo[key]
-            if i == len(after_lines):
-                result = j == len(before_lines) and removed == count
-            else:
-                line = after_lines[i]
-                result = j < len(before_lines) and line == before_lines[j] and matches(i + 1, j + 1, removed)
-                if not result and removed < count and field_line.fullmatch(line):
-                    result = matches(i + 1, j, removed + 1)
-            memo[key] = result
-            return result
-
-        if matches(0, 0, 0):
+        i = j = removed = 0
+        while i < len(after_lines):
+            line = after_lines[i]
+            if j < len(before_lines) and line == before_lines[j]:
+                i += 1
+                j += 1
+                continue
+            if removed < count and field_line.fullmatch(line):
+                i += 1
+                removed += 1
+                continue
+            break
+        if i == len(after_lines) and j == len(before_lines) and removed == count:
             return True
     return False
+
+
+def _p290_is_system_profile_path(path: str) -> bool:
+    """判定 system profile snapshot 路徑；這些檔案不得走 expected_overwrites 整檔豁免。"""
+    normalized = "/" + path.replace("\\", "/").lstrip("/")
+    return "/etc/serialwrap/profiles/" in normalized and normalized.endswith((".yaml", ".yml"))
 
 
 def judge_files_preserved_with_p290_migration(
@@ -498,13 +500,17 @@ def judge_files_preserved_with_p290_migration(
     """保留原有 hash 判準，只額外允許 OD-33 核准的 prpl 欄位精確遷移。"""
     expected = expected_overwrites or {}
     missing = sorted(set(before) - set(after))
-    package_updated = sorted(k for k in before if k in after and before[k] != after[k] and expected.get(k) == after[k])
+    package_updated = sorted(
+        k for k in before
+        if k in after and before[k] != after[k] and expected.get(k) == after[k]
+        and not _p290_is_system_profile_path(k)
+    )
     changed = sorted(k for k in before if k in after and before[k] != after[k] and k not in package_updated)
     added = sorted(set(after) - set(before))
     migrated: list[str] = []
     rejected: dict[str, str] = {}
     for path in changed:
-        if path in expected:
+        if path in expected and not _p290_is_system_profile_path(path):
             rejected[path] = "managed profile did not match the expected package asset"
             continue
         old = before_bytes.get(path)
@@ -1017,7 +1023,23 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
     started = _step_detail(body, "start_and_verify").get("started")
     status = status_after if isinstance(status_after, dict) else {}
     if cfg_before_bytes is None or cfg_after_bytes is None:
-        preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+        missing_profile_bytes = sorted(
+            path for path in cfg_before
+            if path in cfg_after and cfg_before[path] != cfg_after[path]
+            and _p290_is_system_profile_path(path)
+            and (cfg_before_bytes is None or cfg_after_bytes is None
+                 or path not in cfg_before_bytes or path not in cfg_after_bytes)
+        )
+        if missing_profile_bytes:
+            preserved = row(
+                check_id, "FAIL", "system profile 變更缺少前後 bytes，無法驗證精確遷移",
+                files=len(cfg_before), missing=sorted(set(cfg_before) - set(cfg_after)),
+                changed=missing_profile_bytes, added=sorted(set(cfg_after) - set(cfg_before)),
+                package_updated=[], p290_migrated=[],
+                p290_rejected={path: "migration bytes unavailable" for path in missing_profile_bytes},
+            )
+        else:
+            preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
     else:
         preserved = judge_files_preserved_with_p290_migration(
             check_id, cfg_before, cfg_after,

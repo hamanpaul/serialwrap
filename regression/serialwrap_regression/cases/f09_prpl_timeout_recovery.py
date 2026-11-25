@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import time
 
 from realhw.harness import CaseResult
@@ -51,6 +52,17 @@ def _run(ctx) -> CaseResult:
         return CaseResult("SKIP", reason="無法取得命令前 WAL 序號", category="environment",
                           reason_code="wal_unavailable")
 
+    identity_marker = f"P290_SHELL_ID_{time.time_ns()}"
+    identity_command = f"echo {identity_marker}_$$"
+    before_identity = ctx.sw.submit_and_wait(com, identity_command, cmd_timeout=10.0)
+    ctx.note("shell-identity-before.json", str(before_identity))
+    before_match = re.search(rf"{re.escape(identity_marker)}_(\d+)",
+                             str(before_identity.get("stdout") or ""))
+    if before_identity.get("status") != "done" or before_match is None:
+        return CaseResult("FAIL", reason="timeout 前無法取得可辨識的 ash shell PID",
+                          category="test", reason_code="shell_identity_unavailable")
+    before_pid = before_match.group(1)
+
     start_seq = int(wal["seq"])
     timeout_s = 4.0
     result = ctx.sw.submit_and_wait(com, "sleep 30", cmd_timeout=timeout_s,
@@ -76,6 +88,18 @@ def _run(ctx) -> CaseResult:
     if session.get("state") != "READY":
         return CaseResult("FAIL", reason=f"Ctrl-C 後 session 未維持 READY：{session.get('state')!r}",
                           category="test", reason_code="session_not_ready_after_ctrl_c")
+    after_identity = ctx.sw.submit_and_wait(com, identity_command, cmd_timeout=10.0)
+    ctx.note("shell-identity-after.json", str(after_identity))
+    after_match = re.search(rf"{re.escape(identity_marker)}_(\d+)",
+                            str(after_identity.get("stdout") or ""))
+    if after_identity.get("status") != "done" or after_match is None:
+        return CaseResult("FAIL", reason="timeout 後無法取得 ash shell PID",
+                          category="test", reason_code="shell_identity_unavailable")
+    if after_match.group(1) != before_pid:
+        return CaseResult("FAIL", reason=("Ctrl-C 前後 ash shell 身分不同："
+                                           f"before={before_pid} after={after_match.group(1)}"),
+                          category="test", reason_code="shell_identity_changed")
+
     marker = f"P290_ALIVE_{int(time.time())}"
     follow = ctx.sw.submit_and_wait(com, f"echo {marker}", cmd_timeout=10.0)
     ctx.note("post-timeout-shell.json", str(follow))

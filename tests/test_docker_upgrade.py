@@ -2107,6 +2107,104 @@ def test_p290_migration_preservation_is_exact():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_p290_system_profile_accepts_exact_migration_with_expected_asset():
+    """expected_overwrites 不得遮蔽合法的缺欄精確遷移。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    before = (
+        b"# owner profile\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\n"
+    )
+    after = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    result = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(before).hexdigest()},
+        {path: hashlib.sha256(after).hexdigest()},
+        before_bytes={path: before},
+        after_bytes={path: after},
+        expected_overwrites={path: hashlib.sha256(package_asset).hexdigest()},
+    )
+    assert result["verdict"] == "PASS", result
+    assert result["detail"]["p290_migrated"] == [path]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_system_profile_rejects_full_asset_overwrite_of_explicit_values():
+    """套件資產 hash 命中也不能授權整檔覆寫既有 [] 或 null。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    expected = {path: hashlib.sha256(package_asset).hexdigest()}
+    for explicit in (b"[]", b"null"):
+        before = (
+            b"# owner template and unrelated settings\nprofiles:\n  custom:\n    platform: prpl\n"
+            b"    timeout_recovery_keys: " + explicit + b"\nother_setting: retained\n"
+        )
+        result = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade",
+            {path: hashlib.sha256(before).hexdigest()},
+            {path: hashlib.sha256(package_asset).hexdigest()},
+            before_bytes={path: before},
+            after_bytes={path: package_asset},
+            expected_overwrites=expected,
+        )
+        assert result["verdict"] == "FAIL", result
+        assert result["detail"]["changed"] == [path], result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_system_profile_overwrite_without_bytes_is_insufficient():
+    """缺少前後 bytes 時，expected_overwrites 不能替 system profile 的整檔覆寫背書。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    before = b"profiles:\n  custom:\n    platform: prpl\n    timeout_recovery_keys: null\n"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    result = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(before).hexdigest()},
+        {path: hashlib.sha256(package_asset).hexdigest()},
+        before_bytes={},
+        after_bytes={},
+        expected_overwrites={path: hashlib.sha256(package_asset).hexdigest()},
+    )
+    assert result["verdict"] == "FAIL", result
+    assert result["detail"]["changed"] == [path], result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_long_comment_profile_comparison_is_iterative():
+    """超過 Python 遞迴上限的合法插入與非法改寫都要得到結構化判定。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    comments = b"".join(f"# 保留註解 {i}\n".encode("utf-8") for i in range(1_200))
+    before = comments + b"profiles:\n  renamed-prpl:\n    platform: prpl\n"
+    after = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+
+    def judge(candidate: bytes) -> dict[str, Any]:
+        return uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade",
+            {path: hashlib.sha256(before).hexdigest()},
+            {path: hashlib.sha256(candidate).hexdigest()},
+            before_bytes={path: before},
+            after_bytes={path: candidate},
+        )
+
+    assert judge(after)["verdict"] == "PASS"
+    illegal = after.replace("# 保留註解 1\n".encode("utf-8"), b"# changed\n", 1)
+    rejected = judge(illegal)
+    assert rejected["verdict"] == "FAIL", rejected
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_p290_post_setup_expectation_rejects_missing_recovery_keys(tmp_path):
     """遷移後 p289 gate 必須見到欄位；該補未補仍判 FAIL。"""
     asset = tmp_path / "asset.yaml"
@@ -2157,6 +2255,7 @@ class _P290RecoveryFakeSw:
     def __init__(self, recovery: dict[str, Any]) -> None:
         self.recovery = recovery
         self.commands: list[str] = []
+        self.shell_pids = iter((4_201, 4_201))
 
     def session(self, _com: str) -> dict[str, Any]:
         return {"state": "READY"}
@@ -2173,6 +2272,9 @@ class _P290RecoveryFakeSw:
         self.commands.append(command)
         if command == "sleep 30":
             return self.recovery
+        if command.startswith("echo P290_SHELL_ID_") and command.endswith("_$$"):
+            marker = command.removeprefix("echo ").removesuffix("_$$")
+            return {"status": "done", "stdout": f"{marker}_{next(self.shell_pids)}"}
         marker = command.removeprefix("echo ")
         return {"status": "done", "stdout": marker}
 
@@ -2195,8 +2297,11 @@ def test_p290_regression_fake_driver_accepts_done_ctrl_c_recovery():
     ctx = _p290_case_context({"status": "done", "error_code": None, "recovery_action": "CTRL_C"})
     result = p290_case._run(ctx)
     assert result.verdict == "PASS", result
-    assert ctx.sw.commands[0] == "sleep 30"
-    assert ctx.sw.commands[1].startswith("echo P290_ALIVE_")
+    assert ctx.sw.commands[0].startswith("echo P290_SHELL_ID_")
+    assert ctx.sw.commands[0].endswith("_$$")
+    assert ctx.sw.commands[1] == "sleep 30"
+    assert ctx.sw.commands[2] == ctx.sw.commands[0]
+    assert ctx.sw.commands[3].startswith("echo P290_ALIVE_")
     assert "keys=[3]" in ctx.notes["recovery-key-sequence.txt"]
 
 
@@ -2208,7 +2313,21 @@ def test_p290_regression_fake_driver_rejects_failed_recovery():
     result = p290_case._run(ctx)
     assert result.verdict == "FAIL", result
     assert result.reason_code == "timeout_not_recovered_by_ctrl_c"
-    assert ctx.sw.commands == ["sleep 30"]
+    assert len(ctx.sw.commands) == 2
+    assert ctx.sw.commands[0].startswith("echo P290_SHELL_ID_")
+    assert ctx.sw.commands[0].endswith("_$$")
+    assert ctx.sw.commands[1] == "sleep 30"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_rejects_shell_identity_change():
+    """recovery 後若 ash PID 改變，fake driver 必須拒絕即使 echo 命令成功。"""
+    ctx = _p290_case_context({"status": "done", "error_code": None, "recovery_action": "CTRL_C"})
+    ctx.sw.shell_pids = iter((4_201, 9_802))
+    result = p290_case._run(ctx)
+    assert result.verdict == "FAIL", result
+    assert result.reason_code == "shell_identity_changed"
 
 
 @pytest.mark.core_portable
