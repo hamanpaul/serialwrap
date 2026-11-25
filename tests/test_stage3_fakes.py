@@ -6,8 +6,11 @@ import hashlib
 import importlib
 import json
 import shutil
+import stat
+import tarfile
 from datetime import datetime
 from pathlib import Path
+import zipfile
 
 import pytest
 import yaml
@@ -229,6 +232,205 @@ def test_write_ab_manifest_required_cases_sha256_matches_t1_lock(tmp_path):
     assert context["required_cases_sha256"] == lock_sha256
 
 
+def test_write_ab_manifest_uses_shared_candidate_round(tmp_path):
+    fakes = _fakes()
+    default_rounds = set()
+    for layer in ("l1.5", "l2", "l3"):
+        for platform in ("linux", "windows"):
+            manifest_path = fakes.write_ab_manifest(
+                tmp_path / f"default-{layer}-{platform}",
+                layer=layer,
+                platform=platform,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            context_ref = manifest["candidate_context"]
+            context_path = manifest_path.parent / context_ref["path"]
+            assert jsonio.sha256_file(context_path) == context_ref["sha256"]
+            context = candidate_context.load_run_context(context_path)
+            default_rounds.add(context["candidate_round_id"])
+    assert len(default_rounds) == 1
+
+    selected_round = "a" * 32
+    manifest_path = fakes.write_ab_manifest(
+        tmp_path / "override-round",
+        layer="l2",
+        platform="windows",
+        candidate_round_id=selected_round,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    context_ref = manifest["candidate_context"]
+    context_path = manifest_path.parent / context_ref["path"]
+    assert jsonio.sha256_file(context_path) == context_ref["sha256"]
+    context = candidate_context.load_run_context(context_path)
+    assert context["candidate_round_id"] == selected_round
+    assert manifest["required_cases_sha256"] == context["required_cases_sha256"]
+
+
+def _independent_tree_sha256(root: Path) -> str:
+    rows = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        assert not path.is_symlink(), relative.as_posix()
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            rows.append(f"{relative.as_posix()}\0{digest}\n")
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
+def test_make_bundle_python_delegate_tree_is_real_before_retirement(tmp_path):
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "rust-stage-24", stage="2.4", daemon_impl="rust")
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    delegate = manifest["components"]["python_cli_delegate"]
+    runtime = bundle / "py"
+    assert runtime.is_dir()
+    assert (bundle / delegate["entry"][0]).is_file()
+    assert delegate["tree_sha256"] == _independent_tree_sha256(runtime)
+
+    retired = fakes.make_bundle(tmp_path / "rust-stage-3", stage="3", daemon_impl="rust")
+    retired_manifest = json.loads((retired / "release-manifest.json").read_text(encoding="utf-8"))
+    assert retired_manifest["retirement"] == {"python_daemon": "removed"}
+    assert "python_cli_delegate" not in retired_manifest["components"]
+
+
+@pytest.mark.parametrize("stage", ["1A", "1B", "2.1", "2.2", "2.3", "2.4", "3"])
+def test_write_ab_manifest_uses_stage_case_lock_and_side_identities(tmp_path, stage):
+    fakes = _fakes()
+    manifest_path = fakes.write_ab_manifest(
+        tmp_path / f"stage-{stage.replace('.', '-')}",
+        layer="l1.5",
+        platform="linux",
+        stage=stage,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    repo = manifest_path.parent
+
+    case_lock = json.loads((repo / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+    case_rows = yaml.safe_load((repo / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))["cases"]
+    if stage == "3":
+        required_lock = json.loads(
+            (repo / "tests/acceptance/stage3_required_cases.lock.json").read_text(encoding="utf-8")
+        )
+        exit_id = "S3-L15-RELEASE-AB-LINUX"
+        expected_cases = sorted(required_lock["exits"][exit_id]["linux"]["case_ids"])
+        expected_set = required_lock["exits"][exit_id]["linux"]["required_case_set"]
+    else:
+        expected_set = {"1A": "cli_1A", "1B": "cli_1B"}.get(stage, f"slice_{stage}")
+        case_by_id = {row["case_id"]: row for row in case_rows}
+        expected_cases = sorted(
+            case_id
+            for case_id in case_lock["sets"][expected_set]
+            if case_id in case_by_id
+            and str(case_by_id[case_id].get("layer", "")).casefold() == "l1.5"
+            and "linux" in case_by_id[case_id].get("platforms", [])
+        )
+    assert manifest["required_case_set"] == expected_set
+    assert manifest["case_ids"] == expected_cases
+
+    release_manifests = [
+        json.loads((repo / side["release_manifest"]["path"]).read_text(encoding="utf-8"))
+        for side in manifest["sides"]
+    ]
+    a_components, b_components = [item["components"] for item in release_manifests]
+    if stage in ("1A", "1B"):
+        assert (a_components["cli"]["implementation"], b_components["cli"]["implementation"]) == (
+            "python",
+            "rust",
+        )
+        assert a_components["daemon"]["implementation"] == b_components["daemon"]["implementation"] == "python"
+    else:
+        assert a_components["cli"]["implementation"] == b_components["cli"]["implementation"]
+        assert a_components["cli"]["sha256"] == b_components["cli"]["sha256"]
+        assert a_components["daemon"]["implementation"] == "python"
+        assert b_components["daemon"]["implementation"] == "rust"
+
+
+def test_write_ab_manifest_cli_sha_override_changes_only_b_artifact(tmp_path):
+    import jsonschema
+
+    fakes = _fakes()
+    manifest_path = fakes.write_ab_manifest(
+        tmp_path / "cli-diff",
+        stage="2.1",
+        platform="linux",
+        **{"sides.1.cli_sha_override": "0" * 64},
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    schema = json.loads((ACCEPTANCE_DIR / "ab_manifest.schema.json").read_text(encoding="utf-8"))
+    assert list(jsonschema.Draft202012Validator(schema).iter_errors(manifest)) == []
+
+    repo = manifest_path.parent
+    components = []
+    cli_paths = []
+    for side in manifest["sides"]:
+        release_path = repo / side["release_manifest"]["path"]
+        release_manifest = json.loads(release_path.read_text(encoding="utf-8"))
+        cli_rel = release_manifest["components"]["cli"]["path"]
+        cli_path = release_path.parent / cli_rel
+        components.append(release_manifest["components"]["cli"])
+        cli_paths.append(cli_path)
+        assert side["release_manifest"]["sha256"] == hashlib.sha256(release_path.read_bytes()).hexdigest()
+        assert components[-1]["sha256"] == hashlib.sha256(cli_path.read_bytes()).hexdigest()
+    assert cli_paths[0].read_bytes() != cli_paths[1].read_bytes()
+    assert components[0]["sha256"] != components[1]["sha256"]
+
+    def verify_frozen_files(value):
+        if isinstance(value, dict):
+            if set(value) == {"path", "sha256"}:
+                path = repo / value["path"]
+                assert path.is_file()
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == value["sha256"]
+            for child in value.values():
+                verify_frozen_files(child)
+        elif isinstance(value, list):
+            for child in value:
+                verify_frozen_files(child)
+
+    verify_frozen_files(manifest)
+    for tool in manifest["tools"]:
+        assert fakes.tree_sha256(repo / tool["path"]) == tool["tree_sha256"]
+
+
+def test_recording_runner_script_uses_exact_command_key():
+    fakes = _fakes()
+    first = "git:rev-parse HEAD"
+    second = "git:rev-parse HEAD:contracts"
+    sequences = {
+        first: [
+            {"rc": 11, "stdout": "head-1"},
+            {"rc": 12, "stdout": "head-2"},
+        ],
+        second: [
+            {"rc": 21, "stdout": "contracts-1"},
+            {"rc": 22, "stdout": "contracts-2"},
+        ],
+    }
+    for script in (sequences, dict(reversed(list(sequences.items())))):
+        runner = fakes.RecordingRunner(script=script)
+        results = [
+            runner(["git", "rev-parse", "HEAD:contracts"]),
+            runner(["git", "rev-parse", "HEAD"]),
+            runner(["git", "rev-parse", "HEAD"]),
+            runner(["git", "rev-parse", "HEAD:contracts"]),
+        ]
+        assert [(result.rc, result.stdout) for result in results] == [
+            (21, "contracts-1"),
+            (11, "head-1"),
+            (12, "head-2"),
+            (22, "contracts-2"),
+        ]
+        fallback = runner(["git", "status"])
+        assert (fallback.rc, fallback.stdout) == (0, "{}")
+
+    failure = RuntimeError("prefix exception")
+    runner = fakes.RecordingRunner()
+    runner.raise_on("git:rev-parse", failure)
+    with pytest.raises(RuntimeError, match="prefix exception"):
+        runner(["git", "rev-parse", "HEAD:contracts"])
+
+
 def test_rc_archive_is_reproducible(tmp_path):
     fakes = _fakes()
     bundle = fakes.make_bundle(tmp_path / "bundle")
@@ -258,6 +460,102 @@ def test_rc_archive_changes_for_same_manifest_different_tree(tmp_path):
     assert fakes.tree_sha256(bundle_a) != fakes.tree_sha256(bundle_b)
     assert hashlib.sha256(archive_a).digest() != hashlib.sha256(archive_b).digest()
     assert archive_a != archive_b
+
+
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+def test_rc_archive_layout_matches_bundle_bytes_and_fixed_metadata(tmp_path, platform):
+    fakes = _fakes()
+    target = "x86_64-unknown-linux-gnu" if platform == "linux" else "x86_64-pc-windows-gnu"
+    version = "0.9.0"
+    bundle = fakes.make_bundle(tmp_path / f"bundle-{platform}", version=version, stage="2.4", target=target)
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["bundle_version"] == version
+    outer = f"serialwrap-{version}-{platform}-x86_64"
+    version_root = f"{outer}/versions/{version}"
+    archive = fakes.rc_archive(bundle)
+    bundle_files = {
+        path.relative_to(bundle).as_posix(): path.read_bytes()
+        for path in bundle.rglob("*")
+        if path.is_file()
+    }
+    bundle_dirs = {
+        path.relative_to(bundle).as_posix()
+        for path in bundle.rglob("*")
+        if path.is_dir()
+    }
+    version_names = {f"{version_root}/", *(f"{version_root}/{name}/" for name in bundle_dirs)}
+    version_names.update(f"{version_root}/{name}" for name in bundle_files)
+    outer_names = {f"{outer}/", f"{outer}/versions/", f"{version_root}/", f"{outer}/bin/"}
+    suffix = ".exe" if platform == "windows" else ""
+    cli_rel = f"bin/serialwrap{suffix}"
+    daemon_rel = f"bin/serialwrapd{suffix}"
+    assert manifest["components"]["cli"]["path"] == cli_rel
+    assert manifest["components"]["daemon"]["launcher"]["path"] == daemon_rel
+    cli_entry = f"{outer}/{cli_rel}"
+    daemon_entry = f"{outer}/{daemon_rel}"
+    expected_names = version_names | outer_names | {cli_entry, daemon_entry}
+
+    if platform == "linux":
+        assert archive.suffixes == [".tar", ".gz"]
+        assert archive.read_bytes()[4:8] == b"\0\0\0\0"
+        with tarfile.open(archive, "r:gz") as tar:
+            members = tar.getmembers()
+            canonical_names = [member.name + "/" if member.isdir() else member.name for member in members]
+            assert canonical_names == sorted(expected_names)
+            assert len({member.name for member in members}) == len(members)
+            by_name = dict(zip(canonical_names, members))
+            for name, data in bundle_files.items():
+                member = by_name[f"{version_root}/{name}"]
+                assert member.isfile()
+                stream = tar.extractfile(member)
+                assert stream is not None and stream.read() == data
+                expected_mode = 0o755 if name.startswith("bin/") or name in {"py/python", "py/python.exe"} else 0o644
+                assert member.mode == expected_mode
+            for name in bundle_dirs:
+                assert by_name[f"{version_root}/{name}/"].isdir()
+            for name in (f"{outer}/", f"{outer}/versions/", f"{version_root}/", f"{outer}/bin/"):
+                assert by_name[name].isdir() and by_name[name].mode == 0o755
+            for rel, entry in ((cli_rel, cli_entry), (daemon_rel, daemon_entry)):
+                member = by_name[entry]
+                assert member.issym()
+                assert member.linkname == f"../versions/{version}/{rel}"
+                assert member.mode == 0o777
+            for member in members:
+                assert member.mtime == member.uid == member.gid == 0
+                assert member.uname == member.gname == ""
+                assert "\\" not in member.name and ".." not in Path(member.name).parts
+    else:
+        assert archive.suffix == ".zip"
+        with zipfile.ZipFile(archive, "r") as zipped:
+            members = zipped.infolist()
+            assert [member.filename for member in members] == sorted(expected_names)
+            assert len({member.filename for member in members}) == len(members)
+            for name, data in bundle_files.items():
+                member = zipped.getinfo(f"{version_root}/{name}")
+                assert zipped.read(member) == data
+                mode = member.external_attr >> 16
+                assert stat.S_IFMT(mode) == stat.S_IFREG
+                assert stat.S_IMODE(mode) == 0o644
+            for name in bundle_dirs:
+                member = zipped.getinfo(f"{version_root}/{name}/")
+                mode = member.external_attr >> 16
+                assert stat.S_IFMT(mode) == stat.S_IFDIR
+                assert stat.S_IMODE(mode) == 0o755
+            for name in (f"{outer}/", f"{outer}/versions/", f"{version_root}/", f"{outer}/bin/"):
+                member = zipped.getinfo(name)
+                mode = member.external_attr >> 16
+                assert stat.S_IFMT(mode) == stat.S_IFDIR
+                assert stat.S_IMODE(mode) == 0o755
+            for rel, entry in ((cli_rel, cli_entry), (daemon_rel, daemon_entry)):
+                assert zipped.read(entry) == bundle_files[rel]
+                member = zipped.getinfo(entry)
+                mode = member.external_attr >> 16
+                assert stat.S_IFMT(mode) == stat.S_IFREG
+                assert stat.S_IMODE(mode) == 0o644
+            for member in members:
+                assert member.date_time == (1980, 1, 1, 0, 0, 0)
+                assert member.create_system == 3
+                assert "\\" not in member.filename and ".." not in Path(member.filename).parts
 
 
 def test_fake_probe_sequences():

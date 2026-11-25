@@ -232,6 +232,15 @@ def _write_json(path: Path, value: Any) -> Path:
     return path
 
 
+def _write_bundle_sums(root: Path) -> None:
+    """依 bundle 實際檔案重建 SHA256SUMS。"""
+    sums = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.is_file() and path.name not in {"SHA256SUMS", "release-manifest.json"}:
+            sums.append(f"{sha256_file(path)}  {path.relative_to(root).as_posix()}\n")
+    (root / "SHA256SUMS").write_text("".join(sums), encoding="utf-8", newline="\n")
+
+
 def make_bundle(
     root: Path,
     *,
@@ -255,8 +264,9 @@ def make_bundle(
         cli.chmod(0o755)
         daemon.chmod(0o755)
 
+    include_retirement = stage == "3" if retirement_marker is None else retirement_marker
     runtime = root / "py"
-    if daemon_impl == "python":
+    if daemon_impl == "python" or not include_retirement:
         (runtime / "sw_core").mkdir(parents=True, exist_ok=True)
         (runtime / "python").write_text("#!/usr/bin/env python3\n", encoding="utf-8", newline="\n")
         (runtime / "serialwrapd.py").write_text("# 測試用 Python daemon\n", encoding="utf-8", newline="\n")
@@ -293,7 +303,6 @@ def make_bundle(
                 },
             }
         )
-    include_retirement = stage == "3" if retirement_marker is None else retirement_marker
     components: dict[str, Any] = {
         "cli": {
             "implementation": cli_impl,
@@ -313,7 +322,7 @@ def make_bundle(
     if not include_retirement:
         components["python_cli_delegate"] = {
             "entry": ["py/python", "-I", "-B", "-m", "sw_core.cli"],
-            "tree_sha256": tree_sha256(runtime) if runtime.exists() else sha256_text("empty runtime"),
+            "tree_sha256": tree_sha256(runtime),
         }
 
     manifest: dict[str, Any] = {
@@ -330,11 +339,7 @@ def make_bundle(
     if include_retirement:
         manifest["retirement"] = {"python_daemon": "removed"}
     _write_json(root / "release-manifest.json", manifest)
-    sums = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        if path.is_file() and path.name not in {"SHA256SUMS", "release-manifest.json"}:
-            sums.append(f"{sha256_file(path)}  {path.relative_to(root).as_posix()}\n")
-    (root / "SHA256SUMS").write_text("".join(sums), encoding="utf-8", newline="\n")
+    _write_bundle_sums(root)
     return root
 
 
@@ -612,6 +617,7 @@ def write_ab_manifest(
     platform: str = "linux",
     stage: str = "3",
     acceptance_state: str = "current",
+    candidate_round_id: str = "00000000000000000000000000000001",
     **overrides: Any,
 ) -> Path:
     """建立含真實凍結雜湊、逐出口分母與兩側 bundle 的 A/B manifest。"""
@@ -627,6 +633,10 @@ def write_ab_manifest(
     doc["stage"] = stage
     doc["contract_revision"] = "0" * 40
 
+    cli_sha_override = overrides.pop("sides.1.cli_sha_override", None)
+    if cli_sha_override is not None and not isinstance(cli_sha_override, str):
+        raise ValueError("sides.1.cli_sha_override 必須是文字")
+
     from tools.stage3 import required_cases
 
     required_lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
@@ -640,7 +650,16 @@ def write_ab_manifest(
         ("l3", "linux"): "S3-L3-P0P1-REMOTE-LINUX",
         ("l3", "windows"): "S3-L3-P0P1-REMOTE-WINDOWS",
     }
-    doc["required_case_set"] = "slice_2.4"
+    legacy_case_sets = {
+        "1A": "cli_1A",
+        "1B": "cli_1B",
+        "2.1": "slice_2.1",
+        "2.2": "slice_2.2",
+        "2.3": "slice_2.3",
+        "2.4": "slice_2.4",
+    }
+    if stage not in legacy_case_sets and stage != "3":
+        raise ValueError(f"不支援的 A/B manifest 階段：{stage}")
     if stage == "3":
         try:
             exit_item_id = exit_ids[(layer, platform)]
@@ -660,9 +679,10 @@ def write_ab_manifest(
     else:
         case_lock = json.loads((root / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
         case_rows = yaml.safe_load((root / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))["cases"]
+        doc["required_case_set"] = legacy_case_sets[stage]
         case_by_id = {row["case_id"]: row for row in case_rows}
         doc["case_ids"] = sorted(
-            case_id for case_id in case_lock["sets"]["slice_2.4"]
+            case_id for case_id in case_lock["sets"][doc["required_case_set"]]
             if case_id in case_by_id
             and str(case_by_id[case_id].get("layer", "")).casefold() == layer
             and platform in case_by_id[case_id].get("platforms", [])
@@ -699,11 +719,25 @@ def write_ab_manifest(
     side_rows = []
     candidate_bundle: Path | None = None
     bundle_version = "1.0.0" if stage == "3" else "0.9.0"
-    for label, role, daemon_impl in (("A", "baseline", "python"), ("B", "candidate", "rust")):
+    if stage in ("1A", "1B"):
+        side_specs = (("A", "baseline", "python", "python"), ("B", "candidate", "rust", "python"))
+    else:
+        side_specs = (("A", "baseline", "rust", "python"), ("B", "candidate", "rust", "rust"))
+    for label, role, cli_impl, daemon_impl in side_specs:
         bundle = make_bundle(root / "bundles" / label, version=bundle_version, stage=stage,
+                             cli_impl=cli_impl,
                              daemon_impl=daemon_impl,
                              retirement_marker=(False if stage == "3" and label == "A" else None),
                              target=("x86_64-pc-windows-gnu" if platform == "windows" else "x86_64-unknown-linux-gnu"))
+        if label == "B" and cli_sha_override is not None:
+            release_manifest_path = bundle / "release-manifest.json"
+            release_doc = json.loads(release_manifest_path.read_text(encoding="utf-8"))
+            cli_path = bundle / release_doc["components"]["cli"]["path"]
+            marker = cli_sha_override.encode("utf-8")
+            cli_path.write_bytes(b"#!/usr/bin/env python3\n# Test CLI identity override\n" + marker + b"\n")
+            release_doc["components"]["cli"]["sha256"] = sha256_file(cli_path)
+            _write_json(release_manifest_path, release_doc)
+            _write_bundle_sums(bundle)
         if label == "B":
             candidate_bundle = bundle
         rel_bundle = bundle.relative_to(root).as_posix()
@@ -728,7 +762,7 @@ def write_ab_manifest(
         archive_path = rc_archive(candidate_bundle)
         candidate_manifest = candidate_bundle / "release-manifest.json"
         context = {
-            "candidate_round_id": hashlib.sha256(doc["run_id"].encode("utf-8")).hexdigest()[:32],
+            "candidate_round_id": candidate_round_id,
             "rc_tag": "v1.0.0-rc.1",
             "platform": platform,
             "archive_sha256": sha256_file(archive_path),
@@ -737,6 +771,9 @@ def write_ab_manifest(
             "run_id": doc["run_id"],
         }
         context_path = _write_json(root / "run-context.json", context)
+        from tools.stage3 import candidate_context
+
+        candidate_context.load_run_context(context_path)
         doc["candidate_context"] = {
             "path": context_path.relative_to(root).as_posix(),
             "sha256": sha256_file(context_path),
@@ -1030,7 +1067,7 @@ class RecordingRunner:
             if key.startswith(prefix):
                 effect(call_argv, call_env)
 
-        script_key = next((name for name in self.script if key.startswith(name)), None)
+        script_key = key if key in self.script else None
         if script_key is None:
             result = {"rc": 0, "stdout": "{}", "stderr": ""}
             position = 0
