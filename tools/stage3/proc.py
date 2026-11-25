@@ -18,13 +18,13 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 @dataclass(frozen=True)
 class CmdResult:
     rc: int            # timeout 時為 -1
-    stdout: str
-    stderr: str
+    stdout: str | bytes
+    stderr: str | bytes
     elapsed_s: float
     timed_out: bool
 
 
-Runner = Callable[..., CmdResult]   # run(argv, *, env=None, timeout=None, cwd=None) -> CmdResult
+Runner = Callable[..., CmdResult]   # run(argv, *, env=None, timeout=None, cwd=None, bytes_output=False) -> CmdResult
 
 
 def _text(value: Any) -> str:
@@ -36,9 +36,14 @@ def _text(value: Any) -> str:
 
 
 def run_cmd(argv: Sequence[str], *, env: Mapping[str, str] | None = None, timeout: float | None = None,
-            cwd: Path | None = None) -> CmdResult:
-    """同步執行命令並擷取 stdout／stderr；逾時回傳 `rc=-1`、`timed_out=True`。"""
+            cwd: Path | None = None, bytes_output: bool = False) -> CmdResult:
+    """同步執行命令並擷取 stdout／stderr；逾時回傳 `rc=-1`、`timed_out=True`。
+
+    預設維持 UTF-8 文字輸出；`bytes_output=True` 時保留 stdout／stderr 原始位元組，
+    適用於以 NUL 分隔且可能含換行字元的 Git 路徑清單。
+    """
     start = time.monotonic()
+    text_options = {} if bytes_output else {"encoding": "utf-8", "errors": "replace"}
     try:
         cp = subprocess.run(
             list(argv),
@@ -46,13 +51,17 @@ def run_cmd(argv: Sequence[str], *, env: Mapping[str, str] | None = None, timeou
             cwd=str(cwd) if cwd is not None else None,
             timeout=timeout,
             capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+            **text_options,
         )
     except subprocess.TimeoutExpired as exc:
-        return CmdResult(rc=-1, stdout=_text(exc.stdout), stderr=_text(exc.stderr),
+        stdout = exc.stdout or (b"" if bytes_output else "")
+        stderr = exc.stderr or (b"" if bytes_output else "")
+        if not bytes_output:
+            stdout, stderr = _text(stdout), _text(stderr)
+        return CmdResult(rc=-1, stdout=stdout, stderr=stderr,
                          elapsed_s=time.monotonic() - start, timed_out=True)
-    return CmdResult(rc=cp.returncode, stdout=cp.stdout or "", stderr=cp.stderr or "",
+    empty = b"" if bytes_output else ""
+    return CmdResult(rc=cp.returncode, stdout=cp.stdout or empty, stderr=cp.stderr or empty,
                      elapsed_s=time.monotonic() - start, timed_out=False)
 
 

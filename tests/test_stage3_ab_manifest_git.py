@@ -317,9 +317,9 @@ def test_genuinely_untracked_package_tree_member_is_classified_and_allowed(tmp_p
     _refresh_sidecar_and_manifest(root, manifest_path)
     commands = []
 
-    def tracing_runner(argv, *, env=None, timeout=None, cwd=None):
+    def tracing_runner(argv, *, env=None, timeout=None, cwd=None, bytes_output=False):
         commands.append(list(argv))
-        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd)
+        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd, bytes_output=bytes_output)
 
     classified = []
     original_classifier = ab_manifest._tool_revision_input_errors
@@ -356,9 +356,9 @@ def test_external_bundle_members_are_not_classified_as_repo_paths(tmp_path):
     _write_json(manifest_path, top_doc)
     commands = []
 
-    def tracing_runner(argv, *, env=None, timeout=None, cwd=None):
+    def tracing_runner(argv, *, env=None, timeout=None, cwd=None, bytes_output=False):
         commands.append(list(argv))
-        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd)
+        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd, bytes_output=bytes_output)
 
     violations = _verify_with_revision(manifest_path, root, revision, runner=tracing_runner)
 
@@ -451,11 +451,11 @@ def test_tool_revision_fails_closed_when_git_tracking_query_fails(tmp_path):
     doc["suite"]["selftest_report"] = {"path": relative, "sha256": fakes.sha256_file(added)}
     _write_json(manifest_path, doc)
 
-    def fail_ls_files(argv, *, env=None, timeout=None, cwd=None):
+    def fail_ls_files(argv, *, env=None, timeout=None, cwd=None, bytes_output=False):
         if "ls-files" in argv:
             return CmdResult(rc=128, stdout="", stderr="simulated Git query failure", elapsed_s=0.0,
                              timed_out=False)
-        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd)
+        return run_cmd(argv, env=env, timeout=timeout, cwd=cwd, bytes_output=bytes_output)
 
     violations = _verify_with_revision(manifest_path, tmp_path, revision, runner=fail_ls_files)
     assert any("tool revision unavailable" in item and relative in item for item in violations)
@@ -532,6 +532,75 @@ def test_correct_case_and_genuinely_untracked_execution_paths_remain_legal(tmp_p
     untracked = tmp_path / "reports" / "untracked-report.json"
     untracked.write_text("{}\n", encoding="utf-8")
     assert _execution_path_errors(tmp_path, "reports/untracked-report.json", revision) == []
+
+
+@pytest.mark.parametrize("control_name", ["carriage-return", "line-feed", "crlf"],
+                         ids=["cr", "lf", "crlf"])
+def test_real_git_rejects_tracked_control_character_path_after_content_drift(tmp_path, control_name):
+    _manifest_path, _initial_revision = _make_committed_fake_repo(tmp_path)
+    control = {"carriage-return": "\r", "line-feed": "\n", "crlf": "\r\n"}[control_name]
+    relative = f"reports/name{control}report.json"
+    tracked = tmp_path / relative
+    tracked.write_bytes(b"committed report\n")
+    _git(tmp_path, "add", "--", relative)
+    _git(tmp_path, "commit", "-q", "-m", "track control-character path")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    tracked.write_bytes(b"drifted report\n")
+
+    assert _execution_path_errors(tmp_path, relative, revision) == [
+        f"tool revision path contains ASCII control characters: {relative!r}"
+    ]
+    assert ab_manifest._tool_revision_path_inventory(
+        repo_root=tmp_path, revision=revision, run=run_cmd,
+    ) is None
+
+
+@pytest.mark.parametrize("control_name", ["carriage-return", "line-feed", "crlf"],
+                         ids=["cr", "lf", "crlf"])
+def test_real_git_rejects_staged_control_character_path(tmp_path, control_name):
+    _manifest_path, revision = _make_committed_fake_repo(tmp_path)
+    control = {"carriage-return": "\r", "line-feed": "\n", "crlf": "\r\n"}[control_name]
+    relative = f"reports/staged{control}report.json"
+    staged = tmp_path / relative
+    staged.write_bytes(b"staged report\n")
+    _git(tmp_path, "add", "--", relative)
+
+    assert _execution_path_errors(tmp_path, relative, revision) == [
+        f"tool revision path contains ASCII control characters: {relative!r}"
+    ]
+    assert ab_manifest._tool_revision_path_inventory(
+        repo_root=tmp_path, revision=revision, run=run_cmd,
+    ) is None
+
+
+def test_real_git_control_character_path_in_manifest_is_rejected(tmp_path):
+    manifest_path, revision = _make_committed_fake_repo(tmp_path)
+    relative = "reports/declared\rname.json"
+    declared = tmp_path / relative
+    declared.write_bytes(b"report\n")
+    doc = _read_json(manifest_path)
+    doc["suite"]["selftest_report"] = {
+        "path": relative,
+        "sha256": hashlib.sha256(declared.read_bytes()).hexdigest(),
+    }
+    _write_json(manifest_path, doc)
+
+    with pytest.raises(ab_manifest.HarnessError) as caught:
+        _verify_with_revision(manifest_path, tmp_path, revision)
+
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "ASCII control characters" in caught.value.detail
+    assert "declared\\rname.json" in caught.value.detail
+
+
+def test_git_nul_path_parser_preserves_bytes_and_rejects_empty_or_control_entries():
+    assert ab_manifest._parse_git_path_list(b"reports/first.json\0reports/second.json\0") == (
+        "reports/first.json", "reports/second.json",
+    )
+    with pytest.raises(ValueError, match="empty Git path entry"):
+        ab_manifest._parse_git_path_list(b"reports/first.json\0\0")
+    with pytest.raises(ValueError, match="ASCII control characters"):
+        ab_manifest._parse_git_path_list(b"reports/line\nfeed.json\0")
 
 
 def test_repo_profile_staged_new_file_remains_tool_revision_controlled(tmp_path):

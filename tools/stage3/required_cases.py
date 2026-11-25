@@ -106,10 +106,16 @@ _SOURCE_MANIFEST_OBJECT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EXIT_ITEM_ID = re.compile(r"^S3-[A-Z0-9-]+$")
 SourceReader = Callable[[str, str], bytes | None]
+ReadBytes = Callable[[Path], bytes]
 
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _read_bytes(path: Path, read_bytes: ReadBytes | None = None) -> bytes:
+    """透過呼叫端讀取器取得位元組；省略時維持直接讀檔的公開行為。"""
+    return (read_bytes or Path.read_bytes)(Path(path))
 
 
 def _relative_path(value: object) -> str | None:
@@ -188,8 +194,12 @@ def verify_seed_sources(
     *,
     evidence_root: Path,
     source_reader: SourceReader | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
-    """核對指定靜態種子的 revision、來源路徑、附件與原始 Git blob SHA。"""
+    """核對指定靜態種子的 revision、來源路徑、附件與原始 Git blob SHA。
+
+    `read_bytes` 可注入呼叫端快照讀取器；省略時保留直接讀取檔案的行為。
+    """
     if not isinstance(manifest, Mapping):
         return ["來源 manifest 必須是物件"]
     errors = _source_manifest_schema_errors(manifest)
@@ -230,7 +240,7 @@ def verify_seed_sources(
             errors.append(f"{repo_path} 的 sha256 格式錯誤")
             continue
         try:
-            attached_bytes = (root / attachment).read_bytes()
+            attached_bytes = _read_bytes(root / attachment, read_bytes)
         except OSError as exc:
             errors.append(f"無法讀取種子附件 {attachment}: {exc}")
             continue
@@ -258,9 +268,9 @@ def verify_seed_sources(
     return errors
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path, read_bytes: ReadBytes | None = None) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(_read_bytes(path, read_bytes).decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ValueError(f"無法讀取 JSON {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -357,15 +367,18 @@ def _expected_exit_cases(
     return expected
 
 
-def _seed_required_cases_by_initial_exit(evidence_root: Path) -> dict[tuple[str, str], set[str]]:
+def _seed_required_cases_by_initial_exit(
+    evidence_root: Path, *, read_bytes: ReadBytes | None = None,
+) -> dict[tuple[str, str], set[str]]:
     """只用固定附件，依核定初始出口各自展開 seed 必要案例下限。"""
     try:
-        cases_doc = yaml.safe_load((evidence_root / SEED_FILES["tests/acceptance/cases.yaml"]).read_text(encoding="utf-8"))
+        cases_raw = _read_bytes(evidence_root / SEED_FILES["tests/acceptance/cases.yaml"], read_bytes)
+        cases_doc = yaml.safe_load(cases_raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ValueError(f"無法讀取固定 seed 基準 cases.yaml：{exc}") from exc
     if not isinstance(cases_doc, dict):
         raise ValueError("固定 seed 基準 cases.yaml 根節點必須是物件")
-    case_lock = _read_json(evidence_root / SEED_FILES["tests/acceptance/cases.lock.json"])
+    case_lock = _read_json(evidence_root / SEED_FILES["tests/acceptance/cases.lock.json"], read_bytes)
     case_map, slice_ids = _case_maps(cases_doc, case_lock)
     required: dict[tuple[str, str], set[str]] = {}
     for item_id, attributes in INITIAL_REQUIRED_CASE_EXITS.items():
@@ -460,11 +473,13 @@ def _case_family_errors(current_cases: Mapping[str, Any], previous_cases: Mappin
     return errors
 
 
-def _seed_family_errors(current_cases: Mapping[str, Any], evidence_root: Path) -> list[str]:
+def _seed_family_errors(
+    current_cases: Mapping[str, Any], evidence_root: Path, *, read_bytes: ReadBytes | None = None,
+) -> list[str]:
     """固定 seed 中既有案例的 family 標籤不可藉重新分類改寫。"""
     try:
         seed_cases = yaml.safe_load(
-            (evidence_root / SEED_FILES["tests/acceptance/cases.yaml"]).read_text(encoding="utf-8")
+            _read_bytes(evidence_root / SEED_FILES["tests/acceptance/cases.yaml"], read_bytes).decode("utf-8")
         )
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ValueError(f"無法讀取固定 seed 案例 family：{exc}") from exc
@@ -594,7 +609,7 @@ def _validate_lock(
 
 def _base_errors(
     current: Mapping[str, Any], current_cases: Mapping[str, Any], *,
-    base: str, repo_root: Path, source_reader: SourceReader,
+    base: str, repo_root: Path, source_reader: SourceReader, read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     try:
         raw = source_reader(base, "tests/acceptance/stage3_required_cases.lock.json")
@@ -605,9 +620,9 @@ def _base_errors(
     errors: list[str] = []
     if base_manifest_raw is not None:
         try:
-            current_manifest_raw = (
-                repo_root / EVIDENCE_RELATIVE / "denominators" / "source-manifest.json"
-            ).read_bytes()
+            current_manifest_raw = _read_bytes(
+                repo_root / EVIDENCE_RELATIVE / "denominators" / "source-manifest.json", read_bytes,
+            )
         except OSError as exc:
             errors.append(f"無法讀取目前來源 manifest：{exc}")
         else:
@@ -668,29 +683,37 @@ def validate_current_lock(
     *,
     base_revision: str | None = None,
     source_reader: SourceReader | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
-    """重驗目前目錄、固定 seed、分母鎖與可信 base 的只增契約。"""
+    """重驗目前目錄、固定 seed、分母鎖與可信 base 的只增契約。
+
+    `read_bytes` 可注入呼叫端快照讀取器；所有目前工作樹讀取都經同一個讀取器。
+    CLI 省略此參數時仍直接讀取檔案。
+    """
     root = Path(repo_root).resolve()
     reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
     try:
-        cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root)
+        cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root, read_bytes=read_bytes)
         # 與 4b71d2db 的 `--check` 順序一致：鎖 schema 失敗時立即停止，
         # seed 來源失敗時也不繼續累加出口、family 或分母診斷。
         errors = _lock_schema_errors(lock)
         if errors:
             return errors
-        errors = _seed_errors(manifest, root, reader)
+        errors = _seed_errors(manifest, root, reader, read_bytes=read_bytes, lock=lock)
         if errors:
             return errors
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
-        seed_required = _seed_required_cases_by_initial_exit(root / EVIDENCE_RELATIVE)
+        seed_required = _seed_required_cases_by_initial_exit(
+            root / EVIDENCE_RELATIVE, read_bytes=read_bytes,
+        )
         errors.extend(_validate_initial_exit_catalog(catalog))
         errors.extend(_validate_seed_floor(lock, seed_required))
-        errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
+        errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE, read_bytes=read_bytes))
         errors.extend(_validate_lock(lock, expected))
         if base_revision:
             errors.extend(_base_errors(
                 lock, cases_doc, base=base_revision, repo_root=root, source_reader=reader,
+                read_bytes=read_bytes,
             ))
         return errors
     except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError,
@@ -698,26 +721,32 @@ def validate_current_lock(
         return [str(exc)]
 
 
-def _load_inputs(root: Path) -> tuple[dict, dict, dict, dict, dict]:
+def _load_inputs(root: Path, *, read_bytes: ReadBytes | None = None) -> tuple[dict, dict, dict, dict, dict]:
     acceptance = root / ACCEPTANCE_RELATIVE
     evidence = root / EVIDENCE_RELATIVE
     try:
-        cases_doc = yaml.safe_load((acceptance / "cases.yaml").read_text(encoding="utf-8"))
+        cases_doc = yaml.safe_load(_read_bytes(acceptance / "cases.yaml", read_bytes).decode("utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ValueError(f"無法讀取 cases.yaml：{exc}") from exc
     if not isinstance(cases_doc, dict):
         raise ValueError("cases.yaml 根節點必須是物件")
-    case_lock = _read_json(acceptance / "cases.lock.json")
-    catalog = _read_json(acceptance / "stage_exits.json")
-    lock = _read_json(acceptance / "stage3_required_cases.lock.json")
-    manifest = _read_json(evidence / "denominators" / "source-manifest.json")
+    case_lock = _read_json(acceptance / "cases.lock.json", read_bytes)
+    catalog = _read_json(acceptance / "stage_exits.json", read_bytes)
+    lock = _read_json(acceptance / "stage3_required_cases.lock.json", read_bytes)
+    manifest = _read_json(evidence / "denominators" / "source-manifest.json", read_bytes)
     return cases_doc, case_lock, catalog, lock, manifest
 
 
-def _seed_errors(manifest: Mapping[str, Any], root: Path, reader: SourceReader) -> list[str]:
+def _seed_errors(
+    manifest: Mapping[str, Any], root: Path, reader: SourceReader, *,
+    read_bytes: ReadBytes | None = None, lock: Mapping[str, Any] | None = None,
+) -> list[str]:
     evidence = root / EVIDENCE_RELATIVE
-    errors = verify_seed_sources(manifest, evidence_root=evidence, source_reader=reader)
-    lock = _read_json(root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json")
+    errors = verify_seed_sources(
+        manifest, evidence_root=evidence, source_reader=reader, read_bytes=read_bytes,
+    )
+    if lock is None:
+        lock = _read_json(root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json", read_bytes)
     seed = lock.get("seed")
     if not isinstance(seed, dict):
         return errors + ["分母鎖缺少 seed 物件"]

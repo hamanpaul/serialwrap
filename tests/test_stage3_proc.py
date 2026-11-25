@@ -30,6 +30,15 @@ def test_run_cmd_forwards_env_and_cwd(tmp_path):
     assert Path(cwd).resolve() == tmp_path.resolve()
 
 
+def test_run_cmd_bytes_output_preserves_nul_and_control_bytes():
+    payload = b"reports/name\r\npart.json\0reports/next\nname.json\0"
+    code = "import sys;sys.stdout.buffer.write(" + repr(payload) + ")"
+    result = run_cmd([sys.executable, "-c", code], bytes_output=True, timeout=30)
+
+    assert result.rc == 0 and not result.timed_out
+    assert result.stdout == payload
+
+
 def test_spawn_writes_output_to_pid_named_log(tmp_path):
     from tools.stage3 import proc
 

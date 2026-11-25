@@ -1392,7 +1392,8 @@ def test_verify_bundle_reads_a_shared_package_tree_member_once(tmp_path, monkeyp
 
     def counting_open(path, *args, **kwargs):
         nonlocal reads
-        if Path(path).resolve() == target.resolve() and args and args[0] == "rb":
+        mode = args[0] if args else kwargs.get("mode")
+        if Path(path).resolve() == target.resolve() and mode == "rb":
             reads += 1
         return original_open(path, *args, **kwargs)
 
@@ -1882,7 +1883,7 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
         self.docker_result = docker_result or {"rc": 0, "stdout": "", "stderr": ""}
         self.object_types: dict[str, str] = {}
 
-    def __call__(self, argv, *, env=None, timeout=None, cwd=None):
+    def __call__(self, argv, *, env=None, timeout=None, cwd=None, bytes_output=False):
         args = list(argv)
         if args and args[0] == "git":
             if "rev-parse" in args and args[-1] == "HEAD:contracts":
@@ -1957,6 +1958,9 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
             else:
                 stdout, rc = "", 128
             stderr = "unsupported or unresolved test Git command" if rc == 128 else ""
+            if bytes_output:
+                stdout = stdout if isinstance(stdout, bytes) else stdout.encode("utf-8")
+                stderr = stderr.encode("utf-8")
             return fakes.CmdResult(rc=rc, stdout=stdout, stderr=stderr, elapsed_s=0.0, timed_out=False)
         if args and args[0] == "docker":
             return fakes.CmdResult(
@@ -1966,7 +1970,7 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
                 elapsed_s=0.0,
                 timed_out=bool(self.docker_result.get("timed_out", False)),
             )
-        return super().__call__(args, env=env, timeout=timeout, cwd=cwd)
+        return super().__call__(args, env=env, timeout=timeout, cwd=cwd, bytes_output=bytes_output)
 
 
 def _synthetic_trusted_pair_map(root: Path, *, include_alternate: bool = False) -> dict:
@@ -2823,3 +2827,167 @@ def test_external_suite_inputs_remain_sha_frozen_execution_artifacts(tmp_path, p
 def test_repo_relative_path_normalizes_windows_absolute_paths_on_any_host(value, windows, expected):
     root = PureWindowsPath("C:/repo") if windows else Path("/repo")
     assert ab_manifest._repo_relative_path(root, value, windows=windows) == expected
+
+
+def _verify_with_read_tracking(manifest, root: Path, monkeypatch, *, first_read_overrides=None):
+    """只在 verify_frozen 期間追蹤 Path 讀取，並可模擬同路徑後續內容還原。"""
+    runner = _ToolRevisionRecordingRunner(
+        root,
+        _repo_snapshot(root),
+        contract_revision=manifest.contract_revision,
+        tool_revision="1" * 40,
+    )
+    try:
+        identity_sha = ab_manifest._tree_sha256(root / "tools" / "stage3")
+    except (OSError, HarnessError):
+        identity_sha = None
+    trusted_pair_map = (
+        _synthetic_trusted_pair_map(root)
+        if manifest.exit_item_id == EXIT_WINDOWS_L15 else None
+    )
+    base_source_reader = _trusted_source_reader(root)
+    from tools.stage3 import required_cases
+
+    seed_sources = {
+        path: fakes._seed_source_reader(root, required_cases.SEED_REVISION, path)
+        for path in required_cases.SEED_FILES
+    }
+
+    def source_reader(revision: str, path: str) -> bytes | None:
+        if revision == required_cases.SEED_REVISION:
+            return seed_sources.get(path)
+        return base_source_reader(revision, path)
+
+    original_read_bytes = Path.read_bytes
+    original_read_text = Path.read_text
+    overrides = {
+        Path(path).resolve(): content
+        for path, content in (first_read_overrides or {}).items()
+    }
+    counts: dict[Path, int] = {}
+
+    def next_content(path: Path, *, text: bool, args, kwargs):
+        resolved = Path(path).resolve()
+        counts[resolved] = counts.get(resolved, 0) + 1
+        content = overrides.get(resolved)
+        if content is not None and counts[resolved] == 1:
+            if text:
+                return content.decode(kwargs.get("encoding") or "utf-8")
+            return content
+        if text:
+            return original_read_text(path, *args, **kwargs)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", lambda path: next_content(path, text=False, args=(), kwargs={}))
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda path, *args, **kwargs: next_content(path, text=True, args=args, kwargs=kwargs),
+    )
+    options = dict(
+        m=manifest,
+        repo_root=root,
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=source_reader,
+        trusted_pair_map=trusted_pair_map,
+    )
+    with patch.object(ab_manifest, "_executing_tools_identity", lambda: (root, identity_sha)):
+        violations = ab_manifest.verify_frozen(**options)
+    return violations, counts
+
+
+def test_verify_frozen_coverage_uses_first_case_catalog_read(tmp_path, monkeypatch):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    case_path = tmp_path / manifest.case_list.path
+    original = case_path.read_bytes()
+    cases_doc = yaml.safe_load(original.decode("utf-8"))
+    target = next(row for row in cases_doc["cases"] if row["case_id"] in manifest.case_ids)
+    target["destructive"] = not bool(target.get("destructive"))
+    drifted = yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+    violations, counts = _verify_with_read_tracking(
+        manifest, tmp_path, monkeypatch, first_read_overrides={case_path: drifted},
+    )
+
+    assert counts.get(case_path.resolve(), 0) == 1
+    assert f"case_list sha256 mismatch: {manifest.case_list.path}" in violations
+
+
+def test_required_cases_uses_one_lock_read_for_validation_and_selection(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    lock_path = tmp_path / manifest.required_cases_lock.path
+    original = lock_path.read_bytes()
+    changed_doc = json.loads(original.decode("utf-8"))
+    ids = changed_doc["exits"][manifest.exit_item_id][manifest.platform]["case_ids"]
+    ids.pop()
+    drifted = json.dumps(changed_doc, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    reads = 0
+
+    def drift_after_first_read(candidate: Path) -> bytes:
+        nonlocal reads
+        if Path(candidate).resolve() == lock_path.resolve():
+            reads += 1
+            return original if reads == 1 else drifted
+        return Path(candidate).read_bytes()
+
+    required, _rows = ab_manifest.required_cases(
+        manifest,
+        repo_root=tmp_path,
+        source_reader=_trusted_source_reader(tmp_path),
+        read_bytes=drift_after_first_read,
+    )
+
+    assert reads == 1
+    assert required == set(manifest.case_ids)
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "platform", "relative", "error"),
+    [
+        ("catalog", "linux", "tests/acceptance/stage_exits.json", "exit catalog sha256 mismatch"),
+        ("case-lock", "linux", "tests/acceptance/cases.lock.json", "case_lock sha256 mismatch"),
+        (
+            "source-manifest", "linux",
+            "docs/rust-refactor/evidence/denominators/source-manifest.json",
+            "stage3 source-manifest sha256 mismatch",
+        ),
+        (
+            "seed-attachment", "linux", "docs/rust-refactor/evidence/denominators/cases.yaml", "種子附件",
+        ),
+        (
+            "windows-runner-map", "windows",
+            "tests/acceptance/windows_l15_case_transport_map.json", "tool sha256 mismatch",
+        ),
+    ],
+    ids=["catalog", "case-lock", "source-manifest", "seed-attachment", "windows-runner-map"],
+)
+def test_verify_frozen_reuses_first_read_for_each_indirect_input(
+    tmp_path, monkeypatch, input_kind, platform, relative, error,
+):
+    if input_kind == "windows-runner-map":
+        path = _windows_l15_transport_fixture(tmp_path)
+    else:
+        path = fakes.write_ab_manifest(tmp_path, platform=platform, layer="l1.5", stage="3")
+    manifest = _load(path)
+    target = tmp_path / relative
+    original = target.read_bytes()
+    violations, counts = _verify_with_read_tracking(
+        manifest, tmp_path, monkeypatch,
+        first_read_overrides={target: original + b"\n"},
+    )
+
+    assert counts.get(target.resolve(), 0) == 1
+    assert any(error in item for item in violations)
+
+
+def test_verify_frozen_reads_each_path_at_most_once(tmp_path, monkeypatch):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    _violations, counts = _verify_with_read_tracking(manifest, tmp_path, monkeypatch)
+
+    repeated = {str(path): count for path, count in counts.items() if count > 1}
+    assert not repeated, repeated

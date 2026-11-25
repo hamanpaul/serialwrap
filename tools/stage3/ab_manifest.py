@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from string import Formatter
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from tools.stage3 import required_cases as required_cases_module
-from tools.stage3.jsonio import dumps_compact, sha256_file
+from tools.stage3.jsonio import dumps_compact
 from tools.stage3.proc import Runner, run_cmd
 from tools.stage3.reason_codes import HarnessError
 
@@ -25,6 +25,47 @@ _INVARIANTS = ("zero_tx_on_reject", "no_auto_resend", "no_forbidden_interleave",
                "no_stale_context_replay", "no_reopen_before_handoff", "insufficient_evidence_not_pass")
 _STAGES = {"1A", "1B", "2.1", "2.2", "2.3", "2.4", "3"}
 _PLATFORMS = {"linux", "windows"}
+ReadBytes = Callable[[Path], bytes]
+
+
+class _InputSnapshot:
+    """每次入口呼叫使用的原始位元組快照；依解析後路徑快取 bytes 或讀取錯誤。"""
+
+    def __init__(self, reader: ReadBytes | None = None) -> None:
+        self._reader = reader or Path.read_bytes
+        self._values: dict[Path, bytes | Exception] = {}
+
+    @staticmethod
+    def _key(path: Path) -> Path:
+        return Path(path).resolve()
+
+    def read_bytes(self, path: Path) -> bytes:
+        key = self._key(path)
+        if key not in self._values:
+            try:
+                self._values[key] = self._reader(key)
+            except Exception as exc:
+                self._values[key] = exc
+        value = self._values[key]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def sha256(self, path: Path) -> str:
+        return hashlib.sha256(self.read_bytes(path)).hexdigest()
+
+
+def _read_bytes(path: Path, reader: ReadBytes | None = None) -> bytes:
+    """由入口注入快照讀取器；獨立公開 helper 省略時仍直接讀取檔案。"""
+    return (reader or Path.read_bytes)(Path(path))
+
+
+def _sha256(path: Path, reader: ReadBytes | None = None) -> str:
+    return hashlib.sha256(_read_bytes(path, reader)).hexdigest()
+
+
+def _has_ascii_control(value: str) -> bool:
+    return any(ord(char) <= 0x1F or ord(char) == 0x7F for char in value)
 
 
 @dataclass(frozen=True)
@@ -269,9 +310,11 @@ def _schema_errors(value: Any, schema: Mapping[str, Any], root_schema: Mapping[s
     return errors
 
 
-def _read_schema_document(schema_path: Path, *, label: str) -> tuple[bytes, Mapping[str, Any]]:
+def _read_schema_document(
+    schema_path: Path, *, label: str, read_bytes: ReadBytes | None = None,
+) -> tuple[bytes, Mapping[str, Any]]:
     try:
-        raw = schema_path.read_bytes()
+        raw = _read_bytes(schema_path, read_bytes)
         schema = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _invalid(f"cannot read {label} schema: {exc}") from exc
@@ -282,9 +325,10 @@ def _read_schema_document(schema_path: Path, *, label: str) -> tuple[bytes, Mapp
 
 def _validate_schema_document(
     value: Any, schema_path: Path, *, label: str, schema_bytes: bytes | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> str:
     if schema_bytes is None:
-        schema_bytes, schema = _read_schema_document(schema_path, label=label)
+        schema_bytes, schema = _read_schema_document(schema_path, label=label, read_bytes=read_bytes)
     else:
         try:
             schema = json.loads(schema_bytes.decode("utf-8"))
@@ -298,10 +342,12 @@ def _validate_schema_document(
     return hashlib.sha256(schema_bytes).hexdigest()
 
 
-def _validate_manifest_schema(value: Any, *, repo_root: Path) -> str:
+def _validate_manifest_schema(
+    value: Any, *, repo_root: Path, read_bytes: ReadBytes | None = None,
+) -> str:
     """從明確的 repo_root 讀 schema，回傳實際驗證位元組的 SHA-256。"""
     schema_path = Path(repo_root) / "tests" / "acceptance" / "ab_manifest.schema.json"
-    return _validate_schema_document(value, schema_path, label="A/B manifest")
+    return _validate_schema_document(value, schema_path, label="A/B manifest", read_bytes=read_bytes)
 
 
 def _deep_freeze(value: Any) -> Any:
@@ -349,6 +395,8 @@ def _strings(value: Any, where: str) -> tuple[str, ...]:
 def _frozen(value: Any, where: str, *, tree_ok: bool = False) -> FrozenFile | FrozenTree:
     obj = _mapping(value, where)
     path = _string(obj.get("path"), f"{where}.path")
+    if _has_ascii_control(path):
+        raise _invalid(f"{where}.path contains ASCII control characters: {path!r}")
     if tree_ok and isinstance(obj.get("tree_sha256"), str):
         digest = obj["tree_sha256"]
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -362,6 +410,8 @@ def _frozen(value: Any, where: str, *, tree_ok: bool = False) -> FrozenFile | Fr
 
 def _path(root: Path, value: str) -> Path:
     # Manifest 路徑使用 POSIX 分隔；Path 會在原生 Windows 轉成該平台格式。
+    if _has_ascii_control(value):
+        raise _invalid(f"path contains ASCII control characters: {value!r}")
     path = Path(value.replace("/", os.sep))
     return path if path.is_absolute() else root / path
 
@@ -419,6 +469,7 @@ def load_manifest(
     ``repo_root`` 會明確拒絕，不會推測呼叫端想用哪一份 repo。
     因此程式 checkout 與目標 repo 不同時，讀取與版本比對仍指向同一檔案。即使 schema 被弱化，
     ``tools`` 必須包含 ``tools/stage3`` 的信任邊界仍由 loader 程式獨立強制。
+    每次載入建立專用輸入快照；同一個 resolved path 只讀一次，解析與 SHA 均使用快照中的原始 bytes。
 
     Windows L1.5 的可信 pair 對照由呼叫端私下提供；不把實際 COM 名稱寫入
     manifest 或公開映射。正式對照由編排者在 T5B 依原生 COM 實機盤點後建立，
@@ -428,15 +479,21 @@ def load_manifest(
     後才延遲載入的模組不在這次快照的時間界線內。Task 6 必須在 Stage 3 程序啟動後、任何
     A/B 動作之前呼叫 ``verify_frozen``，執行期間不得改動 checkout，並在報告記錄
     ``tools_stage3_tree_sha256``。
+    另，時間戳與大小符合來源檔的舊 `.pyc` 可能先於 `.py` 載入。Task 6 啟動時應用
+    `python -B` 或 `PYTHONDONTWRITEBYTECODE=1`，並在乾淨 checkout 執行，或先確認
+    `tools/stage3` 下沒有 `__pycache__`。
     """
     source = Path(path).resolve()
     root_path = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
+    snapshot = _InputSnapshot()
     try:
-        source_bytes = source.read_bytes()
+        source_bytes = snapshot.read_bytes(source)
         doc = json.loads(source_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise _invalid(f"cannot read manifest: {exc}") from exc
-    manifest_schema_sha256 = _validate_manifest_schema(doc, repo_root=root_path)
+    manifest_schema_sha256 = _validate_manifest_schema(
+        doc, repo_root=root_path, read_bytes=snapshot.read_bytes,
+    )
     root = _mapping(doc, "manifest")
     run_id = _string(root.get("run_id"), "run_id")
     layer = _string(root.get("layer"), "layer")
@@ -450,7 +507,7 @@ def load_manifest(
     if exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
         trusted_pair_schema_path = root_path / "tests" / "acceptance" / "stage3_trusted_pair_map.schema.json"
         trusted_pair_schema_bytes, _trusted_schema_doc = _read_schema_document(
-            trusted_pair_schema_path, label="trusted pair map",
+            trusted_pair_schema_path, label="trusted pair map", read_bytes=snapshot.read_bytes,
         )
         trusted_pair_map_schema_sha256 = hashlib.sha256(trusted_pair_schema_bytes).hexdigest()
     contract_revision = _string(root.get("contract_revision"), "contract_revision")
@@ -497,7 +554,7 @@ def load_manifest(
     profile_files = tuple(_frozen(item, f"profile_files[{i}]") for i, item in enumerate(root.get("profile_files", [])))
     for i, item in enumerate(profile_files):
         try:
-            actual = sha256_file(_path(root_path, item.path))
+            actual = snapshot.sha256(_path(root_path, item.path))
         except OSError as exc:
             raise _invalid(f"profile file missing: profile_files[{i}] {item.path}") from exc
         if actual != item.sha256:
@@ -562,7 +619,7 @@ def load_manifest(
         if manifest_path.resolve() != expected_sidecar.resolve():
             raise _invalid(f"side {label} release_manifest is not the bundle root sidecar")
         try:
-            manifest_bytes = manifest_path.read_bytes()
+            manifest_bytes = snapshot.read_bytes(manifest_path)
             manifest_doc = json.loads(manifest_bytes.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise _invalid(f"side {label} release manifest unreadable: {exc}") from exc
@@ -682,7 +739,7 @@ def load_manifest(
         if not isinstance(map_ref, FrozenFile):
             raise _invalid("case_transport_map must be a frozen file")
         try:
-            map_bytes = _path(root_path, map_ref.path).read_bytes()
+            map_bytes = snapshot.read_bytes(_path(root_path, map_ref.path))
         except OSError as exc:
             raise _invalid(f"case transport map is unreadable: {exc}") from exc
         case_transport_map_loaded_sha256 = hashlib.sha256(map_bytes).hexdigest()
@@ -698,7 +755,7 @@ def load_manifest(
     if candidate_context is not None:
         context_path = _path(root_path, candidate_context.path)
         try:
-            context_bytes = context_path.read_bytes()
+            context_bytes = snapshot.read_bytes(context_path)
         except OSError as exc:
             raise _invalid(f"candidate context is invalid: {exc}") from exc
         candidate_context_loaded_sha256 = hashlib.sha256(context_bytes).hexdigest()
@@ -718,7 +775,7 @@ def load_manifest(
             root_path / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
         )
         try:
-            source_manifest_bytes = source_manifest_path.read_bytes()
+            source_manifest_bytes = snapshot.read_bytes(source_manifest_path)
             source_manifest_value = json.loads(source_manifest_bytes.decode("utf-8"))
             stage3_source_manifest_doc = _mapping(source_manifest_value, "Stage 3 source-manifest")
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, HarnessError) as exc:
@@ -777,11 +834,12 @@ def load_manifest(
         trusted_pair_map_schema_sha256=trusted_pair_map_schema_sha256,
     )
     if stage == "3":
-        _validate_stage3_identity(manifest, root_path)
+        _validate_stage3_identity(manifest, root_path, read_bytes=snapshot.read_bytes)
     if exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
         _validate_windows_l15_transport(
             manifest, root_path, trusted_pair_map=trusted_pair_map,
             trusted_pair_schema_bytes=trusted_pair_schema_bytes,
+            read_bytes=snapshot.read_bytes,
         )
     return manifest
 
@@ -861,7 +919,9 @@ def _validate_release_component_shape(manifest: Mapping[str, Any], *, stage: str
         raise _invalid(f"side {label} components.python_cli_delegate requires entry and tree_sha256")
 
 
-def _validate_stage3_identity(manifest: AbManifest, repo_root: Path) -> None:
+def _validate_stage3_identity(
+    manifest: AbManifest, repo_root: Path, *, read_bytes: ReadBytes | None = None,
+) -> None:
     """核對 Stage 3 出口身分、T1 凍結分母與執行前候選 context。"""
     if (manifest.exit_item_id is None or manifest.candidate_context is None
             or manifest.required_cases_lock is None or manifest.required_cases_sha256 is None
@@ -876,7 +936,9 @@ def _validate_stage3_identity(manifest: AbManifest, repo_root: Path) -> None:
         raise _invalid("required_cases_lock must reference the current Stage 3 exit lock")
 
     try:
-        cases_doc, _case_lock, catalog, lock, _source_manifest = required_cases_module._load_inputs(repo_root)
+        cases_doc, _case_lock, catalog, lock, _source_manifest = required_cases_module._load_inputs(
+            repo_root, read_bytes=read_bytes,
+        )
         item = next((row for row in catalog.get("items", [])
                      if isinstance(row, Mapping) and row.get("item_id") == manifest.exit_item_id), None)
         if item is None or item.get("stage") != "3":
@@ -1045,6 +1107,7 @@ def _validate_windows_l15_transport(
     *,
     trusted_pair_map: Mapping[str, Any] | None = None,
     trusted_pair_schema_bytes: bytes | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> None:
     """驗 Windows L1.5 映射及可信 pair。
 
@@ -1075,7 +1138,9 @@ def _validate_windows_l15_transport(
         raise _invalid("Windows L1.5 requires case_transports")
 
     try:
-        _cases_doc, _case_lock, _catalog, lock, _source_manifest = required_cases_module._load_inputs(repo_root)
+        _cases_doc, _case_lock, _catalog, lock, _source_manifest = required_cases_module._load_inputs(
+            repo_root, read_bytes=read_bytes,
+        )
         required_ids = required_cases_module.required_for_exit(lock, manifest.exit_item_id, "windows")
     except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError) as exc:
         raise _invalid(f"cannot read required Windows L1.5 cases: {exc}") from exc
@@ -1091,7 +1156,7 @@ def _validate_windows_l15_transport(
     if set(cases) != required_ids:
         raise _invalid("case transport map cases must exactly match required case IDs")
 
-    rows, _sets, _case_doc = _read_cases(repo_root, manifest)
+    rows, _sets, _case_doc = _read_cases(repo_root, manifest, read_bytes=read_bytes)
     case_rows = {item.get("case_id"): item for item in rows if isinstance(item, Mapping)}
     approved_pairs = mapping["approved_pairs"]
     physical_substitutes = mapping["physical_substitutes"]
@@ -1213,7 +1278,7 @@ def _valid_templates(dut: DutSpec, sides: Sequence[AbSide], suite: SuiteSpec) ->
     return True
 
 
-def _tree_sha256(root: Path, *, runtime: bool = False) -> str:
+def _tree_sha256(root: Path, *, runtime: bool = False, read_bytes: ReadBytes | None = None) -> str:
     """計算工具來源樹摘要，排除 __pycache__ 與 *.pyc。"""
     root = Path(root)
     rows: list[tuple[str, str]] = []
@@ -1233,6 +1298,8 @@ def _tree_sha256(root: Path, *, runtime: bool = False) -> str:
             path = current_path / name
             mode = path.lstat().st_mode
             rel = path.relative_to(root).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             if not stat.S_ISDIR(mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
             if name == "__pycache__":
@@ -1240,12 +1307,14 @@ def _tree_sha256(root: Path, *, runtime: bool = False) -> str:
         for name in names:
             path = current_path / name
             rel = path.relative_to(root).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             mode = path.lstat().st_mode
             if not stat.S_ISREG(mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
             if path.suffix == ".pyc":
                 continue
-            rows.append((rel, sha256_file(path)))
+            rows.append((rel, _sha256(path, read_bytes)))
     payload = "".join(f"{rel}\0{digest}\n" for rel, digest in sorted(rows, key=lambda item: item[0].encode("utf-8")))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1262,7 +1331,7 @@ def _executing_tools_identity() -> tuple[Path, str | None]:
     return _TOOLS_STAGE3_IMPORT_ROOT, _TOOLS_STAGE3_IMPORT_SHA256
 
 
-def _bundle_tree(root: Path, *, runtime: bool = False) -> str:
+def _bundle_tree(root: Path, *, runtime: bool = False, read_bytes: ReadBytes | None = None) -> str:
     """計算 bundle 目錄摘要，並依 runtime 規則排除根目錄中繼檔。"""
     root = Path(root)
     rows: list[tuple[str, str]] = []
@@ -1281,16 +1350,20 @@ def _bundle_tree(root: Path, *, runtime: bool = False) -> str:
         for name in list(dirs):
             path = current_path / name
             rel = path.relative_to(root).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             if not stat.S_ISDIR(path.lstat().st_mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
         for name in names:
             path = current_path / name
             rel = path.relative_to(root).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             if not stat.S_ISREG(path.lstat().st_mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
             if runtime and rel in {"release-manifest.json", "SHA256SUMS"}:
                 continue
-            rows.append((rel, sha256_file(path)))
+            rows.append((rel, _sha256(path, read_bytes)))
     payload = "".join(f"{rel}\0{digest}\n" for rel, digest in sorted(rows, key=lambda item: item[0].encode("utf-8")))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1317,12 +1390,12 @@ def _package_root(bundle: Path, components: Mapping[str, Any], component: Mappin
     return None
 
 
-def _python_package_tree_sha256(py_root: Path) -> str:
+def _python_package_tree_sha256(py_root: Path, *, read_bytes: ReadBytes | None = None) -> str:
     """依 release manifest 契約計算僅含 sw_core/ 的套件樹摘要。"""
     rows = []
     for path in _python_package_tree_members(py_root):
         rel = "sw_core/" + path.relative_to(Path(py_root) / "sw_core").as_posix()
-        rows.append((rel, sha256_file(path)))
+        rows.append((rel, _sha256(path, read_bytes)))
     payload = "".join(f"{rel}\0{digest}\n" for rel, digest in sorted(rows, key=lambda item: item[0].encode("utf-8")))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1346,6 +1419,8 @@ def _python_package_tree_members(py_root: Path) -> list[Path]:
         for name in list(dirs):
             path = current_path / name
             rel = "sw_core/" + path.relative_to(package).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             if not stat.S_ISDIR(path.lstat().st_mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
             if name == "__pycache__":
@@ -1353,6 +1428,8 @@ def _python_package_tree_members(py_root: Path) -> list[Path]:
         for name in names:
             path = current_path / name
             rel = "sw_core/" + path.relative_to(package).as_posix()
+            if _has_ascii_control(rel):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"ASCII control characters in path: {rel!r}")
             if not stat.S_ISREG(path.lstat().st_mode):
                 raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"non-regular file: {rel}")
             if path.suffix == ".pyc":
@@ -1397,7 +1474,10 @@ def _declared_files(value: Any, path: tuple[str, ...] = ()) -> list[tuple[str, M
     return found
 
 
-def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: str) -> list[str]:
+def verify_bundle(
+    bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: str,
+    read_bytes: ReadBytes | None = None,
+) -> list[str]:
     bundle = Path(bundle_dir).resolve()
     components = _components(manifest_doc)
     violations: list[str] = []
@@ -1408,6 +1488,9 @@ def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: s
         if (not isinstance(raw_path, str) or not raw_path
                 or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
             violations.append(f"release component identity invalid: {label} {component}")
+            continue
+        if _has_ascii_control(raw_path):
+            violations.append(f"release component path contains ASCII control characters: {label} {component}")
             continue
         pure = PurePosixPath(raw_path)
         win = PureWindowsPath(raw_path)
@@ -1427,7 +1510,7 @@ def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: s
             violations.append(f"release component non-regular file: {label} {component}")
             continue
         try:
-            actual = sha256_file(path)
+            actual = _sha256(path, read_bytes)
         except OSError:
             violations.append(f"file missing: {path}")
             continue
@@ -1449,7 +1532,7 @@ def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: s
             root_key = root.resolve()
             actual = package_tree_digests.get(root_key)
             if actual is None:
-                actual = _python_package_tree_sha256(root)
+                actual = _python_package_tree_sha256(root, read_bytes=read_bytes)
                 package_tree_digests[root_key] = actual
         except (OSError, HarnessError):
             violations.append(f"release tree mismatch: {label} {component}")
@@ -1459,12 +1542,14 @@ def verify_bundle(bundle_dir: Path, manifest_doc: Mapping[str, Any], *, label: s
     return violations
 
 
-def _read_cases(repo_root: Path, m: AbManifest) -> tuple[list[dict], Mapping[str, Any], Mapping[str, Any]]:
+def _read_cases(
+    repo_root: Path, m: AbManifest, *, read_bytes: ReadBytes | None = None,
+) -> tuple[list[dict], Mapping[str, Any], Mapping[str, Any]]:
     try:
-        cases_doc = required_cases_module.yaml.safe_load(
-            _path(repo_root, m.case_list.path).read_text(encoding="utf-8")
-        )
-        lock = json.loads(_path(repo_root, m.case_lock.path).read_text(encoding="utf-8"))
+        cases_bytes = _read_bytes(_path(repo_root, m.case_list.path), read_bytes)
+        lock_bytes = _read_bytes(_path(repo_root, m.case_lock.path), read_bytes)
+        cases_doc = required_cases_module.yaml.safe_load(cases_bytes.decode("utf-8"))
+        lock = json.loads(lock_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, required_cases_module.yaml.YAMLError, RecursionError) as exc:
         raise _invalid(f"cannot read frozen cases: {exc}") from exc
     if not isinstance(cases_doc, dict) or not isinstance(cases_doc.get("cases"), list):
@@ -1481,10 +1566,13 @@ def _case_layer_matches(row: Mapping[str, Any], layer: str) -> bool:
 
 def required_cases(
     m: AbManifest, *, repo_root: Path, base_revision: str | None = None, source_reader: Any = None,
+    read_bytes: ReadBytes | None = None,
 ) -> tuple[set[str], dict[str, dict]]:
     root = Path(repo_root).resolve()
     if root != m.repo_root:
         raise _invalid(f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}")
+    snapshot = _InputSnapshot(read_bytes)
+    reader = snapshot.read_bytes
     if m.stage == "3":
         try:
             for frozen, relative, label in (
@@ -1492,35 +1580,35 @@ def required_cases(
                 (m.case_lock, "tests/acceptance/cases.lock.json", "case_lock"),
             ):
                 _require_canonical_path(root, frozen, relative, label)
-                if sha256_file(_path(root, frozen.path)) != frozen.sha256:
+                if hashlib.sha256(reader(_path(root, frozen.path))).hexdigest() != frozen.sha256:
                     raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", f"required cases invalid: {label} sha256 mismatch")
-            _validate_stage3_identity(m, root)
+            _validate_stage3_identity(m, root, read_bytes=reader)
             if m.required_cases_lock is None:
                 raise _invalid("Stage 3 requires required_cases_lock")
             lock_path = _path(root, m.required_cases_lock.path)
-            if sha256_file(lock_path) != m.required_cases_lock.sha256:
+            if hashlib.sha256(reader(lock_path)).hexdigest() != m.required_cases_lock.sha256:
                 raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: required cases lock sha256 mismatch")
             catalog_path = root / "tests" / "acceptance" / "stage_exits.json"
-            if sha256_file(catalog_path) != m.exit_catalog_sha256:
+            if hashlib.sha256(reader(catalog_path)).hexdigest() != m.exit_catalog_sha256:
                 raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: exit catalog sha256 mismatch")
         except HarnessError:
             raise
         except OSError as exc:
             raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", f"required cases invalid: {exc}") from exc
         errors = required_cases_module.validate_current_lock(
-            root, base_revision=base_revision, source_reader=source_reader,
+            root, base_revision=base_revision, source_reader=source_reader, read_bytes=reader,
         )
         if errors:
             raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: " + "; ".join(errors))
 
-    rows, sets, _cases_doc = _read_cases(root, m)
+    rows, sets, _cases_doc = _read_cases(root, m, read_bytes=reader)
     by_id = {row.get("case_id"): row for row in rows if isinstance(row, dict) and isinstance(row.get("case_id"), str)}
     if m.stage == "3":
         if not m.exit_item_id or not m.required_cases_lock:
             raise _invalid("Stage 3 requires exit_item_id and required_cases_lock")
         try:
             lock_path = _path(root, m.required_cases_lock.path)
-            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock = json.loads(reader(lock_path).decode("utf-8"))
             selected = required_cases_module.required_for_exit(lock, m.exit_item_id, m.platform)
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, RecursionError) as exc:
             raise _invalid(f"cannot read Stage 3 required cases: {exc}") from exc
@@ -1540,23 +1628,27 @@ def required_cases(
 
 def _stage3_lock_errors(
     m: AbManifest, repo_root: Path, *, base_revision: str | None, source_reader: Any,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     """共用 T1 驗證器重跑目前目錄與 seed；base_revision 僅在呼叫端提供時補做只增比較。"""
     return required_cases_module.validate_current_lock(
-        repo_root, base_revision=base_revision, source_reader=source_reader,
+        repo_root, base_revision=base_revision, source_reader=source_reader, read_bytes=read_bytes,
     )
 
 
 def verify_case_coverage(
     m: AbManifest, *, repo_root: Path, base_revision: str | None = None, source_reader: Any = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     root = Path(repo_root).resolve()
     if root != m.repo_root:
         raise _invalid(f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}")
-    rows, _sets, case_doc = _read_cases(root, m)
+    snapshot = _InputSnapshot(read_bytes)
+    reader = snapshot.read_bytes
+    rows, _sets, case_doc = _read_cases(root, m, read_bytes=reader)
     by_id = {row.get("case_id"): row for row in rows if isinstance(row, dict) and isinstance(row.get("case_id"), str)}
     required, _ = required_cases(
-        m, repo_root=root, base_revision=base_revision, source_reader=source_reader,
+        m, repo_root=root, base_revision=base_revision, source_reader=source_reader, read_bytes=reader,
     )
     selected = set(m.case_ids)
     violations = [f"required case missing: {case_id}" for case_id in sorted(required - selected)]
@@ -1606,6 +1698,8 @@ def _repo_relative_path(
     ``windows`` 僅供純路徑測試在非 Windows 主機模擬原生語意；正式呼叫依執行平台選擇。
     """
     if not isinstance(value, str) or not value:
+        return None
+    if _has_ascii_control(value):
         return None
     use_windows = os.name == "nt" if windows is None else windows
     windows_value = PureWindowsPath(value)
@@ -1677,6 +1771,9 @@ def _frozen_repo_paths(
     def add_required_file(item: FrozenFile | None, label: str) -> None:
         if item is None:
             return
+        if _has_ascii_control(item.path):
+            path_errors.append(f"tool revision path contains ASCII control characters: {item.path!r}")
+            return
         relative = _repo_relative_path(repo_root, item.path)
         if relative is None:
             path_errors.append(f"tool revision path outside repo: {label} {item.path}")
@@ -1685,6 +1782,9 @@ def _frozen_repo_paths(
 
     def add_execution_file(item: FrozenFile | None) -> None:
         if item is None:
+            return
+        if _has_ascii_control(item.path):
+            path_errors.append(f"tool revision path contains ASCII control characters: {item.path!r}")
             return
         relative = _repo_relative_path(repo_root, item.path)
         if relative is None:
@@ -1697,6 +1797,9 @@ def _frozen_repo_paths(
             execution_files.add(relative)
 
     def add_tree(item: FrozenTree, label: str) -> None:
+        if _has_ascii_control(item.path):
+            path_errors.append(f"tool revision path contains ASCII control characters: {item.path!r}")
+            return
         relative = _repo_relative_path(repo_root, item.path)
         if relative is None:
             path_errors.append(f"tool revision path outside repo: {label} {item.path}")
@@ -1717,6 +1820,9 @@ def _frozen_repo_paths(
     add_required_file(m.allowed_differences, "allowed_differences")
     add_required_file(m.acceptance, "acceptance")
     for item in m.profile_files:
+        if _has_ascii_control(item.path):
+            path_errors.append(f"tool revision path contains ASCII control characters: {item.path!r}")
+            continue
         relative = _repo_relative_path(repo_root, item.path)
         if relative is not None:
             files.add(relative)
@@ -1820,26 +1926,60 @@ def _tool_revision_path_inventory(
 ) -> tuple[frozenset[str], frozenset[str]] | None:
     """一次取得 index 與 revision 路徑，供所有身分路徑共用分類。"""
     try:
-        indexed = run(["git", "-C", str(repo_root), "ls-files", "-z"])
+        indexed = run(["git", "-C", str(repo_root), "ls-files", "-z"], bytes_output=True)
         revision_paths = run([
             "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
-        ])
-    except OSError:
+        ], bytes_output=True)
+    except (OSError, TypeError):
         return None
     if any(result.rc != 0 or result.timed_out for result in (indexed, revision_paths)):
         return None
-    return (
-        frozenset(item for item in indexed.stdout.split("\0") if item),
-        frozenset(item for item in revision_paths.stdout.split("\0") if item),
-    )
+    try:
+        return (
+            frozenset(_parse_git_path_list(indexed.stdout)),
+            frozenset(_parse_git_path_list(revision_paths.stdout)),
+        )
+    except (TypeError, UnicodeError, ValueError):
+        return None
+
+
+def _parse_git_path_list(output: bytes) -> tuple[str, ...]:
+    """解析 Git 的 NUL 路徑清單並拒絕控制字元或無法對應的 inventory 項目。
+
+    Git 路徑輸出必須以 bytes 擷取，否則文字模式會正規化 `\r`，讓路徑索引失真。
+    對含 ASCII 控制字元的 repo 路徑採保守拒絕，避免其在 inventory 中被誤認為另一個名稱。
+    """
+    if not isinstance(output, bytes):
+        raise TypeError("Git NUL path output must be bytes")
+    if output == b"":
+        return ()
+    if not output.endswith(b"\0"):
+        raise ValueError("Git path inventory is not NUL terminated")
+    entries = output[:-1].split(b"\0")
+    paths: list[str] = []
+    for entry in entries:
+        if not entry:
+            raise ValueError("empty Git path entry")
+        path = os.fsdecode(entry)
+        if any(0xDC80 <= ord(char) <= 0xDCFF for char in path):
+            raise ValueError(f"unmappable Git path entry: {path!r}")
+        if _has_ascii_control(path):
+            raise ValueError(f"Git path contains ASCII control characters: {path!r}")
+        if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
+            raise ValueError(f"unmappable Git path entry: {path!r}")
+        paths.append(path)
+    return tuple(paths)
 
 
 def _tool_revision_input_errors(
     *, repo_root: Path, relative: str, revision: str, run: Runner,
     map_path: str | None = None, execution_artifact: bool = False,
     path_inventory: tuple[frozenset[str], frozenset[str]] | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     """統一分類 repo 內身分路徑，再以指定 revision 的原始 blob 比對內容。"""
+    if _has_ascii_control(relative):
+        return [f"tool revision path contains ASCII control characters: {relative!r}"]
     if not relative.isascii():
         # Windows 檔案系統的 Unicode 大小寫表無法在 Linux 可靠重現；保守拒絕
         # 才不會把非 ASCII 大小寫別名誤認成未追蹤路徑。ASCII 路徑仍走 icase 查詢。
@@ -1850,16 +1990,19 @@ def _tool_revision_input_errors(
     if path_inventory is None:
         query = f":(icase,literal){relative}"
         try:
-            indexed = run(["git", "-C", str(repo_root), "ls-files", "-z", "--", query])
+            indexed = run(["git", "-C", str(repo_root), "ls-files", "-z", "--", query], bytes_output=True)
             revision_result = run([
                 "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
-            ])
-        except OSError:
+            ], bytes_output=True)
+        except (OSError, TypeError):
             return [f"tool revision unavailable: {relative}"]
         if any(result.rc != 0 or result.timed_out for result in (indexed, revision_result)):
             return [f"tool revision unavailable: {relative}"]
-        index_paths = {item for item in indexed.stdout.split("\0") if item}
-        revision_members = {item for item in revision_result.stdout.split("\0") if item}
+        try:
+            index_paths = set(_parse_git_path_list(indexed.stdout))
+            revision_members = set(_parse_git_path_list(revision_result.stdout))
+        except (TypeError, UnicodeError, ValueError):
+            return [f"tool revision unavailable: {relative}"]
     else:
         index_paths, revision_members = path_inventory
     index_matches = {
@@ -1903,14 +2046,12 @@ def _tool_revision_input_errors(
     if expected.rc != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", expected_oid):
         return [f"{prefix} unavailable: {relative}"]
     try:
-        actual = run(["git", "-C", str(repo_root), "hash-object", "--no-filters", "--", str(path)])
+        raw = _read_bytes(path, read_bytes)
     except OSError:
         return [f"{prefix} unavailable: {relative}"]
-    if actual.timed_out:
-        return [f"{prefix} unavailable: {relative}"]
-    actual_oid = actual.stdout.strip()
-    if actual.rc != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", actual_oid):
-        return [f"{prefix} mismatch: {relative}"]
+    object_hash = hashlib.sha256 if len(expected_oid) == 64 else hashlib.sha1
+    header = f"blob {len(raw)}\0".encode("ascii")
+    actual_oid = object_hash(header + raw).hexdigest()
     if expected_oid != actual_oid:
         return [f"{prefix} mismatch: {relative}"]
     return []
@@ -1919,6 +2060,7 @@ def _tool_revision_input_errors(
 def _tool_revision_tree_errors(
     *, repo_root: Path, tree: str, revision: str, run: Runner,
     path_inventory: tuple[frozenset[str], frozenset[str]] | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     """以完整 revision 成員集合和工作樹雙向比較，再逐檔比原始 blob。"""
     root = repo_root.joinpath(*PurePosixPath(tree).parts)
@@ -1939,17 +2081,21 @@ def _tool_revision_tree_errors(
         listed = run([
             "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
             "--", f":(literal){tree}",
-        ])
-    except OSError:
+        ], bytes_output=True)
+    except (OSError, TypeError):
         return [f"tool revision unavailable: {tree}"]
     if (tree_oid.rc != 0 or tree_oid.timed_out
             or not re.fullmatch(r"[0-9a-f]{40,64}", tree_oid.stdout.strip())
             or tree_type is None or tree_type.rc != 0 or tree_type.timed_out or tree_type.stdout.strip() != "tree"
             or listed.rc != 0 or listed.timed_out):
         return [f"tool revision unavailable: {tree}"]
+    try:
+        listed_paths = _parse_git_path_list(listed.stdout)
+    except (TypeError, UnicodeError, ValueError):
+        return [f"tool revision unavailable: {tree}"]
     revision_members = {
-        item for item in listed.stdout.split("\0")
-        if item and "__pycache__" not in PurePosixPath(item).parts and not item.endswith(".pyc")
+        item for item in listed_paths
+        if "__pycache__" not in PurePosixPath(item).parts and not item.endswith(".pyc")
     }
 
     working_members: set[str] = set()
@@ -1972,7 +2118,10 @@ def _tool_revision_tree_errors(
                     return [f"{prefix} non-regular file: {path.relative_to(repo_root).as_posix()}"]
                 if path.suffix == ".pyc":
                     continue
-                working_members.add(path.relative_to(repo_root).as_posix())
+                relative = path.relative_to(repo_root).as_posix()
+                if _has_ascii_control(relative):
+                    return [f"tool revision path contains ASCII control characters: {relative!r}"]
+                working_members.add(relative)
     except OSError:
         return [f"{prefix} unreadable tree"]
 
@@ -1983,13 +2132,14 @@ def _tool_revision_tree_errors(
     for relative in sorted(revision_members | working_members):
         violations.extend(_tool_revision_input_errors(
             repo_root=repo_root, relative=relative, revision=revision, run=run,
-            path_inventory=path_inventory,
+            path_inventory=path_inventory, read_bytes=read_bytes,
         ))
     return violations
 
 
 def _tool_revision_frozen_errors(
     m: AbManifest, *, repo_root: Path, run: Runner, tool_revision: str | None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     """以同一輸入比較器錨定檔案、完整樹與明確豁免的執行產物。"""
     revision = _tool_revision_for_checks(repo_root, run, tool_revision)
@@ -2011,11 +2161,12 @@ def _tool_revision_frozen_errors(
     for relative in sorted(files):
         violations.extend(_tool_revision_input_errors(
             repo_root=repo_root, relative=relative, revision=revision, run=run, map_path=map_path,
-            path_inventory=path_inventory,
+            path_inventory=path_inventory, read_bytes=read_bytes,
         ))
     for tree in sorted(trees):
         violations.extend(_tool_revision_tree_errors(
-            repo_root=repo_root, tree=tree, revision=revision, run=run, path_inventory=path_inventory,
+            repo_root=repo_root, tree=tree, revision=revision, run=run,
+            path_inventory=path_inventory, read_bytes=read_bytes,
         ))
     for relative in sorted(execution_files):
         violations.extend(_tool_revision_input_errors(
@@ -2026,12 +2177,14 @@ def _tool_revision_frozen_errors(
             map_path=map_path,
             execution_artifact=True,
             path_inventory=path_inventory,
+            read_bytes=read_bytes,
         ))
     return violations
 
 
 def _executing_tools_stage3_errors(
     m: AbManifest, executing_tools_root: Path, import_snapshot: str | None,
+    *, read_bytes: ReadBytes | None = None,
 ) -> list[str]:
     """要求 import 快照、目前磁碟樹與已錨定工具樹的摘要三者一致。"""
     declared = [
@@ -2043,7 +2196,7 @@ def _executing_tools_stage3_errors(
     expected = declared[0].tree_sha256
     tree_root = Path(executing_tools_root) / "tools" / "stage3"
     try:
-        actual = _tree_sha256(tree_root)
+        actual = _tree_sha256(tree_root, read_bytes=read_bytes)
     except (OSError, HarnessError):
         return ["executing tools/stage3 tree unavailable"]
     violations = []
@@ -2080,11 +2233,14 @@ def verify_frozen(
     | manifest source bytes、candidate_context、sidecar／bundle、suite selftest／testbed／realhw 樣板 | 執行產物；Task 3、§0.4 | 可在 repo 外；repo 內路徑需查 index 與 revision 的大小寫不敏感等價拼字 | 載入 SHA／交叉綁定與執行前重驗；只有確定未追蹤才豁免；`test_casefold_alias_of_staged_execution_file_is_rejected` |
     | Docker image name／digest | 執行產物；Task 3 DUT 驗證 | 不使用 repo 檔案路徑 | 以 image inspect 比對核准 digest |
 
+    每次驗證建立專用輸入快照；同一個 resolved path 只讀一次，SHA、解析與交叉判定都共用該份 bytes。
     ``tool_revision`` 是唯一可信版本錨點；省略時由 Git 讀取執行時 HEAD，Task 6 可固定傳入。
-    單檔使用 ``git hash-object --no-filters`` 比較工作樹 bytes 和同路徑 revision blob；樹使用相同
+    單檔以 Git blob header 與快照 bytes 計算 SHA-1／SHA-256，再和同路徑 revision blob 比較；樹使用相同
     排除規則比對 revision 與工作樹的完整成員集合，再逐檔比 bytes。所有 repo 內參與身分判定的路徑
     （FrozenTree 成員、sidecar 元件檔、package／delegate 樹成員與單檔元件）都經同一分類器；它一次
-    取得 Git index 與指定 revision 的路徑集合，檢查 ASCII 路徑及大小寫別名，Git 查詢失敗一律拒絕。
+    取得 Git index 與指定 revision 的 bytes 路徑集合，保留 NUL 分隔資料原樣；空白或無法對應的項目一律拒絕。
+    repo 內含 ASCII 控制字元（0x00–0x1F、0x7F）的 manifest 路徑、樹成員或 inventory 項目也一律拒絕，
+    避免換行正規化使路徑身分含混。檢查 ASCII 路徑及大小寫別名，Git 查詢失敗一律拒絕。
     只有執行產物確認在 index 與 revision 都沒有大小寫等價路徑時才豁免版本比對。Windows 檔案系統
     的 Unicode 大小寫表無法在 Linux 可靠重現，因此 repo 內含非 ASCII 字元的身分路徑一律保守拒絕。
     T1 CI `--base` 治理該 revision 的只增歷史；``base_revision`` 僅為呼叫端提供時的額外檢查。
@@ -2102,6 +2258,7 @@ def verify_frozen(
     Win32 裝置命名空間前綴後再比對；去識別 ID 必須不同，allowlist 恰含兩端。實際埠名只存非公開位置，
     公開證據只放去識別 ID 與對照 SHA-256。T3 只用合成資料測試。
     """
+    snapshot = _InputSnapshot()
     root = Path(repo_root).resolve()
     if root != m.repo_root:
         return [f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}"]
@@ -2110,7 +2267,7 @@ def verify_frozen(
     def loaded_schema_bytes(relative: str, expected_sha256: str | None) -> bytes | None:
         schema_path = root.joinpath(*PurePosixPath(relative).parts)
         try:
-            raw = schema_path.read_bytes()
+            raw = snapshot.read_bytes(schema_path)
         except OSError:
             violations.append(f"schema sha256 unavailable: {relative}")
             return None
@@ -2128,7 +2285,7 @@ def verify_frozen(
         )
 
     try:
-        source_sha256 = sha256_file(m.source_path)
+        source_sha256 = snapshot.sha256(m.source_path)
     except OSError:
         violations.append(f"file missing: {m.source_path}")
     else:
@@ -2138,7 +2295,7 @@ def verify_frozen(
     def check_file(item: FrozenFile, prefix: str, loaded_sha256: str | None = None) -> None:
         path = _path(root, item.path)
         try:
-            digest = sha256_file(path)
+            digest = snapshot.sha256(path)
         except OSError:
             violations.append(f"file missing: {path}")
             return
@@ -2166,17 +2323,19 @@ def verify_frozen(
             check_file(item, "tool", loaded_sha256=loaded_map_sha256)
         else:
             try:
-                actual = _tree_sha256(path)
+                actual = _tree_sha256(path, read_bytes=snapshot.read_bytes)
             except (OSError, HarnessError):
                 actual = None
             if actual != item.tree_sha256:
                 violations.append(f"tool tree mismatch: {item.path}")
 
     violations.extend(_tool_revision_frozen_errors(
-        m, repo_root=root, run=run, tool_revision=tool_revision,
+        m, repo_root=root, run=run, tool_revision=tool_revision, read_bytes=snapshot.read_bytes,
     ))
     executing_root, import_snapshot = _executing_tools_identity()
-    violations.extend(_executing_tools_stage3_errors(m, executing_root, import_snapshot))
+    violations.extend(_executing_tools_stage3_errors(
+        m, executing_root, import_snapshot, read_bytes=snapshot.read_bytes,
+    ))
 
     if m.exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
         if trusted_pair_map is None:
@@ -2186,6 +2345,7 @@ def verify_frozen(
                 _validate_windows_l15_transport(
                     m, root, trusted_pair_map=trusted_pair_map,
                     trusted_pair_schema_bytes=trusted_pair_schema_bytes,
+                    read_bytes=snapshot.read_bytes,
                 )
             except HarnessError as exc:
                 violations.append(f"trusted pair map invalid: {exc.detail}")
@@ -2193,7 +2353,7 @@ def verify_frozen(
     for side in m.sides:
         manifest_path = _path(root, side.release_manifest.path)
         try:
-            sidecar_bytes = manifest_path.read_bytes()
+            sidecar_bytes = snapshot.read_bytes(manifest_path)
             current_sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
             if not (
                 side.release_manifest_loaded_sha256
@@ -2203,14 +2363,17 @@ def verify_frozen(
                 violations.append(f"release manifest sha256 mismatch: side {side.label}")
         except OSError:
             violations.append(f"file missing: {manifest_path}")
-        violations.extend(verify_bundle(side.bundle_dir, side.manifest_doc, label=f"side {side.label}"))
+        violations.extend(verify_bundle(
+            side.bundle_dir, side.manifest_doc, label=f"side {side.label}",
+            read_bytes=snapshot.read_bytes,
+        ))
 
     if m.stage == "3":
         source_manifest_path = (
             root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
         )
         try:
-            source_manifest_bytes = source_manifest_path.read_bytes()
+            source_manifest_bytes = snapshot.read_bytes(source_manifest_path)
             source_manifest_sha256 = hashlib.sha256(source_manifest_bytes).hexdigest()
         except OSError:
             violations.append(f"file missing: {source_manifest_path}")
@@ -2227,7 +2390,7 @@ def verify_frozen(
             check_file(m.required_cases_lock, "required cases lock")
         catalog_path = root / "tests" / "acceptance" / "stage_exits.json"
         try:
-            catalog_sha = sha256_file(catalog_path)
+            catalog_sha = snapshot.sha256(catalog_path)
         except OSError:
             violations.append(f"file missing: {catalog_path}")
         else:
@@ -2235,6 +2398,7 @@ def verify_frozen(
                 violations.append(f"exit catalog sha256 mismatch: tests/acceptance/stage_exits.json")
         violations.extend(f"required cases invalid: {detail}" for detail in _stage3_lock_errors(
             m, root, base_revision=base_revision, source_reader=source_reader,
+            read_bytes=snapshot.read_bytes,
         ))
 
     try:
@@ -2258,6 +2422,7 @@ def verify_frozen(
     try:
         violations.extend(verify_case_coverage(
             m, repo_root=root, base_revision=base_revision, source_reader=source_reader,
+            read_bytes=snapshot.read_bytes,
         ))
     except HarnessError as exc:
         violations.append(f"required cases invalid: {exc.detail}")
