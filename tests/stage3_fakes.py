@@ -271,12 +271,24 @@ def _write_json(path: Path, value: Any) -> Path:
     return path
 
 
+_ROOT_METADATA_FILES = frozenset({"SHA256SUMS", "release-manifest.json"})
+# 退役 bundle 的資產位置尚待 Task 16 定案；暫放此目錄並據實計算。刻意不使用
+# ``assets/skill/SKILL.md``：Task 3 的樹摘要測試與 Task 16 的正向 fixture 都要在
+# make_bundle(stage="3") 之後「新增」該路徑。
+RETIRED_ASSET_DIR = "assets/pending-t16"
+
+
 def _write_bundle_sums(root: Path) -> None:
-    """依 bundle 實際檔案重建 SHA256SUMS。"""
+    """依 bundle 實際檔案重建 SHA256SUMS；只豁免 bundle 根目錄的兩個 metadata 檔。
+
+    比照 scripts/rust/mkbundle.sh 與 crates/sw-cli/src/install_layout.rs：以相對 bundle 根的
+    完整路徑判斷，巢狀的同名檔（例如 ``bin/SHA256SUMS``）仍須列入。
+    """
     sums = []
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        if path.is_file() and path.name not in {"SHA256SUMS", "release-manifest.json"}:
-            sums.append(f"{sha256_file(path)}  {path.relative_to(root).as_posix()}\n")
+        rel = path.relative_to(root).as_posix()
+        if path.is_file() and rel not in _ROOT_METADATA_FILES:
+            sums.append(f"{sha256_file(path)}  {rel}\n")
     (root / "SHA256SUMS").write_text("".join(sums), encoding="utf-8", newline="\n")
 
 
@@ -292,9 +304,10 @@ def make_bundle(
 ) -> Path:
     """建立摘要可重算的合成 bundle；不執行其中的 CLI 或 daemon。
 
-    非退役 bundle 的資產沿用部署位置 ``py/sw_core``。Task 16 尚未完整定案退役
-    bundle 的 profiles／supervisor 資產位置；退役 fixture 暫放在 bundle 內的
-    ``assets/``，其摘要一律按該處實際檔案計算，待 Task 16 定案。
+    非退役 bundle 的資產沿用部署位置 ``py/sw_core``。Task 16 尚未定案退役 bundle 的
+    skill／profiles／supervisor 資產位置；退役 fixture 暫放在 ``RETIRED_ASSET_DIR``，
+    其摘要一律按該處實際檔案計算，待 Task 16 定案。退役 bundle 不含
+    ``assets/skill/SKILL.md``，供 Task 3／Task 16 在建立後新增。
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -323,7 +336,7 @@ def make_bundle(
         (runtime / "sw_core" / "cli.py").write_text("# 測試用 Python CLI\n", encoding="utf-8", newline="\n")
 
     if include_retirement:
-        assets_dir = root / "assets"
+        assets_dir = root / RETIRED_ASSET_DIR
         supervisor = assets_dir / "systemd_units.py"
     else:
         assets_dir = runtime / "sw_core" / "assets"
@@ -458,7 +471,7 @@ def _archive_entries(bundle: Path) -> tuple[str, str, list[tuple[str, Path | Non
     outer = f"serialwrap-{version}-{platform_name}-x86_64"
     version_root = f"{outer}/versions/{version}"
     entries: list[tuple[str, Path | None, str, bytes | None]] = []
-    # Directory entries are explicit so tar and zip have the same layout.
+    # 明確列出目錄項目，讓 tar 與 zip 的佈局一致。
     directory_names = {outer, f"{outer}/versions", version_root, f"{outer}/bin"}
     for path in bundle.rglob("*"):
         rel = path.relative_to(bundle).as_posix()

@@ -319,7 +319,7 @@ def _assert_bundle_sums_match_files(bundle: Path) -> None:
     expected = []
     for path in sorted(bundle.rglob("*"), key=lambda item: item.relative_to(bundle).as_posix()):
         rel = path.relative_to(bundle).as_posix()
-        if path.is_file() and path.name not in {"SHA256SUMS", "release-manifest.json"}:
+        if path.is_file() and rel not in {"SHA256SUMS", "release-manifest.json"}:
             expected.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}\n")
     assert (bundle / "SHA256SUMS").read_text(encoding="utf-8") == "".join(expected)
 
@@ -403,8 +403,8 @@ def test_make_bundle_retired_manifest_summaries_recompute_from_real_paths(tmp_pa
     assert daemon["launcher"]["path"] == f"bin/serialwrapd{suffix}"
     assert hashlib.sha256((bundle / daemon["launcher"]["path"]).read_bytes()).hexdigest() == daemon["launcher"]["sha256"]
 
-    # Task 16 尚未完整定案退役 bundle 的 profiles／supervisor 資產位置；fixture 選用 bundle 內實檔，待 Task 16 定案。
-    asset_root = bundle / "assets"
+    # Task 16 尚未定案退役 bundle 的資產位置；fixture 暫放 assets/pending-t16 的實檔，待 Task 16 定案。
+    asset_root = bundle / "assets" / "pending-t16"
     skill = asset_root / "skill/SKILL.md"
     skill_windows = asset_root / "skill/SKILL_WINDOWS.md"
     profiles = asset_root / "profiles"
@@ -964,3 +964,35 @@ def test_pre_stage3_release_manifests_follow_current_contract(tmp_path, stage, o
             assert daemon["entry"] == [daemon["launcher"]["path"]], "非退役 Rust daemon 的 entry 指向 Rust launcher"
         else:
             assert daemon["entry"] == ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]
+
+
+def test_bundle_sums_exclude_only_root_metadata_files(tmp_path):
+    """巢狀的 SHA256SUMS／release-manifest.json 必須列入根 SHA256SUMS（只豁免根目錄兩檔）。"""
+    fakes = _fakes()
+    root = tmp_path / "bundle"
+    nested = {"bin/SHA256SUMS": b"nested sums\n", "bin/release-manifest.json": b"{}\n"}
+    for rel, data in nested.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    bundle = fakes.make_bundle(root, stage="2.4")
+
+    lines = (bundle / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    listed = {line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in lines}
+    for rel, data in nested.items():
+        assert listed[rel] == hashlib.sha256(data).hexdigest()
+    assert "SHA256SUMS" not in listed and "release-manifest.json" not in listed
+    _assert_bundle_sums_match_files(bundle)
+
+
+@pytest.mark.parametrize("target", ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"])
+def test_retired_bundle_leaves_task_asset_path_absent(tmp_path, target):
+    """Task 3 樹摘要測試與 Task 16 正向 fixture 都在建立後新增 assets/skill/SKILL.md，該路徑不得預先存在。"""
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "bundle", stage="3", target=target)
+
+    assert not (bundle / "assets" / "skill" / "SKILL.md").exists()
+    before = fakes.tree_sha256(bundle)
+    added = bundle / "assets" / "skill" / "SKILL.md"
+    added.parent.mkdir(parents=True, exist_ok=True)
+    added.write_text("# 新增的資產\n", encoding="utf-8", newline="\n")
+    assert fakes.tree_sha256(bundle) != before, "新增資產必須改變樹摘要（不是覆寫既有檔）"
