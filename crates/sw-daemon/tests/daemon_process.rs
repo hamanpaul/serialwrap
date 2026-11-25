@@ -324,8 +324,8 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
         "複製 config 時必須保留 wal_dir 原字串，不得改成絕對路徑：{copied_config}"
     );
     assert!(
-        copied_config.contains("__serialwrap_internal:")
-            && copied_config.contains("wal_dir_origin:")
+        copied_config.contains("__serialwrap_wal_dir_origin_v1:")
+            && copied_config.contains("__serialwrap_owner: serialwrap")
             && copied_config.contains(
                 env.system_config
                     .parent()
