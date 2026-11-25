@@ -765,11 +765,11 @@ pub struct OriginalSnapshot {
     /// config 在原交易開始前是否存在；不可由復原時的環境重新推導。
     pub config_existed: Option<bool>,
     pub config_sha256: Option<String>,
-    /// 原始 config 的 POSIX owner/group/mode/mtime；不含 ctime，因還原會建立新 inode。
+    /// 原始 config 的 POSIX owner/group/mode/mtime；只供 snapshot 驗證，不授權中斷復原覆寫。
     pub config_original_metadata: Option<String>,
     /// 記錄交易目前預期的 config 內容，供復原確認檔案仍處於交易狀態。
     pub config_written_sha256: Option<String>,
-    /// 最後一次交易寫入時的 POSIX owner/group/mode，供中斷復原確認檔案仍處於交易狀態。
+    /// 最後一次交易寫入時的 POSIX owner/group/mode/mtime/ctime，供中斷復原確認檔案仍處於交易狀態。
     pub config_written_metadata: Option<String>,
     pub supervisor: SupervisorSnapshot,
     pub daemon: Option<DaemonSnapshot>,
@@ -886,20 +886,10 @@ fn verify_transaction_config(
     if actual == expected && actual_metadata == original.config_written_metadata {
         return Ok(());
     }
-    // 第一次復原可能已把 config 還原，但在後續步驟中再次中斷。接受原始內容及存取 metadata
-    // 相符的狀態，避免讓重試覆寫中斷後才修改的其他 config。
-    if original.config_existed == Some(true) && original.config_sha256.as_deref() == Some(actual.as_str()) {
-        let original_metadata = config_metadata_fingerprint(recorded, false).map_err(|error| {
-            ("config_ownership_unknown", format!("無法確認原始 config owner/group/mode：{error}；保留 journal，未修改檔案"))
-        })?;
-        if original_metadata == original.config_original_metadata {
-            return Ok(());
-        }
-    }
     let detail = if actual != expected {
-        "目前 config 內容或 owner/group/mode 與交易記錄不一致"
+        "目前 config 內容或 owner/group/mode/ctime 與交易記錄不一致"
     } else {
-        "目前 config owner/group/mode 與交易記錄不一致"
+        "目前 config owner/group/mode/ctime 與交易記錄不一致"
     };
     Err(("config_ownership_unknown", format!("{detail}：{}；保留 journal，未修改檔案", recorded.display())))
 }
@@ -1239,7 +1229,7 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         }
         report
     };
-    if let Err(message) = restore_original(ctx, root, &journal, backup.as_deref(), &mut progress) {
+    if let Err(message) = restore_original(ctx, root, &mut journal, backup.as_deref(), &mut progress) {
         return Some(legacy_unrestored(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_failed", message), &progress));
     }
     let restored = match restore_supervisor_and_daemon(ctx, root, original, backup.as_deref(), recovery_handoff.as_deref(), recovery_target_hold.as_ref(), false, legacy_capture.is_some(), &mut progress) {
@@ -2925,7 +2915,7 @@ fn revert_after_failure(
     crash_if("revert_to_previous:before_effect");
     let backup_used = backup.dir.as_path();
     let mut progress = RestoreProgress::default();
-    let restore_result = restore_original(ctx, &root, &journal, Some(backup_used), &mut progress);
+    let restore_result = restore_original(ctx, &root, &mut journal, Some(backup_used), &mut progress);
     if restore_result.is_ok() {
         match restore_supervisor_and_daemon(ctx, &root, &original, Some(backup_used), None, target_hold.as_ref(), with_sudo, legacy_argv.is_some(), &mut progress) {
             Ok(mut measured) => {
@@ -3840,12 +3830,13 @@ impl RestoreProgress {
     }
 }
 
-fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal, backup: Option<&Path>, progress: &mut RestoreProgress) -> Result<(), String> {
-    let original = journal.original.as_ref().ok_or("journal 缺少 original snapshot")?;
+fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &mut Journal, backup: Option<&Path>, progress: &mut RestoreProgress) -> Result<(), String> {
+    let original = journal.original.clone().ok_or("journal 缺少 original snapshot")?;
     let snapshot = journal.snapshot_dir.as_deref().map(PathBuf::from).ok_or("journal 缺少 snapshot_dir")?;
-    let config_path = journal_config_path(ctx, original).map_err(|(_, message)| message)?;
-    verify_transaction_config(ctx, original, &config_path).map_err(|(_, message)| message)?;
+    let config_path = journal_config_path(ctx, &original).map_err(|(_, message)| message)?;
+    verify_transaction_config(ctx, &original, &config_path).map_err(|(_, message)| message)?;
     let source = backup.unwrap_or(&snapshot);
+    let mut config_transaction_write = false;
     // state.json 與 benches.state.json 可能在新版運作期間更新（例如 RELEASED）；
     // 回退只還原設定，不可用舊備份覆蓋目前的持久化狀態。
     match (original.config_existed, original.config_sha256.as_deref()) {
@@ -3863,15 +3854,21 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
             if snapshot_metadata != original.config_original_metadata {
                 return Err("原始 config snapshot owner/group/mode 與 journal 不一致".into());
             }
-            copy_replace_owner_group(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
-            let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
-            if sha256_hex(&restored) != expected {
-                return Err("還原後的 config.yaml 與原始快照不一致".into());
-            }
-            let restored_metadata = config_metadata_fingerprint(&config_path, false)
+            let current_bytes = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
+            let current_metadata = config_metadata_fingerprint(&config_path, false)
                 .map_err(|error| error.to_string())?;
-            if restored_metadata != original.config_original_metadata {
-                return Err("還原後 config owner/group/mode 與 journal 不一致".into());
+            if sha256_hex(&current_bytes) != expected || current_metadata != original.config_original_metadata {
+                copy_replace_owner_group(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
+                let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
+                if sha256_hex(&restored) != expected {
+                    return Err("還原後的 config.yaml 與原始快照不一致".into());
+                }
+                let restored_metadata = config_metadata_fingerprint(&config_path, false)
+                    .map_err(|error| error.to_string())?;
+                if restored_metadata != original.config_original_metadata {
+                    return Err("還原後 config owner/group/mode 與 journal 不一致".into());
+                }
+                config_transaction_write = true;
             }
         }
         (Some(false), None) => {
@@ -3880,9 +3877,15 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
                 if let Some(parent) = config_path.parent() {
                     ctx.p.fs.sync_dir(parent).map_err(|error| error.py_message)?;
                 }
+                config_transaction_write = true;
             }
         }
         _ => return Err("journal 的 config 原始存在狀態與 SHA-256 不一致".into()),
+    }
+    // 復原寫入本身會建立新 ctime。先驗證內容與權限後，立即記錄這次交易寫入的指紋；
+    // 若 journal 更新失敗，下一次復原會因舊 ctime 不符而 fail closed。
+    if config_transaction_write {
+        record_transaction_config(ctx, root, journal).map_err(|error| error.to_string())?;
     }
     for name in ["profiles", "supervisor"] {
         let from = source.join(name);

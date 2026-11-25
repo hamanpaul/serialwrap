@@ -3331,12 +3331,12 @@ fn posix_set_file_mode(path: &std::path::Path, mode: u32) {
 }
 
 #[cfg(all(test, unix))]
-fn posix_secondary_group() -> u32 {
+fn posix_secondary_group() -> Option<u32> {
     let (primary, groups) = sw_pal::fs_ops::posix::test_process_groups().expect("讀取 POSIX 測試行程 groups");
     groups
         .into_iter()
-        .find(|group| *group != primary)
-        .expect("POSIX owner/group 測試需要一個不同於 primary group 的 supplementary group")
+        .filter(|group| *group != primary)
+        .min()
 }
 
 #[cfg(all(test, unix))]
@@ -3418,6 +3418,56 @@ fn inst4_f2_interrupted_recovery_refuses_modified_existing_config() {
     assert_eq!(t.journal_bytes().as_deref(), Some(journal_before.as_slice()), "安全停止時 journal 必須原樣保留");
 }
 
+/// inst4-f3：中斷後 config ctime 改變時，即使內容與 mode 回到原樣也必須 fail closed。
+#[cfg(all(test, unix))]
+#[test]
+fn inst4_f3_interrupted_recovery_refuses_config_ctime_changed_after_chmod_roundtrip() {
+    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/original.sock\n";
+    let mut t = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_crash_at("entries_switching:after_effect");
+    posix_set_file_mode(&t.config_path(), 0o640);
+
+    let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    let config_before = std::fs::read(t.config_path()).expect("交易中斷後 config 必須存在");
+    let mode_before = posix_file_mode(&t.config_path());
+    let metadata_before = sw_pal::fs_ops::file_metadata_fingerprint(&t.config_path(), true)
+        .expect("讀取 config ctime")
+        .expect("POSIX metadata 應可用");
+    let metadata_without_ctime_before = sw_pal::fs_ops::file_metadata_fingerprint(&t.config_path(), false)
+        .expect("讀取 config metadata")
+        .expect("POSIX metadata 應可用");
+    let journal_before = t.journal_bytes().expect("交易中斷後必須留下 journal");
+
+    // chmod 兩次只留下 ctime 變化；內容、mode、owner/group 與 mtime 維持原樣。
+    posix_set_file_mode(&t.config_path(), mode_before ^ 0o100);
+    posix_set_file_mode(&t.config_path(), mode_before);
+    assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), config_before);
+    assert_eq!(posix_file_mode(&t.config_path()), mode_before);
+    let metadata_after = sw_pal::fs_ops::file_metadata_fingerprint(&t.config_path(), true)
+        .expect("讀取 config ctime")
+        .expect("POSIX metadata 應可用");
+    let metadata_without_ctime_after = sw_pal::fs_ops::file_metadata_fingerprint(&t.config_path(), false)
+        .expect("讀取 config metadata")
+        .expect("POSIX metadata 應可用");
+    assert_eq!(metadata_without_ctime_after, metadata_without_ctime_before, "內容、owner/group、mode、mtime 必須不變");
+    assert_ne!(metadata_after, metadata_before, "chmod 後改回必須留下不同 ctime");
+
+    t.clear_crash();
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(rc, 2, "無法確認 config 歸屬時 setup 必須安全停止：{out} {err}");
+    assert!(out.contains("config_ownership_unknown"), "應回既有 config 歸屬錯誤碼：{out}");
+    assert!(err.contains("config") && err.contains("journal"), "stderr 應說明 config 與 journal 保留狀態：{err}");
+    assert_eq!(std::fs::read(t.config_path()).expect("安全停止不得改寫 config"), config_before);
+    assert_eq!(posix_file_mode(&t.config_path()), mode_before, "安全停止不得改寫使用者 mode");
+    assert_eq!(t.journal_bytes().as_deref(), Some(journal_before.as_slice()), "安全停止時 journal 必須原樣保留");
+}
+
 /// inst4-f2 V051-a0b00f2-2：切換失敗後回復既有 POSIX config 的內容與 mode。
 #[cfg(all(test, unix))]
 #[test]
@@ -3431,8 +3481,6 @@ fn inst4_f2_switch_failure_restores_existing_config_mode() {
         .with_fs_fault_replace_suffix(".new");
     posix_set_file_mode(&t.config_path(), 0o640);
     let original_owner_group = posix_file_owner_group(&t.config_path());
-    let config_dir = t.config_path().parent().expect("config parent").to_path_buf();
-    posix_setgid_directory(&config_dir, posix_secondary_group());
 
     let (rc, out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
 
@@ -3456,8 +3504,6 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
         .with_crash_at("entries_switching:after_effect");
     posix_set_file_mode(&t.config_path(), 0o640);
     let original_owner_group = posix_file_owner_group(&t.config_path());
-    let config_dir = t.config_path().parent().expect("config parent").to_path_buf();
-    posix_setgid_directory(&config_dir, posix_secondary_group());
 
     let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
@@ -3470,6 +3516,61 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
     assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), original);
     assert_eq!(posix_file_mode(&t.config_path()), 0o640, "journal 復原必須保留原始 0640 mode");
     assert_eq!(posix_file_owner_group(&t.config_path()), original_owner_group, "中斷復原必須保留原始 owner/group");
+}
+
+/// inst4-f3：在可用的 supplementary group 上獨立驗證 setgid 目錄中的兩種 config 回復。
+#[cfg(all(test, unix))]
+#[test]
+fn inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group() {
+    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
+
+    let switch = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_fs_fault_replace_suffix(".new");
+    posix_set_file_mode(&switch.config_path(), 0o640);
+    let switch_owner_group = posix_file_owner_group(&switch.config_path());
+    let Some(group) = posix_secondary_group().filter(|group| *group != switch_owner_group.1) else {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: inst4_f3_different_group_switch_and_interrupted_restore_preserve_owner_group 需要目前行程可使用且不同於 config 原始 group 的 supplementary group；既有內容與 mode 測試不依賴此條件"
+        );
+        return;
+    };
+    let switch_config_dir = switch.config_path().parent().expect("config parent").to_path_buf();
+    posix_setgid_directory(&switch_config_dir, group);
+
+    let (switch_rc, switch_out, _switch_err) = switch.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(switch_rc, 2, "入口切換注入失敗時 setup 必須回報失敗：{switch_out}");
+    assert!(switch_out.contains("\"reverted\":true"), "切換失敗必須完成回復：{switch_out}");
+    assert_eq!(std::fs::read(switch.config_path()).expect("config 必須存在"), original);
+    assert_eq!(posix_file_mode(&switch.config_path()), 0o640, "切換失敗回復必須保留原始 mode");
+    assert_eq!(posix_file_owner_group(&switch.config_path()), switch_owner_group, "setgid 目錄中切換失敗回復必須保留原始 owner/group");
+
+    let mut interrupted = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_crash_at("entries_switching:after_effect");
+    posix_set_file_mode(&interrupted.config_path(), 0o640);
+    let interrupted_owner_group = posix_file_owner_group(&interrupted.config_path());
+    let interrupted_config_dir = interrupted.config_path().parent().expect("config parent").to_path_buf();
+    posix_setgid_directory(&interrupted_config_dir, group);
+
+    let (crash_rc, _out, _err) = interrupted.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    interrupted.clear_crash();
+    let recovery = interrupted.recover().expect("journal");
+
+    assert!(recovery.ok, "中斷復原必須成功：{recovery:?}");
+    assert_eq!(std::fs::read(interrupted.config_path()).expect("config 必須存在"), original);
+    assert_eq!(posix_file_mode(&interrupted.config_path()), 0o640, "中斷復原必須保留原始 mode");
+    assert_eq!(posix_file_owner_group(&interrupted.config_path()), interrupted_owner_group, "setgid 目錄中中斷復原必須保留原始 owner/group");
 }
 
 #[test]
