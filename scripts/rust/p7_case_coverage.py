@@ -10,7 +10,8 @@
   節點須在 junit 恰出現一次（缺漏、重複皆為缺漏；審查 P7-cd7acf0-1）。
 - `contract-blackbox`：凍結 `p7_gate:contract-blackbox-p7-b` 中 nodeid 為 `source_ref` 或 `source_ref[參數]` 的節點須在
   `<ab>/p7-b/junit.xml` 各恰一次 passed；A 輪取 `-p7-a` 的同名節點各恰一次 passed（rust_only SC 案例：A 集合不含，
-  selector 精確 deselect 者不要求 JUnit 列，其餘仍須各恰一次 skip 或 passed）。OD-59 控制延遲案例改由
+  selector 精確 deselect 者不要求 JUnit 列，但 JUnit 仍須可讀，缺檔或損壞即為證據缺失；其餘仍須各恰一次 skip 或
+  passed）。OD-59 控制延遲案例改由
   `od59-contract-a`／`od59-contract-b` 專屬
   契約量測階段承擔，不採用小樣本 p7-a／p7-b 結果。
 - `l15-scenario`／`func-test`：daemon_slice 2.1 的 l15 情境取 `<ab>/l15-slice21-b/junit.xml` 的
@@ -197,8 +198,12 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
                 else set()
             )
             if b_nodes and all(node in deselected for node in b_nodes):
-                unexpected = [node for node in b_nodes if junit("p7-a").get(node)]
-                why = f"selector 已 deselect 但 JUnit 含節點 {unexpected[0]}" if unexpected else None
+                a_junit = junit("p7-a")
+                if a_junit is None:
+                    why = "junit 缺檔或不可解析"
+                else:
+                    unexpected = [node for node in b_nodes if a_junit.get(node)]
+                    why = f"selector 已 deselect 但 JUnit 含節點 {unexpected[0]}" if unexpected else None
                 a_detail = "A selector 已明確 deselect rust_only 節點"
             else:
                 why = _once(junit("p7-a"), b_nodes, ("skipped", "passed"))

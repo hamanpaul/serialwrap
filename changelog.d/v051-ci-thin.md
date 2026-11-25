@@ -7,3 +7,4 @@ scope: tests
 另將 UART writer 停滯測試的期限與每步等待等比例放大，並驗證總排空時間確實超過停滯期限；L1.5 update 測試改以 rig 私有 by-id 目錄的 inotify 事件確認連結移除與復原後各有一次新掃描，仍保留 3 秒窗口及零 TX 判準。console overflow 測試先持有兩個 console PTY，再以 h1 的明確 client_id detach，固定 line-buffered 測試前提。
 
 依擁有者 OD-115，DF-23 黑箱測試改為只在 Rust 執行，並記錄 Python 0.4.x 的時序相依終態與偶發一次自動重試。
+P7 coverage 在 Python A 輪的 rust-only 節點已由 selector 精確 deselect 時，仍要求 A JUnit 可解析；缺檔或 XML 損壞會回報明確的證據缺失 GAP，不再讓診斷程式中止。

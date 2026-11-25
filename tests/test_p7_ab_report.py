@@ -383,6 +383,40 @@ def test_coverage_requires_pass_or_numbered_owner_block(tmp_path):
     assert {r["case_id"]: r["status"] for r in rep["rows"]}["p7-a"] == "GAP"
 
 
+@pytest.mark.parametrize("a_xml", [None, "<testsuites><testsuite>"], ids=["missing", "malformed"])
+def test_coverage_rust_only_deselected_reports_unreadable_a_junit(tmp_path, a_xml):
+    sc30 = "tests/contract_blackbox/test_p7_x.py::test_sc30"
+    case = {
+        "case_id": "p7-df23",
+        "suite": "contract-blackbox",
+        "source_ref": sc30,
+        "behavior_changes": ["SC-30"],
+    }
+    fixture = _cov_fixture(tmp_path, [case])
+    lock = json.loads(fixture[-1].read_text(encoding="utf-8"))
+    lock["sets"][ab.SET_A]["linux"]["selector"] = {
+        "argv": ["-q", "--deselect", sc30],
+        "paths": [],
+        "markexpr": "",
+    }
+    fixture[-1].write_text(json.dumps(lock), encoding="utf-8")
+    ab_dir = tmp_path / "ab"
+    _junit(ab_dir / "p7-b" / "junit.xml", {sc30: "passed"})
+    if a_xml is not None:
+        a_junit = ab_dir / "p7-a" / "junit.xml"
+        a_junit.parent.mkdir(parents=True)
+        a_junit.write_text(a_xml, encoding="utf-8")
+
+    rep = cov.build(ab_dir, *fixture)
+
+    assert rep["rows"] == [{
+        "case_id": "p7-df23",
+        "status": "GAP",
+        "detail": "A 輪：junit 缺檔或不可解析",
+    }], rep["rows"]
+    assert rep["gaps"] == 1
+
+
 def test_external_evidence_path_is_locatable(tmp_path, monkeypatch):
     """審查 P7-7bb9cfd-1：repo 外的證據不得只記 basename——`--run-dir` 內記 `$RUN_DIR/<相對>`，其外記完整路徑
     （去掉開頭 `/`，不留主機絕對路徑前綴，R-21）。"""
