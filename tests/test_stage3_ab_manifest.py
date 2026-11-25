@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import builtins
 import copy
 import contextlib
 import hashlib
 import io
 import json
+import os
+import threading
 from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Mapping
@@ -2829,8 +2832,93 @@ def test_repo_relative_path_normalizes_windows_absolute_paths_on_any_host(value,
     assert ab_manifest._repo_relative_path(root, value, windows=windows) == expected
 
 
+def _track_open_reads(monkeypatch, roots: list[Path]) -> dict[Path, int]:
+    """以底層開檔入口追蹤指定 repo／bundle 內成功的讀取開檔。"""
+    counts: dict[Path, int] = {}
+    allowed_roots = tuple(Path(root).resolve() for root in roots)
+    depth = threading.local()
+
+    def record(file, mode) -> None:
+        if not isinstance(mode, str) or not ("r" in mode or "+" in mode):
+            return
+        try:
+            candidate = Path(os.fsdecode(os.fspath(file))).resolve()
+        except (OSError, TypeError, ValueError):
+            return
+        if not any(candidate.is_relative_to(root) for root in allowed_roots):
+            return
+        counts[candidate] = counts.get(candidate, 0) + 1
+
+    def wrap(original):
+        def tracked(file, *args, **kwargs):
+            mode = kwargs.get("mode", args[0] if args else "r")
+            nested = getattr(depth, "value", 0) > 0
+            depth.value = getattr(depth, "value", 0) + 1
+            try:
+                opened = original(file, *args, **kwargs)
+            finally:
+                depth.value -= 1
+            if not nested:
+                record(file, mode)
+            return opened
+
+        return tracked
+
+    # Python 3.12 的 pathlib.Path.open/read_bytes/read_text 會呼叫 io.open；
+    # builtins.open 是另一個可直接使用的入口。巢狀入口由 thread-local 深度去重。
+    monkeypatch.setattr(builtins, "open", wrap(builtins.open))
+    monkeypatch.setattr(io, "open", wrap(io.open))
+    return counts
+
+
+def _frozen_read_audit_paths(manifest, root: Path) -> list[Path]:
+    paths = [
+        manifest.source_path,
+        ab_manifest._path(root, manifest.case_list.path),
+        ab_manifest._path(root, manifest.case_lock.path),
+        root / "tests" / "acceptance" / "stage_exits.json",
+        root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json",
+        root / "tests" / "acceptance" / "ab_manifest.schema.json",
+    ]
+    if manifest.required_cases_lock is not None:
+        paths.append(ab_manifest._path(root, manifest.required_cases_lock.path))
+    paths.extend(ab_manifest._path(root, side.release_manifest.path) for side in manifest.sides)
+    map_ref = manifest.platform_settings.get("case_transport_map")
+    if isinstance(map_ref, Mapping):
+        paths.append(root / map_ref["path"])
+        paths.append(root / "tests" / "acceptance" / "stage3_trusted_pair_map.schema.json")
+    return list(dict.fromkeys(Path(path).resolve() for path in paths))
+
+
+def _case_coverage_read_audit_paths(manifest, root: Path) -> list[Path]:
+    return [
+        ab_manifest._path(root, manifest.case_list.path),
+        ab_manifest._path(root, manifest.case_lock.path),
+        ab_manifest._path(root, manifest.required_cases_lock.path),
+        root / "tests" / "acceptance" / "stage_exits.json",
+        root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json",
+    ]
+
+
+def _manifest_bundle_roots(path: Path, root: Path) -> list[Path]:
+    doc = _read_json(path)
+    roots = [root]
+    for side in doc.get("sides", []):
+        bundle = Path(side["bundle_dir"])
+        roots.append(bundle if bundle.is_absolute() else root / bundle)
+    return roots
+
+
+def _assert_open_read_audit(violations, counts: dict[Path, int], *, required_paths=()) -> None:
+    assert violations == [], violations
+    repeated = {str(path): count for path, count in counts.items() if count > 1}
+    assert not repeated, repeated
+    missing = [str(Path(path).resolve()) for path in required_paths if counts.get(Path(path).resolve(), 0) < 1]
+    assert not missing, f"必要輸入未經讀取：{missing}"
+
+
 def _verify_with_read_tracking(manifest, root: Path, monkeypatch, *, first_read_overrides=None):
-    """只在 verify_frozen 期間追蹤 Path 讀取，並可模擬同路徑後續內容還原。"""
+    """只在 verify_frozen 期間追蹤 repo／bundle 開檔，並可注入首次讀取內容。"""
     runner = _ToolRevisionRecordingRunner(
         root,
         _repo_snapshot(root),
@@ -2858,32 +2946,26 @@ def _verify_with_read_tracking(manifest, root: Path, monkeypatch, *, first_read_
             return seed_sources.get(path)
         return base_source_reader(revision, path)
 
-    original_read_bytes = Path.read_bytes
-    original_read_text = Path.read_text
     overrides = {
         Path(path).resolve(): content
         for path, content in (first_read_overrides or {}).items()
     }
-    counts: dict[Path, int] = {}
-
-    def next_content(path: Path, *, text: bool, args, kwargs):
-        resolved = Path(path).resolve()
-        counts[resolved] = counts.get(resolved, 0) + 1
-        content = overrides.get(resolved)
-        if content is not None and counts[resolved] == 1:
-            if text:
-                return content.decode(kwargs.get("encoding") or "utf-8")
-            return content
-        if text:
-            return original_read_text(path, *args, **kwargs)
-        return original_read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", lambda path: next_content(path, text=False, args=(), kwargs={}))
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda path, *args, **kwargs: next_content(path, text=True, args=args, kwargs=kwargs),
+    counts = _track_open_reads(
+        monkeypatch, [root, *(side.bundle_dir for side in manifest.sides)],
     )
+
+    # 保持現有內容漂移測試可對快照 reader 注入首次內容；計數本身在 open/io.open。
+    original_snapshot_read = ab_manifest._InputSnapshot.read_bytes
+
+    def tracked_snapshot_read(snapshot, path):
+        key = ab_manifest._InputSnapshot._key(path)
+        data = original_snapshot_read(snapshot, path)
+        if key in overrides:
+            snapshot._values[key] = overrides[key]
+            return overrides[key]
+        return data
+
+    monkeypatch.setattr(ab_manifest._InputSnapshot, "read_bytes", tracked_snapshot_read)
     options = dict(
         m=manifest,
         repo_root=root,
@@ -2896,6 +2978,52 @@ def _verify_with_read_tracking(manifest, root: Path, monkeypatch, *, first_read_
     with patch.object(ab_manifest, "_executing_tools_identity", lambda: (root, identity_sha)):
         violations = ab_manifest.verify_frozen(**options)
     return violations, counts
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    ["read_bytes", "read_text", "path_open", "builtin_open", "io_open", "yaml_safe_load_path_open"],
+    ids=["Path-read_bytes", "Path-read_text", "Path-open", "open", "io-open", "yaml-safe_load-Path-open"],
+)
+def test_open_read_tracker_counts_all_supported_entry_points_once(tmp_path, monkeypatch, entry_point):
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "input.yaml"
+    target.write_text("value: tracked\n", encoding="utf-8")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("value: ignored\n", encoding="utf-8")
+    counts = _track_open_reads(monkeypatch, [root])
+
+    if entry_point == "read_bytes":
+        assert target.read_bytes() == b"value: tracked\n"
+    elif entry_point == "read_text":
+        assert target.read_text(encoding="utf-8") == "value: tracked\n"
+    elif entry_point == "path_open":
+        with target.open("rb") as stream:
+            assert stream.read() == b"value: tracked\n"
+    elif entry_point == "builtin_open":
+        with open(target, "rb") as stream:
+            assert stream.read() == b"value: tracked\n"
+    elif entry_point == "io_open":
+        with io.open(target, "rb") as stream:
+            assert stream.read() == b"value: tracked\n"
+    else:
+        with target.open(encoding="utf-8") as stream:
+            assert yaml.safe_load(stream) == {"value": "tracked"}
+
+    outside.read_bytes()
+    (root / "write-only.bin").write_bytes(b"write mode is excluded")
+    assert counts == {target.resolve(): 1}
+
+
+def test_load_manifest_reads_each_frozen_input_at_most_once(tmp_path, monkeypatch):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    _install_test_schemas(tmp_path)
+    counts = _track_open_reads(monkeypatch, _manifest_bundle_roots(path, tmp_path))
+
+    manifest = ab_manifest.load_manifest(path, repo_root=tmp_path)
+
+    _assert_open_read_audit([], counts, required_paths=_frozen_read_audit_paths(manifest, tmp_path))
 
 
 def test_verify_frozen_coverage_uses_first_case_catalog_read(tmp_path, monkeypatch):
@@ -2987,7 +3115,85 @@ def test_verify_frozen_reuses_first_read_for_each_indirect_input(
 def test_verify_frozen_reads_each_path_at_most_once(tmp_path, monkeypatch):
     path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
     manifest = _load(path)
-    _violations, counts = _verify_with_read_tracking(manifest, tmp_path, monkeypatch)
+    violations, counts = _verify_with_read_tracking(manifest, tmp_path, monkeypatch)
 
-    repeated = {str(path): count for path, count in counts.items() if count > 1}
-    assert not repeated, repeated
+    _assert_open_read_audit(
+        violations, counts, required_paths=_frozen_read_audit_paths(manifest, tmp_path),
+    )
+
+
+@pytest.mark.parametrize(
+    "read_mode",
+    ["builtin", "pathlib"],
+    ids=["duplicate-open", "duplicate-Path-open"],
+)
+def test_verify_frozen_read_audit_rejects_second_case_open(
+    tmp_path, monkeypatch, read_mode,
+):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    case_path = ab_manifest._path(tmp_path, manifest.case_list.path)
+    original_read_cases = ab_manifest._read_cases
+    injected = False
+
+    def read_cases_with_second_open(repo_root, selected_manifest, *, read_bytes=None):
+        nonlocal injected
+        if not injected:
+            injected = True
+            if read_mode == "builtin":
+                with open(case_path, "rb") as stream:
+                    stream.read()
+            else:
+                with case_path.open("rb") as stream:
+                    stream.read()
+        return original_read_cases(repo_root, selected_manifest, read_bytes=read_bytes)
+
+    monkeypatch.setattr(ab_manifest, "_read_cases", read_cases_with_second_open)
+    violations, counts = _verify_with_read_tracking(manifest, tmp_path, monkeypatch)
+
+    assert injected
+    assert violations == []
+    assert counts.get(case_path.resolve()) == 2
+    with pytest.raises(AssertionError):
+        _assert_open_read_audit(
+            violations, counts, required_paths=_frozen_read_audit_paths(manifest, tmp_path),
+        )
+
+
+def test_windows_l15_case_mapping_reads_each_path_at_most_once(tmp_path, monkeypatch):
+    path = _windows_l15_transport_fixture(tmp_path)
+    manifest = _load(path, repo_root=tmp_path)
+    violations, counts = _verify_with_read_tracking(manifest, tmp_path, monkeypatch)
+
+    _assert_open_read_audit(
+        violations, counts, required_paths=_frozen_read_audit_paths(manifest, tmp_path),
+    )
+
+
+def test_verify_case_coverage_entry_reads_each_path_at_most_once(tmp_path, monkeypatch):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    counts = _track_open_reads(monkeypatch, [tmp_path, *(side.bundle_dir for side in manifest.sides)])
+    violations = ab_manifest.verify_case_coverage(
+        manifest, repo_root=tmp_path, base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+
+    _assert_open_read_audit(
+        violations, counts, required_paths=_case_coverage_read_audit_paths(manifest, tmp_path),
+    )
+
+
+def test_required_cases_entry_reads_each_path_at_most_once(tmp_path, monkeypatch):
+    path = fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    manifest = _load(path)
+    counts = _track_open_reads(monkeypatch, [tmp_path, *(side.bundle_dir for side in manifest.sides)])
+    required, _rows = ab_manifest.required_cases(
+        manifest, repo_root=tmp_path, base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
+
+    assert required == set(manifest.case_ids)
+    _assert_open_read_audit(
+        [], counts, required_paths=_case_coverage_read_audit_paths(manifest, tmp_path),
+    )
