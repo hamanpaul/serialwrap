@@ -3814,12 +3814,17 @@ impl SessionCore {
 
         req.session_id = self.sid.clone();
         let cmd_id = self.next_uuid();
+        // Rust-only（OD-111）：command.submit 取 session 現行 profile 的 `max_console_line_chars` 交給 arbiter；
+        // human console 的整行輸入走 `console.rs` 的 `admit`，不套用。
+        let line_limit = self.profile.template.max_console_line_chars.clone();
         let admitted =
-            match self
-                .deps
-                .registry
-                .admit(req, self.queue_registered, cmd_id, &self.wall_iso())
-            {
+            match self.deps.registry.admit_with_line_limit(
+                req,
+                line_limit.as_ref(),
+                self.queue_registered,
+                cmd_id,
+                &self.wall_iso(),
+            ) {
                 Ok(admitted) => admitted,
                 Err(mut result) => {
                     if result.get("session").is_none() {

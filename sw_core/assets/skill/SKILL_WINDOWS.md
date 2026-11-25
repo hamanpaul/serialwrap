@@ -65,6 +65,8 @@ serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:d
 
 > `session self-test` 在忙碌狀態時會被動回覆：一般前景操作、有效 queue、login／recover 或進行中的 background capture 回 `SESSION_BUSY`；有效 agent interactive lease 回 `SESSION_INTERACTIVE_BUSY`。回應的 `recommended_action` 為 `wait`，不送 probe、不新增 UART TX、不 suspend human、不確認 ready，也不清除 readiness pending。忙碌不代表故障。等前景工作或 capture 結束後重跑即可；也可依既有規則由下一個命令終結 capture。
 
+Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，`cmd submit` 會以命令 UTF-8 位元組數檢查單行上限；超過時回 `CMD_TOO_LONG`，`limit` 為 profile 值，命令不入列且不送 UART。此限制套用所有 `cmd submit` mode；human console 的整行輸入不套用。未設定上限時行為不變。
+
 ## 4. Profile 設定
 
 profile 與 Linux 版同一套規則，路徑在家目錄的 `.config`：
@@ -225,7 +227,7 @@ serialwrap device attach --selector COM0
 | `CMD_CONTAINS_NEWLINE` | rpc／posix、windows | 修正參數後 | 命令字串含換行字元，拒絕送入 UART | 移除命令中的換行並以單行命令重送 |
 | `CMD_NOT_CANCELABLE` | rpc／posix、windows | 否 | 命令已是 done 或 error 狀態，無法取消 | 改以 command.get 讀取既有結果，不需取消 |
 | `CMD_NOT_FOUND` | rpc／posix、windows | 否 | cmd_id 不存在（已被淘汰或從未提交），或 result_tail 無法取得該命令的結果 | 確認 cmd_id 來源；命令紀錄只保留有限筆數，紀錄不存在不代表命令未執行，不得因此重送；先以 session self-test、log tail 或 WAL 查證目標狀態，是否重新執行由操作者決定 |
-| `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交 | 縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
+| `CMD_TOO_LONG` | rpc／posix、windows | 修正參數後 | 命令的 UTF-8 長度超過硬上限 16384 bytes，或超過 session profile 的 max_console_line_chars（console 單行上限，不含結尾換行），拒絕提交；limit 為實際套用的上限 | 縮短命令內容；limit 是 profile 的 console 單行上限時，做不到就把內容寫成腳本，以 file push 傳到 target 後執行。超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼） |
 | `COMMAND_ABORTED_IN_FLIGHT` | rpc、rec／posix、windows | 否 | 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止；file.push／file.pull 為傳輸已寫出至少 1 byte 後，因 drain、世代過期或取消而中止（OD-62） | 命令已部分送出：勿重送；先以 session self-test 確認目標狀態；file.push 另需確認 remote_path 與 /tmp/.sw_upload_* 後再決定是否重新傳輸 |
 | `COMMAND_FAILED` | rec／posix、windows | 否 | 命令結果為 ok:false 但未帶 error_code 時的後備碼 | 視為失敗，先以 session self-test 確認狀態 |
 | `CONSOLE_LINE_LIMIT_TOO_SMALL` | rpc／posix、windows | 否 | profile 的 max_console_line_chars 太小，放不下傳輸必要的命令 | 調大 profile 的 max_console_line_chars 後重試 |
