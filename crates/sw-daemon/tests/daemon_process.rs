@@ -286,6 +286,8 @@ fn daemon_reports_absolute_path_for_relative_environment_wal_dir() {
 fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
     let mut env = isolated_env_with_pty_target();
     env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    let daemon_cwd = env.root.join("daemon-cwd");
+    fs::create_dir_all(&daemon_cwd).expect("建立 daemon 工作目錄");
     fs::create_dir_all(env.system_config.parent().expect("system config parent"))
         .expect("建立 system config 目錄");
     fs::write(&env.system_config, "wal_dir: archive/wal\n").expect("寫入 system config");
@@ -296,7 +298,7 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
         .join("archive/wal");
     let expected_wal = expected_dir.join("raw.wal.ndjson");
 
-    let mut first = DaemonProc::spawn(&env, &[]);
+    let mut first = DaemonProc::spawn_with_cwd(&env, &env.vars, &[], &daemon_cwd);
     wait_ready(&env, "COM0");
     assert_eq!(
         health_status(&env.socket)["wal_path"],
@@ -328,7 +330,7 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
             ),
         "複本須保留原 config 的相對路徑基準：{copied_config}"
     );
-    let mut second = DaemonProc::spawn(&env, &[]);
+    let mut second = DaemonProc::spawn_with_cwd(&env, &env.vars, &[], &daemon_cwd);
     wait_ready(&env, "COM0");
     assert_eq!(
         health_status(&env.socket)["wal_path"],
@@ -346,8 +348,227 @@ fn system_config_wal_dir_stays_stable_after_endpoint_copy_and_restart() {
         contents.lines().any(|line| pyjson::loads(line).is_ok()),
         "原 WAL 目錄必須保有有效 JSON 紀錄"
     );
+    let doctor_cwd = env.root.join("doctor-cwd");
+    fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
+    assert_eq!(
+        doctor_wal_dir_ok(&doctor.stdout),
+        Some(true),
+        "doctor 必須依複本保存的來源基準比對 daemon 實際 WAL 目錄；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+}
+
+#[test]
+fn system_config_copy_preserves_internal_scalar_and_restarts() {
+    let mut env = isolated_env_with_pty_target();
+    env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    fs::create_dir_all(env.system_config.parent().expect("system config parent"))
+        .expect("建立 system config 目錄");
+    fs::write(
+        &env.system_config,
+        "wal_dir: archive/wal\n__serialwrap_internal: keep-this\n",
+    )
+    .expect("寫入 system config");
+    let expected_dir = env
+        .system_config
+        .parent()
+        .expect("system config parent")
+        .join("archive/wal");
+
+    let mut first = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        expected_dir.join("raw.wal.ndjson").display().to_string(),
+        "首次啟動必須以 system config 的位置解析相對 wal_dir"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(first.wait(LONG).code(), Some(0), "{}", first.stderr());
+
+    let copied_config = env.config_dir.join("config.yaml");
+    let copied_text = fs::read_to_string(&copied_config).expect("讀取 user config 複本");
+    assert!(
+        copied_text
+            .lines()
+            .any(|line| line.trim() == "__serialwrap_internal: keep-this"),
+        "複製設定不得以 WAL 來源中繼資料覆寫既有同名純量：{copied_text}"
+    );
+    assert!(
+        copied_text.lines().any(|line| line.trim() == "wal_dir: archive/wal"),
+        "複製設定必須保留 wal_dir 原始字串：{copied_text}"
+    );
+
+    let mut second = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        expected_dir.join("raw.wal.ndjson").display().to_string(),
+        "保留既有設定值後重啟仍須使用原 WAL 目錄"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+}
+
+#[test]
+fn system_config_wal_dir_origin_is_invalidated_after_value_changes_across_restarts() {
+    let mut env = isolated_env_with_pty_target();
+    env.vars.insert("SERIALWRAP_WAL_DIR".to_string(), String::new());
+    fs::create_dir_all(env.system_config.parent().expect("system config parent"))
+        .expect("建立 system config 目錄");
+    fs::write(&env.system_config, "wal_dir: archive/wal\n").expect("寫入 system config");
+    let copied_config = env.config_dir.join("config.yaml");
+    let source_dir = env
+        .system_config
+        .parent()
+        .expect("system config parent")
+        .join("archive/wal");
+    let user_dir = env.config_dir.join("archive/wal");
+    let other_dir = env.config_dir.join("other/wal");
+
+    let mut first = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        source_dir.join("raw.wal.ndjson").display().to_string(),
+        "首次啟動必須以來源 config 目錄解析 wal_dir"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(first.wait(LONG).code(), Some(0), "{}", first.stderr());
+
+    replace_config_wal_dir(&copied_config, "archive/wal", "other/wal");
+    let mut second = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        other_dir.join("raw.wal.ndjson").display().to_string(),
+        "不同的設定值必須以目前 user config 目錄解析"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(second.wait(LONG).code(), Some(0), "{}", second.stderr());
+
+    replace_config_wal_dir(&copied_config, "other/wal", "archive/wal");
+    let mut third = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        user_dir.join("raw.wal.ndjson").display().to_string(),
+        "wal_dir 改值後再改回原字串，不得復活已失效的來源基準"
+    );
+    let doctor_cwd = env.root.join("doctor-cwd");
+    fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
+    let doctor = run_isolated_doctor(&env, &env.vars, &doctor_cwd);
+    assert_eq!(
+        doctor_wal_dir_ok(&doctor.stdout),
+        Some(true),
+        "改回原字串後 doctor 必須與 daemon 實際使用目錄一致；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(third.wait(LONG).code(), Some(0), "{}", third.stderr());
+}
+
+#[test]
+fn daemon_and_doctor_in_different_working_directories_do_not_match_relative_wal_paths() {
+    let env = isolated_env_with_pty_target();
+    let daemon_cwd = env.root.join("daemon-cwd");
+    let doctor_cwd = env.root.join("doctor-cwd");
+    fs::create_dir_all(&daemon_cwd).expect("建立 daemon 工作目錄");
+    fs::create_dir_all(&doctor_cwd).expect("建立 doctor 工作目錄");
+    let daemon_wal = daemon_cwd.join("wal");
+    let doctor_wal = doctor_cwd.join("wal");
+    fs::create_dir_all(&daemon_wal).expect("建立 daemon 實際 WAL 目錄");
+    fs::create_dir_all(&doctor_wal).expect("建立 doctor 目錄下的同名 WAL 目錄");
+    assert_ne!(daemon_wal, doctor_wal, "daemon 與 doctor 必須位於不同實體目錄");
+
+    let mut daemon_vars = env.vars.clone();
+    daemon_vars.insert("SERIALWRAP_WAL_DIR".to_string(), "wal".to_string());
+    let mut daemon = DaemonProc::spawn_with_cwd(&env, &daemon_vars, &[], &daemon_cwd);
+    wait_ready(&env, "COM0");
+    let mut doctor_vars = env.vars.clone();
+    doctor_vars.insert(
+        "SERIALWRAP_WAL_DIR".to_string(),
+        doctor_wal.display().to_string(),
+    );
+    let doctor = run_isolated_doctor(&env, &doctor_vars, &doctor_cwd);
+    assert_eq!(
+        doctor_wal_dir_ok(&doctor.stdout),
+        Some(false),
+        "doctor 不得把 daemon 的相對 wal_path 依自身 cwd 解析成相同目錄；stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        health_status(&env.socket)["wal_path"],
+        daemon_wal.join("raw.wal.ndjson").display().to_string(),
+        "daemon status 必須回報依 daemon cwd 解析後的絕對 WAL 路徑"
+    );
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+fn run_isolated_doctor(
+    env: &IsolatedEnv,
+    vars: &std::collections::BTreeMap<String, String>,
+    cwd: &Path,
+) -> std::process::Output {
+    let current_exe = std::env::current_exe().expect("取得 daemon_process 測試執行檔");
+    let cli = current_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("測試執行檔應位於 target/debug/deps")
+        .join(if cfg!(windows) {
+            "serialwrap.exe"
+        } else {
+            "serialwrap"
+        });
+    assert!(cli.is_file(), "需由工作區建置 serialwrap CLI binary：{}", cli.display());
+    Command::new(&cli)
+        .args(["doctor"])
+        .env_clear()
+        .envs(vars)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "在隔離 doctor 工作目錄啟動 serialwrap 失敗：{}（{error}）; isolated root={}",
+                cli.display(),
+                env.root.display()
+            )
+        })
+}
+
+fn doctor_wal_dir_ok(output: &[u8]) -> Option<bool> {
+    let report = pyjson::loads(&String::from_utf8_lossy(output)).ok()?;
+    let PyValue::Dict(report) = report else {
+        return None;
+    };
+    let PyValue::List(checks) = report.get("checks")? else {
+        return None;
+    };
+    let check = checks.iter().find_map(|check| {
+        let PyValue::Dict(check) = check else {
+            return None;
+        };
+        (check.get("check")?.as_str()? == "wal_dir").then_some(check)
+    })?;
+    match check.get("ok")? {
+        PyValue::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn replace_config_wal_dir(config_path: &Path, old: &str, new: &str) {
+    let contents = fs::read_to_string(config_path).expect("讀取待修改的隔離 config");
+    let old_line = format!("wal_dir: {old}\n");
+    assert!(contents.contains(&old_line), "config 中缺少預期 wal_dir：{contents}");
+    let updated = contents.replacen(&old_line, &format!("wal_dir: {new}\n"), 1);
+    fs::write(config_path, updated).expect("更新隔離 config 的 wal_dir");
 }
 
 #[test]
