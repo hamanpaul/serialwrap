@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 import yaml
@@ -61,15 +63,35 @@ def _runner(revision: str, docker_id: str | None = None):
     return fakes.RecordingRunner(script)
 
 
-def _load(path: Path):
-    return ab_manifest.load_manifest(path)
+def _load(path: Path, *, repo_root: Path | None = None):
+    return ab_manifest.load_manifest(path, repo_root=repo_root or Path(path).parent)
 
 
 def _verify(manifest, repo_root: Path):
+    runner = _runner(manifest.contract_revision)
+    map_ref = manifest.platform_settings.get("case_transport_map")
+    if isinstance(map_ref, Mapping) and isinstance(map_ref.get("path"), str):
+        try:
+            map_bytes = (repo_root / map_ref["path"]).read_bytes()
+        except OSError:
+            map_bytes = b""
+        object_id = hashlib.sha1(b"blob " + str(len(map_bytes)).encode("ascii") + b"\0" + map_bytes).hexdigest()
+        runner.script["git:rev-parse"] = [{"rc": 0, "stdout": object_id, "stderr": ""}]
+        runner.script["git:hash-object"] = [{"rc": 0, "stdout": object_id, "stderr": ""}]
     return ab_manifest.verify_frozen(
         manifest,
         repo_root=repo_root,
-        run=_runner(manifest.contract_revision),
+        run=runner,
+        tool_revision="1" * 40,
+        base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(repo_root),
+    )
+
+
+def _coverage(manifest, repo_root: Path):
+    return ab_manifest.verify_case_coverage(
+        manifest, repo_root=repo_root, base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(repo_root),
     )
 
 
@@ -123,6 +145,62 @@ def test_loaded_manifest_is_frozen_and_anchors_its_source(tmp_path):
         manifest.case_list.path = "changed.json"
 
 
+@pytest.mark.parametrize("operation", ["rewrite", "delete"], ids=["changed", "missing"])
+def test_manifest_source_sha_is_rechecked_after_load(tmp_path, operation):
+    path = fakes.write_ab_manifest(tmp_path)
+    manifest = _load(path)
+    if operation == "delete":
+        path.unlink()
+        assert f"file missing: {path.resolve()}" in _verify(manifest, tmp_path)
+    else:
+        doc = _read_json(path)
+        doc["run_id"] = "changed-after-load"
+        _write_json(path, doc)
+        assert f"manifest sha256 mismatch: {path.resolve()}" in _verify(manifest, tmp_path)
+
+
+def test_load_manifest_uses_repo_root_when_manifest_is_nested(tmp_path):
+    repo_root = tmp_path / "repo"
+    source = fakes.write_ab_manifest(repo_root)
+    nested = repo_root / "private" / "run" / "ab-manifest.json"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_bytes(source.read_bytes())
+    manifest = _load(nested, repo_root=repo_root)
+    assert manifest.source_path == nested.resolve()
+    assert _verify(manifest, repo_root) == []
+
+
+def test_load_manifest_uses_repo_root_when_manifest_is_outside_repo(tmp_path):
+    repo_root = tmp_path / "repo"
+    source = fakes.write_ab_manifest(repo_root)
+    private_path = tmp_path / "private-run" / "ab-manifest.json"
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_bytes(source.read_bytes())
+    manifest = _load(private_path, repo_root=repo_root)
+    assert manifest.source_path == private_path.resolve()
+    assert _verify(manifest, repo_root) == []
+
+
+@pytest.mark.parametrize("operation", ["verify", "required_cases"])
+def test_loaded_repo_root_is_shared_by_frozen_checks(tmp_path, operation):
+    repo_root = tmp_path / "repo"
+    path = fakes.write_ab_manifest(repo_root)
+    manifest = _load(path, repo_root=repo_root)
+    other_root = tmp_path / "other-repo"
+    other_root.mkdir()
+    if operation == "verify":
+        assert ab_manifest.verify_frozen(manifest, repo_root=other_root) == [
+            f"manifest repo_root mismatch: loaded {repo_root.resolve()} supplied {other_root.resolve()}"
+        ]
+    else:
+        with pytest.raises(HarnessError, match="manifest repo_root mismatch") as caught:
+            ab_manifest.required_cases(
+                manifest, repo_root=other_root, base_revision="t3-trusted-base",
+                source_reader=_trusted_source_reader(repo_root),
+            )
+        assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
 def test_case_list_drift_detected(tmp_path):
     manifest = _load(fakes.write_ab_manifest(tmp_path))
     path = tmp_path / manifest.case_list.path
@@ -137,11 +215,86 @@ def test_case_lock_drift_detected(tmp_path):
     assert f"case_lock sha256 mismatch: {manifest.case_lock.path}" in _verify(manifest, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "source",
+    ["invariants", "destructive", "expected", "case-lock"],
+    ids=["invariants-copy", "destructive-copy", "expected-copy", "lock-copy"],
+)
+def test_case_inputs_reject_self_hashed_noncanonical_copies(tmp_path, source):
+    path = fakes.write_ab_manifest(tmp_path)
+    doc = _read_json(path)
+    if source == "case-lock":
+        original = tmp_path / doc["case_lock"]["path"]
+        value = _read_json(original)
+        value["sets"]["slice_2.4"].pop()
+        relative = "tests/acceptance/shadow-cases.lock.json"
+        copied = _write_json(tmp_path / relative, value)
+        doc["case_lock"] = {"path": relative, "sha256": fakes.sha256_file(copied)}
+    else:
+        original = tmp_path / doc["case_list"]["path"]
+        value = yaml.safe_load(original.read_text(encoding="utf-8"))
+        row = value["cases"][0]
+        if source == "invariants":
+            row["invariants"] = []
+        elif source == "destructive":
+            row["destructive"] = not row.get("destructive", False)
+        else:
+            row["expected"] = "XFAIL" if row.get("expected") == "PASS" else "PASS"
+        relative = "tests/acceptance/shadow-cases.yaml"
+        copied = tmp_path / relative
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        copied.write_text(yaml.safe_dump(value, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        doc["case_list"] = {"path": relative, "sha256": fakes.sha256_file(copied)}
+    _write_json(path, doc)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "canonical" in caught.value.detail
+
+
 def test_required_cases_lock_drift_detected(tmp_path):
     manifest = _load(fakes.write_ab_manifest(tmp_path))
     path = tmp_path / manifest.required_cases_lock.path
     path.write_bytes(path.read_bytes() + b"\n")
     assert f"required cases lock sha256 mismatch: {manifest.required_cases_lock.path}" in _verify(manifest, tmp_path)
+
+
+def test_candidate_context_sha_is_checked_before_load(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path)
+    doc = _read_json(path)
+    context_path = tmp_path / doc["candidate_context"]["path"]
+    context = _read_json(context_path)
+    context["candidate_round_id"] = "00000000000000000000000000000002"
+    _write_json(context_path, context)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "candidate context sha256 mismatch" in caught.value.detail
+
+
+@pytest.mark.parametrize("operation", ["rewrite", "delete"], ids=["changed", "missing"])
+def test_candidate_context_drift_after_load_is_detected(tmp_path, operation):
+    manifest = _load(fakes.write_ab_manifest(tmp_path))
+    context_path = tmp_path / manifest.candidate_context.path
+    if operation == "delete":
+        context_path.unlink()
+        assert f"file missing: {context_path}" in _verify(manifest, tmp_path)
+    else:
+        context = _read_json(context_path)
+        context["candidate_round_id"] = "00000000000000000000000000000002"
+        _write_json(context_path, context)
+        assert f"candidate_context sha256 mismatch: {manifest.candidate_context.path}" in _verify(manifest, tmp_path)
+
+
+def test_candidate_context_round_cannot_change_between_sides(tmp_path):
+    manifest = _load(fakes.write_ab_manifest(tmp_path))
+    assert _verify(manifest, tmp_path) == []
+    context_path = tmp_path / manifest.candidate_context.path
+    context = _read_json(context_path)
+    context["candidate_round_id"] = "00000000000000000000000000000002"
+    _write_json(context_path, context)
+    violations = _verify(manifest, tmp_path)
+    assert f"candidate_context sha256 mismatch: {manifest.candidate_context.path}" in violations
 
 
 def test_case_list_missing_detected(tmp_path):
@@ -156,6 +309,77 @@ def test_candidate_launcher_swapped_detected(tmp_path):
     launcher = manifest.sides[1].bundle_dir / "bin" / "serialwrapd"
     launcher.write_bytes(b"#!/bin/sh\nexit 0\n")
     assert "release component sha256 mismatch: side B daemon.launcher" in _verify(manifest, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("component", "mutation"),
+    [
+        (component, mutation)
+        for component in ("cli", "daemon")
+        for mutation in ("missing-sha", "wrong-sha-type", "missing-path", "wrong-path-type")
+    ],
+    ids=[f"{component}-{mutation}" for component in ("cli", "daemon")
+         for mutation in ("missing-sha", "wrong-sha-type", "missing-path", "wrong-path-type")],
+)
+def test_stage3_candidate_requires_typed_cli_and_daemon_component_identity(tmp_path, component, mutation):
+    path = fakes.write_ab_manifest(tmp_path, stage="3")
+    doc = _read_json(path)
+    sidecar = tmp_path / doc["sides"][1]["release_manifest"]["path"]
+    release = _read_json(sidecar)
+    target = (release["components"]["cli"] if component == "cli"
+              else release["components"]["daemon"]["launcher"])
+    if mutation == "missing-sha":
+        target.pop("sha256")
+    elif mutation == "wrong-sha-type":
+        target["sha256"] = 123
+    elif mutation == "missing-path":
+        target.pop("path")
+    else:
+        target["path"] = ["bin", "serialwrapd"]
+    _write_json(sidecar, release)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+def test_stage3_candidate_component_delete_is_detected(tmp_path):
+    manifest = _load(fakes.write_ab_manifest(tmp_path, stage="3"))
+    launcher = manifest.sides[1].bundle_dir / "bin" / "serialwrapd"
+    launcher.unlink()
+    assert f"file missing: {launcher}" in _verify(manifest, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("component_path", "field", "value"),
+    [
+        ("daemon.runtime", "sha256", None),
+        ("daemon.runtime", "sha256", 17),
+        ("daemon.package", "tree_sha256", None),
+        ("daemon.package", "tree_sha256", "bad-tree-digest"),
+        ("python_cli_delegate", "tree_sha256", None),
+        ("python_cli_delegate", "tree_sha256", "bad-tree-digest"),
+    ],
+    ids=["runtime-sha-missing", "runtime-sha-wrong-type", "package-tree-missing", "package-tree-malformed",
+         "delegate-tree-missing", "delegate-tree-malformed"],
+)
+def test_stage3_python_baseline_requires_typed_runtime_component_identities(
+    tmp_path, component_path, field, value,
+):
+    path = fakes.write_ab_manifest(tmp_path, stage="3")
+    doc = _read_json(path)
+    sidecar = tmp_path / doc["sides"][0]["release_manifest"]["path"]
+    release = _read_json(sidecar)
+    target = release["components"]
+    for name in component_path.split("."):
+        target = target[name]
+    if value is None:
+        target.pop(field)
+    else:
+        target[field] = value
+    _write_json(sidecar, release)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
 
 
 def test_baseline_python_package_tree_tamper_detected(tmp_path):
@@ -180,7 +404,7 @@ def test_trimmed_case_list_rejected(tmp_path):
     dropped = doc["case_ids"].pop()
     _write_json(path, doc)
     manifest = _load(path)
-    assert f"required case missing: {dropped}" in ab_manifest.verify_case_coverage(manifest, repo_root=tmp_path)
+    assert f"required case missing: {dropped}" in _coverage(manifest, tmp_path)
 
 
 def test_unknown_case_rejected(tmp_path):
@@ -189,7 +413,7 @@ def test_unknown_case_rejected(tmp_path):
     doc["case_ids"].append("t3-unknown-case")
     _write_json(path, doc)
     manifest = _load(path)
-    assert "unknown case: t3-unknown-case" in ab_manifest.verify_case_coverage(manifest, repo_root=tmp_path)
+    assert "unknown case: t3-unknown-case" in _coverage(manifest, tmp_path)
 
 
 def test_stage3_requires_python_baseline_daemon(tmp_path):
@@ -354,6 +578,32 @@ def test_render_argv_rejects_unknown_or_missing_values(template, values):
     assert caught.value.code == "HARNESS_MANIFEST_INVALID"
 
 
+@pytest.mark.parametrize(
+    ("field", "template"),
+    [
+        ("dut.reset_argv", ["{unknown_dut_key}"]),
+        ("dut.fingerprint_argv", ["{unknown_fingerprint_key}"]),
+        ("suite.extra_args", ["{"]),
+        ("suite.extra_args", ["{cli_exe.x}"]),
+        ("suite.extra_args", ["{cli_exe[0]}"]),
+    ],
+    ids=["unknown-reset-key", "unknown-fingerprint-key", "unmatched-brace", "attribute-access", "index-access"],
+)
+def test_load_rejects_invalid_argv_template_fields(tmp_path, field, template):
+    path = fakes.write_ab_manifest(tmp_path, **{field: template})
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("template", [["{cli_exe.x}"], ["{cli_exe[0]}"], ["{"]],
+                         ids=["attribute-access", "index-access", "unmatched-brace"])
+def test_render_argv_wraps_all_template_errors(template):
+    with pytest.raises(HarnessError) as caught:
+        ab_manifest.render_argv(template, {"cli_exe": "/bundle/serialwrap"})
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
 def test_contract_revision_mismatch(tmp_path):
     manifest = _load(fakes.write_ab_manifest(tmp_path))
     other = "1" * 40 if manifest.contract_revision != "1" * 40 else "2" * 40
@@ -458,7 +708,7 @@ def test_invariant_not_covered(tmp_path):
     assert references
     _edit_manifest(path, lambda doc: doc.__setitem__("case_ids", [case_id for case_id in doc["case_ids"] if case_id not in references]))
     manifest = _load(path)
-    assert f"invariant not covered: {invariant}" in ab_manifest.verify_case_coverage(manifest, repo_root=tmp_path)
+    assert f"invariant not covered: {invariant}" in _coverage(manifest, tmp_path)
 
 
 def test_destructive_needs_authorization(tmp_path):
@@ -473,7 +723,7 @@ def test_destructive_needs_authorization(tmp_path):
         doc["case_ids"].append(target)
     _write_json(path, doc)
     manifest = _load(path)
-    assert f"destructive case without authorization: {target}" in ab_manifest.verify_case_coverage(manifest, repo_root=tmp_path)
+    assert f"destructive case without authorization: {target}" in _coverage(manifest, tmp_path)
 
 
 def test_authorization_board_must_belong_to_dut(tmp_path):
@@ -483,7 +733,7 @@ def test_authorization_board_must_belong_to_dut(tmp_path):
         **{"authorization.boards": ["UNDECLARED-BOARD"]},
     )
     manifest = _load(path)
-    assert "authorization board not in dut: UNDECLARED-BOARD" in ab_manifest.verify_case_coverage(manifest, repo_root=tmp_path)
+    assert "authorization board not in dut: UNDECLARED-BOARD" in _coverage(manifest, tmp_path)
 
 
 def test_windows_com0com_requires_allowlist(tmp_path):
@@ -498,10 +748,7 @@ def test_windows_com0com_requires_allowlist(tmp_path):
         },
     )
     manifest = replace(_load(path), test_device_allowlist=())
-    assert "windows com0com instance without test_device_allowlist" in ab_manifest.verify_case_coverage(
-        manifest,
-        repo_root=tmp_path,
-    )
+    assert "windows com0com instance without test_device_allowlist" in _coverage(manifest, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -541,7 +788,10 @@ def test_required_case_set_comes_from_exit_lock_not_report_tier(tmp_path):
     locked = _required_ids(tmp_path, "S3-L3-P0P1-REMOTE-WINDOWS", "windows")
     _edit_manifest(path, lambda doc: doc["suite"].__setitem__("tier", "P0"))
     manifest = _load(path)
-    required, _rows = ab_manifest.required_cases(manifest, repo_root=tmp_path)
+    required, _rows = ab_manifest.required_cases(
+        manifest, repo_root=tmp_path, base_revision="t3-trusted-base",
+        source_reader=_trusted_source_reader(tmp_path),
+    )
     assert required == locked
     assert required <= set(manifest.case_ids)
 
@@ -558,7 +808,7 @@ def test_non_stage3_required_cases_use_legacy_set_layer_and_platform(tmp_path):
         and by_id[case_id].get("layer", "").casefold() == manifest.layer
         and manifest.platform in by_id[case_id].get("platforms", [])
     }
-    required, _rows = ab_manifest.required_cases(manifest, repo_root=tmp_path)
+    required, _rows = _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path))
     assert required == expected
 
 
@@ -595,6 +845,125 @@ def test_required_case_ids_frozen_across_family_change(tmp_path):
     violations = _verify(manifest, tmp_path)
     assert not any(value.startswith("case_list sha256 mismatch:") for value in violations)
     assert any(value.startswith("required cases invalid:") for value in violations)
+
+
+def _base_files_from(root: Path) -> dict[str, bytes]:
+    paths = (
+        "tests/acceptance/stage3_required_cases.lock.json",
+        "tests/acceptance/cases.yaml",
+        "docs/rust-refactor/evidence/denominators/source-manifest.json",
+    )
+    return {path: (root / path).read_bytes() for path in paths}
+
+
+def _trusted_source_reader(root: Path, base_files: dict[str, bytes] | None = None):
+    from tools.stage3 import required_cases
+
+    selected = base_files or _base_files_from(fakes.REPO_ROOT)
+
+    def read(revision: str, path: str) -> bytes | None:
+        if revision == "t3-trusted-base":
+            return selected.get(path)
+        if revision == required_cases.SEED_REVISION:
+            return fakes._seed_source_reader(root, revision, path)
+        return None
+
+    return read
+
+
+def _call_required_cases(manifest, root: Path, source_reader):
+    return ab_manifest.required_cases(
+        manifest, repo_root=root, base_revision="t3-trusted-base", source_reader=source_reader,
+    )
+
+
+def test_required_cases_direct_call_rejects_family_reclassification(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    cases_path = tmp_path / doc["case_list"]["path"]
+    cases_doc = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+    row = next(case for case in cases_doc["cases"] if case["case_id"] == "win-com-open-exclusive")
+    row["family"] = "L15"
+    cases_path.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _refresh_file_ref(doc, tmp_path, "case_list")
+    _write_json(path, doc)
+    manifest = _load(path)
+    with pytest.raises(HarnessError) as caught:
+        _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path))
+    assert caught.value.code == "HARNESS_CASE_SET_INCOMPLETE"
+    assert "family" in caught.value.detail
+
+
+def test_required_cases_direct_call_rejects_deleted_seed_id(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    required_lock = _read_json(tmp_path / doc["required_cases_lock"]["path"])
+    required_ids = required_lock["exits"][EXIT_WINDOWS_L15]["windows"]["case_ids"]
+    removed = required_ids.pop()
+    _write_json(tmp_path / doc["required_cases_lock"]["path"], required_lock)
+    doc["case_ids"].remove(removed)
+    _refresh_candidate_lock_binding(doc, tmp_path)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    map_path = tmp_path / map_ref["path"]
+    mapping = _read_json(map_path)
+    mapping["cases"].pop(removed)
+    _write_json(map_path, mapping)
+    map_sha = fakes.sha256_file(map_path)
+    map_ref["sha256"] = map_sha
+    next(item for item in doc["tools"] if item["path"] == map_ref["path"])["sha256"] = map_sha
+    doc["platform_settings"]["case_transports"].pop(removed)
+    _write_json(path, doc)
+    manifest = _load(path)
+    with pytest.raises(HarnessError) as caught:
+        _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path))
+    assert caught.value.code == "HARNESS_CASE_SET_INCOMPLETE"
+    assert "seed" in caught.value.detail
+
+
+def test_required_cases_direct_call_rejects_deletion_after_prior_addition(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    added = _append_new_required_case(tmp_path, path, register_in_exit_lock=True)
+    base_files = _base_files_from(tmp_path)
+    doc = _read_json(path)
+    cases_doc, cases_path = _case_catalog(tmp_path)
+    cases_doc["cases"] = [row for row in cases_doc["cases"] if row["case_id"] != added]
+    cases_path.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    case_lock_path = tmp_path / doc["case_lock"]["path"]
+    case_lock = _read_json(case_lock_path)
+    case_lock["sets"]["slice_2.4"].remove(added)
+    case_lock["case_attrs"].pop(added)
+    _write_json(case_lock_path, case_lock)
+    required_lock_path = tmp_path / doc["required_cases_lock"]["path"]
+    required_lock = _read_json(required_lock_path)
+    required_lock["exits"][EXIT_WINDOWS_L15]["windows"]["case_ids"].remove(added)
+    _write_json(required_lock_path, required_lock)
+    doc["case_ids"].remove(added)
+    _refresh_file_ref(doc, tmp_path, "case_list")
+    _refresh_file_ref(doc, tmp_path, "case_lock")
+    _refresh_candidate_lock_binding(doc, tmp_path)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    map_path = tmp_path / map_ref["path"]
+    mapping = _read_json(map_path)
+    mapping["cases"].pop(added)
+    _write_json(map_path, mapping)
+    map_sha = fakes.sha256_file(map_path)
+    map_ref["sha256"] = map_sha
+    next(item for item in doc["tools"] if item["path"] == map_ref["path"])["sha256"] = map_sha
+    doc["platform_settings"]["case_transports"].pop(added)
+    _write_json(path, doc)
+    manifest = _load(path)
+    with pytest.raises(HarnessError) as caught:
+        _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path, base_files))
+    assert caught.value.code == "HARNESS_CASE_SET_INCOMPLETE"
+    assert "不可刪除既有案例" in caught.value.detail
+
+
+def test_required_cases_direct_call_accepts_legal_add_only_expansion(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    added = _append_new_required_case(tmp_path, path, register_in_exit_lock=True)
+    manifest = _load(path)
+    required, _rows = _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path))
+    assert added in required
 
 
 def test_required_case_incompleteness_uses_existing_reason_code():
@@ -957,8 +1326,8 @@ def _windows_l15_transport_fixture(root: Path, *, transport: str = "windows-nati
         "cases": mapping_cases,
         "approved_pairs": {
             "T3-COM0COM-PAIR": {
-                "dut_side": "COM20",
-                "daemon_side": "COM21",
+                "dut_side_port_id": "T3-PAIR-DUT",
+                "daemon_side_port_id": "T3-PAIR-DAEMON",
                 "decision_ref": "T3-COM-PAIR-AUTH",
             }
         },
@@ -1008,15 +1377,20 @@ def test_windows_l15_manifest_accepts_native_or_od08_transport_and_full_denomina
     manifest = _load(_windows_l15_transport_fixture(tmp_path, transport=transport))
     locked = _required_ids(tmp_path, EXIT_WINDOWS_L15, "windows")
     assert set(manifest.case_ids) == locked
-    required, _rows = ab_manifest.required_cases(manifest, repo_root=tmp_path)
+    required, _rows = _call_required_cases(manifest, tmp_path, _trusted_source_reader(tmp_path))
     assert required == locked
     native_ids = {case_id for case_id, row in _windows_map_rows(tmp_path).items() if row["requires_native_com"]}
+    mapping_doc = _read_json(tmp_path / manifest.platform_settings["case_transport_map"]["path"])
     assert native_ids
     for case_id in native_ids:
         transport_record = manifest.platform_settings["case_transports"][case_id]
         assert transport_record["transport"] == transport
         assert transport_record["port_id"]
         assert transport_record["decision_ref"]
+        if transport == "windows-native-com":
+            case_map = mapping_doc["cases"][case_id]
+            pair = mapping_doc["approved_pairs"][case_map["pair_id"]]
+            assert transport_record["port_id"] == pair["dut_side_port_id"]
     non_com_id = next(case_id for case_id in manifest.case_ids if case_id not in native_ids)
     non_com = manifest.platform_settings["case_transports"][non_com_id]
     assert non_com == {"transport": "local-process", "port_id": None, "decision_ref": None}
@@ -1103,8 +1477,10 @@ def test_windows_l15_manifest_rejects_map_tool_hash_mismatch(tmp_path):
     tool = next(item for item in doc["tools"] if item["path"] == map_path)
     tool["sha256"] = "f" * 64
     _write_json(path, doc)
-    manifest = _load(path)
-    assert any(value.startswith("tool sha256 mismatch:") for value in _verify(manifest, tmp_path))
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "case_transport_map sha256 must match" in caught.value.detail
 
 
 def test_windows_l15_manifest_requires_map_in_frozen_tools(tmp_path):
@@ -1128,6 +1504,55 @@ def test_windows_l15_manifest_rejects_mapping_reference_hash_mismatch(tmp_path):
     assert caught.value.code == "HARNESS_MANIFEST_INVALID"
 
 
+def test_windows_l15_manifest_rejects_reference_and_tool_sha_disagreement(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    tool = next(item for item in doc["tools"] if item["path"] == map_ref["path"])
+    tool["sha256"] = "f" * 64
+    _write_json(path, doc)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+def test_windows_l15_mapping_cannot_replace_the_tool_revision_with_self_filled_shas(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    map_path = tmp_path / map_ref["path"]
+    revision_bytes = map_path.read_bytes()
+    mapping = json.loads(revision_bytes)
+    native_id = next(case_id for case_id, row in mapping["cases"].items() if row["requires_native_com"])
+    mapping["cases"][native_id]["requires_native_com"] = False
+    mapping["cases"][native_id]["allowed_transports"] = ["local-process"]
+    mapping["cases"][native_id]["pair_id"] = None
+    doc["platform_settings"]["case_transports"][native_id] = {
+        "transport": "local-process", "port_id": None, "decision_ref": None,
+    }
+    _write_json(map_path, mapping)
+    map_sha = fakes.sha256_file(map_path)
+    map_ref["sha256"] = map_sha
+    next(item for item in doc["tools"] if item["path"] == map_ref["path"])["sha256"] = map_sha
+    _write_json(path, doc)
+
+    manifest = _load(path)
+    runner = _runner(manifest.contract_revision)
+    revision_oid = hashlib.sha1(
+        b"blob " + str(len(revision_bytes)).encode("ascii") + b"\0" + revision_bytes
+    ).hexdigest()
+    current_bytes = map_path.read_bytes()
+    current_oid = hashlib.sha1(
+        b"blob " + str(len(current_bytes)).encode("ascii") + b"\0" + current_bytes
+    ).hexdigest()
+    runner.script["git:rev-parse"] = [{"rc": 0, "stdout": revision_oid, "stderr": ""}]
+    runner.script["git:hash-object"] = [{"rc": 0, "stdout": current_oid, "stderr": ""}]
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+    )
+    assert any("case transport map" in value and "tool revision" in value for value in violations)
+
+
 def test_windows_l15_manifest_rejects_changed_frozen_com_requirement(tmp_path):
     path = _windows_l15_transport_fixture(tmp_path)
     doc = _read_json(path)
@@ -1145,6 +1570,32 @@ def test_windows_l15_manifest_rejects_mismatched_com_pair_and_allowlist(tmp_path
     doc = _read_json(path)
     doc["dut"]["com_pair"]["daemon_side"] = "COM99"
     doc["test_device_allowlist"] = ["COM20"]
+    _write_json(path, doc)
+    with pytest.raises(HarnessError) as caught:
+        _load(path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("port_id", ["UNRELATED-PORT-ID", "T3-OTHER-PAIR-DUT-ID"],
+                         ids=["arbitrary-id", "other-approved-pair-id"])
+def test_windows_l15_manifest_rejects_port_id_not_from_its_approved_pair(tmp_path, port_id):
+    path = _windows_l15_transport_fixture(tmp_path)
+    doc = _read_json(path)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    map_path = tmp_path / map_ref["path"]
+    mapping = _read_json(map_path)
+    native_id = next(case_id for case_id, row in mapping["cases"].items() if row["requires_native_com"])
+    if port_id == "T3-OTHER-PAIR-DUT-ID":
+        mapping["approved_pairs"]["T3-OTHER-PAIR"] = {
+            "dut_side_port_id": "T3-OTHER-PAIR-DUT-ID",
+            "daemon_side_port_id": "T3-OTHER-PAIR-DAEMON-ID",
+            "decision_ref": "T3-OTHER-PAIR-AUTH",
+        }
+    _write_json(map_path, mapping)
+    digest = fakes.sha256_file(map_path)
+    map_ref["sha256"] = digest
+    next(item for item in doc["tools"] if item["path"] == map_ref["path"])["sha256"] = digest
+    doc["platform_settings"]["case_transports"][native_id]["port_id"] = port_id
     _write_json(path, doc)
     with pytest.raises(HarnessError) as caught:
         _load(path)

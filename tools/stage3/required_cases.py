@@ -663,6 +663,35 @@ def required_for_exit(lock: Mapping[str, Any], item_id: str, platform: str) -> s
     return set(lock["exits"][item_id][platform]["case_ids"])
 
 
+def validate_current_lock(
+    repo_root: Path,
+    *,
+    base_revision: str | None = None,
+    source_reader: SourceReader | None = None,
+) -> list[str]:
+    """重驗目前目錄、固定 seed、分母鎖與可信 base 的只增契約。"""
+    root = Path(repo_root).resolve()
+    reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
+    try:
+        cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root)
+        errors = _lock_schema_errors(lock)
+        errors.extend(_seed_errors(manifest, root, reader))
+        expected = _expected_exit_cases(catalog, cases_doc, case_lock)
+        seed_required = _seed_required_cases_by_initial_exit(root / EVIDENCE_RELATIVE)
+        errors.extend(_validate_initial_exit_catalog(catalog))
+        errors.extend(_validate_seed_floor(lock, seed_required))
+        errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
+        errors.extend(_validate_lock(lock, expected))
+        if base_revision:
+            errors.extend(_base_errors(
+                lock, cases_doc, base=base_revision, repo_root=root, source_reader=reader,
+            ))
+        return errors
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError,
+            yaml.YAMLError, subprocess.SubprocessError) as exc:
+        return [str(exc)]
+
+
 def _load_inputs(root: Path) -> tuple[dict, dict, dict, dict, dict]:
     acceptance = root / ACCEPTANCE_RELATIVE
     evidence = root / EVIDENCE_RELATIVE
@@ -717,6 +746,13 @@ def main(
     root = Path(repo_root or Path(__file__).resolve().parents[2]).resolve()
     reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
     try:
+        if args.check:
+            check_errors = validate_current_lock(root, base_revision=args.base, source_reader=reader)
+            if check_errors:
+                raise ValueError("；".join(check_errors))
+            print("Stage 3 分母鎖、指定 Git 種子與 PR base 只增檢查通過。")
+            return 0
+
         cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root)
         schema_errors = _lock_schema_errors(lock)
         if schema_errors:
@@ -727,20 +763,6 @@ def main(
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
         seed_required = _seed_required_cases_by_initial_exit(root / EVIDENCE_RELATIVE)
         lock_path = root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json"
-        if args.check:
-            check_errors = _validate_initial_exit_catalog(catalog)
-            check_errors.extend(_validate_seed_floor(lock, seed_required))
-            check_errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
-            check_errors.extend(_validate_lock(lock, expected))
-            if args.base:
-                check_errors.extend(_base_errors(
-                    lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
-                ))
-            if check_errors:
-                raise ValueError("；".join(check_errors))
-            print("Stage 3 分母鎖、指定 Git 種子與 PR base 只增檢查通過。")
-            return 0
-
         # 先核對舊鎖仍與目前目錄相容，並確認 PR base 的所有權分母未被刪改。
         precheck_errors = _validate_initial_exit_catalog(catalog)
         precheck_errors.extend(_validate_seed_floor(lock, seed_required))

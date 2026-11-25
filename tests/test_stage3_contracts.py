@@ -160,6 +160,17 @@ def test_ab_manifest_requires_stage3_tool_tree(example):
     assert list(_validator("ab_manifest.schema.json").iter_errors(doc))
 
 
+def test_ab_manifest_transport_setting_names_remain_open_for_other_exits():
+    doc = _example("ab_manifest.l15.example.json")
+    doc["platform_settings"]["case_transport_map"] = "legacy opaque value"
+    doc["platform_settings"]["case_transports"] = ["old-format", {"transport": "unrecognized"}]
+    assert not list(_validator("ab_manifest.schema.json").iter_errors(doc))
+
+    windows = _example("ab_manifest.l15.windows.example.json")
+    windows["platform_settings"]["case_transport_map"] = "wrong type for the Windows exit"
+    assert list(_validator("ab_manifest.schema.json").iter_errors(windows))
+
+
 @pytest.mark.parametrize("example,wrong", [
     ("ab_manifest.l15.example.json", "l2_regression"),
     ("ab_manifest.l15.example.json", "l3_realhw"),

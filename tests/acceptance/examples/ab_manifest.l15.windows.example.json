@@ -49,7 +49,7 @@
   "platform_settings": {
     "case_transport_map": {
       "path": "tests/acceptance/examples/ab_manifest.l15.windows.transport-map.example.json",
-      "sha256": "08a9773d2d849a7e6b05653d0a8ec0a88df117f555ab0e09f9f5a50f2311c0a1"
+      "sha256": "94338dfa4dcd394919f5e3632f76aa53b6b1c2f26d6ab2bc07ffb8b6753dc2a7"
     },
     "case_transports": {
       "example-local-case": {
@@ -59,7 +59,7 @@
       },
       "example-native-com-case": {
         "decision_ref": "EXAMPLE-PAIR-APPROVED",
-        "port_id": "EXAMPLE-PAIR-DUT",
+        "port_id": "EXAMPLE-PAIR-DUT-ENDPOINT",
         "transport": "windows-native-com"
       }
     },
@@ -165,7 +165,7 @@
     },
     {
       "path": "tests/acceptance/examples/ab_manifest.l15.windows.transport-map.example.json",
-      "sha256": "08a9773d2d849a7e6b05653d0a8ec0a88df117f555ab0e09f9f5a50f2311c0a1"
+      "sha256": "94338dfa4dcd394919f5e3632f76aa53b6b1c2f26d6ab2bc07ffb8b6753dc2a7"
     }
   ]
 }

@@ -875,17 +875,6 @@
       ]
     },
     "platform_settings": {
-      "properties": {
-        "case_transport_map": {
-          "$ref": "#/$defs/FrozenFile"
-        },
-        "case_transports": {
-          "additionalProperties": {
-            "$ref": "#/$defs/CaseTransportRecord"
-          },
-          "type": "object"
-        }
-      },
       "type": "object"
     },
     "profile_files": {

@@ -132,6 +132,7 @@ class AbManifest:
     release: ReleaseSpec
     reverify: ReverifySpec
     failure_retention: str | None
+    repo_root: Path
     source_path: Path
     source_sha256: str
 
@@ -340,6 +341,12 @@ def _inside(root: Path, candidate: Path) -> bool:
     return True
 
 
+def _require_canonical_path(root: Path, item: FrozenFile, relative: str, where: str) -> None:
+    expected = (Path(root) / Path(*PurePosixPath(relative).parts)).resolve()
+    if _path(Path(root), item.path).resolve() != expected:
+        raise _invalid(f"{where} must reference the canonical path {relative}")
+
+
 def _release_component_path(bundle: Path, doc: Mapping[str, Any], *, daemon: bool) -> Path | None:
     components = doc.get("components")
     if not isinstance(components, dict):
@@ -367,11 +374,13 @@ def _release_component_path(bundle: Path, doc: Mapping[str, Any], *, daemon: boo
     return _path(bundle, path)
 
 
-def load_manifest(path: Path) -> AbManifest:
+def load_manifest(path: Path, *, repo_root: Path | None = None) -> AbManifest:
     """讀取 A/B manifest 並檢查結構、階段與兩側 artifact 對應。"""
     source = Path(path).resolve()
+    root_path = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
     try:
-        doc = json.loads(source.read_text(encoding="utf-8"))
+        source_bytes = source.read_bytes()
+        doc = json.loads(source_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise _invalid(f"cannot read manifest: {exc}") from exc
     _validate_manifest_schema(doc)
@@ -391,6 +400,8 @@ def load_manifest(path: Path) -> AbManifest:
 
     case_list = _frozen(root.get("case_list"), "case_list")
     case_lock = _frozen(root.get("case_lock"), "case_lock")
+    _require_canonical_path(root_path, case_list, "tests/acceptance/cases.yaml", "case_list")
+    _require_canonical_path(root_path, case_lock, "tests/acceptance/cases.lock.json", "case_lock")
     allowed_differences = _frozen(root.get("allowed_differences"), "allowed_differences")
     candidate_context_value = root.get("candidate_context")
     candidate_context = None if candidate_context_value is None else _frozen(candidate_context_value, "candidate_context")
@@ -472,11 +483,11 @@ def load_manifest(path: Path) -> AbManifest:
         role = "baseline" if i == 0 else "candidate"
         if side.get("label") != label or side.get("role") != role:
             raise _invalid(f"side {label} must have role {role}")
-        bundle = _path(source.parent, _string(side.get("bundle_dir"), f"sides[{i}].bundle_dir")).resolve()
+        bundle = _path(root_path, _string(side.get("bundle_dir"), f"sides[{i}].bundle_dir")).resolve()
         manifest = _frozen(side.get("release_manifest"), f"sides[{i}].release_manifest")
         if isinstance(manifest, FrozenTree):
             raise _invalid("release_manifest must be a frozen file")
-        manifest_path = _path(source.parent, manifest.path)
+        manifest_path = _path(root_path, manifest.path)
         expected_sidecar = bundle / "release-manifest.json"
         if manifest_path.resolve() != expected_sidecar.resolve():
             raise _invalid(f"side {label} release_manifest is not the bundle root sidecar")
@@ -485,8 +496,9 @@ def load_manifest(path: Path) -> AbManifest:
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise _invalid(f"side {label} release manifest unreadable: {exc}") from exc
         manifest_doc = _mapping(manifest_doc, f"side {label} release manifest")
-        cli_exe = _path(source.parent, _string(side.get("cli_exe"), f"sides[{i}].cli_exe")).resolve()
-        daemon_exe = _path(source.parent, _string(side.get("daemon_exe"), f"sides[{i}].daemon_exe")).resolve()
+        _validate_release_component_shape(manifest_doc, stage=stage, label=label)
+        cli_exe = _path(root_path, _string(side.get("cli_exe"), f"sides[{i}].cli_exe")).resolve()
+        daemon_exe = _path(root_path, _string(side.get("daemon_exe"), f"sides[{i}].daemon_exe")).resolve()
         expected_cli = _release_component_path(bundle, manifest_doc, daemon=False)
         expected_daemon = _release_component_path(bundle, manifest_doc, daemon=True)
         if expected_cli is None or cli_exe != expected_cli.resolve():
@@ -582,7 +594,7 @@ def load_manifest(path: Path) -> AbManifest:
         candidate = sides[1].manifest_doc
         if candidate.get("stage") != "3" or candidate.get("retirement") != {"python_daemon": "removed"}:
             raise _invalid("Stage 3 candidate requires retirement marker")
-    if not _valid_templates(sides, suite):
+    if not _valid_templates(dut, sides, suite):
         raise _invalid("unknown template key")
 
     manifest = AbManifest(
@@ -618,13 +630,14 @@ def load_manifest(path: Path) -> AbManifest:
         release=release,
         reverify=reverify,
         failure_retention=failure_retention,
+        repo_root=root_path,
         source_path=source,
         source_sha256=sha256_file(source),
     )
     if stage == "3":
-        _validate_stage3_identity(manifest, source.parent)
+        _validate_stage3_identity(manifest, root_path)
     if exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
-        _validate_windows_l15_transport(manifest, source.parent)
+        _validate_windows_l15_transport(manifest, root_path)
     return manifest
 
 
@@ -640,6 +653,59 @@ def _component(manifest: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 def _impl(manifest: Mapping[str, Any], name: str) -> Any:
     return _component(manifest, name).get("implementation")
+
+
+def _require_release_file_identity(value: Any, where: str) -> None:
+    if not isinstance(value, Mapping):
+        raise _invalid(f"{where} must be an object")
+    path = value.get("path")
+    digest = value.get("sha256")
+    if not isinstance(path, str) or not path:
+        raise _invalid(f"{where}.path must be a non-empty string")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise _invalid(f"{where}.sha256 must be a lowercase SHA-256")
+
+
+def _validate_release_component_shape(manifest: Mapping[str, Any], *, stage: str, label: str) -> None:
+    """按 stage／角色確認必要的發佈元件都有可驗證身分。"""
+    if (stage in {"1A", "1B"} and label == "A"
+            and _impl(manifest, "cli") == "python" and _impl(manifest, "daemon") == "python"):
+        # 1A／1B 的 A 側是既有 Python 基線，沿用舊 manifest 相容路徑。
+        return
+    components = manifest.get("components")
+    if not isinstance(components, Mapping):
+        raise _invalid(f"side {label} release manifest components must be an object")
+    _require_release_file_identity(components.get("cli"), f"side {label} components.cli")
+    daemon = components.get("daemon")
+    if not isinstance(daemon, Mapping):
+        raise _invalid(f"side {label} components.daemon must be an object")
+    daemon_impl = daemon.get("implementation")
+    retired_candidate = (
+        stage == "3" and label == "B"
+        and manifest.get("retirement") == {"python_daemon": "removed"}
+    )
+    launcher = daemon.get("launcher")
+    if daemon_impl == "rust" or launcher is not None:
+        _require_release_file_identity(launcher, f"side {label} components.daemon.launcher")
+    if retired_candidate:
+        # Task 16 的退役候選最小執行身分為 CLI 與 Rust daemon launcher。
+        return
+
+    runtime = daemon.get("runtime")
+    _require_release_file_identity(runtime, f"side {label} components.daemon.runtime")
+    package = daemon.get("package")
+    if not isinstance(package, Mapping) or not isinstance(package.get("tree_sha256"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", package["tree_sha256"]
+    ):
+        raise _invalid(f"side {label} components.daemon.package.tree_sha256 must be a lowercase SHA-256")
+    delegate = components.get("python_cli_delegate")
+    if (not isinstance(delegate, Mapping)
+            or not isinstance(delegate.get("entry"), list)
+            or not delegate["entry"]
+            or any(not isinstance(item, str) for item in delegate["entry"])
+            or not isinstance(delegate.get("tree_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", delegate["tree_sha256"])):
+        raise _invalid(f"side {label} components.python_cli_delegate requires entry and tree_sha256")
 
 
 def _validate_stage3_identity(manifest: AbManifest, repo_root: Path) -> None:
@@ -681,6 +747,8 @@ def _validate_stage3_identity(manifest: AbManifest, repo_root: Path) -> None:
 
     context_path = _path(repo_root, manifest.candidate_context.path)
     try:
+        if sha256_file(context_path) != manifest.candidate_context.sha256:
+            raise _invalid("candidate context sha256 mismatch")
         from tools.stage3 import candidate_context
 
         context = candidate_context.load_run_context(context_path)
@@ -749,9 +817,10 @@ def _read_transport_map(path: Path) -> Mapping[str, Any]:
         if pair_id is not None and (not isinstance(pair_id, str) or not pair_id):
             raise _invalid(f"case transport map cases.{case_id}.pair_id must be a string or null")
     for pair_id, pair in root["approved_pairs"].items():
-        item = _closed_object(pair, {"dut_side", "daemon_side", "decision_ref"}, set(),
+        item = _closed_object(pair, {"dut_side_port_id", "daemon_side_port_id", "decision_ref"}, set(),
                               f"case transport map approved_pairs.{pair_id}")
-        if any(not isinstance(item.get(key), str) or not item[key] for key in ("dut_side", "daemon_side", "decision_ref")):
+        if any(not isinstance(item.get(key), str) or not item[key]
+               for key in ("dut_side_port_id", "daemon_side_port_id", "decision_ref")):
             raise _invalid(f"case transport map approved_pairs.{pair_id} is incomplete")
     for port_id, substitute in root["physical_substitutes"].items():
         item = _closed_object(substitute, {"platform", "decision_ref"}, set(),
@@ -773,6 +842,8 @@ def _validate_windows_l15_transport(manifest: AbManifest, repo_root: Path) -> No
     matching_tools = [item for item in manifest.tools if item.path == map_file.path and isinstance(item, FrozenFile)]
     if len(matching_tools) != 1:
         raise _invalid("case_transport_map must appear exactly once in frozen tools")
+    if matching_tools[0].sha256 != map_file.sha256:
+        raise _invalid("case_transport_map sha256 must match its frozen tool entry")
     if not manifest.required_cases_lock or not manifest.exit_item_id:
         raise _invalid("Windows L1.5 requires a Stage 3 required case lock")
     case_transports = settings.get("case_transports")
@@ -789,14 +860,6 @@ def _validate_windows_l15_transport(manifest: AbManifest, repo_root: Path) -> No
     if manifest.case_ids and not set(manifest.case_ids) <= required_ids:
         raise _invalid("case_ids contain IDs outside the frozen Windows exit")
 
-    try:
-        actual_map_sha = sha256_file(_path(repo_root, map_file.path))
-    except OSError as exc:
-        raise _invalid(f"case transport map is unreadable: {exc}") from exc
-    declared_tool_digests = {item.sha256 for item in matching_tools if isinstance(item, FrozenFile)}
-    # ref 與檔案或工具凍結值至少有一方一致；單純內容／工具漂移留給 verify_frozen 回報。
-    if actual_map_sha != map_file.sha256 and map_file.sha256 not in declared_tool_digests:
-        raise _invalid("case_transport_map sha256 does not match file")
     mapping = _read_transport_map(_path(repo_root, map_file.path))
     if mapping["exit_item_id"] != manifest.exit_item_id or mapping["platform"] != "windows":
         raise _invalid("case transport map identity does not match manifest")
@@ -835,12 +898,13 @@ def _validate_windows_l15_transport(manifest: AbManifest, repo_root: Path) -> No
             pair = approved_pairs.get(pair_id) if isinstance(pair_id, str) else None
             if not isinstance(pair, Mapping):
                 raise _invalid(f"native COM case {case_id} has no approved pair")
+            actual_pair = manifest.dut.com_pair
             if (manifest.dut.transport != "com0com-pair" or manifest.dut.com_pair is None
-                    or manifest.dut.com_pair.get("bridge_side") != pair["dut_side"]
-                    or manifest.dut.com_pair.get("daemon_side") != pair["daemon_side"]):
+                    or any(not isinstance(value, str) or not value for value in actual_pair.values())
+                    or set(manifest.test_device_allowlist) != set(actual_pair.values())):
                 raise _invalid(f"native COM case {case_id} does not match the approved pair")
-            if set(manifest.test_device_allowlist) != {pair["dut_side"], pair["daemon_side"]}:
-                raise _invalid("native COM requires the exact isolated test_device_allowlist")
+            if port_id != pair["dut_side_port_id"]:
+                raise _invalid(f"native COM case {case_id} port_id does not match approved DUT endpoint")
             auth = manifest.authorization
             if (auth is None or not auth.allow_destructive or auth.decision_ref != pair["decision_ref"]
                     or decision_ref != pair["decision_ref"]):
@@ -862,15 +926,18 @@ def _validate_windows_l15_transport(manifest: AbManifest, repo_root: Path) -> No
             raise _invalid(f"non-COM case {case_id} must not declare a port or substitute authorization")
 
 
-def _valid_templates(sides: Sequence[AbSide], suite: SuiteSpec) -> bool:
-    values = [*suite.extra_args]
+def _valid_templates(dut: DutSpec, sides: Sequence[AbSide], suite: SuiteSpec) -> bool:
+    values = [*dut.reset_argv, *dut.fingerprint_argv, *suite.extra_args]
     for side in sides:
         values.extend(side.activate_argv)
         values.extend(side.deactivate_argv)
     for value in values:
-        for _, field, _, _ in Formatter().parse(value):
-            if field is not None and field.split(".", 1)[0].split("[", 1)[0] not in TEMPLATE_KEYS:
-                return False
+        try:
+            for _, field, _, _ in Formatter().parse(value):
+                if field is not None and field not in TEMPLATE_KEYS:
+                    return False
+        except (TypeError, ValueError):
+            return False
     return True
 
 
@@ -1108,14 +1175,49 @@ def _case_layer_matches(row: Mapping[str, Any], layer: str) -> bool:
     return isinstance(value, str) and value.casefold() == layer.casefold()
 
 
-def required_cases(m: AbManifest, *, repo_root: Path) -> tuple[set[str], dict[str, dict]]:
-    rows, sets, _cases_doc = _read_cases(repo_root, m)
+def required_cases(
+    m: AbManifest, *, repo_root: Path, base_revision: str | None = None, source_reader: Any = None,
+) -> tuple[set[str], dict[str, dict]]:
+    root = Path(repo_root).resolve()
+    if root != m.repo_root:
+        raise _invalid(f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}")
+    if m.stage == "3":
+        if not base_revision:
+            raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "Stage 3 required_cases requires a trusted base revision")
+        try:
+            for frozen, relative, label in (
+                (m.case_list, "tests/acceptance/cases.yaml", "case_list"),
+                (m.case_lock, "tests/acceptance/cases.lock.json", "case_lock"),
+            ):
+                _require_canonical_path(root, frozen, relative, label)
+                if sha256_file(_path(root, frozen.path)) != frozen.sha256:
+                    raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", f"required cases invalid: {label} sha256 mismatch")
+            _validate_stage3_identity(m, root)
+            if m.required_cases_lock is None:
+                raise _invalid("Stage 3 requires required_cases_lock")
+            lock_path = _path(root, m.required_cases_lock.path)
+            if sha256_file(lock_path) != m.required_cases_lock.sha256:
+                raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: required cases lock sha256 mismatch")
+            catalog_path = root / "tests" / "acceptance" / "stage_exits.json"
+            if sha256_file(catalog_path) != m.exit_catalog_sha256:
+                raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: exit catalog sha256 mismatch")
+        except HarnessError:
+            raise
+        except OSError as exc:
+            raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", f"required cases invalid: {exc}") from exc
+        errors = required_cases_module.validate_current_lock(
+            root, base_revision=base_revision, source_reader=source_reader,
+        )
+        if errors:
+            raise HarnessError("HARNESS_CASE_SET_INCOMPLETE", "required cases invalid: " + "; ".join(errors))
+
+    rows, sets, _cases_doc = _read_cases(root, m)
     by_id = {row.get("case_id"): row for row in rows if isinstance(row, dict) and isinstance(row.get("case_id"), str)}
     if m.stage == "3":
         if not m.exit_item_id or not m.required_cases_lock:
             raise _invalid("Stage 3 requires exit_item_id and required_cases_lock")
         try:
-            lock_path = _path(repo_root, m.required_cases_lock.path)
+            lock_path = _path(root, m.required_cases_lock.path)
             lock = json.loads(lock_path.read_text(encoding="utf-8"))
             selected = required_cases_module.required_for_exit(lock, m.exit_item_id, m.platform)
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, RecursionError) as exc:
@@ -1134,41 +1236,28 @@ def required_cases(m: AbManifest, *, repo_root: Path) -> tuple[set[str], dict[st
     return required, by_id
 
 
-def _stage3_lock_errors(m: AbManifest, repo_root: Path) -> list[str]:
-    """重跑 T1 的目前目錄、固定 seed 與只增分母契約。"""
-    try:
-        cases_doc, case_lock, catalog, lock, source_manifest = required_cases_module._load_inputs(repo_root)
-        expected = required_cases_module._expected_exit_cases(catalog, cases_doc, case_lock)
-        errors = required_cases_module._validate_initial_exit_catalog(catalog)
-        seed_required = required_cases_module._seed_required_cases_by_initial_exit(
-            Path(repo_root) / required_cases_module.EVIDENCE_RELATIVE
-        )
-        errors.extend(required_cases_module._validate_seed_floor(lock, seed_required))
-        errors.extend(required_cases_module._validate_lock(lock, expected))
-        errors.extend(required_cases_module._seed_family_errors(
-            cases_doc, Path(repo_root) / required_cases_module.EVIDENCE_RELATIVE
-        ))
-        errors.extend(required_cases_module._seed_errors(
-            source_manifest,
-            Path(repo_root),
-            lambda revision, repo_path: required_cases_module._git_show(Path(repo_root), revision, repo_path),
-        ))
-        if m.exit_item_id is None or m.platform not in ("linux", "windows"):
-            errors.append("manifest 缺少 Stage 3 出口或平台")
-        else:
-            try:
-                required_cases_module.required_for_exit(lock, m.exit_item_id, m.platform)
-            except (KeyError, TypeError) as exc:
-                errors.append(f"manifest 指定的出口分母不存在：{m.exit_item_id}/{m.platform} ({exc})")
-        return errors
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError) as exc:
-        return [str(exc)]
+def _stage3_lock_errors(
+    m: AbManifest, repo_root: Path, *, base_revision: str | None, source_reader: Any,
+) -> list[str]:
+    """共用 T1 驗證器重跑目前目錄、seed 與可信 base 的只增契約。"""
+    if not base_revision:
+        return ["Stage 3 required cases requires a trusted base revision"]
+    return required_cases_module.validate_current_lock(
+        repo_root, base_revision=base_revision, source_reader=source_reader,
+    )
 
 
-def verify_case_coverage(m: AbManifest, *, repo_root: Path) -> list[str]:
-    rows, _sets, case_doc = _read_cases(repo_root, m)
+def verify_case_coverage(
+    m: AbManifest, *, repo_root: Path, base_revision: str | None = None, source_reader: Any = None,
+) -> list[str]:
+    root = Path(repo_root).resolve()
+    if root != m.repo_root:
+        raise _invalid(f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}")
+    rows, _sets, case_doc = _read_cases(root, m)
     by_id = {row.get("case_id"): row for row in rows if isinstance(row, dict) and isinstance(row.get("case_id"), str)}
-    required, _ = required_cases(m, repo_root=repo_root)
+    required, _ = required_cases(
+        m, repo_root=root, base_revision=base_revision, source_reader=source_reader,
+    )
     selected = set(m.case_ids)
     violations = [f"required case missing: {case_id}" for case_id in sorted(required - selected)]
     violations.extend(f"unknown case: {case_id}" for case_id in sorted(selected - by_id.keys()))
@@ -1209,10 +1298,67 @@ def verify_case_coverage(m: AbManifest, *, repo_root: Path) -> list[str]:
     return violations
 
 
-def verify_frozen(m: AbManifest, *, repo_root: Path, run: Runner = run_cmd) -> list[str]:
+def _tool_revision_map_errors(
+    m: AbManifest, *, repo_root: Path, run: Runner, tool_revision: str | None,
+) -> list[str]:
+    """以 Git blob 身分核對 Windows L1.5 映射屬於執行工具的指定版本。"""
+    if m.exit_item_id != "S3-L15-RELEASE-AB-WINDOWS":
+        return []
+    value = m.platform_settings.get("case_transport_map")
+    if not isinstance(value, Mapping):
+        return ["case transport map tool revision unavailable: missing map reference"]
+    try:
+        map_file = _frozen(dict(value), "platform_settings.case_transport_map")
+    except HarnessError:
+        return ["case transport map tool revision unavailable: invalid map reference"]
+    if not isinstance(map_file, FrozenFile):
+        return ["case transport map tool revision unavailable: map is not a file"]
+
+    revision = tool_revision
+    if revision is None:
+        result = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"])
+        if result.rc != 0 or result.timed_out:
+            return [f"case transport map tool revision unavailable: {map_file.path}"]
+        revision = result.stdout.strip()
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return [f"case transport map tool revision unavailable: {map_file.path}"]
+
+    repo_path = PurePosixPath(map_file.path)
+    if (repo_path.is_absolute() or "\\" in map_file.path
+            or any(part in ("", ".", "..") for part in repo_path.parts)):
+        return [f"case transport map tool revision mismatch: {map_file.path}"]
+    path = _path(repo_root, map_file.path)
+    if not _inside(repo_root, path):
+        return [f"case transport map tool revision mismatch: {map_file.path}"]
+
+    expected = run(["git", "-C", str(repo_root), "rev-parse", "--verify", f"{revision}:{repo_path.as_posix()}"])
+    actual = run(["git", "-C", str(repo_root), "hash-object", "--", str(path)])
+    if (expected.rc != 0 or expected.timed_out or actual.rc != 0 or actual.timed_out
+            or not re.fullmatch(r"[0-9a-f]{40,64}", expected.stdout.strip())
+            or not re.fullmatch(r"[0-9a-f]{40,64}", actual.stdout.strip())):
+        return [f"case transport map tool revision unavailable: {map_file.path}"]
+    if expected.stdout.strip() != actual.stdout.strip():
+        return [f"case transport map tool revision mismatch: {map_file.path}"]
+    return []
+
+
+def verify_frozen(
+    m: AbManifest, *, repo_root: Path, run: Runner = run_cmd, tool_revision: str | None = None,
+    base_revision: str | None = None, source_reader: Any = None,
+) -> list[str]:
     """重算所有凍結輸入、bundle 元件及 case coverage。"""
-    root = Path(repo_root)
+    root = Path(repo_root).resolve()
+    if root != m.repo_root:
+        return [f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}"]
     violations: list[str] = []
+
+    try:
+        source_sha256 = sha256_file(m.source_path)
+    except OSError:
+        violations.append(f"file missing: {m.source_path}")
+    else:
+        if source_sha256 != m.source_sha256:
+            violations.append(f"manifest sha256 mismatch: {m.source_path}")
 
     def check_file(item: FrozenFile, prefix: str) -> None:
         path = _path(root, item.path)
@@ -1246,6 +1392,10 @@ def verify_frozen(m: AbManifest, *, repo_root: Path, run: Runner = run_cmd) -> l
             if actual != item.tree_sha256:
                 violations.append(f"tool tree mismatch: {item.path}")
 
+    violations.extend(_tool_revision_map_errors(
+        m, repo_root=root, run=run, tool_revision=tool_revision,
+    ))
+
     for side in m.sides:
         manifest_path = _path(root, side.release_manifest.path)
         try:
@@ -1256,6 +1406,8 @@ def verify_frozen(m: AbManifest, *, repo_root: Path, run: Runner = run_cmd) -> l
         violations.extend(verify_bundle(side.bundle_dir, side.manifest_doc, label=f"side {side.label}"))
 
     if m.stage == "3":
+        if m.candidate_context is not None:
+            check_file(m.candidate_context, "candidate_context")
         if m.required_cases_lock is not None:
             check_file(m.required_cases_lock, "required cases lock")
         catalog_path = root / "tests" / "acceptance" / "stage_exits.json"
@@ -1266,7 +1418,9 @@ def verify_frozen(m: AbManifest, *, repo_root: Path, run: Runner = run_cmd) -> l
         else:
             if catalog_sha != m.exit_catalog_sha256:
                 violations.append(f"exit catalog sha256 mismatch: tests/acceptance/stage_exits.json")
-        violations.extend(f"required cases invalid: {detail}" for detail in _stage3_lock_errors(m, root))
+        violations.extend(f"required cases invalid: {detail}" for detail in _stage3_lock_errors(
+            m, root, base_revision=base_revision, source_reader=source_reader,
+        ))
 
     result = run(["git", "-C", str(root), "rev-parse", "HEAD:contracts"])
     if result.rc != 0 or result.timed_out:
@@ -1281,7 +1435,9 @@ def verify_frozen(m: AbManifest, *, repo_root: Path, run: Runner = run_cmd) -> l
         if result.rc != 0 or result.timed_out or result.stdout.strip() != m.dut.image_digest:
             violations.append("dut image digest mismatch")
     try:
-        violations.extend(verify_case_coverage(m, repo_root=root))
+        violations.extend(verify_case_coverage(
+            m, repo_root=root, base_revision=base_revision, source_reader=source_reader,
+        ))
     except HarnessError as exc:
         violations.append(f"required cases invalid: {exc.detail}")
     return violations
@@ -1292,9 +1448,9 @@ def render_argv(template: Sequence[str], values: Mapping[str, str]) -> list[str]
     for value in template:
         try:
             fields = [field for _, field, _, _ in Formatter().parse(value) if field is not None]
-            if any(field.split(".", 1)[0].split("[", 1)[0] not in TEMPLATE_KEYS for field in fields):
+            if any(field not in TEMPLATE_KEYS for field in fields):
                 raise _invalid(f"unknown template key in {value!r}")
             rendered.append(value.format_map(values))
-        except (KeyError, ValueError, IndexError) as exc:
+        except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
             raise _invalid(f"cannot render argv template {value!r}: {exc}") from exc
     return rendered

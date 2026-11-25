@@ -1,9 +1,9 @@
 {
   "approved_pairs": {
     "EXAMPLE-PAIR": {
-      "daemon_side": "COM21",
+      "daemon_side_port_id": "EXAMPLE-PAIR-DAEMON-ENDPOINT",
       "decision_ref": "EXAMPLE-PAIR-APPROVED",
-      "dut_side": "COM20"
+      "dut_side_port_id": "EXAMPLE-PAIR-DUT-ENDPOINT"
     }
   },
   "cases": {
