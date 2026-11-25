@@ -353,6 +353,9 @@ mod observed_tx_submit_tests {
         };
         let rx = RxShared::new(1024, 0);
         let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(88);
+        rx.set_command_completion_deadline(88, deadline);
         let gate = ObservedTxSubmitGate {
             inner: &inner,
             rx: &rx,
@@ -366,10 +369,29 @@ mod observed_tx_submit_tests {
         };
 
         assert!(matches!(
-            gate.submit(&mut || SubmitStep::WouldBlock),
+            gate.submit(&mut || {
+                clock.advance(std::time::Duration::from_nanos(501));
+                SubmitStep::WouldBlock
+            }),
             Ok(SubmitStep::WouldBlock)
         ));
         assert_eq!(rx.human_tx_state(), crate::uart_bridge::HumanTxState::default());
+        assert!(!rx.tx_submit_pending(), "WouldBlock 結束後不得保留在途旗標");
+        let timed_out = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            crate::uart_bridge::HumanTxState::default(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let crate::uart_bridge::SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = timed_out
+        else {
+            panic!("WouldBlock 對照應取得 deadline snapshot");
+        };
+        assert!(!snapshot.tx_submit_pending, "WouldBlock 不得進入 human timeout 證據");
 
         assert!(matches!(
             gate.submit(&mut || SubmitStep::Accepted(3)),
@@ -386,6 +408,140 @@ mod observed_tx_submit_tests {
         let complete = rx.human_tx_state();
         assert_eq!(complete.generation, 2);
         assert!(!complete.raw_line_open, "接受換行後 raw line 才結束");
+    }
+
+    #[test]
+    fn i294_r8_os_accepted_before_deadline_is_pending_until_observer_registration() {
+        use crate::uart_bridge::SnapshotWaitResult;
+        use std::time::Duration;
+
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(5, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(99);
+        rx.set_command_completion_deadline(99, deadline);
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: Some(b"human\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+        let before_human = rx.human_tx_state();
+        let before_watermark = rx.watermark();
+        let result = gate.submit(&mut || {
+            let os_accepted_at = clock.mono_ns();
+            assert!(os_accepted_at < deadline, "fake OS 接受時間在 deadline 前");
+            clock.advance(Duration::from_nanos(501));
+            SubmitStep::Accepted(1)
+        });
+        assert!(matches!(result, Ok(SubmitStep::Accepted(1))));
+        assert!(clock.mono_ns() > deadline, "observer 登錄時 FakeClock 已越過 deadline");
+        assert!(
+            rx.human_tx_state().generation > before_human.generation,
+            "TX observer 在 FakeClock deadline 後才登錄"
+        );
+        assert!(!rx.tx_submit_pending(), "submit 返回後須清除在途旗標");
+        let settled = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            before_human,
+            before_watermark,
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = settled
+        else {
+            panic!("deadline 必須以 timeout snapshot 結算");
+        };
+        assert!(
+            snapshot.tx_submit_pending,
+            "OS 在期限前接受、observer 在期限後登錄的 submit window 須留在 deadline snapshot"
+        );
+    }
+
+    #[test]
+    fn i294_r8_submit_started_after_timeout_is_not_in_deadline_snapshot() {
+        use crate::uart_bridge::SnapshotWaitResult;
+        use std::time::Duration;
+
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(100);
+        rx.set_command_completion_deadline(100, deadline);
+        clock.advance(Duration::from_nanos(501));
+        let timed_out = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            rx.human_tx_state(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = timed_out
+        else {
+            panic!("deadline 後應立即結算 timeout");
+        };
+        assert!(!snapshot.tx_submit_pending, "submit 尚未開始，不應進入 timeout snapshot");
+
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(6, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: Some(b"late human\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+        assert!(clock.mono_ns() > deadline, "control submit 在 deadline 後才開始");
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+        assert!(rx.human_tx_state().generation > 0, "deadline 後 submit 仍正常登錄");
+        assert!(!snapshot.tx_submit_pending, "已結算的 timeout snapshot 不被事後改寫");
+        let after_late_submit = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            crate::uart_bridge::HumanTxState::default(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = after_late_submit
+        else {
+            panic!("期限後 submit 對照仍須取得 deadline snapshot");
+        };
+        assert!(!snapshot.tx_submit_pending, "期限後才開始的 submit 不得回填 deadline snapshot");
     }
 }
 

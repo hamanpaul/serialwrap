@@ -21,7 +21,7 @@ use sw_core::op_runner::{OpOutcome, extract_command_stdout};
 use sw_core::session_core::{Effect, SessionRequest};
 use sw_core::tx_writer::OpId;
 use sw_pal::fakes::serial::FakeWriteStep;
-use sw_pal::traits::PalError;
+use sw_pal::traits::{Clock, PalError};
 use sw_proto::pycompat::{PyErr, clean_text, py_strip, splitlines};
 use sw_proto::pyjson::{PyDict, PyValue};
 use sw_proto::pyre::{PyFlags, compile};
@@ -508,6 +508,40 @@ fn i294_completion_snapshot_ignores_later_rx() {
 }
 
 #[test]
+fn i294_r8_completion_decided_before_deadline_remains_done() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (matched_tx, matched_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |snapshot| {
+        matched_tx
+            .send(snapshot.clone())
+            .expect("test waits for pre-deadline completion decision");
+        resume_rx
+            .recv()
+            .expect("test releases pre-deadline completion decision");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo PRE_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo PRE_DEADLINE\n");
+    h.inject_rx_reader_processed(b"echo PRE_DEADLINE\r\nPRE_DEADLINE\r\nroot@t:/# ");
+    let accepted = matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已在 deadline 前判定完成");
+    assert!(accepted.text.ends_with("PRE_DEADLINE\r\nroot@t:/# "));
+    assert!(h.clock.mono_ns() < 200_000_000, "FakeClock 仍在 deadline 前");
+    h.advance(Duration::from_millis(201));
+    resume_tx.send(()).expect("釋放 pre-deadline completion barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("PRE_DEADLINE"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo PRE_DEADLINE\n".to_vec());
+}
+
+#[test]
 fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
@@ -636,10 +670,129 @@ fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
     resume_tx.send(()).expect("釋放 evaluator barrier");
 
     let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("done"), "截止前已到達的 RX 必須納入結算：{result:?}");
-    assert_eq!(result["stdout"], PyValue::from("DEADLINE_RX"), "{result:?}");
-    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
-    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo DEADLINE_RX\n".to_vec());
+    assert_eq!(result["status"], PyValue::from("error"), "跨過截止點才完成評估時依 2026-11-26 預先裁決回 timeout：{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("DEADLINE_RX"), "期限內可用輸出仍須保留：{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "無 human TX 時保留基線救援：{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo DEADLINE_RX\n\x03".to_vec(),
+        "期限內尚未判定完成且無 human TX 時維持基線 Ctrl-C 救援"
+    );
+}
+
+#[test]
+fn i294_r8_expired_before_first_wait_returns_timeout_partial() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        entered_tx.send(()).expect("test waits before first snapshot wait");
+        resume_rx.recv().expect("test releases first snapshot wait");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo FIRST_WAIT", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo FIRST_WAIT\n");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("已進入首次 snapshot wait 前的 barrier");
+    h.advance(Duration::from_millis(201));
+    h.inject_rx_reader_processed(b"echo FIRST_WAIT\r\nFIRST_WAIT\r\nroot@t:/# ");
+    resume_tx.send(()).expect("釋放首次 snapshot wait");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n\x03".to_vec());
+}
+
+#[test]
+fn i294_r8_timeout_after_deadline_snapshot_keeps_partial_and_baseline_recovery() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            deadline_tx.send(()).expect("test waits for operation deadline snapshot");
+            resume_rx.recv().expect("test releases deadline settlement");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf NO_OUTPUT", |request| request.timeout_s = 0.2);
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    wait_tx(&h, b"printf NO_OUTPUT\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+    h.advance(Duration::from_millis(201));
+    deadline_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("等待器已取得逾時 snapshot");
+    resume_tx.send(()).expect("釋放逾時結算");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_OUTPUT\n\x03".to_vec());
+}
+
+#[test]
+fn i294_r8_tx_submit_pending_at_settlement_suppresses_recovery() {
+    for pending_before_deadline in [true, false] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        h.rx
+            .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+                deadline_tx.send(()).expect("operation deadline settlement reached");
+                resume_rx.recv().expect("test releases deadline settlement");
+            })));
+
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf HUMAN_PENDING", |request| request.timeout_s = 0.2);
+        let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+        wait_tx(&h, b"printf HUMAN_PENDING\n");
+        assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+            checks,
+            h.rx.snapshot_len(),
+            Duration::from_secs(5),
+        ));
+        if pending_before_deadline {
+            h.rx.set_tx_submit_pending_for_test(true);
+        }
+        h.advance(Duration::from_millis(201));
+        deadline_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("deadline snapshot 已建立；第一輪在途、第二輪在截止後啟動");
+        if !pending_before_deadline {
+            h.rx.set_tx_submit_pending_for_test(true);
+        }
+        resume_tx.send(()).expect("釋放 deadline settlement");
+
+        let result = h.wait_done(&id);
+        h.rx.set_tx_submit_pending_for_test(false);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+        assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf HUMAN_PENDING\n".to_vec(),
+            "結算時有在途 human submit 必須抑制所有救援 TX；pending_before_deadline={pending_before_deadline}"
+        );
+    }
 }
 
 fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
@@ -1021,11 +1174,11 @@ fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
             rec["recovery_action"].clone()
         ),
         (
-            PyValue::from("done"),
-            PyValue::Null,
+            PyValue::from("error"),
+            PyValue::from("PROMPT_TIMEOUT"),
             PyValue::from("CTRL_C")
         )
-    ); // ok:true 的碼不入紀錄
+    ); // recovery 維持，但 operation deadline 一律回 PROMPT_TIMEOUT。
     assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(
         h.command_get(&queued)["error_code"],
@@ -1115,11 +1268,6 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
         PyValue::from(c.source),
         "{label}：紀錄 source：{rec:?}"
     );
-    assert_eq!(
-        rec["error_code"],
-        PyValue::Null,
-        "{label}：ok:true 的結算不入錯誤碼：{rec:?}"
-    );
     assert_eq!(rec["partial"], PyValue::Bool(true), "{label}：{rec:?}");
     assert_eq!(
         state_of(&h),
@@ -1128,6 +1276,11 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
     );
     match c.expect {
         Wp61Expect::Promote { owner } => {
+            assert_eq!(
+                rec["error_code"],
+                PyValue::Null,
+                "{label}：trusted human 升格仍為成功結算：{rec:?}"
+            );
             assert_eq!(
                 uart, b"sleep 20\n",
                 "{label}：UART TX 只有命令本身，零 CTRL_C／CTRL_D"
@@ -1174,6 +1327,11 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
             );
         }
         Wp61Expect::Rescue { key } => {
+            assert_eq!(
+                rec["error_code"],
+                PyValue::from("PROMPT_TIMEOUT"),
+                "{label}：逾時救援成功後 operation 仍回 PROMPT_TIMEOUT：{rec:?}"
+            );
             let mut expected = b"sleep 20\n".to_vec();
             let mut expected_wal = vec![(c.source.to_string(), b"sleep 20\n".to_vec())];
             expected.push(0x03);
@@ -1190,7 +1348,7 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
                 wal, expected_wal,
                 "{label}：WAL TX 依序為命令、system:recover 救援鍵（{key}）"
             );
-            assert_eq!(rec["status"], PyValue::from("done"), "{label}：{rec:?}");
+            assert_eq!(rec["status"], PyValue::from("error"), "{label}：{rec:?}");
             assert_eq!(
                 rec["execution_mode"],
                 PyValue::from("line"),
@@ -1380,7 +1538,9 @@ fn ctrl_d_after_ctrl_c_fails() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
-    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_D"));
     assert!(wal_tx_has(&h, b"\x03") && wal_tx_has(&h, b"\x04"));
     assert_eq!(state_of(&h), "READY");
@@ -2984,7 +3144,8 @@ fn wp53_route_without_flag_keeps_timeout_recovery() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
-    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["status"], PyValue::from("error"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{rec:?}");
     assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
     assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
@@ -5457,7 +5618,11 @@ fn wrapped_echo_whitespace_boundary_matrix() {
         &command[25..60],
         &command[60..]
     );
-    check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+    check(
+        format!("{echo}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{}\n{} {}\nOUT", &command[..25], &command[25..60], &command[60..]),
+    );
 
     // 折行標記不得出現在第一個命令字元之前，亦不得出現在命令完成後。
     let command = format!("echo {}", "z".repeat(40));

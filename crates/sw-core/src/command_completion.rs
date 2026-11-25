@@ -3,13 +3,15 @@
 //! producer completion、passthrough、human 命令與其他 op 保留既有路徑。此 evaluator 只把同一份 RX snapshot
 //! 中的完整 command echo 作為 prompt 搜尋下界；prompt 身分與無換行輸出裁切由 i294-i2 處理。
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use sw_proto::pycompat::{clean_text, clean_text_with_source_ranges};
 use sw_proto::pyre::PyRegex;
 
-use crate::op_runner::{match_wrapped_echo_ending_at, WrapEvidence, WRAP_MIN_SEGMENT};
+use crate::op_runner::{
+    match_wrapped_echo_ending_at, WrapEvidence, WrappedEchoCandidate, WrappedEchoMatchMetrics,
+    WRAP_MIN_SEGMENT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Evaluation {
@@ -73,6 +75,19 @@ impl<'a> CompletionEvaluator<'a> {
             None => Evaluation::Pending,
         }
     }
+
+    /// 從逾時 snapshot 留下可用輸出；此回傳值只用於 partial，不得將 timeout 改判為 Complete。
+    pub(crate) fn partial_stdout(
+        &self,
+        raw: &str,
+        human_tx_seen: bool,
+        raw_half_line: bool,
+    ) -> String {
+        match self.evaluate(raw, human_tx_seen, raw_half_line) {
+            Evaluation::Complete { stdout } | Evaluation::Uncertain { stdout } => stdout,
+            Evaluation::Pending => clean_text(raw).trim_matches('\n').to_string(),
+        }
+    }
 }
 
 /// 保留既有終端連續回顯相容性：只有完整第一行再次等於命令，且後面仍有輸出時才移除。
@@ -101,7 +116,13 @@ struct EchoSearchMetrics {
     candidate_checks: usize,
     prompt_prefix_checks: usize,
     prefix_scan_chars: usize,
+    preprocess_steps: usize,
+    lcp_index_slots: usize,
     matcher_steps: usize,
+    wrap_range_queries: usize,
+    ambiguous_wrap_windows: usize,
+    max_wrap_marker_slots: usize,
+    max_candidate_len: usize,
 }
 
 fn find_command_echo(
@@ -116,6 +137,15 @@ fn find_command_echo(
     if command_chars.is_empty() {
         return None;
     }
+    let reversed_command: Vec<char> = command_chars.iter().rev().copied().collect();
+    let reversed_chars: Vec<char> = chars.iter().rev().copied().collect();
+    metrics.preprocess_steps = metrics
+        .preprocess_steps
+        .saturating_add(command_chars.len())
+        .saturating_add(chars.len());
+    let prefix_lcp = lcp_lengths(&command_chars, &chars, &mut metrics.preprocess_steps);
+    let suffix_lcp = lcp_lengths(&reversed_command, &reversed_chars, &mut metrics.preprocess_steps);
+    metrics.lcp_index_slots = prefix_lcp.len().saturating_add(suffix_lcp.len());
     let mut line_start_by_char = vec![0usize; chars.len() + 1];
     let mut current_line_start = 0usize;
     for (index, ch) in chars.iter().enumerate() {
@@ -133,7 +163,6 @@ fn find_command_echo(
             .unwrap_or(chars.len());
         if line_end < chars.len() {
             metrics.candidate_checks = metrics.candidate_checks.saturating_add(1);
-            let mut prompt_cache = HashMap::new();
             let mut valid_start =
                 |command_start: usize, first_wrap_command_chars: Option<usize>| {
                     if command_start > line_end {
@@ -155,18 +184,13 @@ fn find_command_echo(
                         }
                         return true;
                     }
-                    if let Some(matches) = prompt_cache.get(&command_start) {
-                        return *matches;
-                    }
                     metrics.prompt_prefix_checks = metrics.prompt_prefix_checks.saturating_add(1);
                     metrics.prefix_scan_chars =
                         metrics.prefix_scan_chars.saturating_add(prefix_chars);
                     let prefix: String = chars[command_line_start..command_start].iter().collect();
-                    let matches = prompt
+                    prompt
                         .search(&prefix)
-                        .is_some_and(|matched| matched.start == 0 && matched.end == prefix_chars);
-                    prompt_cache.insert(command_start, matches);
-                    matches
+                        .is_some_and(|matched| matched.start == 0 && matched.end == prefix_chars)
                 };
 
             let mut direct_steps = 0usize;
@@ -187,18 +211,34 @@ fn find_command_echo(
                 });
             }
 
-            let wrap_floor = line_end.saturating_sub(command_chars.len().saturating_mul(2));
-            if (wrap_floor..line_end).any(|index| wraps.is_wrap_at(index, chars[index])) {
-                let mut matcher_steps = 0usize;
+            let candidate_len = command_chars.len().saturating_add(1);
+            let wrap_start = line_end.saturating_sub(candidate_len);
+            metrics.wrap_range_queries = metrics.wrap_range_queries.saturating_add(1);
+            let wrap_count = wraps.wrap_count(wrap_start, line_end);
+            if wrap_count > 1 {
+                metrics.ambiguous_wrap_windows =
+                    metrics.ambiguous_wrap_windows.saturating_add(1);
+            } else if let Some(marker_position) = wraps.sole_wrap_in(wrap_start, line_end) {
+                let mut matcher_metrics = WrappedEchoMatchMetrics::default();
+                metrics.max_candidate_len = metrics.max_candidate_len.max(candidate_len);
                 let candidate = match_wrapped_echo_ending_at(
-                    &chars,
-                    line_end,
-                    &command_chars,
-                    wraps,
+                    WrappedEchoCandidate {
+                        text: &chars,
+                        end: line_end,
+                        command: &command_chars,
+                        marker_position,
+                        prefix_lcp: &prefix_lcp,
+                        suffix_lcp: &suffix_lcp,
+                    },
                     &mut valid_start,
-                    &mut matcher_steps,
+                    &mut matcher_metrics,
                 );
-                metrics.matcher_steps = metrics.matcher_steps.saturating_add(matcher_steps);
+                metrics.matcher_steps = metrics
+                    .matcher_steps
+                    .saturating_add(matcher_metrics.matcher_steps);
+                metrics.max_wrap_marker_slots = metrics
+                    .max_wrap_marker_slots
+                    .max(matcher_metrics.max_marker_slots);
                 if let Some(command_start) = candidate {
                     return Some(EchoRange {
                         _command: command_start..line_end,
@@ -213,6 +253,39 @@ fn find_command_echo(
         line_start = line_end + 1;
     }
     None
+}
+
+/// 對 pattern 與 text 的每個起點計算最長共同前綴，使用 Z 演算法確保整體 O(pattern + text)。
+fn lcp_lengths(pattern: &[char], text: &[char], operations: &mut usize) -> Vec<usize> {
+    let mut sequence = Vec::with_capacity(pattern.len() + 1 + text.len());
+    sequence.extend(pattern.iter().copied().map(Some));
+    sequence.push(None);
+    sequence.extend(text.iter().copied().map(Some));
+    *operations = (*operations).saturating_add(sequence.len());
+
+    let mut z = vec![0usize; sequence.len()];
+    let (mut left, mut right) = (0usize, 0usize);
+    for index in 1..sequence.len() {
+        *operations = (*operations).saturating_add(1);
+        if index < right {
+            z[index] = z[index - left].min(right - index);
+        }
+        while index + z[index] < sequence.len() {
+            *operations = (*operations).saturating_add(1);
+            if sequence[z[index]] != sequence[index + z[index]] {
+                break;
+            }
+            z[index] += 1;
+        }
+        if index + z[index] > right {
+            left = index;
+            right = index + z[index];
+        }
+    }
+
+    let text_start = pattern.len() + 1;
+    *operations = (*operations).saturating_add(text.len());
+    z[text_start..].to_vec()
 }
 
 /// 無 echo 的相容降階只接受 snapshot 尾端、最後一行行首的完整 prompt match。
@@ -240,11 +313,46 @@ fn char_slice(text: &str, range: Range<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uart_bridge::{RxShared, SnapshotWaitResult};
+    use sw_pal::traits::Clock;
     use sw_proto::pyre::{compile, PyFlags};
+    use std::time::Duration;
 
     fn evaluator<'a>(command: &'a str, prompt: &'static str) -> CompletionEvaluator<'a> {
         let prompt = Box::leak(Box::new(compile(prompt, PyFlags(0)).expect("prompt regex")));
         CompletionEvaluator::new(command, prompt)
+    }
+
+    #[test]
+    fn i294_r8_snapshot_evaluator_that_finishes_after_deadline_is_timed_out() {
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let rx = RxShared::new(4096, clock.mono_ns());
+        let raw = "echo DEADLINE\r\nDEADLINE\r\nroot@t:/# ";
+        rx.append(raw.as_bytes(), clock.mono_ns(), 1, 1);
+        let evaluator = evaluator("echo DEADLINE", r"(?m)^root@t:/# ");
+        let deadline = clock.mono_ns().saturating_add(10);
+        let before_human = rx.human_tx_state();
+        let before_watermark = rx.watermark();
+
+        let result = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            before_human,
+            before_watermark,
+            &*clock,
+            |snapshot| match evaluator.evaluate(&snapshot.text, false, false) {
+                Evaluation::Complete { stdout } => {
+                    clock.advance(Duration::from_nanos(10));
+                    Some(stdout)
+                }
+                Evaluation::Pending | Evaluation::Uncertain { .. } => None,
+            },
+        );
+
+        assert!(
+            matches!(result, SnapshotWaitResult::TimedOut { .. }),
+            "完整證據雖在 deadline snapshot 內，但 evaluator 跨過截止點才返回，必須 timeout"
+        );
     }
 
     #[test]
@@ -381,7 +489,7 @@ mod tests {
         let echo = format!("{} \r{}", &command[..cut], &command[cut..]);
         check(&command, &echo, complete.clone());
 
-        // 同一 echo 混用 BusyBox 與 readline 標記，且有多次折行。
+        // 預先裁決 1：多次或混用折行無法可靠定位 echo，套用無 echo／human TX 規則。
         let command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
         let echo = format!(
             "{}\r\r\n{} \r{}",
@@ -389,7 +497,12 @@ mod tests {
             &command[25..60],
             &command[60..]
         );
-        check(&command, &echo, complete.clone());
+        let multi_wrap = evaluator(&command, prompt);
+        let result = multi_wrap.evaluate(&format!("{echo}\r\nOUT\r\nroot@t:/# "), true, false);
+        let Evaluation::Uncertain { stdout } = result else {
+            panic!("多次／混用折行必須套用無 echo 降階：{result:?}");
+        };
+        assert!(stdout.ends_with("OUT"), "無 echo 降階須保留可用輸出：{stdout:?}");
 
         // 命令第一個字元之前的 readline 標記不是 echo 內折行；最後字元之後的插入空白也不能完成 echo。
         let command = format!("echo {}", "z".repeat(40));
@@ -538,6 +651,96 @@ mod tests {
             "長 RX 完成判定超過寬鬆上限：{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn i294_r8_ambiguous_fold_search_has_linear_work_bound() {
+        let prompt = r"(?m)^root@t:/# ";
+        for command_len in [40usize, 100, 200, 400] {
+            let command = format!("X{}", " ".repeat(command_len - 1));
+            let hostile_line = " \r".repeat(command_len * 2);
+            let raw = format!("{hostile_line}\r\nOUT\r\nroot@t:/# ");
+            let evaluator = evaluator(&command, prompt);
+            let (cleaned, source_ranges) = clean_text_with_source_ranges(&raw);
+            let wraps = WrapEvidence::from_raw(&raw, &cleaned, &source_ranges);
+            let mut metrics = EchoSearchMetrics::default();
+            let _ = find_command_echo(
+                &cleaned,
+                &command,
+                evaluator.prompt,
+                &wraps,
+                &mut metrics,
+            );
+            let input_chars = cleaned.chars().count();
+            let linear_budget = 16 * (input_chars + command.chars().count());
+            let counted_operations = metrics
+                .candidate_checks
+                .saturating_add(metrics.prefix_scan_chars)
+                .saturating_add(metrics.preprocess_steps)
+                .saturating_add(metrics.matcher_steps)
+                .saturating_add(metrics.wrap_range_queries);
+            assert!(
+                counted_operations <= linear_budget,
+                "行掃描、prompt 前綴、matcher 與折行索引查詢須受輸入與命令長度線性限制：len={command_len}, budget={linear_budget}, operations={counted_operations}, {metrics:?}"
+            );
+            assert!(
+                wraps.index_slots() <= 3 * (input_chars + 1),
+                "折行索引配置須為輸入長度線性上界：len={command_len}, input={input_chars}, slots={}, {metrics:?}",
+                wraps.index_slots()
+            );
+            assert!(
+                metrics.lcp_index_slots <= 2 * input_chars,
+                "LCP 索引空間須為輸入長度線性上界：input={input_chars}, slots={}, {metrics:?}",
+                metrics.lcp_index_slots
+            );
+            assert!(
+                metrics.max_wrap_marker_slots <= 1,
+                "折行 matcher 只保留一個候選插入點：{metrics:?}"
+            );
+            assert!(
+                metrics.max_candidate_len <= command_len + 1,
+                "matcher 暫存候選不得超過命令長度加一：{metrics:?}"
+            );
+            assert!(
+                metrics.ambiguous_wrap_windows > 0,
+                "800 個重複 readline 標記中，含多個標記的候選必須降階：{metrics:?}"
+            );
+            assert!(
+                matches!(evaluator.evaluate(&raw, true, false), Evaluation::Uncertain { .. }),
+                "大量有局部標記的候選不得被誤認為 echo：len={command_len}"
+            );
+        }
+
+        let command = format!("X{}", " ".repeat(399));
+        let many_short_lines = format!("{}root@t:/# ", "x\n".repeat(2_000));
+        let evaluator = evaluator(&command, r"(?m)^root@t:/# ");
+        let (cleaned, source_ranges) = clean_text_with_source_ranges(&many_short_lines);
+        let wraps = WrapEvidence::from_raw(&many_short_lines, &cleaned, &source_ranges);
+        let mut metrics = EchoSearchMetrics::default();
+        let _ = find_command_echo(
+            &cleaned,
+            &command,
+            evaluator.prompt,
+            &wraps,
+            &mut metrics,
+        );
+        let input_chars = cleaned.chars().count();
+        let counted_operations = metrics
+            .candidate_checks
+            .saturating_add(metrics.prefix_scan_chars)
+            .saturating_add(metrics.preprocess_steps)
+            .saturating_add(metrics.matcher_steps)
+            .saturating_add(metrics.wrap_range_queries);
+        assert!(
+            counted_operations <= 16 * (input_chars + command.chars().count()),
+            "無折行的短行集合仍須線性：operations={counted_operations}, input={input_chars}, {metrics:?}"
+        );
+        assert!(
+            wraps.index_slots() <= 3 * (input_chars + 1),
+            "大量短行的索引記憶體須為輸入長度線性：input={input_chars}, slots={}",
+            wraps.index_slots()
+        );
+        assert!(metrics.lcp_index_slots <= 2 * input_chars);
     }
 
     #[test]

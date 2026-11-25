@@ -8,7 +8,6 @@
 //! TX 一律經該 epoch 的 `TxWriterHandle`，permit 的 `op_id` 為授權 grant 的 `op_id`（帳本以 op 為單位，
 //! 由 actor 在終態處理點 `SettleTx`）。
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +33,7 @@ use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
 use crate::uart_bridge::{
-    RunCancel, RxShared, SnapshotWaitResult, WaitMatchOutcome, WaitOutcome,
+    RunCancel, RxShared, RxSnapshot, SnapshotWaitResult, WaitMatchOutcome, WaitOutcome,
 };
 use crate::wal::{WalAppendReq, WalWriter};
 
@@ -93,6 +92,12 @@ pub enum OpOutcome {
     /// echo 無法確認且同窗口出現可信 human TX；保留輸出並回 PROMPT_TIMEOUT，不降級 session 或送救援鍵。
     CompletionUncertain {
         stdout: String,
+    },
+    /// 一般命令 operation deadline 到時尚未判定完成。保留 timeout 結果；`recovered` 只記錄救援流程是否恢復 prompt。
+    CompletionDeadlineTimeout {
+        stdout: String,
+        recovery_action: Option<&'static str>,
+        recovered: bool,
     },
     ToAttached {
         reason: &'static str,
@@ -259,8 +264,9 @@ pub(crate) const WRAP_MIN_SEGMENT: usize = 20;
 /// 清理後字元索引對應的原始串流折行證據。
 #[derive(Clone, Default)]
 pub(crate) struct WrapEvidence {
-    newline_positions: HashSet<usize>,
-    space_positions: HashSet<usize>,
+    wrap_kinds: Vec<u8>,
+    wrap_prefix: Vec<usize>,
+    wrap_positions: Vec<usize>,
 }
 
 impl WrapEvidence {
@@ -269,7 +275,12 @@ impl WrapEvidence {
         cleaned: &str,
         source_ranges: &[std::ops::Range<usize>],
     ) -> Self {
-        let mut evidence = Self::default();
+        let char_count = cleaned.chars().count();
+        let mut evidence = Self {
+            wrap_kinds: vec![0; char_count],
+            wrap_prefix: vec![0; char_count.saturating_add(1)],
+            wrap_positions: Vec::new(),
+        };
         let bytes = raw.as_bytes();
         debug_assert_eq!(cleaned.chars().count(), source_ranges.len());
         for (position, (ch, source)) in cleaned.chars().zip(source_ranges).enumerate() {
@@ -277,23 +288,51 @@ impl WrapEvidence {
                 && source.start > 0
                 && bytes.get(source.start - 1..source.end) == Some(b"\r\r\n")
             {
-                evidence.newline_positions.insert(position);
+                evidence.wrap_kinds[position] = 1;
             }
             if ch == ' '
                 && bytes.get(source.start..source.end.saturating_add(1)) == Some(b" \r")
+                && bytes.get(source.end..source.end.saturating_add(3)) != Some(b"\r\r\n")
             {
-                evidence.space_positions.insert(position);
+                evidence.wrap_kinds[position] = 2;
             }
+            if evidence.wrap_kinds[position] != 0 {
+                evidence.wrap_positions.push(position);
+            }
+            evidence.wrap_prefix[position + 1] = evidence.wrap_positions.len();
         }
         evidence
     }
 
     pub(crate) fn is_wrap_at(&self, position: usize, ch: char) -> bool {
-        match ch {
-            '\n' => self.newline_positions.contains(&position),
-            ' ' => self.space_positions.contains(&position),
-            _ => false,
+        matches!(
+            (self.wrap_kinds.get(position), ch),
+            (Some(1), '\n') | (Some(2), ' ')
+        )
+    }
+
+    /// 回傳半開區間內的局部折行標記數；用線性前綴索引避免逐行反覆掃完整命令長度。
+    pub(crate) fn wrap_count(&self, start: usize, end: usize) -> usize {
+        let start = start.min(self.wrap_kinds.len());
+        let end = end.min(self.wrap_kinds.len()).max(start);
+        self.wrap_prefix[end].saturating_sub(self.wrap_prefix[start])
+    }
+
+    /// 半開區間恰有一個標記時，回傳該標記的位置。
+    pub(crate) fn sole_wrap_in(&self, start: usize, end: usize) -> Option<usize> {
+        if self.wrap_count(start, end) != 1 {
+            return None;
         }
+        let start = start.min(self.wrap_kinds.len());
+        self.wrap_positions.get(self.wrap_prefix[start]).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_slots(&self) -> usize {
+        self.wrap_kinds
+            .len()
+            .saturating_add(self.wrap_prefix.len())
+            .saturating_add(self.wrap_positions.len())
     }
 }
 
@@ -354,54 +393,54 @@ fn strip_wrapped_command_echo_producer(
     None
 }
 
-/// 從完整 echo 行尾反向比對命令；最多回看兩倍命令長度，覆蓋命令字元與已具局部證據的折行插入。
-/// callback 驗證候選命令起點的 prompt 前綴及首個折行的欄位限制。
+pub(crate) struct WrappedEchoCandidate<'a> {
+    pub text: &'a [char],
+    pub end: usize,
+    pub command: &'a [char],
+    pub marker_position: usize,
+    pub prefix_lcp: &'a [usize],
+    pub suffix_lcp: &'a [usize],
+}
+
+#[derive(Default)]
+pub(crate) struct WrappedEchoMatchMetrics {
+    pub matcher_steps: usize,
+    pub max_marker_slots: usize,
+}
+
+/// 從 echo 行尾檢查一個可能的折行插入點。只接受一個局部來源標記；第二個標記即降階為無 echo。
+/// 候選範圍長度固定為 command 長度加一，掃描與比對各線性一次，且不配置回溯狀態。
 pub(crate) fn match_wrapped_echo_ending_at(
-    text: &[char],
-    end: usize,
-    command: &[char],
-    wraps: &WrapEvidence,
+    candidate: WrappedEchoCandidate<'_>,
     mut valid_start: impl FnMut(usize, Option<usize>) -> bool,
-    matcher_steps: &mut usize,
+    metrics: &mut WrappedEchoMatchMetrics,
 ) -> Option<usize> {
-    if command.is_empty() || end > text.len() {
+    if candidate.command.is_empty() || candidate.end > candidate.text.len() {
         return None;
     }
-    let floor = end.saturating_sub(command.len().saturating_mul(2));
-    let mut pending = vec![(end, command.len(), None::<usize>)];
-    let mut visited = HashSet::new();
-    while let Some((input_end, command_left, right_wrap_command_pos)) = pending.pop() {
-        *matcher_steps = (*matcher_steps).saturating_add(1);
-        if !visited.insert((input_end, command_left, right_wrap_command_pos)) {
-            continue;
-        }
-        if command_left == 0 {
-            if valid_start(input_end, right_wrap_command_pos) {
-                return Some(input_end);
-            }
-            continue;
-        }
-        if input_end <= floor {
-            continue;
-        }
-
-        let input_pos = input_end - 1;
-        let ch = text[input_pos];
-        let is_wrap = wraps.is_wrap_at(input_pos, ch);
-        if is_wrap {
-            let has_minimum_segment = right_wrap_command_pos.is_none_or(|right_pos| {
-                right_pos.saturating_sub(command_left) >= WRAP_MIN_SEGMENT
-            });
-            if command_left > 0 && command_left < command.len() && has_minimum_segment {
-                // 先放入折行分支，再放精確字元分支；LIFO 仍優先保留命令原字元。
-                pending.push((input_pos, command_left, Some(command_left)));
-            }
-        }
-        if ch == command[command_left - 1] {
-            pending.push((input_pos, command_left - 1, right_wrap_command_pos));
-        }
+    let candidate_len = candidate.command.len().saturating_add(1);
+    let start = candidate.end.checked_sub(candidate_len)?;
+    if !(start..candidate.end).contains(&candidate.marker_position) {
+        return None;
     }
-    None
+    metrics.max_marker_slots = metrics.max_marker_slots.max(1);
+    let split = candidate.marker_position - start;
+    if split == 0 || split >= candidate.command.len() {
+        return None;
+    }
+    let suffix_index = candidate.text.len().saturating_sub(candidate.end);
+    metrics.matcher_steps = metrics.matcher_steps.saturating_add(2);
+    if candidate.prefix_lcp.get(start).copied().unwrap_or(0) < split
+        || candidate
+            .suffix_lcp
+            .get(suffix_index)
+            .copied()
+            .unwrap_or(0)
+            < candidate.command.len() - split
+    {
+        return None;
+    }
+    valid_start(start, Some(split)).then_some(start)
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），
@@ -954,12 +993,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 || !evaluator.has_tail_prompt(&human_snapshot_at_boundary))
     });
 
-    // heartbeat／keepalive 迴圈（有 RX 就續等；整段 wait_chunk 無新 RX 即視為靜默結束）。
     let effective_timeout = match q.req.expected_duration_s {
         Some(expected) => timeout_s.max(expected),
         None => timeout_s,
     };
-    let silence_limit = timeout_s.min(30.0);
     let deadline = ctx
         .clock
         .mono_ns()
@@ -971,24 +1008,19 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let wait_re = compile_or_never(completion_pattern.as_deref().unwrap_or("(?!)"));
     let mut matched = false;
     let mut completion_stdout = None;
-    let mut uncertain_stdout = None;
-    'completion_wait: loop {
-        let now = ctx.clock.mono_ns();
-        if now >= deadline {
-            break;
-        }
-        let remaining = (deadline - now) as f64 / 1_000_000_000.0;
-        let wait_chunk = silence_limit.min(remaining);
-        let wait_deadline = deadline.min(
-            now.saturating_add(
-                secs(wait_chunk)
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64,
-            ),
-        );
-        let pre_rx = ctx.rx.snapshot_len();
-        if let Some(evaluator) = echo_evaluator.as_ref() {
-            let wait = ctx.rx.wait_for_snapshot_until_from(
+    let mut completion_timeout_snapshot: Option<RxSnapshot> = None;
+    let mut completion_silence_expired = false;
+    if let Some(evaluator) = echo_evaluator.as_ref() {
+        // 靜默 chunk 仍保留基線的提前救援行為；只有絕對 operation deadline 才走 R8 timeout 結算。
+        let silence_limit = timeout_s.min(30.0);
+        'completion_wait: loop {
+            let now = ctx.clock.mono_ns();
+            let chunk_ns = secs(silence_limit)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let wait_deadline = deadline.min(now.saturating_add(chunk_ns));
+            let pre_rx = ctx.rx.snapshot_len();
+            match ctx.rx.wait_for_snapshot_until_from(
                 pre_offset,
                 wait_deadline,
                 human_tx_before,
@@ -1003,56 +1035,125 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open,
                     ) {
                         CompletionEvaluation::Complete { stdout } => Some(stdout),
-                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => None,
+                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => {
+                            None
+                        }
                     }
                 },
-            );
-            match wait {
+            ) {
                 SnapshotWaitResult::Matched { value: stdout, .. } => {
                     completion_stdout = Some(stdout);
                     matched = true;
                     break;
                 }
                 SnapshotWaitResult::TimedOut { last_snapshot } => {
-                    if let Some(snapshot) = last_snapshot {
-                        match evaluator.evaluate(
-                            &snapshot.text,
-                            pending_human_before
-                                || snapshot.human_tx_state.generation
-                                    > human_tx_before.generation,
-                            human_tx_before.raw_line_open
-                                || snapshot.human_tx_state.raw_line_open,
-                        ) {
-                            CompletionEvaluation::Complete { stdout } => {
-                                completion_stdout = Some(stdout);
-                                matched = true;
-                                break 'completion_wait;
-                            }
-                            CompletionEvaluation::Uncertain { stdout } => {
-                                uncertain_stdout = Some(stdout);
-                            }
-                            CompletionEvaluation::Pending => uncertain_stdout = None,
-                        }
+                    if ctx.clock.mono_ns() >= deadline {
+                        completion_timeout_snapshot = last_snapshot;
+                        break;
                     }
+                    let Some(snapshot) = last_snapshot else {
+                        break;
+                    };
+                    if ctx.rx.snapshot_len() != pre_rx {
+                        continue;
+                    }
+
+                    let human_tx_state = snapshot.human_tx_state;
+                    let human_tx_seen = pending_human_before
+                        || human_tx_state.generation > human_tx_before.generation
+                        || snapshot.tx_submit_pending
+                        || ctx.rx.tx_submit_pending();
+                    let raw_half_line =
+                        human_tx_before.raw_line_open || human_tx_state.raw_line_open;
+                    if let CompletionEvaluation::Uncertain { stdout } =
+                        evaluator.evaluate(&snapshot.text, human_tx_seen, raw_half_line)
+                    {
+                        return OpOutcome::CompletionUncertain { stdout };
+                    }
+
+                    // 尚未到 operation deadline 的靜默 chunk 沿用基線恢復結果與錯誤碼。
+                    completion_silence_expired = true;
+                    break 'completion_wait;
                 }
             }
-        } else if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
-            matched = true;
-            break;
         }
-        if ctx.rx.snapshot_len() == pre_rx {
-            break;
+    } else {
+        // completion_regex／producer 路徑保留原有靜默 chunk 與恢復時序。
+        let silence_limit = timeout_s.min(30.0);
+        loop {
+            let now = ctx.clock.mono_ns();
+            if now >= deadline {
+                break;
+            }
+            let remaining = (deadline - now) as f64 / 1_000_000_000.0;
+            let wait_chunk = silence_limit.min(remaining);
+            let pre_rx = ctx.rx.snapshot_len();
+            if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
+                matched = true;
+                break;
+            }
+            if ctx.rx.snapshot_len() == pre_rx {
+                break;
+            }
         }
     }
     if !matched {
-        if let Some(stdout) = uncertain_stdout {
-            return OpOutcome::CompletionUncertain { stdout };
+        if let Some(evaluator) = echo_evaluator.as_ref() {
+            if completion_silence_expired {
+                return recover_after_failure(
+                    ctx,
+                    grant,
+                    timeout_s,
+                    command,
+                    &t.prompt_regex,
+                    pre_offset,
+                    passthrough,
+                    Some((cmd_id, confirmed_of(&report))),
+                    false,
+                );
+            }
+            let snapshot = completion_timeout_snapshot
+                .expect("absolute deadline wait returns its filtered timeout snapshot");
+            let human_tx_state = snapshot.human_tx_state;
+            let human_tx_seen = pending_human_before
+                || human_tx_state.generation > human_tx_before.generation
+                || snapshot.tx_submit_pending
+                || ctx.rx.tx_submit_pending();
+            let raw_half_line =
+                human_tx_before.raw_line_open || human_tx_state.raw_line_open;
+            // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
+            let stdout = evaluator.partial_stdout(&snapshot.text, human_tx_seen, raw_half_line);
+            if human_tx_seen {
+                return OpOutcome::CompletionUncertain { stdout };
+            }
+
+            // 沒有 human 交錯時維持既有 Ctrl-C／Ctrl-D 救援與 session 收斂；外層命令仍按 deadline 回 timeout。
+            return match recover_after_failure(
+                ctx,
+                grant,
+                timeout_s,
+                command,
+                &t.prompt_regex,
+                pre_offset,
+                passthrough,
+                Some((cmd_id, confirmed_of(&report))),
+                false,
+            ) {
+                OpOutcome::Recovered { key, .. } => OpOutcome::CompletionDeadlineTimeout {
+                    stdout,
+                    recovery_action: Some(key),
+                    recovered: true,
+                },
+                OpOutcome::PromptTimeout { .. } => OpOutcome::CompletionDeadlineTimeout {
+                    stdout,
+                    recovery_action: None,
+                    recovered: false,
+                },
+                other => other,
+            };
         }
         if q.req.is_trusted_human() {
-            // `_recover_after_failure` human 分支（DF-02／OD-74，Python `session_manager.py:6988-7012`）：可信 human
-            // ＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的 `HumanConsole`（rulings s2 D5），永不看
-            // source 字首；不送救援鍵（CTRL_C／CTRL_D），actor 依前景快照改開 human lease。明寫 `human:<x>` 的
-            // RPC（`trusted_human=false`）照常進下方 agent 救援。
+            // `_recover_after_failure` human 分支（DF-02／OD-74）：不送救援鍵，actor 依前景快照升格 human lease。
             return OpOutcome::PromptTimeout {
                 stdout: clean_text(&ctx.rx.text_from(pre_offset)),
             };

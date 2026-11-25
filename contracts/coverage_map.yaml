@@ -100,12 +100,16 @@ entries:
     nodeids:
     - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
     - cargo:sw-core::command_completion::tests::echo_boundary_preserves_command_like_output_lines
+    - cargo:sw-core::command_completion::tests::i294_r8_ambiguous_fold_search_has_linear_work_bound
     - cargo:sw-core::command_completion::tests::i294_end_anchored_prompt_prefix_keeps_echo_stdout_boundary
     - cargo:sw-core::command_completion::tests::i294_long_rx_echo_search_is_bounded
     - cargo:sw-core::command_completion::tests::no_echo_human_tx_is_uncertain_but_clean_no_echo_tail_prompt_completes
     - cargo:sw-core::command_completion::tests::raw_half_line_is_not_accepted_as_clean_echo
+    - cargo:sw-core::command_completion::tests::i294_r8_snapshot_evaluator_that_finishes_after_deadline_is_timed_out
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::command_boundary_retries_after_would_block
     - cargo:sw-core::tx_writer::observed_tx_submit_tests::human_tx_observation_tracks_only_accepted_segments
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::i294_r8_os_accepted_before_deadline_is_pending_until_observer_registration
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::i294_r8_submit_started_after_timeout_is_not_in_deadline_snapshot
     - cargo:sw-core::command_exec::i294_background_uses_command_echo_boundary
     - cargo:sw-core::command_exec::i294_completion_before_deadline_still_completes
     - cargo:sw-core::command_exec::i294_late_echo_and_prompt_after_deadline_do_not_complete
@@ -116,6 +120,10 @@ entries:
     - cargo:sw-core::command_exec::i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx
     - cargo:sw-core::command_exec::i294_no_echo_without_pending_human_tx_uses_tail_prompt
     - cargo:sw-core::command_exec::i294_prompt_before_command_tx_is_outside_no_echo_window
+    - cargo:sw-core::command_exec::i294_r8_completion_decided_before_deadline_remains_done
+    - cargo:sw-core::command_exec::i294_r8_expired_before_first_wait_returns_timeout_partial
+    - cargo:sw-core::command_exec::i294_r8_timeout_after_deadline_snapshot_keeps_partial_and_baseline_recovery
+    - cargo:sw-core::command_exec::i294_r8_tx_submit_pending_at_settlement_suppresses_recovery
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_poison_next_agent_echo
     - cargo:sw-core::command_exec::i294_shipped_prefix_prompts_handle_split_and_co_packed_rx

@@ -73,6 +73,8 @@ struct RxWindow {
     completion_deadline: Option<Mono>,
     command_tx_boundary: Option<(u64, CommandTxBoundary)>,
     tx_submit_pending: bool,
+    tx_submit_pending_started_at: Option<Mono>,
+    completion_tx_submit_crossed_deadline: bool,
 }
 
 impl RxWindow {
@@ -528,6 +530,24 @@ impl RxShared {
         human_tx_state(&window)
     }
 
+    /// 讀取目前是否有 OS submit 尚未完成觀察登錄。
+    pub(crate) fn tx_submit_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .tx_submit_pending
+    }
+
+    /// 測試控制尚未完成的 submit 窗口；用於重現 OS submit 與 human TX observer 登錄間的交錯。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_tx_submit_pending_for_test(&self, pending: bool) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.tx_submit_pending = pending;
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
+    }
+
     #[cfg(feature = "test-fakes")]
     pub fn record_human_tx_for_test(&self, payload: &[u8], clock: &dyn Clock) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -562,12 +582,19 @@ impl RxShared {
                     .saturating_add(window.text.chars().count() as u64)
             });
             window.tx_submit_pending = true;
+            window.tx_submit_pending_started_at = Some(clock.mono_ns());
             (boundary, human_rx_offset)
         };
-        let pending_guard = TxSubmitPendingGuard { rx: self };
+        let mut pending_guard = TxSubmitPendingGuard {
+            rx: self,
+            clock,
+            human_submit: human_payload.is_some(),
+            accepted_or_pending: false,
+        };
         let step = submit();
         let accepted = matches!(&step, SubmitStep::Accepted(count) if *count > 0);
         let submitted = accepted || matches!(&step, SubmitStep::Pending);
+        pending_guard.accepted_or_pending = submitted;
         let mut boundary_recorded = command_boundary_recorded;
 
         if submitted {
@@ -666,6 +693,7 @@ impl RxShared {
         window.clear_rx_events();
         window.completion_capture_op_id = Some(op_id);
         window.completion_deadline = None;
+        window.completion_tx_submit_crossed_deadline = false;
     }
 
     pub(crate) fn set_command_completion_deadline(&self, op_id: u64, deadline: Mono) {
@@ -674,6 +702,7 @@ impl RxShared {
             return;
         }
         window.completion_deadline = Some(deadline);
+        window.completion_tx_submit_crossed_deadline = false;
         window.rx_events.retain(|event| event.mono_ns <= deadline);
         window.rx_event_chars = window
             .rx_events
@@ -687,6 +716,7 @@ impl RxShared {
         if window.completion_capture_op_id == Some(op_id) {
             window.completion_capture_op_id = None;
             window.completion_deadline = None;
+            window.completion_tx_submit_crossed_deadline = false;
             window.clear_rx_events();
         }
         if window
@@ -852,6 +882,7 @@ impl RxShared {
             drop(window);
 
             let value = matches(&snapshot);
+            let evaluated_at = clock.mono_ns();
             #[cfg(feature = "test-fakes")]
             {
                 if let Some(hook) = self
@@ -871,6 +902,12 @@ impl RxShared {
                 );
                 self.snapshot_wait_checks.fetch_add(1, Ordering::AcqRel);
                 self.changed.notify_all();
+            }
+            // 以 evaluator 返回判定的時間結算：計算跨過 deadline 是 timeout；判定已在期限內完成，
+            // 後續 waiter 排程或 barrier 延遲不得把它改判成 timeout。
+            if evaluated_at >= deadline {
+                window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                break;
             }
             if let Some(value) = value {
                 #[cfg(feature = "test-fakes")]
@@ -1013,6 +1050,8 @@ pub struct RxSnapshot {
     pub watermark: (u64, u64),
     /// 同一個 RX watermark 下的 human TX 狀態。
     pub human_tx_state: HumanTxState,
+    /// snapshot 建立時是否仍有尚未完成 observer 登錄的 OS submit。
+    pub tx_submit_pending: bool,
     /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
     pub trimmed_before_from: bool,
 }
@@ -1044,15 +1083,35 @@ pub struct CommandTxBoundary {
 
 struct TxSubmitPendingGuard<'a> {
     rx: &'a RxShared,
+    clock: &'a dyn Clock,
+    human_submit: bool,
+    accepted_or_pending: bool,
 }
 
 impl Drop for TxSubmitPendingGuard<'_> {
     fn drop(&mut self) {
-        self.rx
+        let completed_at = self.clock.mono_ns();
+        let mut window = self
+            .rx
             .inner
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .tx_submit_pending = false;
+            .unwrap_or_else(|error| error.into_inner());
+        if self.human_submit
+            && self.accepted_or_pending
+            && window.completion_deadline.is_some_and(|deadline| {
+                window
+                    .tx_submit_pending_started_at
+                    .is_some_and(|started_at| started_at <= deadline && completed_at > deadline)
+            })
+        {
+            // Submit 在 deadline 前開始、deadline 後才完成觀察登錄；即使 waiter 取得鎖前 pending 已清除，
+            // deadline snapshot 仍須把這段未結算的 human TX 視為窗口內活動。
+            window.completion_tx_submit_crossed_deadline = true;
+        }
+        window.tx_submit_pending = false;
+        window.tx_submit_pending_started_at = None;
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
         self.rx.wake_all();
     }
 }
@@ -1064,6 +1123,7 @@ fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
         text: window.text_from(base).to_string(),
         watermark: window.watermark,
         human_tx_state: human_tx_state(window),
+        tx_submit_pending: window.tx_submit_pending,
         trimmed_before_from: base > from,
     }
 }
@@ -1103,6 +1163,7 @@ fn snapshot_from_window_at(
             .map(|event| event.watermark)
             .unwrap_or(watermark_before),
         human_tx_state,
+        tx_submit_pending: window.tx_submit_pending || window.completion_tx_submit_crossed_deadline,
         trimmed_before_from: base > from,
     }
 }
@@ -1123,6 +1184,7 @@ fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
             text: String::new(),
             watermark: window.watermark,
             human_tx_state,
+            tx_submit_pending: window.tx_submit_pending,
             trimmed_before_from: false,
         }
     } else {
