@@ -246,6 +246,30 @@ loaded when it started (`code_fingerprint`) and where it loaded it from
 (`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
 every other command prints a one-line warning on stderr (stdout JSON is unchanged);
 `serialwrap doctor` reports it as the advisory check `daemon_code_current`.
+Setup never overwrites an existing profile, so fields that a later release adds
+to the shipped templates are missing from an older live `profiles/default.yaml`;
+Rust 0.5.1 adds the Rust-only advisory doctor check `profile_template_fields`.
+It compares the shipped `profiles/default.yaml` with the single on-disk
+`PROFILE_DIR/default.yaml`, and checks only top-level key presence for templates
+present in both files; values and nested fields are not compared. Empty and
+`null` values count as present. Its structured status is `matched`,
+`missing_fields`, `not_materialized`, `unavailable`, or `no_common_templates`;
+the payload also reports `missing_fields`, `compared_templates`, and `reason`.
+An unavailable comparison sets this check's `ok` to false, while the advisory
+does not change the overall doctor result or exit code. This check does not
+report whether a running daemon has loaded or reloaded the file. OD-33 uses a
+version-controlled scenario policy selected before doctor runs and passes only
+when one comparable check has the exact expected missing-field mapping;
+unavailable results and every unexpected difference fail the upgrade gate.
+Under migration policy `p290-template-migration-v1`, setup adds only
+`timeout_recovery_keys: [CTRL_C]` to a managed `platform: prpl` template when
+that key is absent, including renamed templates. Existing values (including
+`null`) are preserved, and this field is inserted without rewriting other
+profile bytes. User profiles and system profiles are migrated before system
+assets are copied; setup reports successful insertions on stderr without
+changing its JSON response. A failed file remains byte-for-byte intact, and a
+later setup can continue. Downgrade retains the inserted field; older Python
+releases ignore it. Other platforms and targets are not migrated.
 When the systemd service is active and the fingerprints differ, `serialwrap setup`
 restarts the service for you and prints a `daemon_code` field with the result.
 For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
@@ -424,10 +448,21 @@ human command authority.
 
 | Prefix | Class | On command timeout (no prompt came back) |
 |--------|-------|------------------------------------------|
-| `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Sends CTRL-C, then CTRL-D, to get a prompt back — CTRL-D **logs out** a console sitting at a shell; no keys inside the boot quiet window |
+| `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Uses the profile's `timeout_recovery_keys` in order (default `[CTRL_C]`); no keys inside the boot quiet window |
 | Bare RPC source `human` / `human:` | Normalized to `human:cli`; human per OD-74 | Sends **no keys**; command timeout promotes to an interactive lease; passes the human gate |
 | Explicit `human:<name>` (including `human:cli`) | Display class is human; agent per DF-02 | Agent timeout and boot quiet behavior; `source_class` does not grant permission |
 | `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
+
+The recovery keys come from `timeout_recovery_keys` in the target or template.
+An omitted or `null` template value defaults to `[CTRL_C]`; an omitted or `null`
+target value inherits the template. An explicit list replaces the inherited
+list, and `[]` sends no recovery keys. The shipped `prpl-template` explicitly
+sets `[CTRL_C]`: Ctrl-D on a logged-in ash prompt is EOF and logs the console
+out. If no configured key restores the prompt, the command returns
+`PROMPT_TIMEOUT` and the session moves to `ATTACHED`. Any general recovery
+invalidates deferred human input, including when the list is empty. The same
+list is used by `session recover` on a `READY` session. Unknown names,
+duplicates or a non-list value fail profile loading.
 
 - Only the raw RPC values `human` and `human:` (no name) are **normalized to `human:cli`**
   and receive the OD-74 human gate and timeout behavior; successful responses carry `source`
@@ -892,7 +927,27 @@ automatically, no `--endpoint` needed, #131). Each session exposes a human
 console as a loopback TCP listener that speaks **Telnet** — connect with
 TeraTerm (Service: Telnet) or PuTTY (Telnet) for char-at-a-time interaction
 with remote echo; the `host:port` is shown as `console_endpoint` in
-`session list`.
+`session list`. The first Telnet console holds raw ownership just like a
+`console-attach`ed minicom on Linux. In the Rust 0.5.1 daemon (BC-23), a
+session-layer mirror lease makes `self-test` report `human_attached` /
+`human_active`, applies idle soft-preempt and reprobe deferral, and preserves
+agent interactive arbitration. A default line `command.submit` with bare
+`--source human` finishes with `SESSION_INTERACTIVE_BUSY` and no UART write
+while that human lease exists. An explicit `session.interactive_close` for a still-registered TCP client's
+human lease, whether a mirror or regular lease, prevents sync from immediately
+recreating its mirror. Existing grant paths clear that revocation for the
+console's current lifetime and keep their pre-package lease representation;
+`interactive_open` remains a regular `Insert` lease without a mirror marker. Detach, EOF, stale pruning and release close-all clear revocation when
+the lifetime leaves the session console table, without waiting for EOF. During
+flash, handoff or release guards, TCP
+mirror leases are not created, replayed or promoted; existing mirror records
+are removed through the sync path while raw ownership and input routing follow
+the pre-package Rust behavior. After a guard opens, a TCP human may briefly
+have no mirror lease until the next sync, and agent commands follow the
+existing arbitration. PTY and Python behavior are unchanged. `file.push` and
+`file.pull` keep their agent execution policy and normal transfer gates (#275).
+This package verifies Linux native TCP with fake UART/WAL only; native Windows
+and TeraTerm smoke are scheduled separately.
 
 ```powershell
 serialwrap.exe daemon start        # spawns serialwrapd.exe detached, binds tcp loopback
@@ -2190,7 +2245,7 @@ serialwrap doctor                # 驗證環境
 - 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
 - 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
-- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。Rust 0.5.1 新增 Rust-only advisory `profile_template_fields`；它只比對出貨 `profiles/default.yaml` 與指定目錄的單一 `default.yaml`，對共同 template 比較頂層欄位是否存在，不比較值與巢狀欄位，空值與 `null` 仍算存在。結果以 `matched`、`missing_fields`、`not_materialized`、`unavailable`、`no_common_templates` 表示，另帶 `missing_fields`、`compared_templates`、`reason`；不可比較時該 check 為 `ok=false`，但 advisory 不改整體 doctor 結果或 exit code，也不代表 daemon 已載入／重讀檔案。OD-33 依執行前選定的受版控情境，只在 check 唯一、可比較且缺漏映射精確相等時放行。p290 的 `p290-template-migration-v1` 只在管理目錄中缺 `timeout_recovery_keys` 的 `platform: prpl` template 插入 `[CTRL_C]`，含使用者改名的 template；其他平台與 target 不遷移。已有值（包含 `null`）不覆寫，採精確位元組插入並於 stderr 回報；檔案失敗則 setup 失敗且保留該檔原文，降級也保留補入欄位。systemd-system 先遷移 `/etc/serialwrap/profiles` 再以 no-clobber 複製套件資產。服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -2509,7 +2564,7 @@ broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown 
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷；Rust daemon 的 session profile 設了 `max_console_line_chars` 時，超過的 `cmd submit` 改在提交時回 `CMD_TOO_LONG`（`limit` 為該 profile 的值；這個上限以 profile 設定為準，不在 `limits` 欄位中）。broker 的全域上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
-**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
+**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程。profile 的 `timeout_recovery_keys` 決定送鍵順序；語言層預設為 `[CTRL_C]`，出貨的 `prpl-template` 也明列 `[CTRL_C]`。target 未設定或為 `null` 時繼承 template；template 未設定或為 `null` 時使用預設。明確設定 `[CTRL_C, CTRL_D]` 才會送 Ctrl-D（它在已登入 shell 等於登出）；`[]` 不送任何救援鍵。救援流程一律使 deferred human 輸入失效；若沒有救回 prompt，仍回 `PROMPT_TIMEOUT`、session 轉 `ATTACHED`。`READY` 時的 `session recover` 使用同一清單。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
 ```bash
 serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
@@ -2555,7 +2610,7 @@ daemon 依 RPC 原始來源決定命令逾時（沒等到 prompt）時怎麼處�
 
 | 前綴 | 歸類 | 命令逾時時 |
 |------|------|-----------|
-| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 CTRL-D **登出**；boot quiet window 內不送按鍵 |
+| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 依 profile 的 `timeout_recovery_keys` 順序送鍵（預設只有 CTRL-C）；boot quiet window 內不送按鍵 |
 | RPC 原始來源恰為 bare `human`／`human:` | 正規化為 `human:cli`；依 OD-74 為 human | **不送任何按鍵**，命令逾時升級成 interactive lease；可通過 human gate |
 | 明寫 `human:<名>`（包括 `human:cli`） | 顯示分類為 human；依 DF-02 為 agent | 逾時與 boot quiet gate 照 agent 處理；`source_class` 不授權 |
 | `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
@@ -2832,10 +2887,10 @@ serialwrap session recover --selector COM0
 recover 行為分成三種：
 
 1. `ATTACHED` 且 bridge 仍存活：先直接 re-probe 現有 bridge，成功就回 `READY`
-2. `READY`：走 `Ctrl-C` → `Ctrl-D`
+2. `READY`：依 profile 的 `timeout_recovery_keys` 順序送鍵（預設只有 `Ctrl-C`；`[]` 不送鍵）
 3. bridge 已不存在但裝置還在：直接 reattach
 
-若 `READY` 路徑中的 `Ctrl-C` / `Ctrl-D` 都救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。
+若清單內的鍵救不回 prompt，session 會降級成 `ATTACHED`，保留 bridge 與 console，交由 human/minicom 接手。進入 recovery 時 deferred human 輸入一律失效。
 
 recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列中**尚未啟動**的命令會以 `status=error`、`error_code: FLUSHED_BY_RECOVERY` 終結（#128）。此類命令**從未送進 UART**——client 收到即代表未執行，應於 session 回 `READY` 後重送；正在執行中（in-flight）的命令不受影響，仍由 worker 以真實結果終結。flush 同時立即釋放 per-session pending 額度，stale 佇列記錄不再永久佔額度、把 session 卡死在 `SESSION_QUEUE_FULL` 直到 daemon 重啟。
 
@@ -3000,7 +3055,7 @@ serialwrap wal current-seq
   - 後端自動依平台選擇，`SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）可覆寫；`pyserial` 為 Windows 後端執行期依賴（`pyproject` `sys_platform=='win32'`）。
 - **human console（PORT-2）**
   - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
-  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。
+  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。**Rust 0.5.1（BC-23）**在 session 層鏡像 TCP raw owner 的 lease，令 `self-test` 回報 `human_attached`／`human_active`，並套用閒置 soft preempt、agent interactive 仲裁與 reprobe 暫緩；明確 `interactive_close` 關閉仍登記 TCP client 的 human lease（不論是 mirror 或普通 lease），同步不會立即補回 mirror。self-heal、retained／stash 還原或 `interactive_open` 等既有授權路徑重新授予該 client 時，以目前 console lifetime 清除撤權，並維持各路徑修前的 Lease／LeaseIndex 記法；`interactive_open` 的普通 human lease 仍是 `Insert`，不帶 mirror 標記。detach、EOF、stale prune 與 release close-all 在 lifetime 離開 console table 時立即清除撤權，不必等待 EOF；已有 human lease 時，預設 line mode 的 bare `--source human` `command.submit` 終態為 `SESSION_INTERACTIVE_BUSY` 且零 UART TX。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease，既有 mirror 簿記由同步路徑撤除，raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由維持修前 Rust 基線；guard 開放至下一次同步之間 TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。PTY 與 Python 語意不變。`file.push`／`file.pull` 仍按 agent 路徑及既有傳輸 gate 執行。此包僅驗證 Linux native TCP listener 搭配 fake UART，Windows 原生與 Tera Term smoke 另行安排。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
 - **Rust daemon 的 console 後端（Slice 2.2）**：依平台選擇——Linux/WSL 為 PTY、Windows 為 loopback Telnet listener；`SERIALWRAP_CONSOLE_BACKEND`（`auto`／`pty`／`tcp`，不分大小寫）可覆寫，Linux 上設 `tcp` 即走與 Windows 相同的 Telnet listener（每個 bridge 一個 `127.0.0.1` ephemeral port，recover／clear 後重新綁定），`session console-attach` 回 `{"client_id": null, "endpoint": "127.0.0.1:<port>", "transport": "tcp", "protocol": "telnet"}` 且不開 lease（OD-85），`session list` 每列都有 `console_endpoint`。listener 只綁 `127.0.0.1`：**同機任何本機使用者都能連線**（OD-12 信任範圍），請部署在單人工作站。選配 com0com Serial console 於 `config.yaml` 的 `windows.serial_console`（`{<DUT COM>: {console_port, peer_port}}`）設定；對應 DUT bridge 與 TCP listener 建立後，daemon 開啟 `console_port`，外接終端連接 `peer_port`。兩端埠自動排除於裝置列舉，格式錯誤時整個鍵忽略並寫一筆 WARNING。
 

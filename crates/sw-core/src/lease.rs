@@ -27,6 +27,12 @@ pub struct InteractiveLease {
     pub suspended_human: bool,
     /// P6 增補 #14（07 Task 7）：human lease 的 peer 消失時點（peer-loss grace 起點）。
     pub peer_lost_at: Option<Mono>,
+    /// p279：TCP raw owner 的 session 鏡像以 client lifetime 識別；非 TCP／一般 lease 為 None。
+    /// 只供 actor 內部生命週期管理，不加入 LeaseContext 或任何 RPC/state 輸出。
+    pub mirror_client_lifetime: Option<u64>,
+    /// p279：soft-preempt 的 agent lease 記下被 stash TCP mirror 的來源 lifetime；
+    /// A EOF 清掉 stash 後仍須辨識 B 接班屬 TCP mirror 情境，不能外溢到 PTY stash。
+    pub preempted_tcp_mirror_lifetime: Option<u64>,
 }
 
 impl InteractiveLease {
@@ -49,6 +55,8 @@ impl InteractiveLease {
             recovery_mode,
             suspended_human: false,
             peer_lost_at: None,
+            mirror_client_lifetime: None,
+            preempted_tcp_mirror_lifetime: None,
         }
     }
 

@@ -53,6 +53,60 @@ entries:
     - cargo:sw-cli::mgmt_supervision_switch::p277_windows_task_switch_releases_install_lock_after_success_and_refusal
     - cargo:sw-cli::mgmt_supervision_switch::p277_windows_task_switch_waits_for_install_transaction
     owner_phase: P4
+  bc:BC-08:
+    nodeids:
+    - cargo:sw-cli::mgmt_doctor::profile_template_asset_errors_are_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_custom_templates_and_no_common
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_drift
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_structure_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_utf8_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_yaml_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_is_read_only
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_matches_shipped_asset
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_not_materialized
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_p290_transition
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_presence_only
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_unreadable_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_windows_payload
+    - cargo:sw-cli::sw_cli::doctor_cmd::profile_template_fields_tests::profile_template_asset_errors_are_unavailable
+    owner_phase: P4
+  bc:BC-09:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::setup_backfills_only_missing_prpl_template_keys_without_rewriting_other_bytes
+    - cargo:sw-cli::mgmt_setup::setup_entry_backfills_and_reports_without_changing_json_shape
+    - cargo:sw-cli::mgmt_setup::setup_force_preserves_each_user_timeout_recovery_value_byte_for_byte
+    - cargo:sw-cli::mgmt_setup::setup_force_preserves_explicit_timeout_recovery_keys
+    - cargo:sw-cli::mgmt_setup::setup_migrates_supported_template_shapes_and_preserves_merge_values
+    - cargo:sw-cli::mgmt_setup::setup_migration_failure_preserves_failed_file_and_reports_completed_files
+    - cargo:sw-cli::mgmt_setup::setup_system_staging_preserves_keys_and_migrates_old_prpl_profiles
+    - cargo:sw-cli::mgmt_update::p290_rollback_preserves_migrated_prpl_profile
+    - cargo:sw-core::timeout_recovery_keys::cancel_after_first_key_blocks_remaining_keys
+    - cargo:sw-core::timeout_recovery_keys::ctrl_c_only_never_sends_ctrl_d
+    - cargo:sw-core::timeout_recovery_keys::ctrl_c_only_still_recovers_with_ctrl_c
+    - cargo:sw-core::timeout_recovery_keys::default_keys_still_send_ctrl_d_after_ctrl_c_fails
+    - cargo:sw-core::timeout_recovery_keys::empty_key_recovery_invalidates_deferred_input_before_resume
+    - cargo:sw-core::timeout_recovery_keys::empty_list_sends_no_keys
+    - cargo:sw-core::timeout_recovery_keys::explicit_two_key_profile_can_still_send_ctrl_d
+    - cargo:sw-core::timeout_recovery_keys::list_order_is_send_order
+    - cargo:sw-core::timeout_recovery_keys::quiet_between_keys_blocks_second_key
+    - cargo:sw-core::timeout_recovery_keys::ready_recover_ctrl_c_only_never_sends_ctrl_d
+    - cargo:sw-core::timeout_recovery_keys::ready_recover_empty_list_goes_straight_to_force
+    - cargo:sw-core::timeout_recovery_keys::recovery_start_keeps_new_epoch_input_after_successful_key
+    - cargo:sw-core::timeout_recovery_keys::shipped_prpl_template_sends_ctrl_c_only
+    - cargo:sw-core::timeout_recovery_keys::stale_recovery_start_does_not_invalidate_new_connection_input
+    - cargo:sw-core::timeout_recovery_keys::stale_mailbox_input_after_recovery_is_not_replayed
+    - cargo:sw-core::timeout_recovery_keys::successful_key_recovery_invalidates_deferred_input_before_resume
+    - cargo:sw-core::timeout_recovery_keys::target_override_replaces_template_keys
+    - cargo:sw-daemon::dispatch::p290_rpc_pinned_dynamic_recover_uses_pin_keys_for_uart_and_wal
+    - cargo:sw-daemon::dispatch::p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal
+    - cargo:sw-daemon::dispatch::p290_rpc_unpinned_dynamic_command_and_recover_use_template_keys_for_uart_and_wal
+    - cargo:sw-pal::fs_ops_p7::atomic_replace_preserves_named_access_acl_for_other_user
+    - cargo:sw-proto::timeout_recovery_keys::invalid_keys_are_rejected_without_fallback
+    - cargo:sw-proto::timeout_recovery_keys::language_default_and_null_use_ctrl_c_only
+    - cargo:sw-proto::timeout_recovery_keys::rust_only_contract_matrix_matches_generated_golden
+    - cargo:sw-proto::timeout_recovery_keys::target_null_inherits_and_empty_list_overrides
+    - cargo:sw-proto::timeout_recovery_keys::template_and_target_key_matrix
+    owner_phase: P7
   bc:BC-10:
     nodeids:
     - cargo:sw-core::arbiter::console_line_limit_rejects_with_exact_response_and_no_enqueue
@@ -118,6 +172,24 @@ entries:
     - cargo:sw-cli::mgmt_daemon::autostart_not_for_daemon_status
     - cargo:sw-cli::mgmt_update::update_release_then_rollback_keeps_released
     owner_phase: P5
+  bc:BC-23:
+    nodeids:
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_lifecycle_and_guards
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_tracks_active_suspended_pending
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_does_not_mutate_owner_fence
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_eof_reconnect_preserves_new_owner
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_agent_open_arbitration
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_preempt_reconnect_preserves_new_owner
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_foreground_refresh_keeps_lease
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_reprobe_respects_activity_window
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_secondary_line_respects_lease_busy
+    - cargo:sw-core::tcp_console_lease::tcp_mirror_interactive_close_revokes_regular_human_lease
+    - cargo:sw-core::tcp_guard_off_baseline::guard_off_tcp_raw_matches_pre_package_baseline
+    - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_selftest_and_arbitration
+    - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_eof_reconnect
+    - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_foreground_refresh_and_replay
+    - cargo:sw-daemon::tcp_console_lease::p279_tcp_rpc_source_policy
+    owner_phase: P6
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
@@ -2738,9 +2810,12 @@ l1_only_approvals:
   "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-06": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-08": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-09": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-13": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-17": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-25 Python 凍結）：bc:BC-17 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-23": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

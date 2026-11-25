@@ -2393,6 +2393,44 @@ fn rollback_keeps_current_state_same_schema() {
 }
 
 #[test]
+fn p290_rollback_preserves_migrated_prpl_profile() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
+        .with_supervisor_state("windows-task", true, true)
+        .with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_new_daemon_reporting_version("0.4.0");
+    t.with_previous_backup_mode("windows-task");
+    let env_snap = sw_proto::runtime_paths::EnvSnapshot::from_pairs(vec![]);
+    let dirs = sw_cli::setup_cmd::user_dirs(&env_snap, &t.home());
+    std::fs::create_dir_all(&dirs.config.join("profiles")).unwrap();
+    let profile = dirs.config.join("profiles/default.yaml");
+    std::fs::write(
+        &profile,
+        b"profiles:\n  renamed-prpl:\n    platform: prpl\n    prompt_regex: x\n",
+    )
+    .unwrap();
+    t.with_cli_ctx(|ctx| {
+        sw_cli::setup_cmd::materialize_assets(ctx, &dirs, false).unwrap();
+    });
+    let migrated = std::fs::read(&profile).unwrap();
+    assert!(migrated
+        .windows(b"timeout_recovery_keys: [CTRL_C]".len())
+        .any(|bytes| bytes == b"timeout_recovery_keys: [CTRL_C]"));
+
+    let (rc, out, _) = t.run(&["setup", "--rollback"]);
+    assert_eq!(rc, 0, "rollback 失敗：{out}");
+    assert_eq!(json(&out)["rollback"]["to_version"], "0.4.0");
+    assert_eq!(
+        std::fs::read(profile).unwrap(),
+        migrated,
+        "降級必須保留已遷移欄位與其餘 profile bytes"
+    );
+}
+
+#[test]
 fn update_release_then_rollback_keeps_released() {
     let t = TestEnv::windows()
         .with_install_root()

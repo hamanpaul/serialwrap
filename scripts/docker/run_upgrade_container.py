@@ -30,6 +30,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -75,6 +76,26 @@ def parse_proc_cmdline(data: bytes) -> list[str]:
     if not payload:
         return []
     return [part.decode("utf-8", "replace") for part in payload.split(b"\0")]
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    """以串流方式計算 CLI 位元組摘要，證明安裝副本與 bundle 候選一致。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_exact_path_file(file_name: str, path_value: str) -> pathlib.Path | None:
+    """依 PATH 順序找第一個名稱完全相同的檔案，不套用平台可執行副檔名規則。"""
+    if not path_value:
+        return None
+    for raw_entry in path_value.split(os.pathsep):
+        candidate = pathlib.Path(raw_entry or os.curdir) / file_name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _read_proc_exe_as_user(proc_exe: pathlib.Path, user: str) -> str:
@@ -211,11 +232,20 @@ ATTACHED_BY_ID = pathlib.Path("/dev/serial/by-id/usb-UPGRADE_ATTACHED-if00-port0
 class Driver:
     def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path, *,
                  scenario: str = "upgrade", installer: pathlib.Path | None = None,
-                 bundle_tarball: pathlib.Path | None = None) -> None:
+                 bundle_tarball: pathlib.Path | None = None,
+                 profile_policies: dict[str, dict[str, Any]],
+                 profile_policy_evidence: dict[str, Any]) -> None:
+        if set(profile_policies) != {"old", "new", "downgrade"}:
+            raise ValueError("Driver 必須保存 old/new/downgrade 三種明確 profile policy")
         self.mode = mode
         self.scenario = scenario
         self.installer = installer
         self.bundle_tarball = bundle_tarball
+        self.profile_policies = profile_policies
+        self.profile_policy_evidence = profile_policy_evidence
+        self.doctor_profile_dir = SYSTEM_PROFILE_DIR if mode == "systemd-system" else CONFIG / "profiles"
+        self.doctor_evidence: list[dict[str, Any]] = []
+        self.cli_asset_evidence: list[dict[str, Any]] = []
         self.flag = {"systemd-user": "--user", "systemd-system": "--system"}.get(mode, "--on-demand")
         self.setup_args = [self.flag, "--with-sudo"] if mode == "systemd-system" else [self.flag]
         self.wheel = wheel
@@ -225,6 +255,8 @@ class Driver:
         self.rows: list[dict[str, Any]] = []
         self.observations: list[dict[str, Any]] = []
         self.samples: list[tuple[float, list[int]]] = []
+        self.cfg_before_bytes: dict[str, bytes] = {}
+        self.cfg_after_migration: dict[str, str] | None = None
         self._stop = threading.Event()
         self.proc_root = pathlib.Path("/proc")
         self.stop_wait_s = STOP_WAIT_S
@@ -233,6 +265,7 @@ class Driver:
             "HOME": str(HOME), "USER": USER, "LOGNAME": USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
             "XDG_RUNTIME_DIR": "/run/user/1000", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
             "PATH": f"{BIN}:/usr/local/bin:/usr/bin:/bin",
+            "SERIALWRAP_PROFILE_DIR": str(self.doctor_profile_dir),
         }
 
     # ---------- 基礎 ----------
@@ -350,8 +383,193 @@ class Driver:
         sessions = self.parse(self.sw("session", "list", label="session list")) or {}
         return {"aliases": aliases.get("aliases") or [], "sessions": sessions.get("sessions") or []}
 
-    def doctor(self, label: str) -> dict[str, Any] | None:
+    def doctor(self, label: str, profile_policy: dict[str, Any]) -> dict[str, Any] | None:
+        self.doctor_evidence.append({
+            "label": label,
+            "profile_path": str(self.doctor_profile_dir),
+            "policy_id": profile_policy.get("policy_id"),
+            "policy_phase": profile_policy.get("phase"),
+            "migration_policy_id": profile_policy.get("migration_policy_id"),
+        })
         return self.parse(self.sw("doctor", label=label))
+
+    def verify_candidate_p290_asset(self, target_asset: pathlib.Path) -> dict[str, Any]:
+        """驗證安裝中的 CLI 與 bundle 候選位元組一致，再用該 CLI 確認內嵌 p290 key。"""
+        field = "timeout_recovery_keys"
+        candidate_version = self.bundle / "versions" / NEW_VERSION
+        cli_name = self.new_cli.name
+        candidate_cli = candidate_version / "bin" / cli_name
+        active_cli = find_exact_path_file(cli_name, self.env.get("PATH", ""))
+        evidence: dict[str, Any] = {
+            "candidate_cli_path": str(candidate_cli),
+            "configured_cli_path": str(self.new_cli),
+            "active_cli_path": str(active_cli) if active_cli else None,
+            "installed_version_dir": None,
+            "target_asset_path": str(target_asset),
+            "field": field,
+            "profile_check": None,
+            "reported_missing_field": False,
+            "candidate_cli_sha256": None,
+            "active_cli_sha256": None,
+        }
+
+        resolution_errors: dict[str, dict[str, str]] = {}
+
+        def resolve_evidence(
+            label: str,
+            path: pathlib.Path,
+            evidence_key: str,
+        ) -> pathlib.Path | None:
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError as exc:
+                resolution_errors[label] = {"path": str(path), "error": type(exc).__name__}
+                return None
+            evidence[evidence_key] = str(resolved)
+            return resolved
+
+        configured_real = resolve_evidence("configured_cli", self.new_cli, "configured_cli_path")
+        candidate_real = resolve_evidence("candidate_cli", candidate_cli, "candidate_cli_path")
+        candidate_version_real = resolve_evidence(
+            "candidate_version_dir", candidate_version, "candidate_version_dir",
+        )
+        bundle_real = resolve_evidence("bundle_dir", self.bundle, "bundle_dir")
+        active_real = resolve_evidence("active_cli", active_cli, "active_cli_path") if active_cli else None
+        installed_version_real = None
+        if active_real is not None:
+            installed_version_real = resolve_evidence(
+                "installed_version_dir", active_real.parent.parent, "installed_version_dir",
+            )
+        if resolution_errors:
+            first_error = next(iter(resolution_errors.values()))["error"]
+            return uc.row("candidate_cli_p290_asset", "FAIL", "無法確認候選 CLI 路徑",
+                          **evidence, path_error=first_error,
+                          path_resolution_errors=resolution_errors)
+        if candidate_real != configured_real:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
+                          **evidence)
+        if active_real is None or installed_version_real is None \
+                or active_real != installed_version_real / "bin" / cli_name \
+                or installed_version_real.name != NEW_VERSION \
+                or installed_version_real == candidate_version_real:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次安裝的候選版本",
+                          **evidence)
+        try:
+            installed_version_real.relative_to(bundle_real)
+        except ValueError:
+            pass
+        else:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 仍位於唯讀 bundle 來源",
+                          **evidence)
+        try:
+            candidate_digest = sha256_file(candidate_real)
+            active_digest = sha256_file(active_real)
+        except OSError as exc:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "無法讀取候選 CLI 位元組",
+                          **evidence, path_error=type(exc).__name__)
+        evidence["candidate_cli_sha256"] = candidate_digest
+        evidence["active_cli_sha256"] = active_digest
+        if candidate_digest != active_digest:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "已安裝候選版本與 bundle 候選內容不一致",
+                          **evidence)
+
+        temp_root: pathlib.Path | None = None
+        prior_profile_dir = self.env.get("SERIALWRAP_PROFILE_DIR")
+        try:
+            temp_root = pathlib.Path(tempfile.mkdtemp(prefix="sw-p290-cli-asset-"))
+            os.chmod(temp_root, 0o755)
+            profile_dir = temp_root / "profiles"
+            profile_dir.mkdir(mode=0o755)
+            (profile_dir / "default.yaml").write_text(
+                "profiles:\n  prpl-template: {}\n", encoding="utf-8",
+            )
+            self.env["SERIALWRAP_PROFILE_DIR"] = str(profile_dir)
+            proc = self.run([str(active_real), "doctor"], label="安裝候選 CLI 內嵌 p290 profile 資產檢查",
+                            timeout=60.0)
+            doctor = self.parse(proc) if proc.returncode == 0 else None
+            checks = doctor.get("checks") if type(doctor) is dict else None
+            matches = [check for check in checks if type(check) is dict
+                       and check.get("check") == "profile_template_fields"] if type(checks) is list else []
+            profile_check = matches[0] if len(matches) == 1 else None
+            evidence["profile_check"] = profile_check
+            missing = profile_check.get("missing_fields") if type(profile_check) is dict else None
+            missing_for_template = missing.get("prpl-template") if type(missing) is dict else None
+            reports_field = type(missing_for_template) is list and field in missing_for_template
+            evidence["reported_missing_field"] = reports_field
+            valid_shape = type(profile_check) is dict \
+                and profile_check.get("comparison_status") == "missing_fields" \
+                and "prpl-template" in (profile_check.get("compared_templates") or []) \
+                and profile_check.get("ok") is False
+            if proc.returncode != 0 or not valid_shape or not reports_field:
+                reason = "候選 CLI 內嵌 profile 資產未確認包含 p290 欄位"
+                if proc.returncode != 0:
+                    reason = "候選 CLI doctor probe 失敗"
+                return uc.row("candidate_cli_p290_asset", "FAIL", reason,
+                              **evidence, doctor_rc=proc.returncode)
+            return uc.row("candidate_cli_p290_asset", "PASS", None, **evidence,
+                          doctor_rc=proc.returncode)
+        except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "候選 CLI 內嵌資產 probe 無法完成",
+                          **evidence, probe_error=type(exc).__name__)
+        finally:
+            if prior_profile_dir is None:
+                self.env.pop("SERIALWRAP_PROFILE_DIR", None)
+            else:
+                self.env["SERIALWRAP_PROFILE_DIR"] = prior_profile_dir
+            if temp_root is not None:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
+    def judge_doctor(self, check_id: str, label: str, *, require_pairing: bool,
+                     profile_policy: dict[str, Any]) -> dict[str, Any]:
+        doctor = self.doctor(label, profile_policy)
+        judged = uc.judge_doctor(check_id, doctor, require_pairing=require_pairing, profile_policy=profile_policy)
+        if check_id in {"doctor_green_new", "reupgrade_doctor"}:
+            expected_phase = "materialized" if self.mode == "systemd-system" else "migrated"
+        else:
+            expected_phase = {
+                "doctor_green_old": "legacy_0_3_2",
+                "doctor_green_downgrade": "downgrade",
+            }.get(check_id)
+        if expected_phase is None or profile_policy.get("phase") != expected_phase:
+            result = uc.row(check_id, "FAIL", "driver phase 使用錯誤的 profile expectation policy",
+                            expected_policy_phase=expected_phase, selected_policy_phase=profile_policy.get("phase"),
+                            doctor_judgement=judged)
+        else:
+            result = judged
+        if expected_phase in {"migrated", "materialized"}:
+            expected_asset = pathlib.PurePosixPath("sw_core/assets/profiles/default.yaml")
+            target_metadata = profile_policy.get("target_asset")
+            configured_asset = pathlib.PurePosixPath(str(target_metadata.get("asset_path", ""))) \
+                if type(target_metadata) is dict else pathlib.PurePosixPath(".")
+            if type(target_metadata) is not dict or configured_asset != expected_asset:
+                migration = uc.row("p290_profile_migration", "FAIL", "p290 target asset 路徑不符受控資產",
+                                   target_asset_path=str(configured_asset), expected_asset_path=str(expected_asset))
+            else:
+                asset_path = self.bundle / "versions" / NEW_VERSION / "py" / pathlib.Path(*expected_asset.parts)
+                live_path = self.doctor_profile_dir / expected_asset.name
+                candidate_asset = self.verify_candidate_p290_asset(asset_path)
+                result.setdefault("detail", {})["candidate_cli_p290_asset"] = candidate_asset
+                self.cli_asset_evidence.append({"check_id": check_id, **candidate_asset})
+                if candidate_asset["verdict"] != "PASS":
+                    result["verdict"] = "FAIL"
+                    prior_reason = result.get("reason")
+                    result["reason"] = "; ".join(part for part in
+                                                 (prior_reason, candidate_asset.get("reason")) if part)
+                candidate_python = self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+                fallback_python = pathlib.Path(self.env.get("HOME", str(HOME))) / ".local" / "share" / "pipx" \
+                    / "venvs" / "serialwrap" / "bin" / "python"
+                migration = uc.judge_p290_profile_migration(
+                    "p290_profile_migration", asset_path, live_path,
+                    migration_policy_id=str(profile_policy.get("migration_policy_id", "")),
+                    candidate_python=candidate_python, fallback_python=fallback_python,
+                )
+            result.setdefault("detail", {})["p290_profile_migration"] = migration
+            if migration["verdict"] != "PASS":
+                result["verdict"] = "FAIL"
+                prior_reason = result.get("reason")
+                result["reason"] = "; ".join(part for part in (prior_reason, migration["reason"]) if part)
+        result.setdefault("detail", {})["doctor_profile_path"] = str(self.doctor_profile_dir)
+        return result
 
     def systemctl_user(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run(["systemctl", "--user", *args], label="systemctl --user " + " ".join(args), timeout=30)
@@ -405,6 +623,18 @@ class Driver:
             files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()})
         return files
 
+    def cfg_file_bytes(self) -> dict[str, bytes]:
+        """與 cfg_files 相同路徑集合的原始 bytes，供 p290 精確遷移判準使用。"""
+        files = uc.snapshot_file_bytes(CONFIG)
+        if self.mode == "systemd-system":
+            files.update({f"/etc/serialwrap/profiles/{k}": v
+                          for k, v in uc.snapshot_file_bytes(SYSTEM_PROFILE_DIR).items()})
+        return files
+
+    def capture_post_migration_config(self) -> None:
+        """setup 成功後保存 rollback／降級必須逐位元組保留的基線。"""
+        self.cfg_after_migration = self.cfg_files()
+
     def expected_overwrites(self) -> dict[str, str]:
         """S1-f3c66b4-1：system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 同名檔（0.3.2 `sudo cp -r`
         同語意）。只允許這些檔案變成新 bundle 的權威內容（bundle 內 sw_core/assets/profiles）；其餘逐位元組比較。"""
@@ -449,12 +679,14 @@ class Driver:
         ]
         self.baseline = self.state_view()
         self.cfg_before = self.cfg_files()
+        self.cfg_before_bytes = self.cfg_file_bytes()
         seed = uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
                              config_files=self.cfg_before)
         if self.mode == "on-demand":
             seed["detail"]["stop_wait"] = seed_wait
         self.add(seed)
-        self.add(uc.judge_doctor("doctor_green_old", self.doctor("0.3.2 doctor"), require_pairing=False))
+        self.add(self.judge_doctor("doctor_green_old", "0.3.2 doctor", require_pairing=False,
+                                   profile_policy=self.profile_policies["old"]))
 
     def _site(self) -> dict[str, Any]:
         return {"daemon_pids": uc.scan_daemon_instances(self.proc_root), "entries": self.entries(),
@@ -478,6 +710,7 @@ class Driver:
         proc = self.run([str(self.new_cli), "setup", *self.setup_args], label=f"{NEW_VERSION} setup（舊 daemon 執行中）", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
+            self.capture_post_migration_config()
             # OD-48：在 driver 任何啟動動作之前取樣，確認新 daemon 由 setup 自己啟動。
             status = self.wait_daemon(version=NEW_VERSION, timeout=20.0)
             t1 = time.monotonic()
@@ -489,7 +722,10 @@ class Driver:
                 "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
                 old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(self.proc_root),
                 cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=overlaps,
-                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
+                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites(),
+                cfg_before_bytes=self.cfg_before_bytes, cfg_after_bytes=self.cfg_file_bytes(),
+                candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+                fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python"))
             return True
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
@@ -502,7 +738,10 @@ class Driver:
             "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
             old_alive_after=sorted(after["daemon_pids"]), status_after=None, instances_after=after["daemon_pids"],
             cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=[],
-            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
+            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites(),
+            cfg_before_bytes=self.cfg_before_bytes, cfg_after_bytes=self.cfg_file_bytes(),
+            candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+            fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python"))
         return False
 
     def phase_upgrade_after_stop(self, already: bool) -> None:
@@ -517,6 +756,8 @@ class Driver:
             install = body.get("install") or {}
             ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
                 and install.get("op") == "install" and install.get("to_version") == NEW_VERSION
+            if proc.returncode == 0 and body.get("ok") is True:
+                self.capture_post_migration_config()
             start_step = next((s for s in install.get("steps") or [] if s.get("step") == "start_and_verify"), {})
             if (start_step.get("detail") or {}).get("started") is False:
                 self.observations.append({"id": "OBS-UPGRADE-NOT-STARTED", "phase": "upgrade_after_stop",
@@ -544,8 +785,13 @@ class Driver:
         self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else f"入口未切到 {NEW_VERSION} 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
-        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files(),
-                                       self.expected_overwrites())
+        cfg = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade", self.cfg_before, self.cfg_files(),
+            before_bytes=self.cfg_before_bytes, after_bytes=self.cfg_file_bytes(),
+            expected_overwrites=self.expected_overwrites(),
+            candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+            fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python",
+        )
         self.add(cfg)
 
     def phase_install_sh(self) -> None:
@@ -567,6 +813,8 @@ class Driver:
         finally:
             del self.env["TMPDIR"]
         body = self.parse(proc) or {}
+        if proc.returncode == 0 and body.get("ok") is True:
+            self.capture_post_migration_config()
         pipx_left = any((HOME / rel / "venvs" / "serialwrap").is_dir() for rel in (".local/share/pipx", ".local/pipx"))
         leftover = sorted(str(p) for p in tmpdir.glob("serialwrap-install.*"))
         self.add(uc.judge_install_sh("install_sh_upgrade", rc=proc.returncode, body=body,
@@ -601,7 +849,8 @@ class Driver:
                         multi_open=status.get("multi_open"), instances=pids, argv=argv[:6], **evidence))
         self._check_supervision("supervision_reconciled", status.get("pid"))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
+        self.add(self.judge_doctor("doctor_green_new", f"{NEW_VERSION} doctor", require_pairing=True,
+                                   profile_policy=self.profile_policies["new"]))
 
     def phase_new_running_system(self) -> None:
         """systemd-system：新 daemon 已由 setup 啟動（不得由 driver 代啟），驗證來源、監管收斂、狀態與 doctor。"""
@@ -636,7 +885,8 @@ class Driver:
                         mode_in_config=mode_line, active=active, enabled=enabled, main_pid=main_pid,
                         daemon_pid=status.get("pid"), dropins=dropins))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
+        self.add(self.judge_doctor("doctor_green_new", f"{NEW_VERSION} doctor", require_pairing=True,
+                                   profile_policy=self.profile_policies["new"]))
         self.run(["sudo", "systemctl", "stop", "serialwrap"], label="收尾 sudo systemctl stop")
         self.wait_no_daemon()
 
@@ -663,9 +913,11 @@ class Driver:
         if proc.returncode == 0 and body.get("ok"):
             # 回滾成功時 CLI、daemon 都必須回到 0.3.2 且設定保留；之後的手動降級照常執行並另行判定
             status = self.wait_daemon(version=OLD_VERSION) or {}
-            self.add(uc.judge_rollback_success("rollback_command", cli_version=self.cli_version(),
-                                               daemon_version=status.get("version"), cfg_before=self.cfg_before,
-                                               cfg_after=uc.snapshot_files(CONFIG), old_version=OLD_VERSION))
+            self.add(uc.judge_rollback_success(
+                "rollback_command", cli_version=self.cli_version(), daemon_version=status.get("version"),
+                cfg_before=self.cfg_after_migration or self.cfg_before, cfg_after=self.cfg_files(),
+                old_version=OLD_VERSION,
+            ))
             return
         self.observations.append({"id": "OBS-UPGRADE-ROLLBACK-PIPX", "phase": "rollback_command",
                                   "error_code": body.get("error_code"), "reason": body.get("reason"),
@@ -698,9 +950,12 @@ class Driver:
                         rcs=[p.returncode for p in steps], old_gone=gone, removed_entries=removed,
                         cli_version=version, daemon_version=status.get("version"), entries=self.entries(),
                         stop_wait=wait))
-        self.add(uc.judge_files_preserved("config_preserved_downgrade", self.cfg_before, uc.snapshot_files(CONFIG)))
+        self.add(uc.judge_files_preserved(
+            "config_preserved_downgrade", self.cfg_after_migration or self.cfg_before, self.cfg_files(),
+        ))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_downgrade"))
-        self.add(uc.judge_doctor("doctor_green_downgrade", self.doctor("0.3.2 doctor（降級）"), require_pairing=False))
+        self.add(self.judge_doctor("doctor_green_downgrade", "0.3.2 doctor（降級）", require_pairing=False,
+                                   profile_policy=self.profile_policies["downgrade"]))
 
     def phase_reupgrade(self) -> None:
         stop, wait = self.stop_daemon("0.3.2 daemon stop（重新升級）")
@@ -713,16 +968,19 @@ class Driver:
             else self.stop_wait_failed(f"{NEW_VERSION} start（重新升級）", wait)
         status = self.wait_daemon(version=NEW_VERSION) or {}
         version = self.cli_version()
+        doctor = self.judge_doctor("reupgrade_doctor", f"{NEW_VERSION} doctor（重新升級）",
+                                   require_pairing=True, profile_policy=self.profile_policies["new"])
         ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
             and start.returncode == 0 and status.get("version") == NEW_VERSION \
-            and uc.cli_version_identifies(version, NEW_VERSION)
+            and uc.cli_version_identifies(version, NEW_VERSION) and doctor["verdict"] == "PASS"
         if op.get("from_version") not in (None, OLD_VERSION):
             self.observations.append({"id": "OBS-UPGRADE-STALE-CURRENT", "phase": "reupgrade",
                                       "op": op.get("op"), "from_version": op.get("from_version"),
                                       "note": f"手動降級後 current-release.json 仍記 {NEW_VERSION}，重新升級被記為 {NEW_VERSION}→{NEW_VERSION} update"})
         self.add(uc.row("reupgrade", "PASS" if ok else "FAIL", None if ok else "降級後重新升級失敗",
                         setup_rc=proc.returncode, op=op.get("op"), from_version=op.get("from_version"),
-                        daemon_version=status.get("version"), cli_version=version, stop_wait=wait))
+                        daemon_version=status.get("version"), cli_version=version, stop_wait=wait,
+                        doctor=doctor, doctor_profile_path=str(self.doctor_profile_dir)))
         self.sw("daemon", "stop", label="收尾 daemon stop")
         self.wait_no_daemon()
 
@@ -842,6 +1100,33 @@ def _sha256(path: pathlib.Path) -> str | None:
         return None
 
 
+def select_upgrade_profile_policies(*, mode: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """在升級 phase 前，從受版控矩陣固定各入口政策並留下來源摘要。"""
+    if mode not in {"on-demand", "systemd-user", "systemd-system"}:
+        raise ValueError(f"不支援的升級驗收模式: {mode!r}")
+    new_phase = "materialized" if mode == "systemd-system" else "migrated"
+    phases = {"old": "legacy_0_3_2", "new": new_phase, "downgrade": "downgrade"}
+    document = uc.load_profile_expectations()
+    policies = {key: uc.select_profile_policy(phase) for key, phase in phases.items()}
+    raw = uc.PROFILE_EXPECTATIONS_PATH.read_bytes()
+    if json.loads(raw.decode("utf-8")) != document:
+        raise ValueError("profile expectation policy 在載入與摘要期間改變")
+    expected_migration_fields = ["timeout_recovery_keys"] if new_phase == "migrated" else []
+    if policies["new"]["phase"] != new_phase \
+            or "timeout_recovery_keys" in policies["new"]["expected_missing_fields"].get("prpl-template", []) \
+            or policies["new"]["allowed_migration_fields"] != expected_migration_fields:
+        raise ValueError("升級完成入口必須選用正確 p290 政策，且不得預期缺少 timeout_recovery_keys")
+    if policies["old"]["supported"] or policies["downgrade"]["supported"]:
+        raise ValueError("舊版與降級入口不得要求新版 profile_template_fields")
+    evidence = {
+        "policy_id": document["policy_id"],
+        "policy_sha256": hashlib.sha256(raw).hexdigest(),
+        "migration_policy_id": document["target_asset"]["migration_policy_id"],
+        "selected_phases": phases,
+    }
+    return policies, evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("systemd-user", "on-demand", "systemd-system"))
@@ -869,12 +1154,15 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    profile_policies, profile_policy_evidence = select_upgrade_profile_policies(mode=args.mode)
     # 於執行 phase 前記錄容器實際載入的來源；只輸出檔名，避免洩露宿主掛載路徑。
     driver_sha256 = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in (pathlib.Path(__file__), pathlib.Path(uc.__file__))}
     driver = Driver(args.mode, wheel, bundle, out, scenario=args.scenario,
                     installer=pathlib.Path(args.installer) if args.installer else None,
-                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None)
+                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None,
+                    profile_policies=profile_policies,
+                    profile_policy_evidence=profile_policy_evidence)
     error = None
     try:
         driver.execute()
@@ -889,6 +1177,9 @@ def main() -> int:
         "producer": "scripts/docker/run-upgrade.sh",
         "driver_sha256": driver_sha256,
         "driver_git_revision": os.environ.get("SW_UPGRADE_DRIVER_REVISION"),
+        "profile_expectation_policy": driver.profile_policy_evidence,
+        "doctor_profile_evidence": driver.doctor_evidence,
+        "candidate_cli_asset_evidence": driver.cli_asset_evidence,
         "old_version": OLD_VERSION,
         "new_version": NEW_VERSION,
         "wheel": wheel.name,

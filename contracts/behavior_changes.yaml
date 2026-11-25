@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；BC-17 依 OD-111／rulings v051（i304，2026-11-26 複本解析裁決）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；BC-23 依 OD-111／OD-112（2026-11-24，p279）；BC-08 依 OD-111／rulings v051（p289）；BC-09 依 OD-111／rulings v051（p290、issue 308）；BC-17 依 OD-111／rulings v051（i304，2026-11-26 複本解析裁決）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 21
+revision: 25
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -196,6 +196,58 @@ changes:
     compatibility_impact: "Rust windows-task 的 service start（daemon start 轉送亦同）只有在 autostart-hold.json 與 install-journal.json 都不存在時才先 /ENABLE 再 /Run；任一 hold 存在時只執行 /Run，原 JSON 回應與 exit code 不變，stderr 另說明 hold。start 會在生命週期交易內取得安裝鎖與 autostart 鎖；安裝鎖最多等待 5 s、autostart 鎖最多等待 15 s。鎖逾時維持 exit code 2 與 TIMEOUT（或鎖錯誤傳出的碼），並保留 message：安裝鎖沿用 lock_error 的 phase=install_lock，autostart 鎖沿用 rollback.rs 的 phase=update_autostart_hold 與 reason=autostart_lock_timeout；兩者都不以 hint 取代 message，也不執行 /Run。取得兩把鎖後會重讀 config.yaml；若監管模式已不是 windows-task，先釋放本次取得的生命週期鎖，再依鎖內重讀到的模式重新分派原命令一次；daemon start 轉送重讀為 on-demand 時會繼續走 daemon 啟動路徑。SC-18 巢狀 autostart 若在等待 autostart.lock 期間切成 windows-task，/Run 成功只代表排程已接受；CLI 最多等待 10 s，以 health.ping 的 ok/pong 判定 daemon 就緒，並另查 health.status 取得 PID 後重送原 RPC；若 status 未提供 PID，仍依 ping 就緒結果處理、不虛報 PID，逾時回既有 DAEMON_NOT_READY 且不重送。supervision-mode set 只要涉及 windows-task 也會取得安裝鎖，逾時可能回 TIMEOUT（phase=install_lock）。"
     approval_conditions: "依 OD-111 只修 Rust 並保留 Python 基線；依 v051 p277 裁決，journal hold 與 switch hold 共用只 /Run 分支，新增 service／daemon 入口與鎖交錯測試；Windows 原生驗證不得預標 PASS。"
     related_decisions: ["OD-111"]
+  - id: "BC-08"
+    kind: "BC"
+    title: "Rust doctor 比較共同 profile template 頂層欄位"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-23"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 24
+    spec_refs: ["§8.7"]
+    reconciliation_refs: ["issue-289"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["bc08-doctor-profile-template-fields", "bc08-doctor-profile-unavailable"]
+    compatibility_impact: "Rust 0.5.1 的 serialwrap doctor 新增 profile_template_fields advisory，比對出貨 profiles/default.yaml 與指定 profile 目錄 default.yaml 中共同 template 的頂層欄位是否存在；不比較欄位值或巢狀欄位。check.extra 輸出 comparison_status、missing_fields、compared_templates 與 reason。未物化、不可讀、不可解析、結構錯誤或沒有共同 template 時，check.ok=false 並明確表示不可比較，但 doctor 整體 ok 與 exit code 維持原判準。Python 0.4.x 基線不新增此檢查。"
+    approval_conditions: "依 OD-111 維持 Python 基線凍結；比較範圍限單一檔案、共同 template 與頂層欄位存在性。OD-33 只能接受受版控政策指定的精確可比較缺漏集合；不可比較、缺少或損壞的 check 一律 FAIL。"
+    related_decisions: ["OD-111"]
+  - id: "BC-09"
+    kind: "BC"
+    title: "可設定逾時救援鍵與 prpl Ctrl-C 預設及 setup 欄位遷移"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-25"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 24
+    spec_refs: ["§6.4", "§8.7", "§13.2"]
+    reconciliation_refs: ["issue-290", "issue-308"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P7"]
+    case_ids: ["bc09-timeout-recovery-keys"]
+    compatibility_impact: "Rust 0.5.1 profile 的 timeout_recovery_keys 依 template／target 解析：template 省略或 null 使用語言層 [CTRL_C]，target 省略或 null 繼承 template，明確 list 完整覆寫且 [] 不送救援鍵。一般逾時 recovery 及 READY session.recover 依清單順序送鍵，進入 recovery 即使清除 deferred human 輸入；缺省不再送 CTRL_D。出貨 prpl-template 明列 [CTRL_C]。setup 僅對管理目錄中缺欄位的 platform: prpl template 精確插入 timeout_recovery_keys: [CTRL_C]，保護既有值、其餘位元組、system profile 與 downgrade 保存；失敗檔保留原文並令 setup 整體失敗，stderr 回報已完成檔案而成功 JSON 形狀不變。Python 0.4.x profile 行為與基線 golden 凍結，不宣稱等價。"
+    approval_conditions: "依 OD-111 與 issue 308：預設僅 CTRL_C；null／繼承、空清單、deferred invalidation 與設定順序均有 Rust L1 覆蓋；setup 只精確補管理 prpl template，並保護 force、system copy、失敗續行及降級。不得改 p289 OD-33 gate。"
+    related_decisions: ["OD-111"]
   - id: "BC-10"
     kind: "BC"
     title: "command.submit 依 profile 單行上限拒絕過長命令"
@@ -264,7 +316,7 @@ changes:
       python: null
       rust:
         stage: "stage-1b"
-    approved_at_revision: 21
+    approved_at_revision: 25
     spec_refs: ["issue-304", "v051.md i304", "v051.md i304 2026-11-26 複本解析裁決"]
     reconciliation_refs: ["issue-304"]
     scope: "rust_only"
@@ -273,6 +325,32 @@ changes:
     case_ids: ["bc17-config-wal-dir"]
     compatibility_impact: "Rust daemon 的 WAL 目錄改依 `SERIALWRAP_WAL_DIR` > `config.yaml` 頂層 `wal_dir` > `<state_dir>/wal` 解析；shell、on-demand、systemd-user、systemd-system 與 Windows 工作排程共用同一規則。config 的相對路徑以目前實際讀取的 config.yaml 所在目錄為基準，`~` 依平台展開。daemon 複製 system fallback 至新建的 user config 時，會在複製當下依 system config 所在目錄解析相對 `wal_dir`，並將絕對路徑寫入 user config；Windows drive-relative 值依該磁碟的原生目前目錄解析，複製時同樣固化完整絕對路徑；含 `~` 的值先依平台展開，原本的絕對路徑字串保持不變。使用者之後編輯 config 時，相對值依目前 user config 所在目錄解析，不追溯 system config。config 不寫入 wal_dir 來源紀錄或內部鍵，其他既有鍵原樣保留。解析與 doctor 比對不得在 symlink 解析前以字串 `normpath` 消去 `..`。`daemon status` 的 `wal_path` 即實際 WAL writer 路徑，doctor 的 `wal_dir` 以同一解析結果比對並將修正建議指向 config.yaml；setup、supervision-mode set、update／rollback 只更新既有管理鍵而保留 wal_dir。目錄建立或寫入失敗沿用既有 WAL 健康／啟動失敗，不新增錯誤碼。"
     approval_conditions: "依 OD-111、OD-112 與 v051 i304 2026-11-26 複本解析裁決：只改 Rust，不改 Python、WAL 格式或 wal_dir 以外的既有設定值；環境變數保有最高優先序；複製 system fallback 時將相對 wal_dir 解析成絕對路徑寫入新 user config，Windows drive-relative 值按該磁碟原生目前目錄解析後固化，並展開含 `~` 的值，原絕對路徑維持原字串；使用者後續編輯的相對值以目前 config 所在目錄為基準；不得寫入或辨識 wal_dir 來源中繼資料；symlink 與 `..` 依檔案系統語意處理；所有監管入口均經同一 daemon 啟動路徑。"
+    related_decisions: ["OD-111", "OD-112"]
+  - id: "BC-23"
+    kind: "BC"
+    title: "Windows TCP raw owner 以 lifetime mirror lease 參與 session 仲裁"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-24"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 23
+    spec_refs: ["openspec/specs/session-interactive/spec.md", "openspec/specs/session-selftest/spec.md", "docs/serialwrap-spec.md"]
+    reconciliation_refs: []
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P6", "P7"]
+    case_ids: ["bc23-tcp-owner-mirror", "bc23-tcp-lifetime-eof-reconnect", "bc23-tcp-agent-preempt-restore", "bc23-tcp-telnet-second-console-line-busy"]
+    compatibility_impact: "Rust 0.5.1 將 Windows／native TCP Telnet raw owner 以內部 lifetime-bound InteractiveLease 鏡像到 session 層，使 self-test 的 human_attached／human_active、60 秒 reprobe 暫緩與 agent interactive 仲裁能辨識同一位 human。accept 同事件建立鏡像；active／suspended／pending owner 均維持同一鏡像，不改 raw ownership、owner_gen 或 RPC schema。mirror kind 只記於內部 LeaseIndex；它不產生 AdmissionFlag::Lease，handoff 不會只因 TCP console 持續連線而被阻擋。有效 EOF／detach 依 client lifetime 立即撤除 mirror；舊 A 的收尾不得清除 B 的 raw owner、mirror 或 deferred input。明確 interactive_close 關閉仍登記 TCP client 的 human lease（不論是 mirror 或普通 lease）後，同步不會立即補回 mirror。self-heal、retained／stash 還原與 interactive_open 等既有授權路徑重新授予該 client 時，以目前 console lifetime 清除撤權，並維持各路徑修前的 Lease／LeaseIndex 記法；interactive_open 的普通 human lease 仍是 Insert，不帶 mirror_client_lifetime。detach、EOF、stale prune 與 release close-all 在 lifetime 離開 human.consoles 時立即清除撤權，不必等待 EOF。foreground agent command 沿既有 suspend／resume 回放一次；idle soft preempt close／expiry 沿既有 execute_post_close／resume 路徑恢復 raw owner，之後由同步路徑依 live TCP 連線重建 mirror。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease，既有 mirror 簿記會在同步路徑撤除；raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由維持修前 Rust 基線。guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。PTY 路徑與 Python 基線語意不變。已有 human lease 時，預設 line mode 的 bare human command.submit 於執行 gate 回 SESSION_INTERACTIVE_BUSY 且零 TX；file.push／file.pull 仍為 agent RPC 路徑。本包以 Linux native TCP 加 fake UART／WAL 驗證，Windows 原生與 Tera Term 證據不在本條宣稱範圍。"
+    approval_conditions: "保留作者歷史並撤回其 Python production／測試／機械同步 golden 差分；同事件 mirror 接受、guards、lifetime EOF／A→B、agent foreground 與 soft-preempt stash、self-test／reprobe、第二 console BUSY＋零 TX 均由新增 Rust 測試鎖定。既有黑箱節點 tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line 為獲准分輪調整的既有節點：Rust 輪斷言第一個 console 的 raw 照常送達 DUT、第二個 console 的 line 不送達 DUT 且 human TX 為空，Python 輪保留原送出斷言；精確的 SESSION_INTERACTIVE_BUSY 由 Cargo 測試 tcp_mirror_secondary_line_respects_lease_busy 鎖定。mirror 不產生 AdmissionFlag::Lease。schema、Python golden 與錯誤碼全集不變；Windows 原生／COM／Tera Term smoke 另行驗證，不得標記為本包 PASS。"
     related_decisions: ["OD-111", "OD-112"]
   - id: "SC-01"
     kind: "SC"

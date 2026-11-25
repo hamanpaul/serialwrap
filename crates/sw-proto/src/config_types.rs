@@ -36,6 +36,43 @@ impl Default for UartProfile {
     }
 }
 
+/// 逾時恢復按鍵（`config.py` 的 `TIMEOUT_RECOVERY_KEY_BYTES`）：命令逾時與 READY 時 `session recover` 依序送出。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutRecoveryKey {
+    CtrlC,
+    CtrlD,
+}
+
+impl TimeoutRecoveryKey {
+    /// 設定檔與回應 `recovery_action` 用的鍵名（`CTRL_C`／`CTRL_D`）。
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeoutRecoveryKey::CtrlC => "CTRL_C",
+            TimeoutRecoveryKey::CtrlD => "CTRL_D",
+        }
+    }
+
+    /// 送出的 byte（`b"\x03"`／`b"\x04"`）。
+    pub fn payload(self) -> &'static [u8] {
+        match self {
+            TimeoutRecoveryKey::CtrlC => b"\x03",
+            TimeoutRecoveryKey::CtrlD => b"\x04",
+        }
+    }
+
+    /// 鍵名 → 按鍵；只認 `CTRL_C`、`CTRL_D`（大小寫須相同）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "CTRL_C" => Some(TimeoutRecoveryKey::CtrlC),
+            "CTRL_D" => Some(TimeoutRecoveryKey::CtrlD),
+            _ => None,
+        }
+    }
+}
+
+/// Rust 0.5.1 語言層預設：只送 CTRL_C。需要 CTRL_D 時由 profile 明確設定。
+pub const DEFAULT_TIMEOUT_RECOVERY_KEYS: [TimeoutRecoveryKey; 1] = [TimeoutRecoveryKey::CtrlC];
+
 /// `ProfileTemplate`（09 §2.1）。欄位順序與 Python dataclass 相同。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileTemplate {
@@ -61,6 +98,9 @@ pub struct ProfileTemplate {
     /// 開機完成訊號（#234，`config.py` 的 `boot_done_regex`）：`str(v or "").strip()`；空字串＝不設。
     pub boot_done_regex: String,
     pub max_console_line_chars: Option<PyInt>,
+    /// 命令逾時（及 READY 時 session recover）依序送出的恢復按鍵（`config.py` 的 `timeout_recovery_keys`）。
+    /// 預設 [`DEFAULT_TIMEOUT_RECOVERY_KEYS`]；`[CTRL_C]` 不送 CTRL_D，空清單完全不送。
+    pub timeout_recovery_keys: Vec<TimeoutRecoveryKey>,
 }
 
 impl ProfileTemplate {
@@ -277,6 +317,35 @@ fn as_max_console_line_chars(
             "max_console_line_chars 必須是正整數或 null".to_string(),
         )),
     }
+}
+
+/// `config.py` `_as_timeout_recovery_keys`：`None`（未設或 null）取 `default`；否則必須是由 `CTRL_C`、`CTRL_D`
+/// 組成且不重複的 list（空 list 合法＝不送）。字串、未知鍵名、非字串項目或重複項目一律 `ValueError`，
+/// 不悄悄退回預設、照送 CTRL_D。
+fn as_timeout_recovery_keys(
+    v: Option<&YValue>,
+    default: &[TimeoutRecoveryKey],
+) -> Result<Vec<TimeoutRecoveryKey>, ConfigError> {
+    let invalid = || {
+        ConfigError::Value("timeout_recovery_keys 必須是由 CTRL_C、CTRL_D 組成且不重複的清單".to_string())
+    };
+    let items = match v {
+        None | Some(YValue::Null) => return Ok(default.to_vec()),
+        Some(YValue::Seq(items)) => items,
+        Some(_) => return Err(invalid()),
+    };
+    let mut keys = Vec::with_capacity(items.len());
+    for item in items {
+        let key = match item {
+            YValue::Str(name) => TimeoutRecoveryKey::from_name(name).ok_or_else(invalid)?,
+            _ => return Err(invalid()),
+        };
+        if keys.contains(&key) {
+            return Err(invalid());
+        }
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 fn as_unlock_idle(v: Option<&YValue>, default: f64) -> Result<f64, ConfigError> {
@@ -496,6 +565,12 @@ fn template_from_map(
         None => String::new(),
     };
 
+    // config.py `_template_from_dict`：最後一個 kwarg（求值順序在其他會拋 ValueError 的欄位之後）。
+    let timeout_recovery_keys = as_timeout_recovery_keys(
+        raw.get_str("timeout_recovery_keys"),
+        &DEFAULT_TIMEOUT_RECOVERY_KEYS,
+    )?;
+
     Ok(ProfileTemplate {
         profile_name: name.to_string(),
         platform,
@@ -518,6 +593,7 @@ fn template_from_map(
         bootloader_prompts,
         boot_done_regex,
         max_console_line_chars,
+        timeout_recovery_keys,
     })
 }
 
@@ -705,6 +781,12 @@ fn merge_session(
         Some(v) => py_strip(&py_str_of(v)).to_string(),
         None => py_strip(&template.boot_done_regex).to_string(),
     };
+    // config.py `_merge_session`：`_as_timeout_recovery_keys(target.get(...), template.timeout_recovery_keys)`——
+    // target 未設或 null 繼承 template；有設就整份覆寫（含空清單）。
+    let timeout_recovery_keys = as_timeout_recovery_keys(
+        target.get_str("timeout_recovery_keys"),
+        &template.timeout_recovery_keys,
+    )?;
 
     let merged_template = ProfileTemplate {
         profile_name: template.profile_name.clone(),
@@ -728,6 +810,7 @@ fn merge_session(
         bootloader_prompts,
         boot_done_regex,
         max_console_line_chars,
+        timeout_recovery_keys,
     };
 
     Ok(SessionProfile {

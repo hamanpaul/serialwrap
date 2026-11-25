@@ -418,6 +418,284 @@ fn gpb_command_submit_reaches_uart_and_wal() {
     );
 }
 
+/// p290 BC-09：正式 `command.submit/get` RPC 經 target 覆寫選鍵，驗證救援鍵實際到 UART 與 WAL。
+#[test]
+fn p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal() {
+    let r = ServiceRig::build(RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: []\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}, timeout_recovery_keys: [CTRL_C]}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let wal_mark = r.wal.current_seq();
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"sleep 20","timeout_s":1}"#,
+    );
+    assert_eq!(
+        submitted.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&submitted)
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("p290 命令逾時完成", || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(s(&record, "recovery_action"), "CTRL_C", "{}", j(&record));
+    assert_eq!(
+        record.get("error_code"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(dev.tx_since(tx_mark), b"sleep 20\n\x03");
+    assert_eq!(
+        wp61_wal_tx_since(&r, wal_mark),
+        vec![
+            ("agent".into(), b"sleep 20\n".to_vec()),
+            ("system:recover".into(), b"\x03".to_vec()),
+        ],
+        "RPC 結果須與 UART 實際 TX 對齊"
+    );
+
+    // FakeDevice 的 trigger 會檢查累積 TX；清掉前一輪 Ctrl-C，避免新 trigger 提前注入 RX。
+    let _ = dev.take_tx();
+    dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let recover_tx_mark = dev.tx_len();
+    let recover_wal_mark = r.wal.current_seq();
+    let recovered = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| r.call("session.recover", r#"{"selector":"COM0"}"#));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "p290 session.recover RPC 未回覆");
+            r.clock.advance(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap()
+    });
+    assert_eq!(recovered.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&recovered));
+    assert_eq!(s(&recovered, "recovery_action"), "CTRL_C", "{}", j(&recovered));
+    assert_eq!(dev.tx_since(recover_tx_mark), b"\x03", "READY recover RPC 必須依 target profile 送鍵");
+    assert_eq!(
+        wp61_wal_tx_since(&r, recover_wal_mark),
+        vec![("system:recover".into(), b"\x03".to_vec())],
+        "session.recover 的有效鍵須與 UART／WAL 對齊"
+    );
+
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_pins
+        .insert(BY_ID_A.to_string(), "pinned".to_string());
+    let dynamic = ServiceRig::build_with_loaded_state(
+        RigSpec {
+            yaml: (
+                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_D]\n  pinned:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C]\n"
+            )
+            .to_string(),
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 0,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        loaded,
+    );
+    dynamic.wait_state("COM0", "READY");
+    let dynamic_dev = dynamic.device(REAL_A);
+    dynamic_dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let dynamic_tx_mark = dynamic_dev.tx_len();
+    let dynamic_wal_mark = dynamic.wal.current_seq();
+    let submitted = dynamic.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"sleep 20","timeout_s":1}"#,
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    let dynamic_cmd_id = s(&submitted, "cmd_id").to_string();
+    let mut dynamic_record = PyDict::default();
+    wait_until("p290 pin profile 命令逾時完成", || {
+        dynamic.clock.advance(Duration::from_millis(100));
+        dynamic_record = sub(
+            &dynamic.call("command.get", &format!(r#"{{"cmd_id":"{dynamic_cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(dynamic_record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&dynamic_record, "recovery_action"), "CTRL_C", "pin profile 必須勝過 dynamic template");
+    assert_eq!(dynamic_dev.tx_since(dynamic_tx_mark), b"sleep 20\n\x03");
+    assert_eq!(
+        wp61_wal_tx_since(&dynamic, dynamic_wal_mark),
+        vec![
+            ("agent".into(), b"sleep 20\n".to_vec()),
+            ("system:recover".into(), b"\x03".to_vec()),
+        ],
+        "dynamic pin profile 的命令與救援 TX 須落在 UART／WAL"
+    );
+}
+
+#[test]
+fn p290_rpc_unpinned_dynamic_command_and_recover_use_template_keys_for_uart_and_wal() {
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_detected
+        .insert(BY_ID_A.to_string(), "t".to_string());
+    let dynamic = ServiceRig::build_with_loaded_state(
+        RigSpec {
+            yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_D]\n".to_string(),
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 0,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        loaded,
+    );
+    dynamic.wait_state("COM0", "READY");
+    let dev = dynamic.device(REAL_A);
+    dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
+
+    let tx_mark = dev.tx_len();
+    let wal_mark = dynamic.wal.current_seq();
+    let submitted = dynamic.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"sleep 20","timeout_s":1}"#,
+    );
+    assert_eq!(
+        submitted.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&submitted)
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("p290 未 pin dynamic 命令逾時完成", || {
+        dynamic.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &dynamic.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "recovery_action"), "CTRL_D", "{}", j(&record));
+    assert_eq!(dev.tx_since(tx_mark), b"sleep 20\n\x04");
+    assert_eq!(
+        wp61_wal_tx_since(&dynamic, wal_mark),
+        vec![
+            ("agent".into(), b"sleep 20\n".to_vec()),
+            ("system:recover".into(), b"\x04".to_vec()),
+        ],
+        "未 pin dynamic command 的實際救援鍵須與 UART／WAL 對齊"
+    );
+
+    let _ = dev.take_tx();
+    dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
+    let recover_tx_mark = dev.tx_len();
+    let recover_wal_mark = dynamic.wal.current_seq();
+    let recovered = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| dynamic.call("session.recover", r#"{"selector":"COM0"}"#));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "p290 dynamic session.recover RPC 未回覆"
+            );
+            dynamic.clock.advance(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap()
+    });
+    assert_eq!(
+        recovered.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&recovered)
+    );
+    assert_eq!(
+        s(&recovered, "recovery_action"),
+        "CTRL_D",
+        "{}",
+        j(&recovered)
+    );
+    assert_eq!(dev.tx_since(recover_tx_mark), b"\x04");
+    assert_eq!(
+        wp61_wal_tx_since(&dynamic, recover_wal_mark),
+        vec![("system:recover".into(), b"\x04".to_vec())],
+        "未 pin dynamic session.recover 的模板鍵須落到 UART／WAL"
+    );
+}
+
+#[test]
+fn p290_rpc_pinned_dynamic_recover_uses_pin_keys_for_uart_and_wal() {
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_pins
+        .insert(BY_ID_A.to_string(), "pinned".to_string());
+    let dynamic = ServiceRig::build_with_loaded_state(
+        RigSpec {
+            yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_D]\n  pinned:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C]\n".to_string(),
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 0,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        loaded,
+    );
+    dynamic.wait_state("COM0", "READY");
+    let dev = dynamic.device(REAL_A);
+    dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let wal_mark = dynamic.wal.current_seq();
+
+    let recovered = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| dynamic.call("session.recover", r#"{"selector":"COM0"}"#));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "p290 pinned dynamic session.recover RPC 未回覆"
+            );
+            dynamic.clock.advance(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap()
+    });
+    assert_eq!(
+        recovered.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&recovered)
+    );
+    assert_eq!(
+        s(&recovered, "recovery_action"),
+        "CTRL_C",
+        "pin 必須覆寫 dynamic template：{}",
+        j(&recovered)
+    );
+    assert_eq!(
+        dev.tx_since(tx_mark),
+        b"\x03",
+        "pin 的救援鍵必須實際送到 UART"
+    );
+    assert_eq!(
+        wp61_wal_tx_since(&dynamic, wal_mark),
+        vec![("system:recover".into(), b"\x03".to_vec())],
+        "pinned dynamic session.recover 的救援鍵須與 UART／WAL 對齊"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 計畫列
 // ---------------------------------------------------------------------------

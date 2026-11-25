@@ -7,9 +7,10 @@
     "313d792863ab380c7dc10c43d756aac0debf2f19",
     "4baca8c3d922ec210ee2cc25cae2a8121560c7ae",
     "654c6b263aeffc19cca1cb0f7e087e3fcc64dc8b",
-    "ddd642aa99b32f9f96d79084bf19252c7bf81186"
+    "ddd642aa99b32f9f96d79084bf19252c7bf81186",
+    "a70519555c6125590e0cb2c74b90f3b954d0d510"
   ],
-  "case_set_sha256": "c7fe7ce2a9b9bf961bca46879b8b96a450793f10f435997fdba634c19284ae7c",
+  "case_set_sha256": "f777def2a42cef81c222f75bf1e36582dc2123012056bfe39d1e345835739793",
   "cases": [
     {
       "case_id": "bc05-process-lifecycle-stop-restart",
@@ -80,6 +81,34 @@
       "sha256": "1c3cb301daa2b74988d672458527ab702135c91f5ab63542412af08133284423",
       "tests": [
         "sw-cli::mgmt_service::p277_start_serializes_hold_creation_after_check"
+      ]
+    },
+    {
+      "case_id": "bc08-doctor-profile-template-fields",
+      "sha256": "956dbc73cf726a8a5cb39126da82fb5a66d52e8800c641bb830a512c0faae240",
+      "tests": [
+        "sw-cli::mgmt_doctor::profile_template_fields_drift",
+        "sw-cli::mgmt_doctor::profile_template_fields_is_read_only",
+        "sw-cli::mgmt_doctor::profile_template_fields_matches_shipped_asset",
+        "sw-cli::mgmt_doctor::profile_template_fields_p290_transition",
+        "sw-cli::mgmt_doctor::profile_template_fields_presence_only",
+        "sw-cli::mgmt_doctor::profile_template_fields_windows_payload",
+        "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_exact_payload"
+      ]
+    },
+    {
+      "case_id": "bc08-doctor-profile-unavailable",
+      "sha256": "123ded938f464589f6aecf24ed74afc72f44f370f7b6f6ddf581eeb1f2c7c79b",
+      "tests": [
+        "sw-cli::mgmt_doctor::profile_template_asset_errors_are_unavailable",
+        "sw-cli::mgmt_doctor::profile_template_fields_custom_templates_and_no_common",
+        "sw-cli::mgmt_doctor::profile_template_fields_invalid_structure_is_unavailable",
+        "sw-cli::mgmt_doctor::profile_template_fields_invalid_utf8_is_unavailable",
+        "sw-cli::mgmt_doctor::profile_template_fields_invalid_yaml_is_unavailable",
+        "sw-cli::mgmt_doctor::profile_template_fields_not_materialized",
+        "sw-cli::mgmt_doctor::profile_template_fields_unreadable_is_unavailable",
+        "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_invalid_yaml",
+        "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_not_materialized"
       ]
     },
     {
