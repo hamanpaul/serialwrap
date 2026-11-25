@@ -145,7 +145,12 @@ def _example(name: str) -> dict:
     return _load(ACC / "examples" / name)
 
 
-AB_EXAMPLES = ("ab_manifest.l15.example.json", "ab_manifest.l2.example.json", "ab_manifest.l3.example.json")
+AB_EXAMPLES = (
+    "ab_manifest.l15.example.json",
+    "ab_manifest.l15.windows.example.json",
+    "ab_manifest.l2.example.json",
+    "ab_manifest.l3.example.json",
+)
 
 
 @pytest.mark.parametrize("example", AB_EXAMPLES)

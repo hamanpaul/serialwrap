@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import FrozenInstanceError, is_dataclass
+from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -288,7 +288,7 @@ def test_side_bundle_paths_must_share_one_version_root(tmp_path):
 
 
 def test_windows_manifest_uses_executable_suffixes_in_declared_bundle_paths(tmp_path):
-    manifest = _load(fakes.write_ab_manifest(tmp_path, platform="windows", stage="3"))
+    manifest = _load(_windows_l15_transport_fixture(tmp_path))
     for side in manifest.sides:
         assert side.cli_exe.name == "serialwrap.exe"
         assert side.daemon_exe.name == "serialwrapd.exe"
@@ -494,10 +494,10 @@ def test_windows_com0com_requires_allowlist(tmp_path):
         **{
             "dut.transport": "com0com-pair",
             "dut.com_pair": {"daemon_side": "COM20", "bridge_side": "COM21"},
-            "test_device_allowlist": [],
+            "test_device_allowlist": ["COM20", "COM21"],
         },
     )
-    manifest = _load(path)
+    manifest = replace(_load(path), test_device_allowlist=())
     assert "windows com0com instance without test_device_allowlist" in ab_manifest.verify_case_coverage(
         manifest,
         repo_root=tmp_path,
@@ -572,7 +572,7 @@ def test_exit_catalog_digest_is_frozen(tmp_path):
 
 
 def test_required_case_ids_frozen_across_family_change(tmp_path):
-    path = fakes.write_ab_manifest(tmp_path, platform="windows", stage="3")
+    path = _windows_l15_transport_fixture(tmp_path)
     doc = _read_json(path)
     cases_path = tmp_path / doc["case_list"]["path"]
     raw = cases_path.read_bytes()
@@ -618,6 +618,7 @@ def _append_new_required_case(root: Path, manifest_path: Path, *, register_in_ex
     assert all(row.get("case_id") != new_id for row in cases_doc["cases"])
     new_case = copy.deepcopy(source)
     new_case["case_id"] = new_id
+    new_case["platforms"] = ["windows"]
     cases_doc["cases"].append(new_case)
     cases_path.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8", newline="\n")
 
@@ -643,12 +644,34 @@ def _append_new_required_case(root: Path, manifest_path: Path, *, register_in_ex
         _write_json(required_lock_path, required_lock)
         doc["case_ids"] = sorted(set(doc["case_ids"]) | {new_id})
         _refresh_candidate_lock_binding(doc, root)
+        map_ref = doc.get("platform_settings", {}).get("case_transport_map")
+        if isinstance(map_ref, dict):
+            map_path = root / map_ref["path"]
+            transport_map = _read_json(map_path)
+            transport_map["cases"][new_id] = {
+                "requires_native_com": False,
+                "runner": new_case["suite"],
+                "platform": "windows",
+                "allowed_transports": ["local-process"],
+                "pair_id": None,
+            }
+            doc["platform_settings"]["case_transports"][new_id] = {
+                "transport": "local-process",
+                "port_id": None,
+                "decision_ref": None,
+            }
+            _write_json(map_path, transport_map)
+            map_sha = fakes.sha256_file(map_path)
+            map_ref["sha256"] = map_sha
+            for tool in doc["tools"]:
+                if tool.get("path") == map_ref["path"] and "sha256" in tool:
+                    tool["sha256"] = map_sha
     _write_json(manifest_path, doc)
     return new_id
 
 
 def test_required_case_lock_rejects_new_applicable_case_until_registered(tmp_path):
-    path = fakes.write_ab_manifest(tmp_path, platform="windows", stage="3")
+    path = _windows_l15_transport_fixture(tmp_path)
     _append_new_required_case(tmp_path, path, register_in_exit_lock=False)
     manifest = _load(path)
     violations = _verify(manifest, tmp_path)
@@ -656,7 +679,7 @@ def test_required_case_lock_rejects_new_applicable_case_until_registered(tmp_pat
 
 
 def test_required_case_lock_allows_add_only_case_with_complete_coverage(tmp_path):
-    path = fakes.write_ab_manifest(tmp_path, platform="windows", stage="3")
+    path = _windows_l15_transport_fixture(tmp_path)
     prior = _required_ids(tmp_path, EXIT_WINDOWS_L15, "windows")
     added = _append_new_required_case(tmp_path, path, register_in_exit_lock=True)
     manifest = _load(path)
@@ -695,7 +718,7 @@ def test_required_case_lock_context_binding_rejects_mismatch(tmp_path, mutation)
 
 
 def test_tampered_required_lock_cannot_delete_seeded_id(tmp_path):
-    path = fakes.write_ab_manifest(tmp_path, platform="windows", stage="3")
+    path = _windows_l15_transport_fixture(tmp_path)
     doc = _read_json(path)
     lock_path = tmp_path / doc["required_cases_lock"]["path"]
     lock = _read_json(lock_path)
@@ -703,7 +726,19 @@ def test_tampered_required_lock_cannot_delete_seeded_id(tmp_path):
     old_id = "win-com-open-exclusive"
     assert old_id in locked_ids
     locked_ids.remove(old_id)
+    doc["case_ids"].remove(old_id)
     _write_json(lock_path, lock)
+    map_ref = doc["platform_settings"]["case_transport_map"]
+    map_path = tmp_path / map_ref["path"]
+    transport_map = _read_json(map_path)
+    transport_map["cases"].pop(old_id)
+    doc["platform_settings"]["case_transports"].pop(old_id)
+    _write_json(map_path, transport_map)
+    map_sha = fakes.sha256_file(map_path)
+    map_ref["sha256"] = map_sha
+    for tool in doc["tools"]:
+        if tool.get("path") == map_ref["path"] and "sha256" in tool:
+            tool["sha256"] = map_sha
     _refresh_candidate_lock_binding(doc, tmp_path)
     _write_json(path, doc)
     manifest = _load(path)
