@@ -59,6 +59,7 @@ fn job(
                 source: "agent:test".into(),
                 cmd_id: Some(format!("cmd-{op_id}")),
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,

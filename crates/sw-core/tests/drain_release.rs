@@ -1258,6 +1258,7 @@ fn stale_reply_context_rejected_after_release() {
         source: "agent".into(),
         cmd_id: Some(cmd.cmd_id),
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,

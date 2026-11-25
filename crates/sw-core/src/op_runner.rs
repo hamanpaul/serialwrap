@@ -28,7 +28,7 @@ use crate::login_fsm::LoginOutcome;
 use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
-use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
+use crate::tx_writer::{FenceReject, SecretTx, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
 use crate::uart_bridge::{RunCancel, RxShared};
 use crate::wal::{WalAppendReq, WalWriter};
 
@@ -537,6 +537,19 @@ fn send(
     cmd_id: Option<&str>,
     log: bool,
 ) -> TxReport {
+    send_with_secret(ctx, grant, payload, class, source, cmd_id, log, None)
+}
+
+fn send_with_secret(
+    ctx: &OpCtx,
+    grant: &OpGrant,
+    payload: &[u8],
+    class: TxClass,
+    source: &str,
+    cmd_id: Option<&str>,
+    log: bool,
+    secret_tx: Option<SecretTx>,
+) -> TxReport {
     let (reply, report) = crossbeam_channel::bounded(1);
     let permit = TxPermit {
         op_id: grant.op_id,
@@ -547,6 +560,7 @@ fn send(
         source: source.to_string(),
         cmd_id: cmd_id.map(str::to_string),
         log,
+        secret_tx,
         // 07 D-03：06 既有 permit 建構點一律 `None`。
         input_epoch: None,
         replay_hold: None,
@@ -728,7 +742,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         });
     }
     let payload = command_payload(command);
-    let report = send(
+    let report = send_with_secret(
         ctx,
         grant,
         &payload,
@@ -736,6 +750,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         &q.req.source,
         Some(cmd_id),
         true,
+        q.req.secret_tx,
     );
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
@@ -840,7 +855,7 @@ fn run_reboot(
     }
     let pre_offset = ctx.rx.snapshot_len();
     let payload = command_payload(command);
-    let report = send(
+    let report = send_with_secret(
         ctx,
         grant,
         &payload,
@@ -848,6 +863,7 @@ fn run_reboot(
         &q.req.source,
         Some(&q.cmd_id),
         true,
+        q.req.secret_tx,
     );
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(

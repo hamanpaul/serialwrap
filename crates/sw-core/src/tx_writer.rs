@@ -17,7 +17,7 @@ use sw_pal::{
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 
 use crate::mailbox::ControlEvent;
-use crate::uart_bridge::RunCancel;
+use crate::uart_bridge::{RunCancel, RxShared};
 use crate::wal::{WalAppend, WalAppendReq, WalHealthSink, WalWriter};
 
 /// 未結算 op 上限；滿時新 op 一律不提交（見 saturation）。
@@ -61,6 +61,8 @@ pub struct TxPermit {
     pub source: String,
     pub cmd_id: Option<String>,
     pub log: bool,
+    /// 人類密碼列：只跳過 TX payload 前綴，並在行尾寫入長度 META。
+    pub secret_tx: Option<SecretTx>,
     /// P6 增補 #3（07 D-03）：只有 HumanRaw／HumanReplay 為 `Some`（擷取當下的 `input_epoch`），06 既有建構點一律 `None`。
     pub input_epoch: Option<u64>,
     /// P6 增補 #3（07 D-22）：只有 HumanReplay 為 `Some(hold_id)`，其餘一律 `None`。
@@ -68,6 +70,21 @@ pub struct TxPermit {
     /// P8 Task 8（09 計畫 Fence 規則表）：只有 `FlashProbe` 為 `Some(probe_id)`（認線 probe 的身分，不以 `op_id` 代替），
     /// 其餘一律 `None`；`Fence::admit` 只在 `flash_mode == Probe(probe_id)` 時放行該 probe 的 TX。
     pub probe_id: Option<u64>,
+}
+
+/// human console 密碼輸入在 TxWriter 的稽核與回顯遮罩指示。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SecretTx {
+    /// TX WAL 從此 byte 起記錄；UART 寫入仍使用完整 payload。
+    pub log_skip_prefix: usize,
+    /// 非空時寫入一筆 `secret_tx` 長度 META。
+    pub meta_len: Option<usize>,
+    /// 開始新的人類 secret echo matcher。
+    pub echo_start: bool,
+    /// 本 job 前 matcher 已收到的 secret 長度，供部分 TX 回滾期望內容。
+    pub echo_prior_len: usize,
+    /// 本行已結束，停止擴充 matcher。
+    pub echo_finish: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,6 +870,7 @@ struct TxWriter {
     cancel: CancelToken,
     fence: Arc<Fence>,
     wal: Arc<WalWriter>,
+    rx: Option<Arc<RxShared>>,
     epoch: u64,
     control: Sender<ControlEvent>,
     jobs: Receiver<TxJob>,
@@ -1076,12 +1094,28 @@ impl TxWriter {
                     Some(reason),
                 ),
                 Precheck::Admitted => {
+                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
+                        if secret.echo_start {
+                            rx.begin_human_secret_echo();
+                        }
+                        let secret_len = secret.log_skip_prefix.min(job.payload.len());
+                        if secret_len > 0 {
+                            rx.extend_human_secret_echo(&job.payload[..secret_len]);
+                        }
+                    }
                     let gate = FenceSubmitGate {
                         fence: &self.fence,
                         permit: &job.permit,
                         last_reject: Cell::new(None),
                     };
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
+                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
+                        let requested_secret_len = secret.log_skip_prefix.min(job.payload.len());
+                        let sent_secret_len = confirmed_bytes(&result.outcome).min(requested_secret_len);
+                        if sent_secret_len < requested_secret_len {
+                            rx.truncate_human_secret_echo(secret.echo_prior_len + sent_secret_len);
+                        }
+                    }
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
                     let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
                     let (result, reject) =
@@ -1110,6 +1144,27 @@ impl TxWriter {
             };
 
             let confirmed = confirmed_bytes(&result.outcome);
+            let secret_meta_wal = if let Some(len) = job.permit.secret_tx.and_then(|secret| secret.meta_len) {
+                let mut meta = PyDict::new();
+                meta.insert("event", PyValue::from("secret_tx"));
+                meta.insert("secret_len", PyValue::Int(PyInt::Small(len as i128)));
+                Some(self.wal.append(WalAppendReq {
+                    com: &self.com,
+                    dir: "META",
+                    source: &job.permit.source,
+                    payload: b"",
+                    cmd_id: job.permit.cmd_id.as_deref(),
+                    loss_flag: false,
+                    meta: Some(meta),
+                }))
+            } else {
+                None
+            };
+            if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
+                if secret.echo_finish {
+                    rx.finish_human_secret_echo();
+                }
+            }
             // P8 Task 5：`Append` 的確認 bytes 進聚合緩衝（`Finish`／收尾 flush 時一筆落 WAL），不單獨寫 TX。
             if let Some(key) = append_key.as_ref() {
                 if confirmed > 0 {
@@ -1122,15 +1177,22 @@ impl TxWriter {
             }
             let tx_wal = if job.permit.log && append_key.is_none() && confirmed > 0 {
                 let confirmed_payload_len = confirmed.min(job.payload.len());
-                Some(self.wal.append(WalAppendReq {
-                    com: &self.com,
-                    dir: "TX",
-                    source: &job.permit.source,
-                    payload: &job.payload[..confirmed_payload_len],
-                    cmd_id: job.permit.cmd_id.as_deref(),
-                    loss_flag: false,
-                    meta: None,
-                }))
+                let log_start = job
+                    .permit
+                    .secret_tx
+                    .map(|secret| secret.log_skip_prefix.min(confirmed_payload_len))
+                    .unwrap_or_default();
+                (confirmed_payload_len > log_start).then(|| {
+                    self.wal.append(WalAppendReq {
+                        com: &self.com,
+                        dir: "TX",
+                        source: &job.permit.source,
+                        payload: &job.payload[log_start..confirmed_payload_len],
+                        cmd_id: job.permit.cmd_id.as_deref(),
+                        loss_flag: false,
+                        meta: None,
+                    })
+                })
             } else {
                 None
             };
@@ -1187,6 +1249,15 @@ impl TxWriter {
                     op_id,
                     "TX",
                     confirmed.min(job.payload.len()),
+                    append,
+                    self.wal_append_error(append),
+                );
+            }
+            if let Some(append) = secret_meta_wal.as_ref() {
+                op_ledger.record_wal_append(
+                    op_id,
+                    "META",
+                    0,
                     append,
                     self.wal_append_error(append),
                 );
@@ -1375,6 +1446,7 @@ pub fn spawn_tx_writer(
     cancel: CancelToken,
     fence: Arc<Fence>,
     wal: Arc<WalWriter>,
+    rx: Option<Arc<RxShared>>,
     epoch: u64,
     control: Sender<ControlEvent>,
 ) -> (
@@ -1399,6 +1471,7 @@ pub fn spawn_tx_writer(
         cancel,
         fence,
         wal,
+        rx,
         epoch,
         control,
         jobs: job_rx,

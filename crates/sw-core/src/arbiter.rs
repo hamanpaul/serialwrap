@@ -11,6 +11,7 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
 
 use crate::admission::{AdmissionGate, Ticket};
+use crate::tx_writer::SecretTx;
 
 /// 命令提交請求（對應 Python `CommandArbiter.submit` 的參數）。
 #[derive(Clone, Debug)]
@@ -25,6 +26,8 @@ pub struct SubmitReq {
     pub completion_regex: Option<String>,
     pub expect_reboot: bool,
     pub trusted_human: bool,
+    /// line-buffer human password 的 TX WAL 遮罩指示。
+    pub secret_tx: Option<SecretTx>,
     /// P6 增補 #6（07 D-10，DF-02）：只有 line editor 產生的 `HumanConsole` 會被視為 human；06 既有建構點一律 `Rpc`。
     pub origin: SubmitOrigin,
 }

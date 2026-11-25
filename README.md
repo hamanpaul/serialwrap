@@ -450,6 +450,13 @@ so arrow keys, Tab, and escape sequences behave like a direct minicom session.
 When an agent submits a command, the daemon suspends human raw mode, runs the
 agent command, then resumes the human console and flushes deferred input.
 
+Human password input is omitted from WAL TX payloads while the latest RX line
+matches the profile's `password_regex`, or a recognized console unlock prompt is
+active, through the next CR or LF. The WAL keeps a length META with the human
+source, and records the line terminator normally. If the profile has no matching
+`password_regex` and no recognized unlock prompt, the input remains logged as
+plaintext.
+
 Foreground commands and file transfers share operation admission: competing direct
 writers receive `SESSION_BUSY`; normal multi-client `command.submit` queue acceptance
 is unchanged. A console joining during an operation can still observe output and use
@@ -2678,6 +2685,7 @@ serialwrap-minicom -D /dev/ttyUSB0
 - **`console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console raw interactive ownership**，不需手動 `interactive-open`。所有按鍵（包含方向鍵、Tab、ESC 序列）即時透傳到 UART，操作體感與直接 minicom 一致。
 - 若 agent 在 human interactive 期間提交命令，daemon 會暫時掛起（suspend）human raw mode → 執行 agent 命令 → 完成後自動恢復（resume）。Human 在 agent 執行期間的按鍵會累積在 deferred buffer，agent 完成後 flush 到 UART。
 - 第二個以後的 minicom console 因為 interactive lease 已存在，仍走 line-buffer 模式（broker 提供本地回顯與 backspace 行編輯）。
+- **手動登入密碼記錄**：RX 最近一行符合 profile 的 `password_regex`，或符合可辨識的 console unlock 提示時，到下一個 CR/LF 為止的 human TX 不寫入 WAL payload，只保留含長度與來源的 META；換行與判定窗外的輸入照常記錄。若 profile 沒有符合的 `password_regex`、也沒有可辨識的 unlock 提示，密碼仍會以明文記錄。
 - bridge rebuild / reattach 時，broker 會盡量保留既有 console PTY 與 human ownership，避免既有 minicom 掛到 stale `/dev/pts/*`。
 - **孤兒 console 週期回收（#76）**：daemon 在每次 readiness tick（節流）主動回收「PTY slave 已無外部 reader」的孤兒 console（含死掉的非哨兵 primary；不碰當前 owner 與 agent 命令期間的 suspended owner、不碰內部哨兵 primary），避免 minicom 不乾淨關閉（SIGKILL/crash）後 console 累積拖慢 RX fan-out（卡頓/掉字）。
 - **raw ownership 自癒**：若 human console 的 raw ownership 因故掉失但 console 仍連著，daemon 會在 tick 中自動重授（lease-backed、原子授予），不需重開 minicom 即恢復方向鍵/Tab；agent 命令進行中（含 flash）不自癒、不奪權。

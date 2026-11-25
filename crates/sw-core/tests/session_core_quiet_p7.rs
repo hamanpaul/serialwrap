@@ -58,6 +58,7 @@ fn login_permit(epoch: u64, fsm_gen: u64) -> TxPermit {
         source: "system".into(),
         cmd_id: None,
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,

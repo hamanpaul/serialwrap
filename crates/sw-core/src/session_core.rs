@@ -14,7 +14,7 @@ use sw_proto::constants::{HUMAN_ACTIVE_WINDOW_S, PASSTHROUGH_READY_QUIET_S};
 use sw_proto::pycompat::{PyErr, clean_text, py_round, strftime_local, uuid4_dashed, uuid4_hex};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
-use sw_proto::pyre::valid_completion_regex;
+use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
 
 use crate::Mono;
 use crate::admission::AdmissionTicket;
@@ -575,6 +575,7 @@ pub struct PublicCtx {
 /// sans-IO session 狀態機（05 §1.6 `SessionRuntime` 對應；bridge 物件改為 `conn_epoch`）。
 pub struct SessionCore {
     profile: SessionProfile,
+    password_regex: Option<PyRegex>,
     /// 最近一次發布到 fence 的 `foreground_busy`（P7 Task 16-wire）。
     published_foreground_busy: bool,
     sid: String,
@@ -730,6 +731,13 @@ pub struct SessionCore {
     self_test_probes: SelfTestProbes,
     /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
     last_rx_wal_seq: u64,
+    /// RX 目前未終止行，用來辨識 profile 密碼提示與 console unlock 提示。
+    password_prompt_line: String,
+    /// 最近一行仍符合密碼提示，且尚未收到 RX 行終止符。
+    password_prompt_active: bool,
+    /// 人類已在密碼提示後開始輸入，等 human TX 行終止符結算。
+    human_password_active: bool,
+    human_password_len: usize,
     pending_release: Option<PendingRelease>,
     pending_auto_login: bool,
     shutdown_requested: bool,
@@ -986,8 +994,12 @@ enum RetiredReceipt {
 impl SessionCore {
     pub fn new(profile: SessionProfile, profile_source: &str, deps: CoreDeps) -> SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
+        let password_regex = (!profile.template.password_regex.is_empty())
+            .then(|| compile(&profile.template.password_regex, PyFlags(0)).ok())
+            .flatten();
         SessionCore {
             profile,
+            password_regex,
             published_foreground_busy: false,
             sid,
             binding_generation: 0,
@@ -1079,6 +1091,10 @@ impl SessionCore {
             force_poll_after_clear: Vec::new(),
             self_test_probes: SelfTestProbes::default(),
             last_rx_wal_seq: 0,
+            password_prompt_line: String::new(),
+            password_prompt_active: false,
+            human_password_active: false,
+            human_password_len: 0,
             pending_release: None,
             pending_auto_login: false,
             shutdown_requested: false,
@@ -5834,6 +5850,53 @@ impl SessionCore {
         }
     }
 
+    fn observe_password_prompt(&mut self, chunk: &str) {
+        for part in chunk.split_inclusive(|ch| matches!(ch, '\r' | '\n')) {
+            let terminated = part.ends_with('\r') || part.ends_with('\n');
+            let line_part = if terminated {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            self.password_prompt_line.push_str(line_part);
+            if self.password_prompt_line.len() > 4096 {
+                let trim_to = self.password_prompt_line.len() - 4096;
+                let boundary = self
+                    .password_prompt_line
+                    .char_indices()
+                    .find_map(|(index, _)| (index >= trim_to).then_some(index))
+                    .unwrap_or(self.password_prompt_line.len());
+                self.password_prompt_line.drain(..boundary);
+            }
+            let profile_match = self
+                .password_regex
+                .as_ref()
+                .is_some_and(|regex| regex.search(&self.password_prompt_line).is_some());
+            let unlock_match = self
+                .profile
+                .template
+                .console_unlock_env
+                .as_deref()
+                .is_some_and(|env| {
+                    if env.is_empty() {
+                        return false;
+                    }
+                    let line = self.password_prompt_line.trim_end().to_ascii_lowercase();
+                    let prompt_end =
+                        line.ends_with(':') || line.ends_with('?') || line.ends_with('>');
+                    prompt_end
+                        && ["password", "passphrase", "unlock"]
+                            .iter()
+                            .any(|word| line.contains(word))
+                });
+            self.password_prompt_active |= profile_match || unlock_match;
+            if terminated {
+                self.password_prompt_line.clear();
+                self.password_prompt_active = false;
+            }
+        }
+    }
+
     fn rx_chunk(&mut self, epoch: u64, bytes: &[u8], wal_seq: u64, now: Mono) -> Vec<Effect> {
         if self.generations.conn_epoch != Some(epoch) || bytes.is_empty() {
             return Vec::new();
@@ -5844,6 +5907,7 @@ impl SessionCore {
         // RX 恢復即重臂 transport stall 一次性告警（#150，Python `_mark_session_rx`）。
         self.transport_stall_warned = false;
         let chunk = clean_text(&String::from_utf8_lossy(bytes));
+        self.observe_password_prompt(&chunk);
         if self.is_passthrough() {
             // SC-35：passthrough 不 arm quiet，只重設安靜視窗。
             if self.state == SessionState::Attached {

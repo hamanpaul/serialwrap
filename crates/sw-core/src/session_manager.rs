@@ -3601,6 +3601,7 @@ impl Shared {
             cancel,
             fence,
             self.wal.clone(),
+            None,
             0,
             control_tx,
         );
@@ -3615,6 +3616,7 @@ impl Shared {
                 source: "system".to_string(),
                 cmd_id: None,
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,

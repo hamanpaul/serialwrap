@@ -25,6 +25,7 @@ fn req(cmd: &str) -> SubmitReq {
         completion_regex: None,
         expect_reboot: false,
         trusted_human: false,
+        secret_tx: None,
         origin: SubmitOrigin::Rpc,
     }
 }

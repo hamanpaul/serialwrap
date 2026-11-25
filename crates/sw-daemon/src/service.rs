@@ -1185,6 +1185,7 @@ impl Service {
                     completion_regex,
                     expect_reboot,
                     trusted_human,
+                    secret_tx: None,
                     // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭；
                     // 空名 human 的可信判定只經 `trusted_human` 傳遞（D5：與 origin 取 OR）。
                     origin: SubmitOrigin::Rpc,

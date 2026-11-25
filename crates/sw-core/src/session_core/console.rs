@@ -19,7 +19,7 @@ use crate::human_console::line_mode::human_console_mode;
 use crate::human_console::ownership::InputRoute;
 use crate::human_console::{ConsoleRecord, ConsoleScanSnapshot, ConsoleTransportKind, ReplayHold};
 use crate::human_console::line_editor::LineEditor;
-use crate::tx_writer::{TxClass, TxReport};
+use crate::tx_writer::{SecretTx, TxClass, TxReport};
 
 /// D-19 限速表上限（超過時整批清空；只影響 WARNING 次數）。
 const DROP_WARN_KEYS_MAX: usize = 1024;
@@ -387,6 +387,8 @@ impl SessionCore {
 
     fn emit_human_tx(&mut self, tag: HumanTxTag, hold: Option<u64>, payload: Vec<u8>, fx: &mut Vec<Effect>) {
         self.next_op_id = self.next_op_id.saturating_add(1);
+        let secret_tx = self.classify_human_secret_tx(&payload);
+        let log = secret_tx.is_none_or(|secret| secret.log_skip_prefix < payload.len());
         let permit = TxPermit {
             op_id: OpId(self.next_op_id),
             epoch: self.generations.conn_epoch.unwrap_or_default(),
@@ -395,7 +397,8 @@ impl SessionCore {
             class: tag.class,
             source: format!("human:{}", tag.client_id),
             cmd_id: None,
-            log: true,
+            log,
+            secret_tx,
             input_epoch: Some(tag.input_epoch),
             replay_hold: hold,
             probe_id: None,
@@ -407,6 +410,37 @@ impl SessionCore {
             ledger: (permit.op_id, permit.epoch),
         });
         fx.push(Effect::HumanTx { tag, permit, payload });
+    }
+
+    /// 密碼提示後到 human 行終止符間的 raw TX 只保留長度與 echo matcher。
+    fn classify_human_secret_tx(&mut self, payload: &[u8]) -> Option<SecretTx> {
+        if payload.is_empty() || (!self.human_password_active && !self.password_prompt_active) {
+            return None;
+        }
+        if !self.human_password_active {
+            // RX buffer 仍含未換行的密碼提示；清掉它，避免回顯文字接在提示後再次命中 regex。
+            self.password_prompt_line.clear();
+        }
+        let prior_len = self.human_password_len;
+        let line_end = payload.iter().position(|byte| matches!(byte, b'\r' | b'\n'));
+        let secret_len = line_end.unwrap_or(payload.len());
+        let total_len = prior_len.saturating_add(secret_len);
+        if secret_len > 0 {
+            self.human_password_active = true;
+            self.human_password_len = total_len;
+        }
+        if line_end.is_some() {
+            self.password_prompt_active = false;
+            self.human_password_active = false;
+            self.human_password_len = 0;
+        }
+        (total_len > 0).then_some(SecretTx {
+            log_skip_prefix: secret_len,
+            meta_len: line_end.is_some().then_some(total_len),
+            echo_start: prior_len == 0 && secret_len > 0,
+            echo_prior_len: prior_len,
+            echo_finish: line_end.is_some(),
+        })
     }
 
     /// backlog 依序：Replay 直接送出、Input 重新路由；直到有在途者或 backlog 清空。
@@ -667,6 +701,7 @@ impl SessionCore {
     fn submit_console_line(&mut self, client_id: &str, line: String, now: Mono, fx: &mut Vec<Effect>) {
         let mode = human_console_mode(&line, self.path_flavor).as_str().to_string();
         let bytes = line.len();
+        let secret_tx = self.classify_human_secret_line(&line);
         let req = SubmitReq {
             session_id: self.sid.clone(),
             command: line,
@@ -678,6 +713,7 @@ impl SessionCore {
             completion_regex: None,
             expect_reboot: false,
             trusted_human: true,
+            secret_tx,
             origin: SubmitOrigin::HumanConsole {
                 client_id: client_id.to_string(),
             },
@@ -703,6 +739,26 @@ impl SessionCore {
                 }
             }
         }
+    }
+
+    /// line-buffer console 在 Enter 時只記錄密碼長度；command payload 仍完整送到 UART。
+    fn classify_human_secret_line(&mut self, line: &str) -> Option<SecretTx> {
+        if !self.human_password_active && !self.password_prompt_active {
+            return None;
+        }
+        self.password_prompt_line.clear();
+        let prior_len = self.human_password_len;
+        let total_len = prior_len.saturating_add(line.len());
+        self.password_prompt_active = false;
+        self.human_password_active = false;
+        self.human_password_len = 0;
+        Some(SecretTx {
+            log_skip_prefix: line.len(),
+            meta_len: Some(total_len),
+            echo_start: prior_len == 0,
+            echo_prior_len: prior_len,
+            echo_finish: true,
+        })
     }
 
     /// `ControlEvent::ConsoleConnected`（TCP／com0com accept；ownership 依 `on_stream_accept`）。

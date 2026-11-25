@@ -58,6 +58,7 @@ fn permit(class: TxClass, source: &str, cmd_id: Option<&str>, log: bool) -> TxPe
         source: source.to_string(),
         cmd_id: cmd_id.map(str::to_string),
         log,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,

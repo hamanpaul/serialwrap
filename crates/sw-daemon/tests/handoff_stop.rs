@@ -687,6 +687,7 @@ fn inject_background_tx_on(
             source: "system:probe".to_string(),
             cmd_id: None,
             log: true,
+            secret_tx: None,
             input_epoch: None,
             replay_hold: None,
             probe_id: None,

@@ -82,8 +82,16 @@ fn rig() -> Rig {
             }
         });
     }
-    let (h, stop, j) =
-        spawn_tx_writer("COM0".into(), w, cancel.clone(), fence.clone(), wal.clone(), 7, ctl_tx);
+    let (h, stop, j) = spawn_tx_writer(
+        "COM0".into(),
+        w,
+        cancel.clone(),
+        fence.clone(),
+        wal.clone(),
+        None,
+        7,
+        ctl_tx,
+    );
     Rig { fence, wal, dev, h, wfs, cancel, stop: Some(stop), join: Some(j), ctl }
 }
 
@@ -108,6 +116,7 @@ fn job(
                 source: "agent:x".into(),
                 cmd_id: Some("c".into()),
                 log,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -133,6 +142,7 @@ fn send(r: &Rig, class: TxClass, op: u64, epoch: u64, payload: &[u8]) -> TxRepor
                 source: "agent:x".into(),
                 cmd_id: Some("c".into()),
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -189,6 +199,7 @@ fn shutdown_permit(op: u64, class: TxClass) -> TxPermit {
         source: "agent:x".into(),
         cmd_id: None,
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,
@@ -729,6 +740,7 @@ fn gate_rules() {
                 source: "agent:x".into(),
                 cmd_id: None,
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -757,6 +769,7 @@ fn human_line_job(op: u64, payload: &[u8]) -> (TxJob, crossbeam_channel::Receive
                 source: "human:cli".into(),
                 cmd_id: Some("c".into()),
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -895,6 +908,7 @@ fn wp55_human_line_fence_exempts_only_quiet_and_reconfirm() {
                 source: "human:cli".into(),
                 cmd_id: None,
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -1184,6 +1198,7 @@ fn wp53_passthrough_fence_exempts_only_command_quiet_and_reconfirm() {
                 source: "agent".into(),
                 cmd_id: None,
                 log: true,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,
@@ -1412,6 +1427,7 @@ fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
         source: "system:flash".into(),
         cmd_id: None,
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,
@@ -1434,6 +1450,7 @@ fn flash_permit(class: TxClass, probe_id: Option<u64>) -> TxPermit {
         source: "flash".into(),
         cmd_id: None,
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id,
@@ -1897,6 +1914,7 @@ fn cancelled_ops_bounded_512_fifo() {
         source: "agent:x".into(),
         cmd_id: None,
         log: true,
+        secret_tx: None,
         input_epoch: None,
         replay_hold: None,
         probe_id: None,

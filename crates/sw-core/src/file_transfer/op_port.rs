@@ -171,6 +171,7 @@ impl<'a> OpTransferPort<'a> {
             source: source.to_string(),
             cmd_id: cmd_id.map(str::to_string),
             log,
+            secret_tx: None,
             // brief 不符 #4：只有 human／flash probe 的 permit 帶這三欄。
             input_epoch: None,
             replay_hold: None,

@@ -1324,6 +1324,7 @@ fn wp510r_r18_shutdown_reaper_deadline_preserves_blocked_worker_cleanup() {
                 source: "agent".to_string(),
                 cmd_id: None,
                 log: false,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,

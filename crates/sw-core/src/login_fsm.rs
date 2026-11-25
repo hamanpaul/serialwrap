@@ -350,6 +350,7 @@ pub fn login_tx_sender(
                 source: source.to_string(),
                 cmd_id: None,
                 log,
+                secret_tx: None,
                 input_epoch: None,
                 replay_hold: None,
                 probe_id: None,

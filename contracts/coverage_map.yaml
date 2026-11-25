@@ -58,6 +58,12 @@ entries:
     - cargo:sw-daemon::issue311_secret_echo::issue311_console_unlock_prompt_prefix_overlapping_secret_does_not_timeout
     - cargo:sw-daemon::issue311_secret_echo::issue311_secret_split_across_one_byte_rx_chunks_is_masked
     owner_phase: P5
+  bc:BC-16:
+    nodeids:
+    - cargo:sw-daemon::issue311_secret_echo::issue312_raw_password_input_is_meta_only_until_enter
+    - cargo:sw-daemon::issue311_secret_echo::issue312_line_buffer_password_input_is_meta_only_until_enter
+    - cargo:sw-daemon::issue311_secret_echo::issue312_console_unlock_prompt_without_password_regex_match_is_meta_only
+    owner_phase: P6
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
@@ -2678,6 +2684,7 @@ l1_only_approvals:
   "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-14": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-14 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-16": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-16 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

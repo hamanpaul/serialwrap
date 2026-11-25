@@ -88,6 +88,7 @@ pub fn agent_submit(cmd: &str) -> SubmitReq {
         completion_regex: None,
         expect_reboot: false,
         trusted_human: false,
+        secret_tx: None,
         origin: SubmitOrigin::Rpc,
     }
 }
@@ -3375,6 +3376,7 @@ impl TxRig {
             cancel,
             fence.clone(),
             wal,
+            None,
             TXRIG_EPOCH,
             ctl_tx,
         );
@@ -3406,6 +3408,7 @@ impl TxRig {
             source: source.into(),
             cmd_id: None,
             log: true,
+            secret_tx: None,
             input_epoch,
             replay_hold: None,
             probe_id: None,
