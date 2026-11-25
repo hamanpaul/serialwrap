@@ -281,6 +281,12 @@ pub enum FakeWriteStep {
     Unknown { confirmed: usize, error: PalError },
     /// 提交 confirmed bytes 後先暫停，再回 `Unknown`，供 reader／TX 結算交錯測試。
     UnknownPause { confirmed: usize, error: PalError },
+    /// 提交指定 bytes 後先暫停，再回報較短的 confirmed 前綴與 `Unknown`，模擬實際送出但結果不明的尾段。
+    UnknownPauseAfterSubmit {
+        confirmed: usize,
+        submitted: usize,
+        error: PalError,
+    },
     /// 經 gate 提交後（已交 OS、in_flight 已設）於 gate 外阻塞直到 `CancelToken::cancel`，回 `Completed(accept_before_cancel)`。
     BlockUntilCancel { accept_before_cancel: usize },
     /// 經 gate 提交後於 gate 外阻塞直到 `FakeDevice::release_block`（模擬 D-state；不持 Fence 鎖）。
@@ -670,7 +676,7 @@ impl FakeDevice {
         self.inner.cond.notify_all();
     }
 
-    /// 只含已「確認寫出」的 bytes；讀後清空。
+    /// fake OS 實際收到的 bytes（包含 Unknown 結果中已提交但未確認的尾段）；讀後清空。
     pub fn take_tx(&self) -> Vec<u8> {
         let mut tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
         let out = tx.clone();
@@ -683,12 +689,12 @@ impl FakeDevice {
         out
     }
 
-    /// 已「確認寫出」的 bytes 長度（不清空、不動 loopback／tx_match 游標；P6 審查 sol 補審 Medium）。
+    /// fake OS 收到的 bytes 長度（不清空、不動 loopback／tx_match 游標；P6 審查 sol 補審 Medium）。
     pub fn tx_len(&self) -> usize {
         self.inner.tx.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// 已「確認寫出」bytes 中 `from` 之後的副本（不清空）。
+    /// fake OS 收到的 bytes 中 `from` 之後的副本（不清空）。
     pub fn tx_since(&self, from: usize) -> Vec<u8> {
         let tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
         tx.get(from..).map(<[u8]>::to_vec).unwrap_or_default()
@@ -1463,6 +1469,56 @@ impl SerialWriter for FakeSerialWriter {
                             .extend_from_slice(&data[..to_accept]);
                         check_tx_triggers_and_matches(&self.inner);
                         SubmitStep::Accepted(to_accept)
+                    } else {
+                        SubmitStep::Pending
+                    }
+                });
+                match submit_res {
+                    Ok(_) => {
+                        do_pause(&self.inner);
+                        TxResult {
+                            outcome: TxOutcome::Unknown { confirmed },
+                            error: Some(error),
+                        }
+                    }
+                    Err(SubmitRevoked) => TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    },
+                }
+            }
+            FakeWriteStep::UnknownPauseAfterSubmit {
+                confirmed,
+                submitted,
+                error,
+            } => {
+                assert!(
+                    submitted <= data.len(),
+                    "UnknownPauseAfterSubmit 實際提交長度超過請求長度"
+                );
+                assert!(
+                    confirmed <= submitted,
+                    "UnknownPauseAfterSubmit confirmed 前綴不可超過實際提交長度"
+                );
+                let submit_res = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    if submitted > 0 {
+                        self.inner
+                            .tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&data[..submitted]);
+                        check_tx_triggers_and_matches(&self.inner);
+                        SubmitStep::Accepted(submitted)
                     } else {
                         SubmitStep::Pending
                     }

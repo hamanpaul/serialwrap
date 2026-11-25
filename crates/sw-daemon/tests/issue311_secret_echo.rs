@@ -1693,11 +1693,12 @@ fn issue311_login_partial_secret_tx_masks_echo_before_login_cleanup() {
 #[test]
 fn issue311_login_unknown_secret_tx_masks_echo_before_login_cleanup() {
     run_login_secret_echo_while_tx_report_is_pending(
-        FakeWriteStep::UnknownPause {
-            confirmed: SECRET.len() + 1,
+        FakeWriteStep::UnknownPauseAfterSubmit {
+            confirmed: 1,
+            submitted: SECRET.len(),
             error: sw_pal::traits::PalError::io(5, "受控未知 TX"),
         },
-        b"i311secret\n",
+        SECRET.as_bytes(),
         "unknown",
     );
 }
