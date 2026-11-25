@@ -106,6 +106,12 @@ pub enum ControlEvent {
         outcome: OpOutcome,
         after_rx_seq: Option<u64>,
     },
+    /// 一般逾時恢復的開始屏障：actor 先依 op／bridge 世代驗證並使 deferred human 輸入失效，再允許 OpRunner 送鍵。
+    RecoveryStart {
+        op_id: OpId,
+        epoch: u64,
+        reply: Sender<bool>,
+    },
     LoginFinished {
         epoch: u64,
         fsm_gen: u64,

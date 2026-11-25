@@ -90,11 +90,9 @@ pub const LEGACY_CRASH_POINTS: &[&str] = &[
     "legacy_stop:after_stopped",
 ];
 
-struct EventFs {
-    inner: Arc<dyn FsOps>,
-    events: Arc<Mutex<Vec<(u64, String)>>>,
-    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
-}
+type FsEventLog = Arc<Mutex<Vec<(u64, String)>>>;
+type FsMutationLog = Arc<Mutex<Vec<String>>>;
+type FsReadFault = Arc<Mutex<Option<(String, PalErrorKind)>>>;
 
 struct ConfigRewriteOnRead {
     path: PathBuf,
@@ -104,25 +102,48 @@ struct ConfigRewriteOnRead {
     applied: bool,
 }
 
+struct EventFs {
+    inner: Arc<dyn FsOps>,
+    events: FsEventLog,
+    mutations: FsMutationLog,
+    read_fault: FsReadFault,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
+}
+
 struct EventFsHarness {
     fs: Arc<dyn FsOps>,
-    events: Arc<Mutex<Vec<(u64, String)>>>,
+    events: FsEventLog,
+    mutations: FsMutationLog,
+    read_fault: FsReadFault,
     config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
 }
 
 impl EventFs {
     fn wrap(inner: Arc<dyn FsOps>) -> EventFsHarness {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let mutations = Arc::new(Mutex::new(Vec::new()));
+        let read_fault = Arc::new(Mutex::new(None));
         let config_rewrite_on_read = Arc::new(Mutex::new(None));
         EventFsHarness {
             fs: Arc::new(Self {
                 inner,
                 events: Arc::clone(&events),
+                mutations: Arc::clone(&mutations),
+                read_fault: Arc::clone(&read_fault),
                 config_rewrite_on_read: Arc::clone(&config_rewrite_on_read),
             }),
             events,
+            mutations,
+            read_fault,
             config_rewrite_on_read,
         }
+    }
+
+    fn record_mutation(&self, operation: &str, path: &Path) {
+        self.mutations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{operation}:{}", path.display()));
     }
 
     fn record_write(&self, path: &Path, bytes: &[u8]) {
@@ -158,6 +179,16 @@ impl EventFs {
 
 impl FsRead for EventFs {
     fn read(&self, path: &Path) -> PalResult<Vec<u8>> {
+        let fault = self
+            .read_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((suffix, kind)) = fault {
+            if path.to_string_lossy().ends_with(&suffix) {
+                return Err(sw_pal::traits::PalError::plain(kind, "fake read fault"));
+            }
+        }
         let rewrite = {
             let mut script = self
                 .config_rewrite_on_read
@@ -181,6 +212,7 @@ impl FsRead for EventFs {
         }
         self.inner.read(path)
     }
+
     fn exists(&self, path: &Path) -> bool {
         let exists = self.inner.exists(path);
         match path.file_name().and_then(|name| name.to_str()) {
@@ -195,6 +227,7 @@ impl FsRead for EventFs {
         }
         exists
     }
+
     fn is_dir(&self, path: &Path) -> bool { self.inner.is_dir(path) }
     fn is_file(&self, path: &Path) -> bool { self.inner.is_file(path) }
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> { self.inner.list_dir(path) }
@@ -202,18 +235,33 @@ impl FsRead for EventFs {
 
 impl FsOps for EventFs {
     fn atomic_write(&self, path: &Path, bytes: &[u8], mode: Option<u32>) -> PalResult<()> {
+        self.record_mutation("atomic_write", path);
         self.inner.atomic_write(path, bytes, mode)?;
         self.record_write(path, bytes);
         Ok(())
     }
+    fn atomic_replace_preserving_metadata(&self, path: &Path, bytes: &[u8]) -> PalResult<()> {
+        self.record_mutation("atomic_write", path);
+        self.inner.atomic_replace_preserving_metadata(path, bytes)?;
+        self.record_write(path, bytes);
+        Ok(())
+    }
     fn write_file(&self, path: &Path, bytes: &[u8]) -> PalResult<()> {
+        self.record_mutation("write_file", path);
         self.inner.write_file(path, bytes)?;
         self.record_write(path, bytes);
         Ok(())
     }
-    fn mkdirs(&self, path: &Path) -> PalResult<()> { self.inner.mkdirs(path) }
-    fn replace(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.replace(from, to) }
+    fn mkdirs(&self, path: &Path) -> PalResult<()> {
+        self.record_mutation("mkdirs", path);
+        self.inner.mkdirs(path)
+    }
+    fn replace(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.record_mutation("replace", to);
+        self.inner.replace(from, to)
+    }
     fn remove_file(&self, path: &Path) -> PalResult<()> {
+        self.record_mutation("remove_file", path);
         self.inner.remove_file(path)?;
         if path.file_name().and_then(|name| name.to_str()) == Some("autostart-hold.json") {
             self.events.lock().unwrap_or_else(|e| e.into_inner())
@@ -221,15 +269,37 @@ impl FsOps for EventFs {
         }
         Ok(())
     }
-    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_preserving(from, to) }
-    fn sync_file(&self, path: &Path) -> PalResult<()> { self.inner.sync_file(path) }
-    fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_tree(from, to) }
-    fn remove_tree(&self, path: &Path) -> PalResult<()> { self.inner.remove_tree(path) }
+    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.record_mutation("copy_preserving", to);
+        self.inner.copy_preserving(from, to)
+    }
+    fn sync_file(&self, path: &Path) -> PalResult<()> {
+        self.record_mutation("sync_file", path);
+        self.inner.sync_file(path)
+    }
+    fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.record_mutation("copy_tree", to);
+        self.inner.copy_tree(from, to)
+    }
+    fn remove_tree(&self, path: &Path) -> PalResult<()> {
+        self.record_mutation("remove_tree", path);
+        self.inner.remove_tree(path)
+    }
     fn read_link(&self, path: &Path) -> PalResult<Option<PathBuf>> { self.inner.read_link(path) }
-    fn set_mode(&self, path: &Path, mode: u32) -> PalResult<()> { self.inner.set_mode(path, mode) }
-    fn sync_dir(&self, path: &Path) -> PalResult<()> { self.inner.sync_dir(path) }
-    fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> { self.inner.symlink_file(link, target) }
+    fn set_mode(&self, path: &Path, mode: u32) -> PalResult<()> {
+        self.record_mutation("set_mode", path);
+        self.inner.set_mode(path, mode)
+    }
+    fn sync_dir(&self, path: &Path) -> PalResult<()> {
+        self.record_mutation("sync_dir", path);
+        self.inner.sync_dir(path)
+    }
+    fn symlink_file(&self, link: &Path, target: &Path) -> PalResult<()> {
+        self.record_mutation("symlink_file", link);
+        self.inner.symlink_file(link, target)
+    }
     fn symlink_or_copy_dir(&self, link: &Path, target: &Path) -> PalResult<LinkKind> {
+        self.record_mutation("symlink_or_copy_dir", link);
         self.inner.symlink_or_copy_dir(link, target)
     }
     fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
@@ -393,6 +463,22 @@ impl ServiceCtl for InstallLockContenderServiceCtl {
     }
 }
 
+struct RecordingSerialBackend {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    inner: Arc<sw_pal::fakes::serial::FakeSerialBackend>,
+}
+
+impl sw_pal::traits::SerialBackend for RecordingSerialBackend {
+    fn open_exclusive(
+        &self,
+        device: &sw_pal::traits::DevicePath,
+        config: &sw_pal::traits::SerialConfig,
+    ) -> Result<Box<dyn sw_pal::traits::SerialHandle>, sw_pal::traits::OpenError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        sw_pal::traits::SerialBackend::open_exclusive(self.inner.as_ref(), device, config)
+    }
+}
+
 pub struct TestEnv {
     tmp_dir: tempfile::TempDir,
     windows: bool,
@@ -400,6 +486,9 @@ pub struct TestEnv {
     env: Arc<FakeSysEnv>,
     fs: Arc<dyn FsOps>,
     fs_events: Arc<Mutex<Vec<(u64, String)>>>,
+    fs_mutations: FsMutationLog,
+    read_fault: FsReadFault,
+    uart_operations: Option<Arc<std::sync::atomic::AtomicUsize>>,
     config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
     clock: Arc<FakeClock>,
     rpc: Arc<FakeRpcConnector>,
@@ -472,6 +561,13 @@ impl TestEnv {
         Self::new(true)
     }
 
+    pub fn fs_mutations(&self) -> Vec<String> {
+        self.fs_mutations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn new(windows: bool) -> Self {
         let tmp_dir = tempfile::tempdir().expect("tempdir 建立失敗");
         let event_fs = EventFs::wrap(real_fs());
@@ -482,6 +578,9 @@ impl TestEnv {
             env: FakeSysEnv::builder().build(),
             fs: event_fs.fs,
             fs_events: event_fs.events,
+            fs_mutations: event_fs.mutations,
+            read_fault: event_fs.read_fault,
+            uart_operations: None,
             config_rewrite_on_read: event_fs.config_rewrite_on_read,
             clock: FakeClock::new(),
             rpc: FakeRpcConnector::new(),
@@ -1644,6 +1743,29 @@ impl TestEnv {
         self
     }
 
+    /// 以測試替身注入線上 profile 的讀取錯誤，不依賴檔案權限。
+    pub fn with_fs_fault_read_suffix(self, suffix: &str) -> Self {
+        self.with_fs_read_error_suffix(suffix, PalErrorKind::Io)
+    }
+
+    pub fn with_fs_read_error_suffix(mut self, suffix: &str, kind: PalErrorKind) -> Self {
+        *self.read_fault.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((suffix.to_string(), kind));
+        self
+    }
+
+    pub fn with_uart_operation_recording(mut self) -> Self {
+        self.uart_operations = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        self
+    }
+
+    pub fn uart_operation_count(&self) -> usize {
+        self.uart_operations
+            .as_ref()
+            .map(|count| count.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// 以 `FaultFs` 包住 fs；寫入目標以 `s` 結尾時失敗（平台中立的「狀態檔不可寫」）。
     pub fn with_fs_fault_write_suffix(mut self, s: &str) -> Self {
         let faulty = FaultFs::wrap(Arc::clone(&self.fs));
@@ -2270,7 +2392,14 @@ impl TestEnv {
         if let Some(r) = &self.registry {
             b = b.registry(r.clone());
         }
-        b.build()
+        let mut platform = b.build();
+        if let Some(calls) = &self.uart_operations {
+            platform.serial = Arc::new(RecordingSerialBackend {
+                calls: Arc::clone(calls),
+                inner: sw_pal::fakes::serial::FakeSerialBackend::new(),
+            });
+        }
+        platform
     }
 
     /// 以 `sw_cli::run` 執行（`argv[0]` 為程式名）；回傳 `(rc, stdout, stderr)`。

@@ -123,6 +123,17 @@ impl FsOps for RealFs {
         let _ = mode;
         std::fs::rename(&tmp, p).map_err(io_error)
     }
+    fn atomic_replace_preserving_metadata(&self, p: &Path, data: &[u8]) -> PalResult<()> {
+        #[cfg(unix)]
+        {
+            use crate::fs_ops::posix::NativeFsOps;
+            NativeFsOps.atomic_replace_preserving_metadata(p, data)
+        }
+        #[cfg(not(unix))]
+        {
+            self.atomic_write(p, data, None)
+        }
+    }
     fn write_file(&self, p: &Path, data: &[u8]) -> PalResult<()> {
         std::fs::write(p, data).map_err(io_error)
     }

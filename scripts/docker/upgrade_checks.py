@@ -1,13 +1,16 @@
 """OD-33 R2(b)：0.3.2 → 新版（driver 的 NEW_VERSION）升級驗證的判定純函式（容器內 driver 與 pytest 共用）。
 
-只用標準函式庫：容器內 driver 以系統 python3 執行，不依賴 repo 套件。
+driver 僅依賴標準函式庫並以系統 python3 執行；profile YAML 解析由 subprocess 呼叫 bundle 或舊版 venv 的 PyYAML。
 每個檢查列為 {"id", "verdict": PASS|FAIL|INSUFFICIENT, "reason", "detail"}；整體 verdict 規則見 overall_verdict。
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -87,10 +90,20 @@ ATTACHED_LEGACY_MAX_SETUP_S = 120.0
 
 PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
 
-# 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
+# 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0。
+# `profile_template_fields` 只在明確的 profile policy（固定情境資料）驗證，不能整類豁免；一般 advisory
+# allowlist 仍維持只有 devices，避免把未受控的 drift 視為正常。
 ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
 _DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe", "serialwrapd.py"})
+PROFILE_EXPECTATIONS_PATH = Path(__file__).with_name("upgrade_profile_expectations.json")
+_PROFILE_POLICY_PHASES = frozenset({
+    "before_asset_addition",
+    "asset_added_not_migrated",
+    "migrated",
+    "materialized",
+})
+_PROFILE_UNSUPPORTED_MODES = frozenset({"legacy_0_3_2", "downgrade"})
 
 # 升級前寫入的使用者資料（driver phase_seed 建立）：基線必須真的含這些，相容比對才不會空轉。
 SEED_ALIASES = frozenset({"upgbench", "pinned"})
@@ -293,6 +306,17 @@ def snapshot_files(root: Path) -> dict[str, str]:
     return result
 
 
+def snapshot_file_bytes(root: Path) -> dict[str, bytes]:
+    """與 snapshot_files 使用同一檔案集合，保留逐位元組升級證據。"""
+    result: dict[str, bytes] = {}
+    if not root.is_dir():
+        return result
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            result[path.relative_to(root).as_posix()] = path.read_bytes()
+    return result
+
+
 def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str],
                           expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
     """既有檔案逐位元組保留。`expected_overwrites`（路徑 → 新 bundle 權威內容的 sha256）列出 setup 依 0.3.2 同語意
@@ -306,6 +330,226 @@ def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str
         return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added,
                    package_updated=package_updated)
     return row(check_id, "PASS", None, files=len(before), added=added, package_updated=package_updated)
+
+
+_P290_YAML_PROBE = r"""
+import copy
+import json
+import sys
+
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name == "yaml":
+        print(json.dumps({"status": "missing_pyyaml"}))
+        raise SystemExit(0)
+    raise
+
+def truthy(value):
+    return bool(value)
+
+def py_string(value):
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+def eligible(profile):
+    if not isinstance(profile, dict) or "timeout_recovery_keys" in profile:
+        return False
+    platform = profile.get("platform")
+    return truthy(platform) and py_string(platform).strip().lower() == "prpl"
+
+def candidates(document):
+    if not isinstance(document, dict):
+        return []
+    found = []
+    recognized = 0
+    profiles = document.get("profiles")
+    if isinstance(profiles, dict):
+        for name, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            if not py_string(name).strip():
+                continue
+            recognized += 1
+            if eligible(profile):
+                found.append(profile)
+    elif isinstance(profiles, list):
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            name = profile.get("name")
+            if not truthy(name):
+                name = profile.get("profile_name")
+            if not truthy(name) or not py_string(name).strip():
+                continue
+            recognized += 1
+            if eligible(profile):
+                found.append(profile)
+    if recognized == 0 and eligible(document):
+        found.append(document)
+    return found
+
+try:
+    pair = json.load(sys.stdin)
+    before = yaml.safe_load(pair["before"])
+    after = yaml.safe_load(pair["after"])
+    expected = copy.deepcopy(before)
+    targets = candidates(expected)
+    for profile in targets:
+        profile["timeout_recovery_keys"] = ["CTRL_C"]
+except (UnicodeError, yaml.YAMLError, TypeError, ValueError, KeyError) as exc:
+    result = {"status": "invalid_yaml", "error_type": type(exc).__name__}
+else:
+    result = {"status": "ok", "candidate_count": len(targets), "semantic_match": expected == after,
+              "pyyaml_version": getattr(yaml, "__version__", None)}
+print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+"""
+
+
+def _p290_yaml_migration_probe(before: bytes, after: bytes, *,
+                               candidate_python: str | Path | None,
+                               fallback_python: str | Path | None) -> dict[str, Any]:
+    """用候選 runtime／舊版 venv 的 PyYAML 確認只改到缺欄位的 prpl templates。"""
+    try:
+        before_text = before.decode("utf-8")
+        after_text = after.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"status": "invalid_utf8"}
+    interpreters: list[str] = []
+    for value in (candidate_python, fallback_python, sys.executable):
+        if value is not None and str(value) not in interpreters:
+            interpreters.append(str(value))
+    # JSON 在 pipe 上只使用 ASCII，避免 Windows 非 UTF-8 stdin locale 破壞 YAML Unicode 內容。
+    payload = json.dumps({"before": before_text, "after": after_text}, ensure_ascii=True).encode("ascii")
+    attempts: list[dict[str, Any]] = []
+    for interpreter in interpreters:
+        try:
+            process = subprocess.run(
+                [interpreter, "-I", "-c", _P290_YAML_PROBE],
+                input=payload, capture_output=True, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "parser_timeout", "attempts": attempts}
+        except OSError as exc:
+            attempts.append({"interpreter": interpreter, "status": type(exc).__name__})
+            continue
+        if process.returncode != 0:
+            return {"status": "parser_failed", "returncode": process.returncode, "attempts": attempts}
+        try:
+            result = json.loads(process.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"status": "parser_invalid_output", "attempts": attempts}
+        if type(result) is not dict or type(result.get("status")) is not str:
+            return {"status": "parser_invalid_result", "attempts": attempts}
+        attempts.append({"interpreter": interpreter, "status": result["status"],
+                         "pyyaml_version": result.get("pyyaml_version")})
+        if result["status"] == "missing_pyyaml":
+            continue
+        result["attempts"] = attempts
+        return result
+    return {"status": "parser_unavailable", "attempts": attempts}
+
+
+def _p290_only_inserted_fields(before: bytes, after: bytes, count: int) -> bool:
+    """確認差異只有 count 行精確的 timeout_recovery_keys 插入，允許 EOF 所需的一個換行。"""
+    if count <= 0:
+        return False
+    bases = [before]
+    if before and not before.endswith(b"\n"):
+        newline = b"\r\n" if b"\r\n" in before else b"\n"
+        bases.append(before + newline)
+    after_lines = after.splitlines(keepends=True)
+    field_line = re.compile(rb" *timeout_recovery_keys: \[CTRL_C\](?:\r?\n)?\Z")
+
+    for base in bases:
+        before_lines = base.splitlines(keepends=True)
+        i = j = removed = 0
+        while i < len(after_lines):
+            line = after_lines[i]
+            if j < len(before_lines) and line == before_lines[j]:
+                i += 1
+                j += 1
+                continue
+            if removed < count and field_line.fullmatch(line):
+                i += 1
+                removed += 1
+                continue
+            break
+        if i == len(after_lines) and j == len(before_lines) and removed == count:
+            return True
+    return False
+
+
+def _p290_is_system_profile_path(path: str) -> bool:
+    """判定 system profile snapshot 路徑；這些檔案不得走 expected_overwrites 整檔豁免。"""
+    normalized = "/" + path.replace("\\", "/").lstrip("/")
+    return "/etc/serialwrap/profiles/" in normalized and normalized.endswith((".yaml", ".yml"))
+
+
+def judge_files_preserved_with_p290_migration(
+    check_id: str,
+    before: dict[str, str],
+    after: dict[str, str],
+    *,
+    before_bytes: dict[str, bytes],
+    after_bytes: dict[str, bytes],
+    expected_overwrites: dict[str, str] | None = None,
+    candidate_python: str | Path | None = None,
+    fallback_python: str | Path | None = None,
+) -> dict[str, Any]:
+    """保留原有 hash 判準，只額外允許 OD-33 核准的 prpl 欄位精確遷移。"""
+    expected = expected_overwrites or {}
+    missing = sorted(set(before) - set(after))
+    package_updated = sorted(
+        k for k in before
+        if k in after and before[k] != after[k] and expected.get(k) == after[k]
+        and not _p290_is_system_profile_path(k)
+    )
+    changed = sorted(k for k in before if k in after and before[k] != after[k] and k not in package_updated)
+    added = sorted(set(after) - set(before))
+    migrated: list[str] = []
+    rejected: dict[str, str] = {}
+    for path in changed:
+        if path in expected and not _p290_is_system_profile_path(path):
+            rejected[path] = "managed profile did not match the expected package asset"
+            continue
+        old = before_bytes.get(path)
+        new = after_bytes.get(path)
+        if old is None or new is None:
+            rejected[path] = "migration bytes unavailable"
+            continue
+        if hashlib.sha256(old).hexdigest() != before[path] or hashlib.sha256(new).hexdigest() != after[path]:
+            rejected[path] = "migration bytes do not match recorded hashes"
+            continue
+        probe = _p290_yaml_migration_probe(
+            old, new, candidate_python=candidate_python, fallback_python=fallback_python,
+        )
+        count = probe.get("candidate_count") if probe.get("status") == "ok" else 0
+        if probe.get("status") != "ok" or type(count) is not int or count < 1:
+            rejected[path] = f"migration YAML could not be validated: {probe.get('status')}"
+            continue
+        if probe.get("semantic_match") is not True:
+            rejected[path] = "migration changed YAML semantics beyond the approved key"
+            continue
+        if not _p290_only_inserted_fields(old, new, count):
+            rejected[path] = "migration bytes contain changes beyond exact key insertion"
+            continue
+        migrated.append(path)
+
+    unapproved_changes = sorted(set(changed) - set(migrated))
+    detail = {
+        "files": len(before),
+        "missing": missing,
+        "changed": unapproved_changes,
+        "added": added,
+        "package_updated": package_updated,
+        "p290_migrated": sorted(migrated),
+        "p290_rejected": rejected,
+    }
+    if missing or unapproved_changes:
+        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", **detail)
+    return row(check_id, "PASS", None, **detail)
 
 
 def _alias_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -328,21 +572,394 @@ def judge_state_compatible(base: dict[str, Any], now: dict[str, Any], check_id: 
     return row(check_id, "PASS", None, **detail)
 
 
-def judge_doctor(check_id: str, doctor: dict[str, Any] | None, *, require_pairing: bool) -> dict[str, Any]:
+def _canonicalize_field_list(values: Any, *, label: str) -> list[str]:
+    if type(values) is not list:
+        raise ValueError(f"{label} 必須為 list[str]")
+    if any(type(item) is not str or not item for item in values):
+        raise ValueError(f"{label} 必須只含非空字串")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{label} 含重複項目")
+    return sorted(values)
+
+
+def _validate_profile_expectation_entry(name: str, entry: Any, *, supported: bool) -> None:
+    if type(entry) is not dict:
+        raise ValueError(f"profile expectation {name} 必須為 object")
+    if entry.get("phase") != name or type(entry.get("supported")) is not bool:
+        raise ValueError(f"profile expectation {name} 的 phase/supported 無效")
+    if entry["supported"] is not supported:
+        raise ValueError(f"profile expectation {name} 的 supported 不符政策類別")
+    common = _canonicalize_field_list(entry.get("expected_common_templates"),
+                                      label=f"{name}.expected_common_templates")
+    missing = entry.get("expected_missing_fields")
+    if type(missing) is not dict or any(type(key) is not str for key in missing):
+        raise ValueError(f"{name}.expected_missing_fields 必須為 object[str, list[str]]")
+    normalized_missing = {
+        template: _canonicalize_field_list(fields, label=f"{name}.expected_missing_fields[{template!r}]")
+        for template, fields in missing.items()
+    }
+    if not set(normalized_missing) <= set(common) or any(not fields for fields in normalized_missing.values()):
+        raise ValueError(f"{name}.expected_missing_fields 只能列出有缺漏的共同 template")
+    _canonicalize_field_list(entry.get("allowed_migration_fields"), label=f"{name}.allowed_migration_fields")
+    if supported:
+        if not common or type(entry.get("target_asset_revision")) is not str:
+            raise ValueError(f"{name} 支援的政策必須指定共同 template 與資產 revision")
+    else:
+        if common or normalized_missing or entry["allowed_migration_fields"]:
+            raise ValueError(f"{name} 不支援模式不得含比較或遷移預期")
+        if type(entry.get("unsupported_reason")) is not str or not entry["unsupported_reason"]:
+            raise ValueError(f"{name} 不支援模式必須說明原因")
+
+
+def load_profile_expectations(path: str | Path | None = None) -> dict[str, Any]:
+    """讀取並驗證受版控的 OD-33 固定情境，不從 doctor 輸出推導政策。"""
+    policy_path = PROFILE_EXPECTATIONS_PATH if path is None else Path(path)
+    try:
+        document = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"無法讀取 profile expectation policy: {type(exc).__name__}") from exc
+    if type(document) is not dict or type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        raise ValueError("profile expectation schema_version 無效")
+    if type(document.get("policy_id")) is not str or not document["policy_id"]:
+        raise ValueError("profile expectation policy_id 無效")
+    source = document.get("source")
+    source_fields = ("fixture_id", "fixture_kind", "source_version", "source_ref", "source_path", "source_sha256")
+    if type(source) is not dict or any(type(source.get(key)) is not str or not source[key] for key in source_fields):
+        raise ValueError("profile expectation source provenance 不完整")
+    if source["fixture_kind"] != "tagged_release_asset" or len(source["source_sha256"]) != 64 \
+            or any(char not in "0123456789abcdef" for char in source["source_sha256"]):
+        raise ValueError("profile expectation source 必須指向可追溯的 tagged release asset")
+    target = document.get("target_asset")
+    target_fields = ("asset_id", "asset_path", "migration_policy_id")
+    if type(target) is not dict or any(type(target.get(key)) is not str or not target[key] for key in target_fields):
+        raise ValueError("profile expectation target_asset 不完整")
+    phases = document.get("phases")
+    unsupported_modes = document.get("unsupported_modes")
+    if type(phases) is not dict or set(phases) != _PROFILE_POLICY_PHASES:
+        raise ValueError("profile expectation phases 必須精確列出四個核准階段")
+    if type(unsupported_modes) is not dict or set(unsupported_modes) != _PROFILE_UNSUPPORTED_MODES:
+        raise ValueError("profile expectation unsupported_modes 必須明列舊版與降級")
+    for name, entry in phases.items():
+        _validate_profile_expectation_entry(name, entry, supported=True)
+    for name, entry in unsupported_modes.items():
+        _validate_profile_expectation_entry(name, entry, supported=False)
+    return document
+
+
+def select_profile_policy(phase: str) -> dict[str, Any]:
+    """依呼叫端明確提供的階段選出政策；未知階段不會退回較寬鬆預設值。"""
+    if type(phase) is not str:
+        raise ValueError("profile policy phase 必須為字串")
+    document = load_profile_expectations()
+    entry = document["phases"].get(phase)
+    if entry is None:
+        entry = document["unsupported_modes"].get(phase)
+    if entry is None:
+        raise ValueError(f"沒有登錄 profile policy phase: {phase}")
+    selected = dict(entry)
+    selected["policy_id"] = document["policy_id"]
+    selected["source"] = dict(document["source"])
+    selected["target_asset"] = dict(document["target_asset"])
+    selected["migration_policy_id"] = document["target_asset"]["migration_policy_id"]
+    return selected
+
+
+_PROFILE_YAML_PROBE = r"""
+import json
+import sys
+
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name == "yaml":
+        print(json.dumps({"status": "missing_pyyaml"}))
+        raise SystemExit(0)
+    raise
+
+path, template_name, expected_platform, field_name = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as stream:
+        document = yaml.safe_load(stream)
+except (OSError, UnicodeError, yaml.YAMLError) as exc:
+    result = {"status": "invalid_yaml", "error_type": type(exc).__name__}
+else:
+    if not isinstance(document, dict):
+        result = {"status": "not_mapping"}
+    elif not isinstance(document.get("profiles"), dict):
+        result = {"status": "profiles_not_mapping"}
+    elif template_name not in document["profiles"]:
+        result = {"status": "template_missing"}
+    elif not isinstance(document["profiles"][template_name], dict):
+        result = {"status": "template_not_mapping"}
+    else:
+        profile = document["profiles"][template_name]
+        if profile.get("platform") != expected_platform:
+            result = {"status": "platform_mismatch"}
+        elif field_name not in profile:
+            result = {"status": "field_missing"}
+        else:
+            result = {"status": "ok", "has_field": True}
+result["pyyaml_version"] = getattr(yaml, "__version__", None)
+print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+"""
+
+
+def _profile_template_field_probe(path: str | Path, *, template: str, platform: str, field: str,
+                                  candidate_python: str | Path | None,
+                                  fallback_python: str | Path | None) -> dict[str, Any]:
+    """以候選 bundle 或舊版 venv 的 PyYAML 解析 profile，不依賴容器系統套件。"""
+    attempts: list[dict[str, Any]] = []
+    selected: dict[str, Any] | None = None
+    selected_path: str | None = None
+
+    for python_path in (candidate_python, fallback_python):
+        if python_path is None:
+            continue
+        interpreter = str(python_path)
+        try:
+            process = subprocess.run(
+                [interpreter, "-I", "-c", _PROFILE_YAML_PROBE,
+                 str(path), template, platform, field],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            attempts.append({"interpreter_path": interpreter, "status": "timeout"})
+            return {"has_field": False, "error": "YAML parser subprocess timed out",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        except UnicodeError as exc:
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_output",
+                             "error_type": type(exc).__name__})
+            return {"has_field": False, "error": "YAML parser returned invalid output",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        except OSError as exc:
+            attempts.append({"interpreter_path": interpreter, "status": "unavailable",
+                             "error_type": type(exc).__name__})
+            continue
+
+        if process.returncode != 0:
+            attempts.append({"interpreter_path": interpreter, "status": "parser_exit",
+                             "returncode": process.returncode})
+            return {"has_field": False, "error": "YAML parser subprocess failed",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        try:
+            result = json.loads(process.stdout)
+        except (TypeError, json.JSONDecodeError):
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_output"})
+            return {"has_field": False, "error": "YAML parser returned invalid output",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        if type(result) is not dict or type(result.get("status")) is not str:
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_result"})
+            return {"has_field": False, "error": "YAML parser returned an invalid result",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+
+        attempts.append({"interpreter_path": interpreter, "status": result["status"],
+                         "pyyaml_version": result.get("pyyaml_version")})
+        if result["status"] == "missing_pyyaml":
+            continue
+        selected = result
+        selected_path = interpreter
+        break
+
+    evidence = {"interpreter_path": selected_path,
+                "pyyaml_version": selected.get("pyyaml_version") if selected else None,
+                "parser_attempts": attempts}
+    if selected is None:
+        return {"has_field": False, "error": "PyYAML parser unavailable", "evidence": evidence}
+
+    status = selected["status"]
+    if status == "ok":
+        return {"has_field": selected.get("has_field") is True, "error": None, "evidence": evidence}
+    errors = {
+        "invalid_yaml": "YAML parse failed: " + str(selected.get("error_type", "unknown")),
+        "not_mapping": "YAML document is not a mapping",
+        "profiles_not_mapping": "profiles is not a mapping",
+        "template_missing": f"template {template!r} is missing",
+        "template_not_mapping": f"template {template!r} is not a mapping",
+        "platform_mismatch": f"template {template!r} is not platform {platform!r}",
+        "field_missing": f"template {template!r} lacks field {field!r}",
+    }
+    return {"has_field": False, "error": errors.get(status, "YAML parser returned an unsupported result"),
+            "evidence": evidence}
+
+
+def judge_p290_profile_migration(check_id: str, target_asset_path: str | Path, live_profile_path: str | Path,
+                                 *, migration_policy_id: str,
+                                 candidate_python: str | Path | None = None,
+                                 fallback_python: str | Path | None = None) -> dict[str, Any]:
+    """升級完成必須同時含 p290 欄位於候選資產與實際管理目錄。"""
+    field = "timeout_recovery_keys"
+    template = "prpl-template"
+    platform = "prpl"
+    if migration_policy_id != "p290-template-migration-v1":
+        return row(check_id, "FAIL", "不支援的 profile migration policy",
+                   migration_policy_id=migration_policy_id)
+    target = _profile_template_field_probe(
+        target_asset_path, template=template, platform=platform, field=field,
+        candidate_python=candidate_python, fallback_python=fallback_python,
+    )
+    live = _profile_template_field_probe(
+        live_profile_path, template=template, platform=platform, field=field,
+        candidate_python=candidate_python, fallback_python=fallback_python,
+    )
+    missing = []
+    if not target["has_field"]:
+        missing.append("target_asset")
+    if not live["has_field"]:
+        missing.append("live_profile")
+    verdict = "FAIL" if missing else "PASS"
+    reason = "p290 timeout_recovery_keys 缺於 " + ", ".join(missing) if missing else None
+    return row(check_id, verdict, reason,
+               migration_policy_id=migration_policy_id, template=template, platform=platform, field=field,
+               target_asset_path=str(target_asset_path), target_asset_has_field=target["has_field"],
+               target_asset_error=target["error"], target_asset_yaml=target["evidence"],
+               live_profile_path=str(live_profile_path), live_profile_has_field=live["has_field"],
+               live_profile_error=live["error"], live_profile_yaml=live["evidence"])
+
+
+def _validate_profile_policy(profile_policy: Any) -> tuple[bool, list[str], dict[str, list[str]]]:
+    if type(profile_policy) is not dict:
+        raise ValueError("profile_policy 必須由 select_profile_policy() 明確選出")
+    if type(profile_policy.get("supported")) is not bool:
+        raise ValueError("profile_policy.supported 必須為真 boolean")
+    phase = profile_policy.get("phase")
+    if type(phase) is not str:
+        raise ValueError("profile_policy.phase 必須為字串")
+    expected_policy = select_profile_policy(phase)
+    if profile_policy != expected_policy:
+        raise ValueError("profile_policy 與受版控政策不一致")
+    supported = profile_policy["supported"]
+    common = _canonicalize_field_list(profile_policy["expected_common_templates"],
+                                      label="expected_common_templates")
+    missing = profile_policy["expected_missing_fields"]
+    if type(missing) is not dict or any(type(template) is not str for template in missing):
+        raise ValueError("expected_missing_fields 必須為 object[str, list[str]]")
+    normalized_missing = {
+        template: _canonicalize_field_list(fields, label=f"expected_missing_fields[{template!r}]")
+        for template, fields in missing.items()
+    }
+    if not set(normalized_missing) <= set(common) or any(not fields for fields in normalized_missing.values()):
+        raise ValueError("expected_missing_fields 只能列出有缺漏的共同 template")
+    _canonicalize_field_list(profile_policy["allowed_migration_fields"], label="allowed_migration_fields")
+    return supported, common, normalized_missing
+
+
+def _profile_check_payload_error(profile_check: dict[str, Any], *, expected_common: list[str],
+                                 expected_missing: dict[str, list[str]]) -> str | None:
+    required = ("comparison_status", "missing_fields", "compared_templates", "reason")
+    if any(key not in profile_check for key in required):
+        return "profile_template_fields payload 缺必要欄位"
+    status = profile_check["comparison_status"]
+    if type(status) is not str:
+        return "profile_template_fields.comparison_status 必須為字串"
+    if status not in {"matched", "missing_fields", "not_materialized", "unavailable", "no_common_templates"}:
+        return f"profile_template_fields.comparison_status 非法: {status!r}"
+    if status not in {"matched", "missing_fields"}:
+        return f"profile_template_fields 不可比較: {status}"
+    if type(profile_check.get("check")) is not str or profile_check["check"] != "profile_template_fields":
+        return "profile_template_fields check 名稱無效"
+    if type(profile_check.get("ok")) is not bool:
+        return "profile_template_fields.ok 必須為真 boolean"
+    if type(profile_check.get("advisory")) is not bool or profile_check["advisory"] is not True:
+        return "profile_template_fields.advisory 必須為 True"
+    if profile_check["reason"] is not None and type(profile_check["reason"]) is not str:
+        return "profile_template_fields.reason 必須為字串或 null"
+    if profile_check["reason"] is not None:
+        return "可比較的 profile_template_fields.reason 必須為 null"
+    try:
+        compared = _canonicalize_field_list(profile_check["compared_templates"],
+                                            label="profile_template_fields.compared_templates")
+    except ValueError as exc:
+        return str(exc)
+    if compared != expected_common:
+        return f"compared_templates 不符預期: got={compared}, expected={expected_common}"
+    missing = profile_check["missing_fields"]
+    if type(missing) is not dict or any(type(template) is not str for template in missing):
+        return "profile_template_fields.missing_fields 必須為 object[str, list[str]]"
+    try:
+        normalized_missing = {
+            template: _canonicalize_field_list(fields, label=f"missing_fields[{template!r}]")
+            for template, fields in missing.items()
+        }
+    except ValueError as exc:
+        return str(exc)
+    if normalized_missing != expected_missing:
+        return f"missing_fields 不符預期: got={normalized_missing}, expected={expected_missing}"
+    has_missing = any(normalized_missing.values())
+    expected_status = "missing_fields" if has_missing else "matched"
+    expected_ok = not has_missing
+    if status != expected_status or profile_check["ok"] is not expected_ok:
+        return "comparison_status、ok 與 missing_fields 集合不一致"
+    return None
+
+
+def judge_doctor(check_id: str, doctor: dict[str, Any] | None, *, require_pairing: bool,
+                 profile_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    if profile_policy is None:
+        return row(check_id, "FAIL", "缺少明確的 profile_policy；不得退回寬鬆判定")
+    try:
+        policy_supported, expected_common, expected_missing = _validate_profile_policy(profile_policy)
+    except (ValueError, KeyError, TypeError) as exc:
+        return row(check_id, "FAIL", f"profile_policy 無效: {exc}")
     if not isinstance(doctor, dict) or not isinstance(doctor.get("checks"), list):
         return row(check_id, "FAIL", "doctor 輸出不可解析")
-    checks = [c for c in doctor["checks"] if isinstance(c, dict)]
-    hard = sorted(c.get("check") for c in checks if not c.get("ok") and not c.get("advisory"))
-    advisory = sorted(c.get("check") for c in checks if not c.get("ok") and c.get("advisory"))
-    extra_adv = sorted(set(advisory) - ALLOWED_ADVISORY_FAILURES)
-    pairing = next((c for c in checks if c.get("check") == "version_pairing"), None)
-    detail = {"ok": doctor.get("ok"), "failed": hard, "advisory_failed": advisory,
-              "version_pairing": None if pairing is None else pairing.get("ok")}
-    if hard or doctor.get("ok") is not True:
+    if type(doctor.get("ok")) is not bool:
+        return row(check_id, "FAIL", "doctor.ok 必須為 boolean")
+    checks = doctor["checks"]
+    if any(type(check) is not dict for check in checks):
+        return row(check_id, "FAIL", "doctor.checks 含非 object 項目")
+    for check in checks:
+        if type(check.get("check")) is not str or not check["check"] \
+                or type(check.get("ok")) is not bool or type(check.get("advisory")) is not bool:
+            return row(check_id, "FAIL", "doctor check 的名稱、ok、advisory 型別無效")
+    hard = sorted(c["check"] for c in checks if not c["ok"] and not c["advisory"])
+    advisory = sorted(c["check"] for c in checks if not c["ok"] and c["advisory"])
+    pairing = next((c for c in checks if c["check"] == "version_pairing"), None)
+    detail = {
+        "ok": doctor["ok"],
+        "failed": hard,
+        "advisory_failed": advisory,
+        "version_pairing": None if pairing is None else pairing["ok"],
+        "profile_policy": {
+            "policy_id": profile_policy["policy_id"],
+            "phase": profile_policy["phase"],
+            "migration_policy_id": profile_policy["migration_policy_id"],
+            "expected_common_templates": expected_common,
+            "expected_missing_fields": expected_missing,
+            "allowed_migration_fields": profile_policy["allowed_migration_fields"],
+        },
+    }
+    if hard or doctor["ok"] is not True:
         return row(check_id, "FAIL", "doctor 有非 advisory 檢查失敗", **detail)
+
+    profile_checks = [c for c in checks if c["check"] == "profile_template_fields"]
+    if policy_supported:
+        if len(profile_checks) != 1:
+            return row(check_id, "FAIL", "profile_template_fields 必須恰好出現一次",
+                       profile_check_count=len(profile_checks), **detail)
+        profile_check = profile_checks[0]
+        payload_error = _profile_check_payload_error(
+            profile_check,
+            expected_common=expected_common,
+            expected_missing=expected_missing,
+        )
+        if payload_error is not None:
+            return row(check_id, "FAIL", payload_error, profile_check=profile_check, **detail)
+        allowed = set(ALLOWED_ADVISORY_FAILURES) | {"profile_template_fields"}
+    else:
+        if profile_checks:
+            return row(check_id, "FAIL", "不支援此 check 的政策下，doctor 不得輸出 profile_template_fields",
+                       profile_check_count=len(profile_checks), **detail)
+        allowed = set(ALLOWED_ADVISORY_FAILURES)
+
+    extra_adv = sorted(set(advisory) - allowed)
     if extra_adv:
-        return row(check_id, "FAIL", f"doctor advisory 失敗超出容器允許集合 {sorted(ALLOWED_ADVISORY_FAILURES)}", **detail)
-    if require_pairing and (pairing is None or pairing.get("ok") is not True):
+        return row(check_id, "FAIL", f"doctor advisory 失敗超出允許集合 {sorted(allowed)}", **detail)
+    if require_pairing and (pairing is None or pairing["ok"] is not True):
         return row(check_id, "FAIL", "release 安裝的 doctor 缺 version_pairing 或未通過", **detail)
     return row(check_id, "PASS", None, **detail)
 
@@ -394,7 +1011,11 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
                               old_alive_after: list[int], status_after: dict[str, Any] | None, instances_after: list[int],
                               cfg_before: dict[str, str], cfg_after: dict[str, str], overlaps: list[dict[str, Any]],
                               new_version: str = "0.4.0", old_version: str = "0.3.2",
-                              expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
+                              expected_overwrites: dict[str, str] | None = None,
+                              cfg_before_bytes: dict[str, bytes] | None = None,
+                              cfg_after_bytes: dict[str, bytes] | None = None,
+                              candidate_python: str | Path | None = None,
+                              fallback_python: str | Path | None = None) -> dict[str, Any]:
     """OD-48：0.3.2 daemon 執行中直接 setup → 成功切換、舊 daemon 行程樹結束、新 daemon 由 setup 自己啟動
     （判定在 driver 任何啟動動作之前取樣；setup 沒啟動就 FAIL）、config／profiles 逐位元組保留、無兩個 daemon 重疊。"""
     body = body if isinstance(body, dict) else {}
@@ -402,7 +1023,31 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
     legacy = _step_detail(body, "stop_supervisor").get("legacy_stop") or {}
     started = _step_detail(body, "start_and_verify").get("started")
     status = status_after if isinstance(status_after, dict) else {}
-    preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+    if cfg_before_bytes is None or cfg_after_bytes is None:
+        missing_profile_bytes = sorted(
+            path for path in cfg_before
+            if path in cfg_after and cfg_before[path] != cfg_after[path]
+            and _p290_is_system_profile_path(path)
+            and (cfg_before_bytes is None or cfg_after_bytes is None
+                 or path not in cfg_before_bytes or path not in cfg_after_bytes)
+        )
+        if missing_profile_bytes:
+            preserved = row(
+                check_id, "FAIL", "system profile 變更缺少前後 bytes，無法驗證精確遷移",
+                files=len(cfg_before), missing=sorted(set(cfg_before) - set(cfg_after)),
+                changed=missing_profile_bytes, added=sorted(set(cfg_after) - set(cfg_before)),
+                package_updated=[], p290_migrated=[],
+                p290_rejected={path: "migration bytes unavailable" for path in missing_profile_bytes},
+            )
+        else:
+            preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+    else:
+        preserved = judge_files_preserved_with_p290_migration(
+            check_id, cfg_before, cfg_after,
+            before_bytes=cfg_before_bytes, after_bytes=cfg_after_bytes,
+            expected_overwrites=expected_overwrites,
+            candidate_python=candidate_python, fallback_python=fallback_python,
+        )
     detail = {"setup_rc": setup_rc, "op": report.get("op"), "to_version": report.get("to_version"),
               "legacy_stop": legacy, "started_by_setup": started, "old_pids": list(old_pids),
               "old_alive_after": list(old_alive_after), "daemon_version_after": status.get("version"),

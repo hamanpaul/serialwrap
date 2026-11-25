@@ -1371,6 +1371,7 @@ impl SessionCore {
                 | MailboxItem::Control(ControlEvent::FlashProbeReleased { .. })
                 | MailboxItem::Control(ControlEvent::FlashSyncMatched { .. })
                 | MailboxItem::Control(ControlEvent::FlashHolderGone { .. })
+                | MailboxItem::Control(ControlEvent::RecoveryStart { .. })
         )
     }
 
@@ -1389,6 +1390,7 @@ impl SessionCore {
                     | ControlEvent::WorkerStopped(_)
                     | ControlEvent::WorkerDrainTimeout { .. }
                     | ControlEvent::ShutdownFlushWaiters
+                    | ControlEvent::RecoveryStart { .. }
                     // S2-PAR-wp510r R3（設計 §3.1.7）：帳本紀錄的關閉終態（Pending 延後、Permanent 處理）。
                     | ControlEvent::CustodyTerminal { .. }
                     // S2-PAR-wp510r R4（設計 §3.1.7）：W6 的 offer 通知（Pending 延後、Permanent 只關閉）。
@@ -1497,6 +1499,9 @@ impl SessionCore {
                 MailboxItem::Control(ControlEvent::ShutdownGate { reply }) => {
                     self.flush_shutdown_queue();
                     effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
+                }
+                MailboxItem::Control(ControlEvent::RecoveryStart { reply, .. }) => {
+                    let _ = reply.try_send(false);
                 }
                 _ => {}
             }
@@ -1662,6 +1667,22 @@ impl SessionCore {
                 effects
                     .0
                     .extend(self.op_finished(op_id, epoch, outcome, now));
+            }
+            MailboxItem::Control(ControlEvent::RecoveryStart {
+                op_id,
+                epoch,
+                reply,
+            }) => {
+                let current = !self.retired
+                    && !self.shutdown_requested
+                    && self.stop.is_none()
+                    && self.pending_open_stop.is_none()
+                    && self.generations.conn_epoch == Some(epoch)
+                    && self.pending_ops.contains_key(&op_id);
+                if current {
+                    self.invalidate_input(InvalidateReason::Recovery, &mut effects.0);
+                }
+                let _ = reply.try_send(current);
             }
             MailboxItem::Control(ControlEvent::LoginFinished {
                 epoch,

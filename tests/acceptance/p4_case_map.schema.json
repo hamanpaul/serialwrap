@@ -48,7 +48,11 @@
                 "no_forbidden_interleave",
                 "no_reopen_before_handoff",
                 "no_stale_context_replay",
-                "zero_tx_on_reject"
+                "zero_tx_on_reject",
+                "comparison_status_matches_exact_missing_fields",
+                "doctor_advisory_does_not_change_exit_status",
+                "unavailable_comparison_never_reports_matched",
+                "no_common_template_is_not_comparable"
               ]
             }
           },

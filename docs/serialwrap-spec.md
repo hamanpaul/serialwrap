@@ -317,13 +317,18 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 升級順序固定：
 
-1. `Ctrl-C`
-2. `Ctrl-D`
-3. 若仍無 prompt，session 降級為 `ATTACHED`
+1. 依 profile 的 `timeout_recovery_keys` 順序送鍵；語言層預設為 `[CTRL_C]`。
+2. 清單為 `[]` 時不送救援鍵，直接進入既有逾時收尾。
+3. 若未恢復 prompt，session 降級為 `ATTACHED`。
+
+進入一般 recovery 時，先使 deferred human 輸入失效，不論清單是否為空。欄位在 template
+省略或設為 `null` 時使用 `[CTRL_C]`；target 省略或設為 `null` 時繼承 template。明確清單
+完全取代繼承值；只有清單明列 `CTRL_D` 才會送 Ctrl-D。`READY` 狀態的 `session recover`
+使用同一份有效清單。
 
 #### `_recover_after_failure` 語義
 
-當前景命令因 `PROMPT_TIMEOUT` 失敗後，`_recover_after_failure()` 會嘗試透過 `Ctrl-C` / `Ctrl-D` 恢復 prompt。若成功恢復：
+當前景命令因 `PROMPT_TIMEOUT` 失敗後，`_recover_after_failure()` 依 profile 的 `timeout_recovery_keys` 恢復 prompt（語言層預設 `[CTRL_C]`；出貨 `prpl-template` 明列 `[CTRL_C]`）。若成功恢復：
 
 - 回傳 `ok: true`（表示 session 已回到可用狀態）
 - 保留 `error_code: PROMPT_TIMEOUT_RECOVERED`
@@ -695,6 +700,19 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - **`doctor` 的 `daemon_code_current`**（advisory）：以 `health.ping` 取 daemon 指紋與本行程
   比對；daemon 沒回報 `code_fingerprint` 視為舊 build（不一致）；daemon 連不上或本行程算不出
   指紋 → informational ok。
+- **Rust-only `doctor` 檢查 `profile_template_fields`（BC-08，advisory）**：比較編譯時出貨資產 `profiles/default.yaml` 與指定 `PROFILE_DIR/default.yaml` 這兩個磁碟檔案；只對兩邊共同 template 比較頂層欄位存在性，不比較值、不比較 `uart.*` 等巢狀欄位，也不納入線上額外 template 或欄位。空字串、`null`、空集合等值只要 key 存在就算存在。Python 0.4.x 基線不新增此 check；`profile_bootloader_prompts` 維持原判準。
+
+  `check.extra` 將四個欄位攤平輸出：`comparison_status`、`missing_fields`、`compared_templates`、`reason`。狀態與 invariant 如下：
+
+  | `comparison_status` | `check.ok` | `missing_fields` | 語意 |
+  |---|---:|---|---|
+  | `matched` | `true` | `{}` | 已完成比較且沒有缺漏 |
+  | `missing_fields` | `false` | 排序後的 template → 欄位清單 | 已完成比較且有缺漏 |
+  | `not_materialized` | `false` | `null` | 線上檔案不存在 |
+  | `unavailable` | `false` | `null` | 讀取、UTF-8、YAML 或結構錯誤 |
+  | `no_common_templates` | `false` | `null` | 兩端沒有共同 template |
+
+  `compared_templates` 與每個缺漏欄位清單皆排序；成功比較時 `reason=null`，不可比較時提供穩定原因分類，不回顯 YAML 原文或值。此 check 是 advisory：不可比較時 check 自身 `ok=false`，但不改 doctor 整體 `ok` 或 exit code，也不表示 daemon 已載入或重新讀取 profile。OD-33 升級判定另依執行前從受版控情境資料選定的政策，要求唯一且可比較的 check、正確 payload，以及實測缺漏映射與固定預期完全相等；不可比較或任何額外／缺少欄位一律 FAIL，不從結果反選政策。p290 的 `p290-template-migration-v1` 僅於管理 profile 目錄中缺欄位的 `platform: prpl` template 精確插入 `timeout_recovery_keys: [CTRL_C]`（含改名 template），不處理 target 或其他平台。既有值（含 `null`）不覆寫，其餘位元組保持不變；檔案遷移失敗時 setup 整體失敗、該檔保持原文並列出已成功檔案，重跑可續行。成功訊息寫入 stderr，不改 setup JSON；降級保留補入欄位。systemd-system 先遷移 `/etc/serialwrap/profiles`，再以 no-clobber 複製新資產。遷移後預期缺漏不含 `timeout_recovery_keys`。
 
 **`serialwrap setup` 的行為**（`cli._run_setup` + `setup_cmd.reconcile(restart_daemon=…)`）：
 以既有的 `health.ping` 探測回應取 daemon 指紋（不多一次 RPC），與本行程（＝剛安裝的版本）比對：
@@ -885,6 +903,7 @@ targets:
     - "^BCM\\d+>> $"  # Broadcom BCM 系列 bootloader
   ```
 - `boot_done_regex`：開機完成訊號 regex（字串，預設空＝不設）。boot quiet window 期間 RX 命中即提早解除，與 `login_regex`／`prompt_regex` 同列判定，同樣受 `bootloader_prompts` 尾行例外約束；**不參與登入流程**（不會因命中而送帳密）。target 可覆寫。出貨 `prpl-template` 設為 `"Please press Enter to activate this console"`。
+- `timeout_recovery_keys`：命令逾時（以及 `READY` 時的 `session recover`）依序送出的恢復按鍵；YAML list，元素只能是 `CTRL_C`、`CTRL_D` 且不得重複，內部以 `tuple[str, ...]` 儲存。語言層預設 `[CTRL_C]`，出貨 `prpl-template` 明列 `[CTRL_C]`。template 省略或 `null` 取預設；target 省略或 `null` 繼承 template；明確清單完整取代繼承值。`[]` 不送按鍵，未恢復時仍回 `PROMPT_TIMEOUT` 並轉 `ATTACHED`；一般 recovery 一律使 deferred human 輸入失效。只有清單明列 `CTRL_D` 才會送 Ctrl-D，避免預設將已登入 shell 登出。未知鍵名、重複或非 list 在載入時拋 `ValueError`。boot quiet window、passthrough 與 bare human 來源的既有例外不變。
 
 ### 13.3 Platform 行為
 
@@ -959,7 +978,7 @@ targets:
 - human input 在 line-buffer 模式下經 broker 排隊；raw interactive 模式直接透傳 UART
 - 裝置 real_path 變更時會 reattach
 - `self_test` 可區分主要故障類型
-- `recover` 會先對 `ATTACHED` bridge 做 re-probe；`READY` 才走 `Ctrl-C -> Ctrl-D`
+- `recover` 會先對 `ATTACHED` bridge 做 re-probe；`READY` 依 profile 的 `timeout_recovery_keys` 送鍵（預設只送 `Ctrl-C`，`[]` 不送鍵）
 - agent 明確 reboot 後可重新回 `READY`
 - `file.push` / `file.pull` 可完成 base64 分段傳輸與 md5 校驗
 - README / spec / CLI 命名一致

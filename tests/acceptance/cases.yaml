@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-21.3
+revision: 2026-11-25.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -48,6 +48,7 @@ features:
   remote_cli: 1B
   expect_reboot: '2.3'
   async_reboot_evidence: '2.3'
+  timeout_recovery: '2.3'
 cases:
 - case_id: f1-limits-queryable
   suite: regression
@@ -995,6 +996,31 @@ cases:
   necessity: conditional
   issues: ['#130', '#162']
   behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f9-prpl-timeout-ctrl-c-no-logout
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_prpl_timeout_recovery.py:112
+  family: F9
+  title: prpl 命令逾時只送 Ctrl-C 且不登出 ash
+  contract: '#308／BC-09：prpl 命令逾時只送一個 Ctrl-C，session 維持 READY，且同一個 ash shell 可繼續執行命令。'
+  invariants: [insufficient_evidence_not_pass]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 需擁有者提供 Windows 原生序列埠與 prpl DUT 實跑證據；本輪只驗證軟體路徑，硬體項目維持 BLOCKED-OWNER。
+  capabilities: [physical_uart, prpl_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [timeout_recovery, login_full]
+  necessity: conditional
+  issues: ['#308']
+  behavior_changes: [BC-09]
   destructive: true
   expected: PASS
   sentinel: null

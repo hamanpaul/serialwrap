@@ -4,19 +4,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from bb_harness import (
+    ab_env,
     cli_prefix,
     is_rust,
     isolated_env,
     python_baseline_prefix,
     repo_root,
+    rust_daemon_code_fingerprint,
 )
 from bb_l15 import in_isolated_pidns
 
@@ -34,6 +38,69 @@ pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
 _RUNTIME_CHECKS = ("python", "pyyaml")
 _RUNTIME_CHECK_NAMES = ("python", "pyyaml", "pyserial")
 _REINSTALL_FIX = "重新安裝發佈組合（serialwrap setup）"
+_DAEMON_CODE_CURRENT_FIX = (
+    "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；"
+    "on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；"
+    "serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝"
+)
+
+
+def _assert_doctor_check_payload(actual: dict, expected: dict, context: str) -> None:
+    """逐欄比對 doctor check 的完整外部 payload。"""
+    assert actual == expected, f"{context}: doctor check payload mismatch"
+
+
+def _python_code_fingerprint(bundle_root: Path, full_oracle: bool) -> str:
+    """以 Python oracle 自己的 interpreter 計算基線指紋，不在測試行程匯入產品模組。"""
+    if full_oracle:
+        interpreter = bundle_root / "py" / "bin" / "python3"
+        command = [str(interpreter), "-I", "-B"]
+    else:
+        command = [sys.executable]
+    command.extend(
+        ["-c", "from sw_core.version import code_fingerprint; print(code_fingerprint() or '')"]
+    )
+    result = subprocess.run(
+        command,
+        cwd=repo_root(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"Python doctor 指紋計算失敗：{result.stderr}"
+    fingerprint = result.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{12}", fingerprint), f"Python doctor 指紋格式錯誤：{fingerprint!r}"
+    return fingerprint
+
+
+def _assert_doctor_payload_mutations_rejected() -> None:
+    expected = {
+        "advisory": True,
+        "check": "daemon_code_current",
+        "detail": "daemon 與目前安裝的程式碼相同（code 0123456789ab）",
+        "fix": "",
+        "ok": True,
+    }
+    counterexamples = (
+        ("A", "detail", "錯誤診斷"),
+        ("A", "fix", "錯誤修復指示"),
+        ("B", "fix", "錯誤修復指示"),
+    )
+    for context, field, value in counterexamples:
+        malformed = dict(expected)
+        malformed[field] = value
+        with pytest.raises(AssertionError):
+            _assert_doctor_check_payload(malformed, expected, context)
+
+
+def _daemon_code_current_payload(*, ok: bool, detail: str, fix: str) -> dict:
+    return {
+        "advisory": True,
+        "check": "daemon_code_current",
+        "detail": detail,
+        "fix": fix,
+        "ok": ok,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -63,7 +130,7 @@ def _specified_rust_bundle() -> Path | None:
     """`SERIALWRAP_CLI_EXE`（即 `SW_BUNDLE/bin/serialwrap`）指定的受測 Rust artifact 所在 bundle 根；未指定或非 Rust 回 None。"""
     if not is_rust():
         return None
-    cli = os.environ.get("SERIALWRAP_CLI_EXE", "")
+    cli = ab_env().get("SERIALWRAP_CLI_EXE", "")
     if not cli or cli == "/bin/serialwrap":
         return None
     cli_path = Path(cli)
@@ -89,7 +156,7 @@ def _bundle_has_python_oracle(bundle_root: Path) -> bool:
     py = bundle_root / "py" / "bin" / "python3"
     if not py.exists():
         return False
-    res = subprocess.run([str(py), "-I", "-c", "import sw_core"], capture_output=True, text=True, timeout=30)
+    res = subprocess.run([str(py), "-I", "-B", "-c", "import sw_core"], capture_output=True, text=True, timeout=30)
     return res.returncode == 0
 
 
@@ -127,6 +194,47 @@ def _wait_no_serialwrapd(timeout_s: float = 15.0) -> None:
         if time.monotonic() >= deadline:
             pytest.fail(f"隔離 pid namespace 內 doctor 比對前仍有殘留 serialwrapd：pid={pids}")
         time.sleep(0.2)
+
+
+def _profile_tree_snapshot(config_dir: Path) -> tuple[tuple[str, bool, bytes | None], ...]:
+    """擷取隔離設定目錄的相對路徑、目錄型態與檔案 bytes。"""
+    if not config_dir.exists():
+        return ()
+    return tuple(
+        sorted(
+            (
+                item.relative_to(config_dir).as_posix(),
+                item.is_dir(),
+                None if item.is_dir() else item.read_bytes(),
+            )
+            for item in config_dir.rglob("*")
+        )
+    )
+
+
+def _run_rust_doctor_with_profile(work: Path, profile_bytes: bytes | None) -> tuple[dict, dict, subprocess.CompletedProcess[str]]:
+    """執行指定 Rust artifact；doctor 只讀隔離設定目錄，不啟動 daemon。"""
+    assert is_rust(), "此 blackbox 必須以 SERIALWRAP_AB_LABEL=rust-p289 執行"
+    env = isolated_env(work)
+    config_dir = Path(env["SERIALWRAP_CONFIG_DIR"])
+    if profile_bytes is not None:
+        profile_dir = config_dir / "profiles"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "default.yaml").write_bytes(profile_bytes)
+    before = _profile_tree_snapshot(config_dir)
+    proc = subprocess.run(
+        cli_prefix() + ["doctor"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"Rust doctor exit={proc.returncode}: {proc.stderr}"
+    result = json.loads(proc.stdout)
+    checks = [item for item in result["checks"] if item.get("check") == "profile_template_fields"]
+    assert len(checks) == 1, checks
+    assert _profile_tree_snapshot(config_dir) == before, "doctor 不得改寫 profile 或其目錄內容"
+    return result, checks[0], proc
 
 
 @pytest.mark.case("sc25-release-manifest-version-pairing")
@@ -180,12 +288,22 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     assert not any(c.get("check") == "version_pairing" for c in py_checks)
     assert not any(c.get("check") == "version_pairing" for c in cli_checks)
 
-    # Linux 清單含 daemon_code_current，共 19 項（python／pyyaml 的 detail 除外，見上方 SC-25 附註）
+    # Python 基線固定 19 項；Rust 依 BC-08 只額外插入一個 profile_template_fields。
     assert len(py_checks) == 19
-    assert len(cli_checks) == 19
-    assert [c["check"] for c in cli_checks] == [c["check"] for c in py_checks]
+    if is_rust():
+        profile_checks = [c for c in cli_checks if c.get("check") == "profile_template_fields"]
+        assert len(profile_checks) == 1, profile_checks
+        profile_index = next(i for i, item in enumerate(cli_checks) if item["check"] == "profile_template_fields")
+        assert cli_checks[profile_index - 1]["check"] == "profile_bootloader_prompts"
+        assert profile_checks[0]["advisory"] is True
+        cli_shared_checks = [c for c in cli_checks if c["check"] != "profile_template_fields"]
+        assert len(cli_checks) == 20
+    else:
+        assert len(cli_checks) == 19
+        cli_shared_checks = cli_checks
+    assert [c["check"] for c in cli_shared_checks] == [c["check"] for c in py_checks]
 
-    for py_item, cli_item in zip(py_checks, cli_checks):
+    for py_item, cli_item in zip(py_checks, cli_shared_checks):
         chk = py_item["check"]
         assert cli_item["check"] == chk
         assert cli_item["advisory"] == py_item["advisory"], f"check={chk} advisory mismatch"
@@ -203,9 +321,75 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
         assert cli_detail == py_detail, f"check={chk} detail mismatch"
 
 
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-template-fields")
+def test_doctor_profile_template_fields_exact_payload(tmp_path: Path) -> None:
+    profile = (
+        b"profiles:\n"
+        b"  prpl-template:\n"
+        b"    platform: prpl\n"
+        b"    prompt_regex: x\n"
+        b"    login_regex: ''\n"
+        b"    password_regex: ''\n"
+        b"    ready_probe: ''\n"
+        b"    uart: {}\n"
+    )
+    result, check, _ = _run_rust_doctor_with_profile(tmp_path, profile)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "missing_fields",
+        "missing_fields": {"prpl-template": ["boot_done_regex", "bootloader_prompts", "timeout_recovery_keys"]},
+        "compared_templates": ["prpl-template"],
+        "reason": None,
+    }
+    assert isinstance(result.get("ok"), bool)
+
+
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-unavailable")
+def test_doctor_profile_template_fields_invalid_yaml(tmp_path: Path) -> None:
+    profile = b"profiles: [SW_SECRET_PROFILE_SENTINEL\n"
+    _, check, proc = _run_rust_doctor_with_profile(tmp_path, profile)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "unavailable",
+        "missing_fields": None,
+        "compared_templates": [],
+        "reason": "live_yaml",
+    }
+    assert "SW_SECRET_PROFILE_SENTINEL" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-unavailable")
+def test_doctor_profile_template_fields_not_materialized(tmp_path: Path) -> None:
+    _, check, _ = _run_rust_doctor_with_profile(tmp_path, None)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "not_materialized",
+        "missing_fields": None,
+        "compared_templates": [],
+        "reason": "live_not_found",
+    }
+
+
 @pytest.mark.case("sc25-release-manifest-version-pairing")
 @pytest.mark.pidns_rig
 def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
+    _assert_doctor_payload_mutations_rejected()
+
     # 受測 artifact：有指定 SERIALWRAP_CLI_EXE（Rust）時即為該 bundle（不另行重建）；否則建置自含 bundle。
     artifact = _specified_rust_bundle()
     bundle_root = artifact if artifact is not None else _full_bundle_version_dir(tmp_path)
@@ -216,8 +400,9 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
     # Python oracle：自含 bundle 內的 py（P1 T18，`-I -m sw_core.cli`）；sentinel artifact 的 py 不含 sw_core，
     # 則以凍結的 Python 基線對同一份 manifest 與檔案執行（version_pairing 只比對 manifest 目錄內的檔案）。
     full_oracle = _bundle_has_python_oracle(bundle_root)
+    python_fp = _python_code_fingerprint(bundle_root, full_oracle)
     if full_oracle:
-        py_doctor = [str(bundle_root / "py" / "bin" / "python3"), "-I", "-m", "sw_core.cli", "doctor"]
+        py_doctor = [str(bundle_root / "py" / "bin" / "python3"), "-I", "-B", "-m", "sw_core.cli", "doctor"]
     else:
         py_doctor = python_baseline_prefix() + ["doctor"]
 
@@ -229,9 +414,55 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
         return json.loads(py_res.stdout)["checks"], json.loads(rust_res.stdout)["checks"]
 
     def _assert_same_checks(py_checks: list[dict], rust_checks: list[dict], state: str) -> None:
-        assert [c["check"] for c in rust_checks] == [c["check"] for c in py_checks], f"{state}: 項目順序不一致（證據 {evidence}）"
-        for py_item, rust_item in zip(py_checks, rust_checks):
+        py_version_pairing = [c for c in py_checks if c.get("check") == "version_pairing"]
+        assert len(py_version_pairing) == 1, f"{state}: Python bundle 應保留唯一 version_pairing（證據 {evidence}）"
+        assert len(py_checks) == 20, f"{state}: Python 應為 19 項基線加 version_pairing（證據 {evidence}）"
+        assert len(rust_checks) == 21, f"{state}: Rust 應為 19 項基線、version_pairing 加唯一 BC-08（證據 {evidence}）"
+        profile_checks = [c for c in rust_checks if c.get("check") == "profile_template_fields"]
+        assert len(profile_checks) == 1, f"{state}: Rust profile_template_fields 必須恰好一項（證據 {evidence}）"
+        profile_index = next(i for i, item in enumerate(rust_checks) if item["check"] == "profile_template_fields")
+        assert rust_checks[profile_index - 1]["check"] == "profile_bootloader_prompts", f"{state}: BC-08 插入位置錯誤（證據 {evidence}）"
+        assert profile_checks[0]["advisory"] is True, f"{state}: BC-08 必須為 advisory（證據 {evidence}）"
+        shared_rust_checks = [item for item in rust_checks if item["check"] != "profile_template_fields"]
+        assert [c["check"] for c in shared_rust_checks] == [c["check"] for c in py_checks], f"{state}: Python 19 項順序或集合不一致（證據 {evidence}）"
+        for py_item, rust_item in zip(py_checks, shared_rust_checks):
             name = py_item["check"]
+            if name == "daemon_code_current":
+                # 此 advisory 比對各 CLI 與目前 daemon 的實作指紋；Stage 2 Rust daemon 的指紋不等於 Python 基線。
+                assert py_item["advisory"] is True and rust_item["advisory"] is True, state
+                if state == "daemon_down":
+                    expected = _daemon_code_current_payload(
+                        ok=True,
+                        detail="daemon 未在跑或無法連線，略過",
+                        fix="",
+                    )
+                    _assert_doctor_check_payload(py_item, expected, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected, f"{state}: Rust")
+                elif is_rust():
+                    daemon_fp = rust_daemon_code_fingerprint()
+                    expected_rust = _daemon_code_current_payload(
+                        ok=True,
+                        detail=f"daemon 與目前安裝的程式碼相同（code {daemon_fp}）",
+                        fix="",
+                    )
+                    expected_py = _daemon_code_current_payload(
+                        ok=False,
+                        detail=(
+                            f"daemon 載入的程式碼（code {daemon_fp}）與目前安裝的（code {python_fp}）不同"
+                        ),
+                        fix=_DAEMON_CODE_CURRENT_FIX,
+                    )
+                    _assert_doctor_check_payload(py_item, expected_py, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected_rust, f"{state}: Rust")
+                else:
+                    expected = _daemon_code_current_payload(
+                        ok=True,
+                        detail=f"daemon 與目前安裝的程式碼相同（code {python_fp}）",
+                        fix="",
+                    )
+                    _assert_doctor_check_payload(py_item, expected, f"{state}: Python")
+                    _assert_doctor_check_payload(rust_item, expected, f"{state}: Rust")
+                continue
             if not full_oracle and name in _RUNTIME_CHECK_NAMES:
                 # 基線 interpreter 與 artifact 內的 runtime 可能不同，只比名稱與 advisory。
                 assert rust_item["advisory"] == py_item["advisory"], f"{state}: check={name} advisory mismatch"
@@ -264,6 +495,7 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
 
     from bb_daemon import PyDaemon
 
+    # A 輪以 Python daemon、B 輪以候選 daemon；daemon_code_current 是依實作指紋判定的 advisory。
     daemon = PyDaemon(env2, profile_dir=profile2, socket=str(run2 / "serialwrapd.sock"), lock=work2 / "daemon.lock")
     daemon.start()
     try:

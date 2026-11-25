@@ -218,6 +218,7 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         MailboxItem::Control(ControlEvent::ShutdownGate { .. }) => Some("ShutdownGate"),
         MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => Some("ShutdownFlushWaiters"),
         MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
+        MailboxItem::Control(ControlEvent::RecoveryStart { .. }) => Some("RecoveryStart"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
         MailboxItem::Control(ControlEvent::OpFinished { .. }) => Some("OpFinished"),
         #[cfg(feature = "test-fakes")]
@@ -773,6 +774,7 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => {
             (None, "ShutdownFlushWaiters")
         }
+        MailboxItem::Control(ControlEvent::RecoveryStart { .. }) => (None, "RecoveryStart"),
         MailboxItem::Control(ControlEvent::ConsoleConnected { .. }) => (None, "ConsoleConnected"),
         MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
@@ -874,6 +876,7 @@ fn dispatch(
                 | ControlEvent::Tick
                 | ControlEvent::ShutdownGate { .. }
                 | ControlEvent::ShutdownFlushWaiters
+                | ControlEvent::RecoveryStart { .. }
                 | ControlEvent::ConsoleConnected { .. }
                 | ControlEvent::ConsoleScan { .. }
                 | ControlEvent::HumanTxCompleted { .. }

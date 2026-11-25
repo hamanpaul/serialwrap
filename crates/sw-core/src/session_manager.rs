@@ -34,6 +34,7 @@ use sw_pal::traits::{
 use sw_pal::Capabilities;
 use sw_proto::config_types::{
     LoadResult, ProfileTemplate, SerialConsoleMap, SessionProfile, UartProfile,
+    DEFAULT_TIMEOUT_RECOVERY_KEYS,
 };
 use sw_proto::pycompat::{clean_text, iso_utc_now, PyErr};
 use sw_proto::pydict;
@@ -1024,6 +1025,7 @@ fn minimal_passthrough_template(name: &str) -> ProfileTemplate {
         bootloader_prompts: Vec::new(),
         boot_done_regex: String::new(),
         max_console_line_chars: None,
+        timeout_recovery_keys: DEFAULT_TIMEOUT_RECOVERY_KEYS.to_vec(),
     }
 }
 
