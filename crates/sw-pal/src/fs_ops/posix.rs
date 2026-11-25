@@ -81,6 +81,7 @@ impl FsOps for NativeFsOps {
         }
         file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))
             .map_err(posix_io_error)?;
+        preserve_access_acl(p, file.as_raw_fd())?;
         file.write_all(data).map_err(posix_io_error)?;
         file.sync_all().map_err(posix_io_error)?;
         drop(file);
@@ -232,6 +233,86 @@ fn parent_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(target_os = "linux")]
+fn preserve_access_acl(source: &Path, destination_fd: std::os::fd::RawFd) -> PalResult<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| PalError::plain(PalErrorKind::InvalidInput, "ACL 來源路徑含 NUL"))?;
+    let name = b"system.posix_acl_access\0";
+    // SAFETY: 來源路徑與 xattr 名稱皆為 NUL 結尾；null value 僅查詢 ACL 大小。
+    let size = unsafe {
+        libc::getxattr(
+            source.as_ptr(),
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let acl = if size >= 0 {
+        let mut bytes = vec![0u8; size as usize];
+        // SAFETY: `bytes` 依前次 getxattr 回報的大小配置，來源路徑與名稱仍有效。
+        let read = unsafe {
+            libc::getxattr(
+                source.as_ptr(),
+                name.as_ptr().cast(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if read < 0 {
+            return Err(posix_io_error(io::Error::last_os_error()));
+        }
+        if read != size {
+            return Err(posix_io_error(io::Error::from_raw_os_error(libc::ERANGE)));
+        }
+        Some(bytes)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            None
+        } else {
+            // 不支援 xattr、權限不足或 ACL 無法讀取都拒絕替換，避免以未知 ACL 完成原子更新。
+            return Err(posix_io_error(error));
+        }
+    };
+
+    match acl {
+        Some(bytes) => {
+            // SAFETY: destination fd 由呼叫端持有；xattr 名稱與 bytes 在呼叫期間有效。
+            if unsafe {
+                libc::fsetxattr(
+                    destination_fd,
+                    name.as_ptr().cast(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    0,
+                )
+            } != 0
+            {
+                return Err(posix_io_error(io::Error::last_os_error()));
+            }
+        }
+        None => {
+            // 新暫存檔可能繼承父目錄 default ACL；來源沒有 access ACL 時需移除，才能保留原讀取權限。
+            // SAFETY: destination fd 由呼叫端持有，xattr 名稱為 NUL 結尾。
+            if unsafe { libc::fremovexattr(destination_fd, name.as_ptr().cast()) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENODATA) {
+                    return Err(posix_io_error(error));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preserve_access_acl(_source: &Path, _destination_fd: std::os::fd::RawFd) -> PalResult<()> {
+    Err(PalError::plain(
+        PalErrorKind::Unsupported,
+        "此 POSIX 平台無法確認並保留 system.posix_acl_access，拒絕原子替換",
+    ))
 }
 
 fn create_temp_file(path: &Path) -> PalResult<(File, PathBuf)> {

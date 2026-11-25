@@ -186,7 +186,7 @@ pub trait FsOps: FsRead {
     fn atomic_write(&self, p: &Path, data: &[u8], mode: Option<u32>) -> PalResult<()> {
         unimplemented!("P4-T5")
     }
-    /// 原子取代既有一般檔案，POSIX 實作保留原檔的 owner、group 與 mode。
+    /// 原子取代既有一般檔案，POSIX 實作保留擁有者、群組、權限模式與 access ACL；無法確認 ACL 時拒絕替換。
     /// 僅供必須修改 managed config 內容、但不可改變其讀取權限的遷移使用。
     fn atomic_replace_preserving_metadata(&self, p: &Path, data: &[u8]) -> PalResult<()> {
         self.atomic_write(p, data, None)
