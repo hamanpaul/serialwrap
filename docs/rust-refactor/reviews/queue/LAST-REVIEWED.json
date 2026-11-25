@@ -42,6 +42,6 @@
   "fix/311-secret-echo-masking": "7f47a5b",
   "fix/288-submit-console-line-limit": "48b519b",
   "fix/279-tcp-console-lease": "b8483d9",
-  "fix/290-timeout-recovery-keys": "8679083",
+  "fix/290-timeout-recovery-keys": "8d7d068",
   "fix/inst4-install-upgrade": "f3932f2"
 }
