@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 18,
+  "x-catalog-revision": 19,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -847,7 +847,9 @@
         "device_by_id",
         "profile",
         "updated_at",
-        "alias"
+        "alias",
+        "effective",
+        "conflict"
       ],
       "properties": {
         "session_id": {
@@ -867,11 +869,21 @@
         },
         "alias": {
           "type": "string"
+        },
+        "effective": {
+          "type": "boolean",
+          "x-note": "此 session 目前實際採用的 alias"
+        },
+        "conflict": {
+          "type": "boolean",
+          "x-note": "此 alias 有其他 session 或裝置的同名 claim"
         }
       },
       "required": [
         "updated_at",
-        "alias"
+        "alias",
+        "effective",
+        "conflict"
       ],
       "oneOf": [
         {
@@ -889,9 +901,11 @@
         "device_by_id",
         "updated_at",
         "profile",
-        "alias"
+        "alias",
+        "effective",
+        "conflict"
       ],
-      "x-order-note": "x-order 為 state.json 重載後（sort_keys）順序；新指派 by-id 列的寫入順序見 x-order-new-by-id（alias_registry.py:44-52）"
+      "x-order-note": "alias.list 先輸出 state.json 重載後的列，再附 effective 與 conflict；新指派 by-id 列欄位順序見 x-order-new-by-id（alias_registry.py:44-52）"
     },
     "ErrorResponse": {
       "type": "object",

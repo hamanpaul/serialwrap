@@ -411,6 +411,15 @@ pub struct ServiceRig {
     pub flash: Option<FlashParts>,
 }
 
+struct ServiceRigBuildOptions {
+    console: Option<Arc<RigPtyFactory>>,
+    code_fingerprint: Option<String>,
+    code_path: Option<String>,
+    serial_backend: Option<Arc<dyn SerialBackend>>,
+    loaded: LoadedState,
+    env: Option<Arc<FakeEnv>>,
+}
+
 /// `targets:` 一列。
 fn target_line(com: &str, by_id: &str) -> String {
     format!("  - {{com: {com}, profile: t, device_by_id: {by_id}}}\n")
@@ -644,6 +653,51 @@ impl ServiceRig {
         loaded: LoadedState,
         env: Option<Arc<FakeEnv>>,
     ) -> ServiceRig {
+        Self::build_with_code_identity_and_state_fs(
+            spec,
+            ServiceRigBuildOptions {
+                console,
+                code_fingerprint,
+                code_path,
+                serial_backend,
+                loaded,
+                env,
+            },
+            Arc::new(RigFs::default()),
+        )
+    }
+
+    /// 以既有的 state filesystem 重建 service，模擬同一 state.json 下的 daemon 重啟。
+    pub fn build_with_state_fs(spec: RigSpec, fs: Arc<RigFs>) -> ServiceRig {
+        let (loaded, _) = sw_core::state_store::load_state(Path::new(STATE_PATH), fs.as_ref())
+            .expect("同一 state filesystem 內的 state.json 應可重載");
+        Self::build_with_code_identity_and_state_fs(
+            spec,
+            ServiceRigBuildOptions {
+                console: None,
+                code_fingerprint: None,
+                code_path: Some("/fake/bundle".to_string()),
+                serial_backend: None,
+                loaded,
+                env: None,
+            },
+            fs,
+        )
+    }
+
+    fn build_with_code_identity_and_state_fs(
+        spec: RigSpec,
+        options: ServiceRigBuildOptions,
+        fs: Arc<RigFs>,
+    ) -> ServiceRig {
+        let ServiceRigBuildOptions {
+            console,
+            code_fingerprint,
+            code_path,
+            serial_backend,
+            loaded,
+            env,
+        } = options;
         let env = env.unwrap_or_else(|| Arc::new(FakeEnv::default()));
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
@@ -662,7 +716,6 @@ impl ServiceRig {
         }
         let load = load_profiles(PROFILE_DIR, &MemProfileFs { yaml: spec.yaml })
             .expect("測試 YAML 應可載入");
-        let fs = Arc::new(RigFs::default());
         let wfs = FakeWalFs::new();
         let clock = FakeClock::new();
         let wal = Arc::new(WalWriter::open(

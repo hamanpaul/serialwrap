@@ -67,6 +67,12 @@ serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:d
 
 Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，`cmd submit` 會以命令 UTF-8 位元組數檢查單行上限；超過時回 `CMD_TOO_LONG`，`limit` 為 profile 值，命令不入列且不送 UART。此限制套用所有 `cmd submit` mode；human console 的整行輸入不套用。未設定上限時行為不變。
 
+### Dynamic session alias
+
+- `serialwrap alias set --session-id <session_id> --alias <name>` 設定 session 自訂名稱；`serialwrap alias assign --by-id <COM 名稱> --alias <name>` 將名稱綁到實體 COM 對應的 by-id。
+- Alias 優先序是 by-id 自訂名稱、session 自訂名稱、自動 `<template>+<number>`。dynamic／pin session 的有效名稱會跨 daemon restart 與 pin template 切換保留。
+- Selector 只接受有效 alias、session ID 或 serialwrap 的邏輯 COM（如 `COM0`）。用 `serialwrap alias list` 查看 `effective` 與 `conflict`；同名衝突時先登錄者保留名稱，後續 session 使用自動 alias。YAML `targets` 維持 YAML alias。
+
 ## 4. Profile 設定
 
 profile 與 Linux 版同一套規則，路徑在家目錄的 `.config`：

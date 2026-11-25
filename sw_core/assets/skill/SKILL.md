@@ -56,6 +56,11 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 - `SESSION_NOT_READY` 用於 `command_capable` session 尚未達 `READY` 的情形。遇到 `session.attach`／`session.recover` 回應時，先讀頂層 `last_error`、`last_error_detail` 並依 Session last_error 表處置；終態值不可盲目重試。
 - `serialwrap session self-test` 的最外層 result 直接帶 `command_capable` 欄位，不必鑽進巢狀 dict 判斷。
 
+## Dynamic session alias
+- `serialwrap alias set --session-id <session_id> --alias <name>` 將自訂名稱設到目前 session；`serialwrap alias assign --by-id <by-id> --alias <name>` 將名稱綁到裝置。
+- Alias 優先序是 by-id 自訂名稱、session 自訂名稱、自動 `<template>+<number>`。dynamic／pin session 的有效名稱會跨 daemon restart 與 pin template 切換保留。
+- Selector 只接受有效 alias、session ID 或 COM。用 `serialwrap alias list` 查看 `effective` 與 `conflict`；同名衝突時先登錄的 session 保留名稱，後續 session 使用自動 alias。YAML `targets` 維持 YAML alias。
+
 ## 裝置 handoff（把 raw device 暫時交給外部工具，如 MCU 韌體燒錄）（#54）
 當外部工具需要對同一 raw `/dev/ttyUSBx` 做**獨佔**存取（例如 `ocp-mcu-upgrade` 燒錄 MCU SBL 二進位協定）時，serialwrap 持有該 FD 會造成 two-reader 競爭、外部工具 timeout。**不要**用 `session clear`（detach 後會自動 re-attach 搶回），改用 first-class handoff：
 1. `serialwrap device release --selector COM0 --source agent:flash --reason "flash MCU"`：serialwrap 關閉該 UART FD、clean-slate 清空 console、進入 `RELEASED`，**不會自動搶回**（跨 daemon 重啟亦保留）。

@@ -387,6 +387,19 @@ Use stable `/dev/serial/by-id/` or `/dev/serial/by-path/` selectors rather than
 volatile `/dev/ttyUSB*` names. If several boards use the same USB-serial chip
 and therefore share the same by-id value, prefer by-path.
 
+### Dynamic session aliases
+
+Set a readable name for a dynamic session with
+`serialwrap alias set --session-id <session_id> --alias <name>`, or bind a name
+to a device with `serialwrap alias assign --by-id <by-id> --alias <name>`.
+By-id aliases take precedence over session aliases, which take precedence over
+the automatic `<template>+<number>` name. The selected name survives daemon
+restarts and pin changes; only the effective alias, session ID, and COM select
+that session. `serialwrap alias list` reports `effective` and `conflict`. When
+two sessions claim the same custom name, the first keeps it and the later
+session uses its automatic name. Explicit YAML `targets` keep their configured
+aliases.
+
 ### Command Modes
 
 `line` is for commands that return to a prompt:
@@ -2229,6 +2242,10 @@ target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖�
 - **生效時機（#181 起）**：pin/unpin 寫入後**不主動**重新 attach，但**下一次 attach 就會套用**——對已存在的 session 執行 `serialwrap session clear --selector <COM>` 即可，不必重啟 daemon。pin 命中時繞過偵測（不開 PROBE bridge），session_id 依新 profile 名重算（如 `others-template:COM2` → `prpl-template:COM2`），COM 號、`act_no`、`device_by_id` 與使用者自訂 alias 均保留，掛在該 session 上的 human console 也不會被丟掉。
 - **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\n`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
 - **卡在 fallback 時的排查順序**：`serialwrap session self-test --selector <COM>` → 若回 `recommended_action: "pin_profile"` 與 `suggested_profile`，照它給的 `session pin` + `session clear` 兩行套用即可。`command_capable` 純粹由 profile 的 `ready_probe` 決定，**與 session state 或 console 是否被佔用無關**（COM 掛著 console 一樣能下命令），不要往「session 被佔用」的方向排查。
+
+### Dynamic session alias
+
+以 `serialwrap alias set --session-id <session_id> --alias <名稱>` 設定目前 session 名稱；以 `serialwrap alias assign --by-id <by-id> --alias <名稱>` 將名稱綁到裝置。優先序為 by-id 自訂 alias > session 自訂 alias > `<template>+<編號>` 自動 alias。生效名稱會跨 daemon 重啟與 pin template 切換保留；selector 只接受目前生效 alias、session_id 或 COM。`serialwrap alias list` 顯示 `effective` 與 `conflict`。同名衝突由先登錄者保留名稱，後續 session 使用自動 alias；YAML `targets` 繼續採用 YAML 設定的 alias。
 
 ### COM 編號確定性綁定 by-id（#100）
 

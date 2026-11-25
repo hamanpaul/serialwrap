@@ -41,7 +41,10 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{compile, PyFlags};
 
 use crate::actor::{try_spawn_actor_with_reaper, ActorHandle, EffectExecutor};
-use crate::alias_registry::AliasRegistry;
+use crate::alias_registry::{
+    has_conflict, is_automatic_alias_name, is_automatic_session_alias, is_by_id_row, AliasKind,
+    AliasRegistry,
+};
 use crate::arbiter::CommandRegistry;
 use crate::generations::EpochAllocator;
 use crate::mailbox::{ControlEvent, DataEvent, DetachReason, Mailbox, OpenFailure, OpenedBridge};
@@ -1024,11 +1027,61 @@ fn minimal_passthrough_template(name: &str) -> ProfileTemplate {
     }
 }
 
-/// `AliasRegistry.set_for_session` 產生的列。
+/// `AliasRegistry.set_for_session` 產生的自動 alias 列。
 fn alias_row(sid: &str, alias: &str, now_iso: &str) -> PyDict {
     let mut reg = AliasRegistry::default();
-    reg.set_for_session(sid, alias, now_iso);
+    reg.set_automatic_for_session(sid, alias, now_iso);
     reg.dump().shift_remove(alias).unwrap_or_default()
+}
+
+fn yaml_alias_row(sid: &str, alias: &str, now_iso: &str) -> PyDict {
+    let mut reg = AliasRegistry::default();
+    reg.set_for_yaml_session(sid, alias, now_iso);
+    reg.dump().shift_remove(alias).unwrap_or_default()
+}
+
+fn changed_alias_rows(
+    before: &AliasRegistry,
+    after: &AliasRegistry,
+) -> Vec<(String, PyDict)> {
+    let previous = before.dump();
+    after
+        .dump()
+        .into_iter()
+        .filter_map(|(alias, row)| {
+            (previous.get(&alias) != Some(&row)).then_some((alias, row))
+        })
+        .collect()
+}
+
+fn alias_taken(inner: &Inner, alias: &str, except_sid: Option<&str>) -> bool {
+    inner
+        .sessions
+        .values()
+        .any(|entry| Some(entry.sid.as_str()) != except_sid && entry.profile.alias == alias)
+}
+
+fn unique_automatic_alias(
+    inner: &Inner,
+    registry: &AliasRegistry,
+    template: &str,
+    act_no: i128,
+    except_sid: Option<&str>,
+) -> String {
+    let mut n = act_no;
+    loop {
+        let alias = format!("{template}+{n}");
+        let registry_owner_is_current_automatic = registry.row(&alias).is_some_and(|row| {
+            row.get("session_id").and_then(PyValue::as_str) == except_sid
+                && is_automatic_session_alias(&alias, row)
+        });
+        if !alias_taken(inner, &alias, except_sid)
+            && (registry.row(&alias).is_none() || registry_owner_is_current_automatic)
+        {
+            return alias;
+        }
+        n += 1;
+    }
 }
 
 /// `{"ok":false,"error_code":"FLASHING_BUSY","selector":<com>,"session":…}`（Python clear／bind 的鍵序）。
@@ -2358,7 +2411,16 @@ impl Shared {
             .remove(by_id)
             .unwrap_or_else(|| inner.next_dynamic_com());
         let act_no = inner.sessions.len() as i128 + 1;
-        let alias = format!("{}+{act_no}", tpl.profile_name);
+        let automatic_alias = format!("{}+{act_no}", tpl.profile_name);
+        let expected_sid = format!("{}:{com}", tpl.profile_name);
+        let registry = AliasRegistry::load(self.model_snapshot().aliases);
+        let choice = registry.resolve_for_session(&expected_sid, by_id, &automatic_alias);
+        let mut alias = choice.alias.clone();
+        let mut alias_kind = choice.kind;
+        if alias_taken(inner, &alias, None) {
+            alias = unique_automatic_alias(inner, &registry, &tpl.profile_name, act_no, None);
+            alias_kind = AliasKind::Automatic;
+        }
         let profile = profile_from_template(tpl, &com, act_no, &alias, by_id);
         let sid = self.create_session_locked(
             inner,
@@ -2370,10 +2432,20 @@ impl Shared {
             preopened,
             None,
         )?;
-        self.model_apply(StateDelta::AliasSet {
-            alias: alias.clone(),
-            row: Some(alias_row(&sid, &alias, &self.now_iso())),
-        });
+        if alias_kind == AliasKind::Session && alias == choice.alias {
+            let mut upgraded = registry.clone();
+            if upgraded.associate_custom_session_with_device(&alias, &sid, by_id, &self.now_iso()) {
+                self.model_apply(StateDelta::AliasSet {
+                    alias: alias.clone(),
+                    row: upgraded.row(&alias).cloned(),
+                });
+            }
+        } else if alias_kind == AliasKind::Automatic && registry.row(&alias).is_none() {
+            self.model_apply(StateDelta::AliasSet {
+                alias: alias.clone(),
+                row: Some(alias_row(&sid, &alias, &self.now_iso())),
+            });
+        }
         Some(sid)
     }
 
@@ -4069,7 +4141,7 @@ impl Shared {
         }
     }
 
-    /// `_rematerialize_profile_locked`（#31）：換 template、重算 session_id／自動 alias，搬移以 sid 為 key 的結構；
+    /// `_rematerialize_profile_locked`（#31）：換 template、重算 session_id 與生效 alias，搬移以 sid 為 key 的結構；
     /// 新 sid 已被佔用時不動作。回傳新 sid（未變更回 `None`）。
     fn rematerialize(
         self: &Arc<Self>,
@@ -4077,7 +4149,7 @@ impl Shared {
         tpl: &ProfileTemplate,
         source: &str,
     ) -> Option<String> {
-        let (old_profile, new_sid, alias) = {
+        let (old_profile, new_sid, alias, alias_kind, stale_automatic_alias) = {
             let inner = lock(&self.inner);
             let e = inner.sessions.get(sid)?;
             let old = e.profile.clone();
@@ -4086,13 +4158,28 @@ impl Shared {
                 return None;
             }
             let act = pyint_i128(&old.act_no);
-            let auto_alias = format!("{}+{act}", old.template.profile_name);
-            let alias = if old.alias == auto_alias {
-                format!("{}+{act}", tpl.profile_name)
-            } else {
-                old.alias.clone()
+            let automatic_alias = format!("{}+{act}", tpl.profile_name);
+            let registry = AliasRegistry::load(self.model_snapshot().aliases);
+            let choice = registry.resolve_for_session(sid, &old.device_by_id, &automatic_alias);
+            let (mut alias, mut kind) = match choice.kind {
+                AliasKind::Automatic => (automatic_alias, AliasKind::Automatic),
+                _ => (choice.alias, choice.kind),
             };
-            (old, new_sid, alias)
+            if alias_taken(&inner, &alias, Some(sid)) {
+                alias = unique_automatic_alias(
+                    &inner,
+                    &registry,
+                    &tpl.profile_name,
+                    act,
+                    Some(sid),
+                );
+                kind = AliasKind::Automatic;
+            }
+            let stale_automatic_alias = (alias != old.alias
+                && kind == AliasKind::Automatic
+                && registry.is_explicit_automatic_session_alias(&old.alias))
+            .then(|| old.alias.clone());
+            (old, new_sid, alias, kind, stale_automatic_alias)
         };
         let mut profile = old_profile.clone();
         profile.template = tpl.clone();
@@ -4125,8 +4212,14 @@ impl Shared {
         let now = self.now_iso();
         let old_sid = sid.to_string();
         let target_sid = new_sid.clone();
-        let old_alias = old_profile.alias.clone();
+        let by_id = old_profile.device_by_id.clone();
         if let Err(e) = self.commit_sync(move |m| {
+            if let Some(stale_alias) = stale_automatic_alias {
+                m.apply(StateDelta::AliasSet {
+                    alias: stale_alias,
+                    row: None,
+                });
+            }
             if target_sid != old_sid {
                 if let Some(b) = m.snapshot().bindings.get(&old_sid).cloned() {
                     m.apply(StateDelta::Binding {
@@ -4139,16 +4232,24 @@ impl Shared {
                     });
                 }
             }
-            if alias != old_alias {
-                m.apply(StateDelta::AliasSet {
-                    alias: old_alias.clone(),
-                    row: None,
-                });
+            match alias_kind {
+                AliasKind::ById => {}
+                AliasKind::Session => {
+                    let mut registry = AliasRegistry::load(m.snapshot().aliases.clone());
+                    if registry.rekey_custom_session(&alias, &old_sid, &target_sid, &by_id, &now) {
+                        m.apply(StateDelta::AliasSet {
+                            alias: alias.clone(),
+                            row: registry.row(&alias).cloned(),
+                        });
+                    }
+                }
+                AliasKind::Automatic => {
+                    m.apply(StateDelta::AliasSet {
+                        alias: alias.clone(),
+                        row: Some(alias_row(&target_sid, &alias, &now)),
+                    });
+                }
             }
-            m.apply(StateDelta::AliasSet {
-                alias: alias.clone(),
-                row: Some(alias_row(&target_sid, &alias, &now)),
-            });
         }) {
             self.warn(format!("state.json 寫入失敗（rematerialize {sid}）：{e:?}"));
         }
@@ -4329,7 +4430,7 @@ impl Shared {
             }
             self.model_apply(StateDelta::AliasSet {
                 alias: profile.alias.clone(),
-                row: Some(alias_row(&sid, &profile.alias, &now)),
+                row: Some(yaml_alias_row(&sid, &profile.alias, &now)),
             });
         }
         for (sid, row) in &unmaterialized {
@@ -4376,21 +4477,7 @@ impl Shared {
                 ));
                 continue;
             }
-            let aliases = lock(&self.model).snapshot().aliases;
-            let alias = aliases
-                .iter()
-                .find(|(_, r)| r.get("session_id").and_then(PyValue::as_str) == Some(sid.as_str()))
-                .map(|(name, _)| name.clone());
-            let mut act_no: Option<i128> = None;
-            if let Some(a) = &alias {
-                if a.starts_with(&format!("{}+", tpl.profile_name)) {
-                    let suffix = a.rsplit('+').next().unwrap_or("");
-                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                        act_no = suffix.parse().ok();
-                    }
-                }
-            }
-            let act_no = act_no.unwrap_or_else(|| {
+            let default_act_no = {
                 let upper = sid_com.to_ascii_uppercase();
                 match upper
                     .strip_prefix("COM")
@@ -4399,10 +4486,32 @@ impl Shared {
                     Some(d) => d.parse::<i128>().map(|n| n + 1).unwrap_or(1),
                     None => inner.sessions.len() as i128 + 1,
                 }
-            });
-            let alias = alias
-                .filter(|a| !a.is_empty())
-                .unwrap_or_else(|| format!("{}+{act_no}", tpl.profile_name));
+            };
+            let aliases = AliasRegistry::load(self.model_snapshot().aliases);
+            let default_alias = format!("{}+{default_act_no}", tpl.profile_name);
+            let choice = aliases.resolve_for_session(sid, &by_id, &default_alias);
+            let act_no = if choice.kind == AliasKind::Automatic
+                && is_automatic_alias_name(&choice.alias)
+            {
+                choice
+                    .alias
+                    .rsplit_once('+')
+                    .and_then(|(_, suffix)| suffix.parse::<i128>().ok())
+                    .unwrap_or(default_act_no)
+            } else {
+                default_act_no
+            };
+            let automatic_alias = format!("{}+{act_no}", tpl.profile_name);
+            let mut alias = if choice.kind == AliasKind::Automatic {
+                automatic_alias.clone()
+            } else {
+                choice.alias.clone()
+            };
+            let mut alias_kind = choice.kind;
+            if alias_taken(&inner, &alias, None) {
+                alias = unique_automatic_alias(&inner, &aliases, &tpl.profile_name, act_no, None);
+                alias_kind = AliasKind::Automatic;
+            }
             let source = if pinned.is_some() {
                 "pin"
             } else if detected.is_some() {
@@ -4421,10 +4530,12 @@ impl Shared {
                 None,
                 Some(sid),
             );
-            self.model_apply(StateDelta::AliasSet {
-                alias: alias.clone(),
-                row: Some(alias_row(sid, &alias, &now)),
-            });
+            if alias_kind == AliasKind::Automatic && aliases.row(&alias).is_none() {
+                self.model_apply(StateDelta::AliasSet {
+                    alias: alias.clone(),
+                    row: Some(alias_row(sid, &alias, &now)),
+                });
+            }
             self.model_apply(StateDelta::Released {
                 sid: sid.clone(),
                 row: row.clone(),
@@ -7542,6 +7653,37 @@ impl SessionManager {
         if explicit {
             return Ok(pydict! { "ok" => false, "error_code" => "PROFILE_IS_EXPLICIT" });
         }
+        let alias_update = {
+            let inner = lock(&self.shared.inner);
+            inner
+                .session_by_id(&key)
+                .filter(|entry| entry.profile_source != "yaml-target")
+                .and_then(|entry| {
+                    let sid = entry.sid.as_str();
+                    let by_id = entry.profile.device_by_id.as_str();
+                    let automatic = format!(
+                        "{}+{}",
+                        entry.profile.template.profile_name,
+                        pyint_i128(&entry.profile.act_no)
+                    );
+                    let mut registry =
+                        AliasRegistry::load(self.shared.model_snapshot().aliases);
+                    let choice = registry.resolve_for_session(sid, by_id, &automatic);
+                    (choice.kind == AliasKind::Session
+                        && registry.associate_custom_session_with_device(
+                            &choice.alias,
+                            sid,
+                            by_id,
+                            &self.shared.now_iso(),
+                        ))
+                    .then(|| {
+                        (
+                            choice.alias.clone(),
+                            registry.row(&choice.alias).cloned().unwrap_or_default(),
+                        )
+                    })
+                })
+        };
         let device_key = key.clone();
         let name = profile.to_string();
         self.shared
@@ -7549,7 +7691,13 @@ impl SessionManager {
                 m.apply(StateDelta::Pin {
                     device_key,
                     profile: Some(name),
-                })
+                });
+                if let Some((alias, row)) = alias_update {
+                    m.apply(StateDelta::AliasSet {
+                        alias,
+                        row: Some(row),
+                    });
+                }
             })
             .map_err(|e| commit_error(&e))?;
         Ok(pydict! { "ok" => true, "device_key" => key, "profile" => profile.to_string() })
@@ -7580,11 +7728,37 @@ impl SessionManager {
     /// `alias.list`：`{"ok":true,"aliases":[...]}`（依 alias 字典序）。
     pub fn alias_list(&self) -> PyDict {
         let reg = AliasRegistry::load(self.shared.model_snapshot().aliases);
-        let rows: Vec<PyValue> = reg.list_alias().into_iter().map(PyValue::Dict).collect();
+        let inner = lock(&self.shared.inner);
+        let rows: Vec<PyValue> = reg
+            .list_alias()
+            .into_iter()
+            .map(|mut row| {
+                let name = row
+                    .get("alias")
+                    .and_then(PyValue::as_str)
+                    .unwrap_or_default();
+                let registry_row = reg.row(name);
+                let active = reg.is_active_alias(name);
+                let live_alias_users = inner
+                    .sessions
+                    .values()
+                    .filter(|entry| entry.profile.alias == name)
+                    .count();
+                let targets_live_session = live_alias_users > 0;
+                row.insert("effective", PyValue::Bool(active && targets_live_session));
+                row.insert(
+                    "conflict",
+                    PyValue::Bool(
+                        registry_row.is_some_and(has_conflict) || live_alias_users > 1,
+                    ),
+                );
+                PyValue::Dict(row)
+            })
+            .collect();
         pydict! { "ok" => true, "aliases" => PyValue::List(rows) }
     }
 
-    /// `set_alias_for_session`：manager 側 profile alias 立即生效；重啟後依 YAML／template 重算（WAL-D15 KEEP）。
+    /// `alias.set`：立即更新 actor 與鏡像，dynamic session 以 registry 來源保存自訂 alias。
     ///
     /// Python `session_manager.py:2612-2620` 的存在檢查、更新與 `_save_state()` 全在 manager lock 內；OD-63 佔位退休
     /// （`retire_released_placeholder_locked`，Python `:3640-3652`）同樣持 manager 鎖移除 entry。Rust 等 actor 確認時
@@ -7599,14 +7773,65 @@ impl SessionManager {
                 "session_id" => sid.to_string()
             }
         };
-        let actor = {
-            let mut inner = lock(&self.shared.inner);
-            let Some(e) = inner.sessions.get_mut(sid) else {
+        let (actor, active_alias, row_updates) = {
+            let inner = lock(&self.shared.inner);
+            let Some(e) = inner.sessions.get(sid) else {
                 return Ok(not_found());
             };
-            e.profile.alias = alias.to_string();
-            lock(&e.io.profile).alias = alias.to_string();
-            e.actor.clone()
+            let by_id = e.profile.device_by_id.clone();
+            let source = e.profile_source.clone();
+            let mut active_alias = alias.to_string();
+            let row_updates;
+            if source != "yaml-target" {
+                let mut registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
+                let original_registry = registry.clone();
+                let same_by_id_assignment = registry.is_by_id_assignment(alias)
+                    && registry
+                        .row(alias)
+                        .is_some_and(|row| is_by_id_row(row, &by_id));
+                if same_by_id_assignment {
+                    // by-id 為最高優先序；同名 alias.set 不得改寫或降級這筆設定。
+                } else if registry.conflicts_with_claim(alias, sid, &by_id) {
+                    registry.record_conflicting_session(alias, sid, &by_id);
+                } else {
+                    registry.set_custom_for_session(
+                        sid,
+                        alias,
+                        Some(&by_id),
+                        &self.shared.now_iso(),
+                    );
+                }
+                let automatic = format!(
+                    "{}+{}",
+                    e.profile.template.profile_name,
+                    pyint_i128(&e.profile.act_no)
+                );
+                active_alias = registry.resolve_for_session(sid, &by_id, &automatic).alias;
+                if alias_taken(&inner, &active_alias, Some(sid)) {
+                    if active_alias == alias && registry.row(alias).is_some() {
+                        registry.record_conflicting_session(alias, sid, &by_id);
+                    }
+                    active_alias = unique_automatic_alias(
+                        &inner,
+                        &registry,
+                        &e.profile.template.profile_name,
+                        pyint_i128(&e.profile.act_no),
+                        Some(sid),
+                    );
+                    registry.set_automatic_for_session(
+                        sid,
+                        &active_alias,
+                        &self.shared.now_iso(),
+                    );
+                }
+                row_updates = changed_alias_rows(&original_registry, &registry);
+            } else {
+                row_updates = vec![(
+                    alias.to_string(),
+                    alias_row(sid, alias, &self.shared.now_iso()),
+                )];
+            }
+            (e.actor.clone(), active_alias, row_updates)
         };
         let still_same_session = |inner: &Inner| {
             inner
@@ -7617,7 +7842,7 @@ impl SessionManager {
         // actor 持有的 profile 一併更新並等確認（GetState／submit 等回應中的 `session.alias`；sol-backfill p5 #3）。
         let applied = match actor.request(
             SessionRequest::SetAlias {
-                alias: alias.to_string(),
+                alias: active_alias.clone(),
             },
             QUERY_TIMEOUT,
         ) {
@@ -7633,18 +7858,29 @@ impl SessionManager {
         if let Some(hook) = lock(&self.shared.alias_pre_commit_hook).as_ref() {
             hook();
         }
-        let inner = lock(&self.shared.inner);
+        let mut inner = lock(&self.shared.inner);
         if !still_same_session(&inner) {
             return Ok(not_found());
         }
-        let row = alias_row(sid, alias, &self.shared.now_iso());
-        let name = alias.to_string();
-        let committed = self.shared.commit_sync(move |m| {
-            m.apply(StateDelta::AliasSet {
-                alias: name,
-                row: Some(row),
-            })
-        });
+        if let Some(entry) = inner.sessions.get_mut(sid) {
+            let mut entry_profile = entry.profile.clone();
+            entry_profile.alias = active_alias.clone();
+            *lock(&entry.io.profile) = entry_profile.clone();
+            entry.profile = entry_profile;
+        }
+        let committed = if row_updates.is_empty() {
+            Ok(())
+        } else {
+            self.shared
+                .commit_sync(move |m| {
+                    for (name, row) in row_updates {
+                        m.apply(StateDelta::AliasSet {
+                            alias: name,
+                            row: Some(row),
+                        });
+                    }
+                })
+        };
         drop(inner);
         committed.map_err(|e| commit_error(&e))?;
         Ok(pydict! { "ok" => true, "session_id" => sid.to_string(), "alias" => alias.to_string() })
@@ -7656,16 +7892,78 @@ impl SessionManager {
         alias: &str,
         profile: Option<&str>,
     ) -> Result<PyDict, PyErr> {
-        let mut reg = AliasRegistry::default();
-        reg.assign_by_id(by_id, alias, profile, &self.shared.now_iso());
-        let row = reg.dump().shift_remove(alias);
-        let name = alias.to_string();
+        let by_id = by_id.to_string();
+        let requested_alias = alias.to_string();
+        let (mut registry, original_registry, live) = {
+            let inner = lock(&self.shared.inner);
+            let mut registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
+            let original_registry = registry.clone();
+            registry.assign_by_id(&by_id, &requested_alias, profile, &self.shared.now_iso());
+            let live = inner.session_by_id(&by_id).and_then(|entry| {
+                (entry.profile_source != "yaml-target").then(|| {
+                    (
+                        entry.sid.clone(),
+                        entry.actor.clone(),
+                        entry.profile.clone(),
+                        entry.profile_source.clone(),
+                    )
+                })
+            });
+            (registry, original_registry, live)
+        };
+        let mut active_alias = requested_alias.clone();
+        if let Some((sid, _, profile, _)) = live.as_ref() {
+            let automatic = format!(
+                "{}+{}",
+                profile.template.profile_name,
+                pyint_i128(&profile.act_no)
+            );
+            let inner = lock(&self.shared.inner);
+            if alias_taken(&inner, &requested_alias, Some(sid)) {
+                active_alias = unique_automatic_alias(
+                    &inner,
+                    &registry,
+                    &profile.template.profile_name,
+                    pyint_i128(&profile.act_no),
+                    Some(sid),
+                );
+                registry.set_automatic_for_session(sid, &active_alias, &self.shared.now_iso());
+            } else {
+                active_alias = registry.resolve_for_session(sid, &by_id, &automatic).alias;
+            }
+        }
+        let row_updates = changed_alias_rows(&original_registry, &registry);
         self.shared
-            .commit_sync(move |m| m.apply(StateDelta::AliasSet { alias: name, row }))
+            .commit_sync(move |m| {
+                for (alias, row) in row_updates {
+                    m.apply(StateDelta::AliasSet {
+                        alias,
+                        row: Some(row),
+                    });
+                }
+            })
             .map_err(|e| commit_error(&e))?;
-        Ok(
-            pydict! { "ok" => true, "alias" => alias.to_string(), "device_by_id" => by_id.to_string() },
-        )
+        if let Some((sid, actor, _, _)) = live {
+            let applied = actor.request(
+                SessionRequest::SetAlias {
+                    alias: active_alias.clone(),
+                },
+                QUERY_TIMEOUT,
+            )?;
+            if !is_ok(&applied) {
+                return Ok(applied);
+            }
+            let mut inner = lock(&self.shared.inner);
+            if let Some(entry) = inner
+                .sessions
+                .get_mut(&sid)
+                .filter(|entry| Arc::ptr_eq(&entry.actor, &actor))
+            {
+                entry.profile.alias = active_alias.clone();
+                *lock(&entry.io.profile) = entry.profile.clone();
+            }
+        }
+        Ok(pydict! { "ok" => true, "alias" => requested_alias, "device_by_id" => by_id })
     }
 
     /// `unassign_alias`：先寫 state.json（不論是否存在），再回報結果。

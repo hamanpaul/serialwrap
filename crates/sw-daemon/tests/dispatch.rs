@@ -3722,6 +3722,497 @@ fn contract_coverage_alias_unassign_pin_unpin_rpc_routes() {
     );
 }
 
+const I281_DYNAMIC_TEMPLATES: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\n  u:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\n";
+
+fn i281_dynamic_spec() -> RigSpec {
+    RigSpec {
+        yaml: I281_DYNAMIC_TEMPLATES.to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 0,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    }
+}
+
+fn i281_session_alias_row(session_id: &str, updated_at: &str) -> PyDict {
+    let mut row = PyDict::new();
+    row.insert("session_id", PyValue::from(session_id));
+    row.insert("updated_at", PyValue::from(updated_at));
+    row
+}
+
+fn i281_device_alias_row(by_id: &str, updated_at: &str) -> PyDict {
+    let mut row = PyDict::new();
+    row.insert("device_by_id", PyValue::from(by_id));
+    row.insert("updated_at", PyValue::from(updated_at));
+    row
+}
+
+fn i281_session_from_list(response: &PyDict, selector: &str) -> Option<PyDict> {
+    response
+        .get("sessions")
+        .and_then(PyValue::as_array)
+        .and_then(|rows| {
+            rows.iter().find_map(|row| match row {
+                PyValue::Dict(session)
+                    if session.get("session_id").and_then(PyValue::as_str) == Some(selector)
+                        || session.get("com").and_then(PyValue::as_str) == Some(selector)
+                        || session.get("alias").and_then(PyValue::as_str) == Some(selector) =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+        })
+}
+
+fn i281_alias_from_list(response: &PyDict, alias: &str) -> Option<PyDict> {
+    response
+        .get("aliases")
+        .and_then(PyValue::as_array)
+        .and_then(|rows| {
+            rows.iter().find_map(|row| match row {
+                PyValue::Dict(row) if row.get("alias").and_then(PyValue::as_str) == Some(alias) => {
+                    Some(row.clone())
+                }
+                _ => None,
+            })
+        })
+}
+
+fn i281_restart(rig: ServiceRig, spec: RigSpec) -> ServiceRig {
+    rig.settle();
+    let state_fs = rig.fs.clone();
+    rig.mgr.shutdown(Duration::from_secs(5));
+    drop(rig);
+    ServiceRig::build_with_state_fs(spec, state_fs)
+}
+
+/// issue 281 現象一：動態 session 的 alias.set 經同一 state.json 重建 daemon 後仍可供 CLI selector 使用。
+#[test]
+fn issue281_dynamic_alias_set_survives_service_restart_and_cli_selector() {
+    let spec = i281_dynamic_spec();
+    let rig = ServiceRig::build(spec);
+    wait_until("動態 COM0 session", || rig.session("COM0").is_some());
+    let session_id = s(
+        &rig.session("COM0").expect("動態 COM0 session"),
+        "session_id",
+    )
+    .to_string();
+    let first = rig.call(
+        "alias.set",
+        &format!(r#"{{"session_id":"{session_id}","alias":"z-old-workbench"}}"#),
+    );
+    assert_eq!(
+        first.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&first)
+    );
+    let changed = rig.call(
+        "alias.set",
+        &format!(r#"{{"session_id":"{session_id}","alias":"workbench"}}"#),
+    );
+    assert_eq!(
+        changed.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&changed)
+    );
+    let pinned = rig.call("session.pin", r#"{"selector":"COM0","profile":"u"}"#);
+    assert_eq!(pinned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&pinned));
+    let restarted = i281_restart(rig, i281_dynamic_spec());
+    wait_until("重啟後動態 COM0 session", || {
+        restarted.session("COM0").is_some()
+    });
+
+    let listed = restarted.call("session.list", "{}");
+    let session = i281_session_from_list(&listed, "workbench");
+    let selector_state = restarted.call("session.get_state", r#"{"selector":"workbench"}"#);
+    let submitted = restarted.call(
+        "command.submit",
+        r#"{"selector":"workbench","cmd":"echo issue281-alias-set"}"#,
+    );
+    assert_eq!(
+        session.as_ref().and_then(|s| s.get("alias")),
+        Some(&PyValue::from("workbench")),
+        "daemon 重啟後 session.list 應保留 alias：{}",
+        j(&listed)
+    );
+    assert_eq!(
+        session.as_ref().and_then(|s| s.get("profile")),
+        Some(&PyValue::from("u")),
+        "重啟後應採用 pin 的 template：{}",
+        j(&listed)
+    );
+    assert_eq!(
+        selector_state.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "重啟後 session.get_state --selector workbench 應解析到 session：{}",
+        j(&selector_state)
+    );
+    assert_ne!(
+        submitted.get("error_code").and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "command.submit --selector workbench 不得因 alias 丟失而找不到 session：{}",
+        j(&submitted)
+    );
+    assert_eq!(
+        restarted
+            .call(
+                "session.get_state",
+                r#"{"selector":"z-old-workbench"}"#
+            )
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND"),
+        "只有最新的 session 自訂 alias 可作 selector"
+    );
+    let aliases = restarted.call("alias.list", "{}");
+    assert_eq!(
+        i281_alias_from_list(&aliases, "workbench")
+            .and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(true))
+    );
+    assert_eq!(
+        i281_alias_from_list(&aliases, "z-old-workbench")
+            .and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(false))
+    );
+}
+
+/// issue 281 現象二：by-id alias 立即生效，並跨 daemon 重啟及 pin 換 template 保留。
+#[test]
+fn issue281_by_id_alias_is_live_and_survives_pin_template_restart() {
+    let rig = ServiceRig::build(i281_dynamic_spec());
+    wait_until("動態 COM0 session", || rig.session("COM0").is_some());
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_A}","alias":"z-old-by-id"}}"#),
+    );
+    assert_eq!(
+        assigned.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&assigned)
+    );
+    let immediate = rig.call(
+        "command.submit",
+        r#"{"selector":"z-old-by-id","cmd":"echo issue281-by-id-live"}"#,
+    );
+    let immediate_state = rig.call("session.get_state", r#"{"selector":"z-old-by-id"}"#);
+    let reassigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_A}","alias":"a-current-by-id"}}"#),
+    );
+    assert_eq!(
+        reassigned.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&reassigned)
+    );
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"a-current-by-id"}"#)
+            .get("ok"),
+        Some(&PyValue::Bool(true)),
+        "新 by-id alias 應立即接管 selector"
+    );
+    assert_eq!(
+        s(
+            &rig.call("session.get_state", r#"{"selector":"z-old-by-id"}"#),
+            "error_code"
+        ),
+        "SESSION_NOT_FOUND",
+        "被新指派取代的 by-id alias 不得繼續作為 selector"
+    );
+    let pinned = rig.call("session.pin", r#"{"selector":"COM0","profile":"u"}"#);
+    assert_eq!(
+        pinned.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&pinned)
+    );
+
+    let restarted = i281_restart(rig, i281_dynamic_spec());
+    wait_until("重啟後動態 COM0 session", || {
+        restarted.session("COM0").is_some()
+    });
+    let listed = restarted.call("session.list", "{}");
+    let session = i281_session_from_list(&listed, "a-current-by-id");
+    let after_state =
+        restarted.call("session.get_state", r#"{"selector":"a-current-by-id"}"#);
+    let after_restart = restarted.call(
+        "command.submit",
+        r#"{"selector":"a-current-by-id","cmd":"echo issue281-by-id-restart"}"#,
+    );
+    let mut failures = Vec::new();
+    if immediate_state.get("ok") != Some(&PyValue::Bool(true)) {
+        failures.push(format!("即時 session selector={}", j(&immediate_state)));
+    }
+    if immediate.get("error_code").and_then(PyValue::as_str) == Some("SESSION_NOT_FOUND") {
+        failures.push(format!("即時 selector={}", j(&immediate)));
+    }
+    if session.as_ref().and_then(|s| s.get("alias")) != Some(&PyValue::from("a-current-by-id")) {
+        failures.push(format!("重啟後 session.list={}", j(&listed)));
+    }
+    if session.as_ref().and_then(|s| s.get("profile")) != Some(&PyValue::from("u")) {
+        failures.push(format!("重啟後 pin template={}", j(&listed)));
+    }
+    if after_restart.get("ok") != Some(&PyValue::Bool(true)) {
+        failures.push(format!("重啟後 selector={}", j(&after_restart)));
+    }
+    if after_state.get("ok") != Some(&PyValue::Bool(true)) {
+        failures.push(format!("重啟後 session selector={}", j(&after_state)));
+    }
+    assert!(
+        failures.is_empty(),
+        "issue 281 by-id alias 未端到端生效：{failures:?}"
+    );
+    let aliases = restarted.call("alias.list", "{}");
+    assert_eq!(
+        i281_alias_from_list(&aliases, "a-current-by-id")
+            .and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(true))
+    );
+    assert_eq!(
+        i281_alias_from_list(&aliases, "z-old-by-id")
+            .and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(false))
+    );
+}
+
+/// 舊版 registry 沒有來源欄時，保留所有列並以自訂 session alias 蓋過 `<template>+<編號>`。
+#[test]
+fn issue281_legacy_alias_rows_keep_custom_over_automatic() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "t+1".into(),
+        i281_session_alias_row("t:COM0", "2026-10-01T00:00:00Z"),
+    );
+    loaded.aliases.insert(
+        "legacy-workbench".into(),
+        i281_session_alias_row("t:COM0", "2026-10-02T00:00:00Z"),
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+    wait_until("dynamic COM0 session", || rig.session("COM0").is_some());
+
+    let listed = rig.call("session.list", "{}");
+    let session = i281_session_from_list(&listed, "COM0").expect("COM0 session");
+    let aliases = rig.call("alias.list", "{}");
+    assert_eq!(
+        session.get("alias"),
+        Some(&PyValue::from("legacy-workbench"))
+    );
+    assert_eq!(session.get("profile"), Some(&PyValue::from("t")));
+    assert!(i281_alias_from_list(&aliases, "legacy-workbench").is_some());
+    assert!(i281_alias_from_list(&aliases, "t+1").is_some());
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"legacy-workbench"}"#)
+            .get("ok"),
+        Some(&PyValue::Bool(true))
+    );
+    assert_eq!(
+        i281_alias_from_list(&aliases, "legacy-workbench")
+            .and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(true))
+    );
+    assert_eq!(
+        i281_alias_from_list(&aliases, "t+1").and_then(|row| row.get("effective").cloned()),
+        Some(PyValue::Bool(false))
+    );
+    assert_eq!(
+        s(
+            &rig.call("session.get_state", r#"{"selector":"t+1"}"#),
+            "error_code"
+        ),
+        "SESSION_NOT_FOUND"
+    );
+}
+
+/// by-id 自訂列優先於同一 session_id 的自訂列；被蓋過的名稱不是 selector。
+#[test]
+fn issue281_by_id_alias_overrides_session_alias_selector() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "t+1".into(),
+        i281_session_alias_row("t:COM0", "2026-10-01T00:00:00Z"),
+    );
+    loaded.aliases.insert(
+        "session-name".into(),
+        i281_session_alias_row("t:COM0", "2026-10-02T00:00:00Z"),
+    );
+    loaded.aliases.insert(
+        "device-name".into(),
+        i281_device_alias_row(BY_ID_A, "2026-10-03T00:00:00Z"),
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+    wait_until("dynamic COM0 session", || rig.session("COM0").is_some());
+
+    let listed = rig.call("session.list", "{}");
+    let session = i281_session_from_list(&listed, "COM0").expect("COM0 session");
+    let aliases = rig.call("alias.list", "{}");
+    let device_alias = i281_alias_from_list(&aliases, "device-name").expect("by-id row");
+    assert_eq!(session.get("alias"), Some(&PyValue::from("device-name")));
+    assert_eq!(device_alias.get("effective"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        s(
+            &rig.call("session.get_state", r#"{"selector":"session-name"}"#),
+            "error_code"
+        ),
+        "SESSION_NOT_FOUND"
+    );
+    assert_eq!(
+        s(
+            &rig.call("session.get_state", r#"{"selector":"t+1"}"#),
+            "error_code"
+        ),
+        "SESSION_NOT_FOUND"
+    );
+}
+
+/// RELEASED 還原時從同一 session_id 的舊自動列與自訂列中選自訂列，不依 IndexMap 順序。
+#[test]
+fn issue281_released_restore_chooses_custom_alias_over_earlier_auto_row() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "t+1".into(),
+        i281_session_alias_row("t:COM0", "2026-10-01T00:00:00Z"),
+    );
+    loaded.aliases.insert(
+        "released-workbench".into(),
+        i281_session_alias_row("t:COM0", "2026-10-02T00:00:00Z"),
+    );
+    loaded.released.insert(
+        "t:COM0".into(),
+        ReleasedRow {
+            by_id: PyValue::from(BY_ID_A),
+            released_by: PyValue::from("agent"),
+            released_at: PyValue::from("2026-10-03T00:00:00Z"),
+            reason: PyValue::Null,
+        },
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+
+    let session = rig.call("session.get_state", r#"{"selector":"t:COM0"}"#);
+    let restored = match session.get("session") {
+        Some(PyValue::Dict(session)) => session,
+        _other => panic!("RELEASED session 應可還原：{}", j(&session)),
+    };
+    assert_eq!(
+        restored.get("state").and_then(PyValue::as_str),
+        Some("RELEASED")
+    );
+    assert_eq!(
+        restored.get("alias"),
+        Some(&PyValue::from("released-workbench"))
+    );
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"released-workbench"}"#)
+            .get("ok"),
+        Some(&PyValue::Bool(true))
+    );
+}
+
+/// YAML target 保留 YAML alias；by-id assignment 不可把它改成動態 alias。
+#[test]
+fn issue281_yaml_target_alias_is_not_overridden_by_by_id_assignment() {
+    let mut spec = i281_dynamic_spec();
+    spec.yaml = format!(
+        "{}targets:\n  - {{com: COM0, profile: t, act_no: 1, alias: yaml-workbench, device_by_id: {BY_ID_A}}}\n",
+        I281_DYNAMIC_TEMPLATES
+    );
+    spec.explicit_target_count = 1;
+    spec.wait_ready = vec!["COM0".into()];
+    let rig = ServiceRig::build(spec);
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_A}","alias":"device-workbench"}}"#),
+    );
+    let yaml_session = rig
+        .session("yaml-workbench")
+        .expect("YAML alias 仍可 selector");
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        yaml_session.get("alias"),
+        Some(&PyValue::from("yaml-workbench"))
+    );
+    assert!(rig.session("device-workbench").is_none());
+}
+
+/// 同名 alias 衝突時，先建立的 YAML session 保留名稱，後續動態 session 使用自動 alias 並標示衝突。
+#[test]
+fn issue281_alias_conflict_keeps_first_materialized_and_marks_conflict() {
+    let yaml = format!(
+        "{}targets:\n  - {{com: COM0, profile: t, act_no: 1, alias: claimed-name, device_by_id: {BY_ID_A}}}\n",
+        I281_DYNAMIC_TEMPLATES
+    );
+    let rig = ServiceRig::build(RigSpec {
+        yaml,
+        devices: vec![
+            (BY_ID_A.into(), REAL_A.into()),
+            (BY_ID_B.into(), REAL_B.into()),
+        ],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    wait_until("第二個 dynamic session", || {
+        rig.session("COM1").is_some()
+    });
+    let dynamic = rig.session("COM1").expect("dynamic session").clone();
+    let changed = rig.call(
+        "alias.set",
+        &format!(
+            r#"{{"session_id":"{}","alias":"claimed-name"}}"#,
+            s(&dynamic, "session_id")
+        ),
+    );
+    let yaml_session = rig.session("COM0").expect("YAML session");
+    let dynamic_session = rig.session("COM1").expect("dynamic session");
+    let alias_row = i281_alias_from_list(&rig.call("alias.list", "{}"), "claimed-name")
+        .expect("衝突的 alias 列應保留");
+    assert_eq!(changed.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        yaml_session.get("alias"),
+        Some(&PyValue::from("claimed-name"))
+    );
+    assert_eq!(dynamic_session.get("alias"), Some(&PyValue::from("t+2")));
+    assert_eq!(alias_row.get("effective"), Some(&PyValue::Bool(true)));
+    assert_eq!(alias_row.get("conflict"), Some(&PyValue::Bool(true)));
+}
+
+/// registry 已有別的 session alias claim 時，即使舊 session 不在本次 runtime，也不可讓衝突裝置取得該 alias。
+#[test]
+fn issue281_conflicting_by_id_claim_falls_back_to_automatic_when_owner_not_live() {
+    let mut loaded = LoadedState::default();
+    loaded.aliases.insert(
+        "claimed-name".into(),
+        i281_session_alias_row("t:COM9", "2026-10-01T00:00:00Z"),
+    );
+    let rig = ServiceRig::build_with_loaded_state(i281_dynamic_spec(), loaded);
+    wait_until("動態 COM0 session", || rig.session("COM0").is_some());
+
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_A}","alias":"claimed-name"}}"#),
+    );
+    let listed = rig.call("session.list", "{}");
+    let session = i281_session_from_list(&listed, "COM0").expect("COM0 session");
+    let aliases = rig.call("alias.list", "{}");
+    let claim = i281_alias_from_list(&aliases, "claimed-name").expect("原 alias claim 應保留");
+
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(session.get("alias"), Some(&PyValue::from("t+1")));
+    assert_eq!(claim.get("effective"), Some(&PyValue::Bool(false)));
+    assert_eq!(claim.get("conflict"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"claimed-name"}"#)
+            .get("error_code")
+            .and_then(PyValue::as_str),
+        Some("SESSION_NOT_FOUND")
+    );
+}
+
 #[test]
 fn mcu_patterns_exact() {
     let r = ServiceRig::ready_shell();
