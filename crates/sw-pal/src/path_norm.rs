@@ -7,6 +7,20 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// 以原生工作目錄解析相對 WAL 路徑；Windows 路徑風格在 POSIX 測試宿主上保持相對字串。
+pub fn absolute_path_from_cwd(path: &str, _flavor: crate::PalPathFlavor) -> Option<String> {
+    #[cfg(unix)]
+    if _flavor == crate::PalPathFlavor::Windows {
+        return Some(path.to_string());
+    }
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    let cwd = std::env::current_dir().ok()?;
+    Some(cwd.join(path).to_string_lossy().into_owned())
+}
+
 /// 去 `unix://` 前綴 → `expanduser`（對齊 P1 `normalize_endpoint_path`）→ abspath → normpath；
 /// Windows 另轉小寫並統一 `\`。用於實例鎖的 `(lock_path, socket)` 比對。
 pub fn normalize_for_compare(p: &str, cwd: &Path, home: Option<&Path>) -> String {

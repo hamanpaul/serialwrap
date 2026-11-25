@@ -195,7 +195,12 @@ pub fn resolve_config_wal_dir(
     if pypath::isabs(f, &expanded) {
         return Some(expanded);
     }
-    let config_dir = pypath::dirname(f, config_path);
+    let source_path = cfg
+        .wal_dir_origin()
+        .filter(|(source_value, _)| *source_value == configured)
+        .map(|(_, source_path)| source_path)
+        .unwrap_or(config_path);
+    let config_dir = pypath::dirname(f, source_path);
     Some(pypath::join(f, &config_dir, &[&expanded]))
 }
 

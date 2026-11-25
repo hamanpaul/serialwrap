@@ -1124,6 +1124,9 @@ fn comparable_wal_path(flavor: PathFlavor, path: &str) -> String {
 }
 
 fn wal_dirs_match(ctx: &CliCtx, flavor: PathFlavor, expected: &str, daemon: &str) -> bool {
+    if !pypath::isabs(flavor, daemon) {
+        return false;
+    }
     let resolved_expected = ctx.p.env.realpath(Path::new(expected));
     let resolved_daemon = ctx.p.env.realpath(Path::new(daemon));
     if let (Ok(expected), Ok(daemon)) = (resolved_expected, resolved_daemon) {

@@ -44,8 +44,8 @@ use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::release_manifest::parse_current_release;
 use sw_proto::runtime_paths::{
-    resolve_config_wal_dir, resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot,
-    NativeTraits, PathsError, RuntimePaths,
+    resolve_daemon_dirs, resolve_wal_dir, DaemonDirs, EnvSnapshot, NativeTraits, PathsError,
+    RuntimePaths,
 };
 use sw_proto::yaml11::YValue;
 
@@ -1190,6 +1190,11 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         &config_path,
         &cfg,
     );
+    if let Some(wal_dir) =
+        sw_pal::path_norm::absolute_path_from_cwd(&paths.wal_dir, p.caps.path_flavor)
+    {
+        paths.wal_dir = wal_dir;
+    }
 
     if let Err(e) = ensure_runtime_dirs(&paths, &dirs, &*p.fs) {
         eprintln!("{}", e.py_message);
@@ -1600,18 +1605,31 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
             RuntimeConfig::from_text(None).map_err(|e| e.to_string())?
         };
         let flavor = flavor_of(&p.caps);
-        let relative_wal_dir = match cfg.wal_dir() {
-            Some(YValue::Str(raw)) if !py_strip(raw).is_empty() => {
-                let expanded = pypath::expanduser(flavor, raw, env, &home);
-                !pypath::isabs(flavor, &expanded)
-            }
-            _ => false,
-        };
-        if read_path != write_path && relative_wal_dir {
-            if let Some(resolved) =
-                resolve_config_wal_dir(env, flavor, &home, &read_path, &cfg)
-            {
-                cfg.set_wal_dir(&resolved);
+        if read_path != write_path {
+            let raw_wal_dir = match cfg.wal_dir() {
+                Some(YValue::Str(raw)) => Some(raw.clone()),
+                _ => None,
+            };
+            if let Some(raw) = raw_wal_dir {
+                let expanded = pypath::expanduser(flavor, &raw, env, &home);
+                if !py_strip(&raw).is_empty() && !pypath::isabs(flavor, &expanded) {
+                    let origin_path = cfg
+                        .wal_dir_origin()
+                        .filter(|(source_value, _)| *source_value == raw.as_str())
+                        .map(|(_, source_path)| source_path.to_string())
+                        .unwrap_or_else(|| {
+                            if pypath::isabs(flavor, &read_path) {
+                                read_path.clone()
+                            } else {
+                                sw_pal::path_norm::absolute_path_from_cwd(
+                                    &read_path,
+                                    p.caps.path_flavor,
+                                )
+                                .unwrap_or_else(|| read_path.clone())
+                            }
+                        });
+                    cfg.set_wal_dir_origin(&raw, &origin_path);
+                }
             }
         }
         cfg.set_socket(endpoint);

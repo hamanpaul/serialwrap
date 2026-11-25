@@ -935,6 +935,48 @@ impl RuntimeConfig {
         self.data.get_str("wal_dir")
     }
 
+    /// Endpoint 寫回複製 system config 時保留 `wal_dir` 的原值與來源檔案。
+    ///
+    /// 當使用者修改 `wal_dir` 後，來源記錄內的值不再相符，解析端會改用目前 config 檔的目錄。
+    pub fn wal_dir_origin(&self) -> Option<(&str, &str)> {
+        let YValue::Map(metadata) = self.data.get_str("__serialwrap_internal")? else {
+            return None;
+        };
+        let YValue::Map(origin) = metadata.get_str("wal_dir_origin")? else {
+            return None;
+        };
+        let YValue::Str(value) = origin.get_str("value")? else {
+            return None;
+        };
+        let YValue::Str(config_path) = origin.get_str("config_path")? else {
+            return None;
+        };
+        Some((value, config_path))
+    }
+
+    /// 記錄複製前的 config 來源；`wal_dir` 本身仍保留原始字串。
+    pub fn set_wal_dir_origin(&mut self, value: &str, config_path: &str) {
+        let mut origin = YMap::default();
+        origin.0.push((
+            YValue::Str("value".to_string()),
+            YValue::Str(value.to_string()),
+        ));
+        origin.0.push((
+            YValue::Str("config_path".to_string()),
+            YValue::Str(config_path.to_string()),
+        ));
+        let mut metadata = match self.data.get_str("__serialwrap_internal") {
+            Some(YValue::Map(map)) => map.clone(),
+            _ => YMap::default(),
+        };
+        upsert_value_key(&mut metadata, "wal_dir_origin", YValue::Map(origin));
+        upsert_value_key(
+            &mut self.data,
+            "__serialwrap_internal",
+            YValue::Map(metadata),
+        );
+    }
+
     /// 07 §5.1：socket_path Some 才覆寫。
     ///
     /// 對應 `sw_core/runtime_config.py` `set_mode`：`supervision_mode` 必寫；`socket_path` 只在 `Some` 時覆寫，
@@ -967,7 +1009,10 @@ impl RuntimeConfig {
 
 /// 以字串 key 覆寫值（既有 key 原位取代，否則附加於尾端；對應 Python `dict.__setitem__`）。
 fn upsert_str_key(map: &mut YMap, key: &str, value: &str) {
-    let value = YValue::Str(value.to_string());
+    upsert_value_key(map, key, YValue::Str(value.to_string()));
+}
+
+fn upsert_value_key(map: &mut YMap, key: &str, value: YValue) {
     match map
         .0
         .iter_mut()
