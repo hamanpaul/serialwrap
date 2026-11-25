@@ -121,9 +121,13 @@ fn atomic_replace_profile(
             path.display()
         )));
     }
-    if let Err(error) = ctx.p.fs.atomic_write(path, updated, None) {
+    if let Err(error) = ctx
+        .p
+        .fs
+        .atomic_replace_preserving_metadata(path, updated)
+    {
         let message = if ctx.p.fs.read(path).is_ok_and(|bytes| bytes != original) {
-            match ctx.p.fs.atomic_write(path, original, None) {
+            match ctx.p.fs.atomic_replace_preserving_metadata(path, original) {
                 Ok(()) => format!("{}；原檔已回復", error.py_message),
                 Err(restore) => {
                     format!("{}；原檔回復失敗：{}", error.py_message, restore.py_message)
@@ -267,6 +271,27 @@ pub fn materialize_assets(
                     error.py_message
                 ))
             })?;
+            if let Some((updated, labels)) =
+                crate::profile_migration::migrate_bytes(&current).map_err(|error| {
+                    SetupError::Io(format!(
+                        "檢查既有 profile {} 失敗：{}",
+                        dest.display(),
+                        error
+                    ))
+                })?
+            {
+                atomic_replace_profile(ctx, &dest, &current, &updated)?;
+                ctx.io
+                    .err_str(&format!(
+                        "serialwrap setup: 已補入 profile {} 的 timeout_recovery_keys=[CTRL_C]（{}）\n",
+                        dest.display(),
+                        labels.join(", ")
+                    ))
+                    .map_err(|error| {
+                        SetupError::Io(format!("寫入 setup 遷移診斷失敗：{error}"))
+                    })?;
+                continue;
+            }
             if crate::profile_migration::contains_timeout_key(&current).map_err(|error| {
                 SetupError::Io(format!(
                     "檢查既有 profile {} 失敗：{}",
@@ -1084,28 +1109,30 @@ fn run_command(ctx: &CliCtx<'_>, argv: &[String]) -> CmdRecord {
 }
 
 fn run_system_file_commands(ctx: &mut CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
-    argvs
-        .iter()
-        .map(|argv| {
-            let result = ctx.p.env.run(argv, None);
-            let is_migration = argv
-                .iter()
-                .any(|arg| arg == &format!("{}=1", INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV));
-            let rc = match result {
-                Ok(output) => {
-                    if is_migration && !output.stderr.is_empty() {
-                        let _ = ctx.io.err_str(&output.stderr);
-                    }
-                    output.rc
+    let mut records = Vec::with_capacity(argvs.len());
+    for argv in argvs {
+        let is_migration = argv
+            .iter()
+            .any(|arg| arg == &format!("{}=1", INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV));
+        let result = ctx.p.env.run(argv, None);
+        let rc = match result {
+            Ok(output) => {
+                if is_migration && !output.stderr.is_empty() {
+                    let _ = ctx.io.err_str(&output.stderr);
                 }
-                Err(_) => -1,
-            };
-            CmdRecord {
-                argv: argv.clone(),
-                rc,
+                output.rc
             }
-        })
-        .collect()
+            Err(_) => -1,
+        };
+        records.push(CmdRecord {
+            argv: argv.clone(),
+            rc,
+        });
+        if is_migration && rc != 0 {
+            break;
+        }
+    }
+    records
 }
 
 fn run_records(ctx: &CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
@@ -1642,6 +1669,18 @@ fn start_new(
             let file_commands = &commands[..4];
             let file_records = run_system_file_commands(ctx, file_commands);
             extend_records(ran, &file_records);
+            if let Some(migration) = file_records.iter().find(|record| {
+                record.rc != 0
+                    && record
+                        .argv
+                        .iter()
+                        .any(|arg| arg == &format!("{}=1", INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV))
+            }) {
+                return Err(ReconcileError::Config(format!(
+                    "system profile 遷移失敗（rc={}），已中止後續複製與服務操作",
+                    migration.rc
+                )));
+            }
             let root = install_layout::resolve_install_root(ctx);
             let unit = req.home.join(".local/share/serialwrap/serialwrap.service");
             let def = SupervisorDefinition {

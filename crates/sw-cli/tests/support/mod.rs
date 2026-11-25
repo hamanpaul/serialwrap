@@ -240,6 +240,12 @@ impl FsOps for EventFs {
         self.record_write(path, bytes);
         Ok(())
     }
+    fn atomic_replace_preserving_metadata(&self, path: &Path, bytes: &[u8]) -> PalResult<()> {
+        self.record_mutation("atomic_write", path);
+        self.inner.atomic_replace_preserving_metadata(path, bytes)?;
+        self.record_write(path, bytes);
+        Ok(())
+    }
     fn write_file(&self, path: &Path, bytes: &[u8]) -> PalResult<()> {
         self.record_mutation("write_file", path);
         self.inner.write_file(path, bytes)?;

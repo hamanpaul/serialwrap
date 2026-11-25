@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,6 +46,40 @@ impl FsOps for NativeFsOps {
         let mut cleanup = TempPath::new(temp_path.clone());
         let requested_mode = mode.unwrap_or(0o600);
         file.set_permissions(fs::Permissions::from_mode(requested_mode))
+            .map_err(posix_io_error)?;
+        file.write_all(data).map_err(posix_io_error)?;
+        file.sync_all().map_err(posix_io_error)?;
+        drop(file);
+        fs::rename(&temp_path, p).map_err(posix_io_error)?;
+        cleanup.disarm();
+        self.sync_dir(parent)
+    }
+
+    fn atomic_replace_preserving_metadata(&self, p: &Path, data: &[u8]) -> PalResult<()> {
+        let metadata = fs::symlink_metadata(p).map_err(posix_io_error)?;
+        if !metadata.file_type().is_file() {
+            return Err(PalError::plain(
+                PalErrorKind::InvalidInput,
+                "atomic_replace_preserving_metadata 目標不是一般檔案",
+            ));
+        }
+
+        let parent = parent_dir(p);
+        let (mut file, temp_path) = create_temp_file(p)?;
+        let mut cleanup = TempPath::new(temp_path.clone());
+        // 先 chown 再 chmod；chown 可能清除 setuid/setgid bit。
+        // SAFETY: fd 由 `file` 持有；metadata 來自同一個既有 POSIX 檔案。
+        if unsafe {
+            libc::fchown(
+                file.as_raw_fd(),
+                metadata.uid() as libc::uid_t,
+                metadata.gid() as libc::gid_t,
+            )
+        } != 0
+        {
+            return Err(posix_io_error(io::Error::last_os_error()));
+        }
+        file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))
             .map_err(posix_io_error)?;
         file.write_all(data).map_err(posix_io_error)?;
         file.sync_all().map_err(posix_io_error)?;

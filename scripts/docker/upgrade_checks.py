@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -305,6 +306,17 @@ def snapshot_files(root: Path) -> dict[str, str]:
     return result
 
 
+def snapshot_file_bytes(root: Path) -> dict[str, bytes]:
+    """與 snapshot_files 使用同一檔案集合，保留逐位元組升級證據。"""
+    result: dict[str, bytes] = {}
+    if not root.is_dir():
+        return result
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            result[path.relative_to(root).as_posix()] = path.read_bytes()
+    return result
+
+
 def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str],
                           expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
     """既有檔案逐位元組保留。`expected_overwrites`（路徑 → 新 bundle 權威內容的 sha256）列出 setup 依 0.3.2 同語意
@@ -318,6 +330,219 @@ def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str
         return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added,
                    package_updated=package_updated)
     return row(check_id, "PASS", None, files=len(before), added=added, package_updated=package_updated)
+
+
+_P290_YAML_PROBE = r"""
+import copy
+import json
+import sys
+
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name == "yaml":
+        print(json.dumps({"status": "missing_pyyaml"}))
+        raise SystemExit(0)
+    raise
+
+def truthy(value):
+    return bool(value)
+
+def py_string(value):
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+def eligible(profile):
+    if not isinstance(profile, dict) or "timeout_recovery_keys" in profile:
+        return False
+    platform = profile.get("platform")
+    return truthy(platform) and py_string(platform).strip().lower() == "prpl"
+
+def candidates(document):
+    if not isinstance(document, dict):
+        return []
+    found = []
+    recognized = 0
+    profiles = document.get("profiles")
+    if isinstance(profiles, dict):
+        for name, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            if not py_string(name).strip():
+                continue
+            recognized += 1
+            if eligible(profile):
+                found.append(profile)
+    elif isinstance(profiles, list):
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            name = profile.get("name")
+            if not truthy(name):
+                name = profile.get("profile_name")
+            if not truthy(name) or not py_string(name).strip():
+                continue
+            recognized += 1
+            if eligible(profile):
+                found.append(profile)
+    if recognized == 0 and eligible(document):
+        found.append(document)
+    return found
+
+try:
+    pair = json.load(sys.stdin)
+    before = yaml.safe_load(pair["before"])
+    after = yaml.safe_load(pair["after"])
+    expected = copy.deepcopy(before)
+    targets = candidates(expected)
+    for profile in targets:
+        profile["timeout_recovery_keys"] = ["CTRL_C"]
+except (UnicodeError, yaml.YAMLError, TypeError, ValueError, KeyError) as exc:
+    result = {"status": "invalid_yaml", "error_type": type(exc).__name__}
+else:
+    result = {"status": "ok", "candidate_count": len(targets), "semantic_match": expected == after,
+              "pyyaml_version": getattr(yaml, "__version__", None)}
+print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+"""
+
+
+def _p290_yaml_migration_probe(before: bytes, after: bytes, *,
+                               candidate_python: str | Path | None,
+                               fallback_python: str | Path | None) -> dict[str, Any]:
+    """用候選 runtime／舊版 venv 的 PyYAML 確認只改到缺欄位的 prpl templates。"""
+    try:
+        before_text = before.decode("utf-8")
+        after_text = after.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"status": "invalid_utf8"}
+    interpreters: list[str] = []
+    for value in (candidate_python, fallback_python, sys.executable):
+        if value is not None and str(value) not in interpreters:
+            interpreters.append(str(value))
+    payload = json.dumps({"before": before_text, "after": after_text}, ensure_ascii=False).encode("utf-8")
+    attempts: list[dict[str, Any]] = []
+    for interpreter in interpreters:
+        try:
+            process = subprocess.run(
+                [interpreter, "-I", "-c", _P290_YAML_PROBE],
+                input=payload, capture_output=True, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "parser_timeout", "attempts": attempts}
+        except OSError as exc:
+            attempts.append({"interpreter": interpreter, "status": type(exc).__name__})
+            continue
+        if process.returncode != 0:
+            return {"status": "parser_failed", "returncode": process.returncode, "attempts": attempts}
+        try:
+            result = json.loads(process.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"status": "parser_invalid_output", "attempts": attempts}
+        if type(result) is not dict or type(result.get("status")) is not str:
+            return {"status": "parser_invalid_result", "attempts": attempts}
+        attempts.append({"interpreter": interpreter, "status": result["status"],
+                         "pyyaml_version": result.get("pyyaml_version")})
+        if result["status"] == "missing_pyyaml":
+            continue
+        result["attempts"] = attempts
+        return result
+    return {"status": "parser_unavailable", "attempts": attempts}
+
+
+def _p290_only_inserted_fields(before: bytes, after: bytes, count: int) -> bool:
+    """確認差異只有 count 行精確的 timeout_recovery_keys 插入，允許 EOF 所需的一個換行。"""
+    if count <= 0:
+        return False
+    bases = [before]
+    if before and not before.endswith(b"\n"):
+        newline = b"\r\n" if b"\r\n" in before else b"\n"
+        bases.append(before + newline)
+    after_lines = after.splitlines(keepends=True)
+    field_line = re.compile(rb" *timeout_recovery_keys: \[CTRL_C\](?:\r?\n)?\Z")
+
+    for base in bases:
+        before_lines = base.splitlines(keepends=True)
+        memo: dict[tuple[int, int, int], bool] = {}
+
+        def matches(i: int, j: int, removed: int) -> bool:
+            key = (i, j, removed)
+            if key in memo:
+                return memo[key]
+            if i == len(after_lines):
+                result = j == len(before_lines) and removed == count
+            else:
+                line = after_lines[i]
+                result = j < len(before_lines) and line == before_lines[j] and matches(i + 1, j + 1, removed)
+                if not result and removed < count and field_line.fullmatch(line):
+                    result = matches(i + 1, j, removed + 1)
+            memo[key] = result
+            return result
+
+        if matches(0, 0, 0):
+            return True
+    return False
+
+
+def judge_files_preserved_with_p290_migration(
+    check_id: str,
+    before: dict[str, str],
+    after: dict[str, str],
+    *,
+    before_bytes: dict[str, bytes],
+    after_bytes: dict[str, bytes],
+    expected_overwrites: dict[str, str] | None = None,
+    candidate_python: str | Path | None = None,
+    fallback_python: str | Path | None = None,
+) -> dict[str, Any]:
+    """保留原有 hash 判準，只額外允許 OD-33 核准的 prpl 欄位精確遷移。"""
+    expected = expected_overwrites or {}
+    missing = sorted(set(before) - set(after))
+    package_updated = sorted(k for k in before if k in after and before[k] != after[k] and expected.get(k) == after[k])
+    changed = sorted(k for k in before if k in after and before[k] != after[k] and k not in package_updated)
+    added = sorted(set(after) - set(before))
+    migrated: list[str] = []
+    rejected: dict[str, str] = {}
+    for path in changed:
+        if path in expected:
+            rejected[path] = "managed profile did not match the expected package asset"
+            continue
+        old = before_bytes.get(path)
+        new = after_bytes.get(path)
+        if old is None or new is None:
+            rejected[path] = "migration bytes unavailable"
+            continue
+        if hashlib.sha256(old).hexdigest() != before[path] or hashlib.sha256(new).hexdigest() != after[path]:
+            rejected[path] = "migration bytes do not match recorded hashes"
+            continue
+        probe = _p290_yaml_migration_probe(
+            old, new, candidate_python=candidate_python, fallback_python=fallback_python,
+        )
+        count = probe.get("candidate_count") if probe.get("status") == "ok" else 0
+        if probe.get("status") != "ok" or type(count) is not int or count < 1:
+            rejected[path] = f"migration YAML could not be validated: {probe.get('status')}"
+            continue
+        if probe.get("semantic_match") is not True:
+            rejected[path] = "migration changed YAML semantics beyond the approved key"
+            continue
+        if not _p290_only_inserted_fields(old, new, count):
+            rejected[path] = "migration bytes contain changes beyond exact key insertion"
+            continue
+        migrated.append(path)
+
+    unapproved_changes = sorted(set(changed) - set(migrated))
+    detail = {
+        "files": len(before),
+        "missing": missing,
+        "changed": unapproved_changes,
+        "added": added,
+        "package_updated": package_updated,
+        "p290_migrated": sorted(migrated),
+        "p290_rejected": rejected,
+    }
+    if missing or unapproved_changes:
+        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", **detail)
+    return row(check_id, "PASS", None, **detail)
 
 
 def _alias_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -779,7 +1004,11 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
                               old_alive_after: list[int], status_after: dict[str, Any] | None, instances_after: list[int],
                               cfg_before: dict[str, str], cfg_after: dict[str, str], overlaps: list[dict[str, Any]],
                               new_version: str = "0.4.0", old_version: str = "0.3.2",
-                              expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
+                              expected_overwrites: dict[str, str] | None = None,
+                              cfg_before_bytes: dict[str, bytes] | None = None,
+                              cfg_after_bytes: dict[str, bytes] | None = None,
+                              candidate_python: str | Path | None = None,
+                              fallback_python: str | Path | None = None) -> dict[str, Any]:
     """OD-48：0.3.2 daemon 執行中直接 setup → 成功切換、舊 daemon 行程樹結束、新 daemon 由 setup 自己啟動
     （判定在 driver 任何啟動動作之前取樣；setup 沒啟動就 FAIL）、config／profiles 逐位元組保留、無兩個 daemon 重疊。"""
     body = body if isinstance(body, dict) else {}
@@ -787,7 +1016,15 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
     legacy = _step_detail(body, "stop_supervisor").get("legacy_stop") or {}
     started = _step_detail(body, "start_and_verify").get("started")
     status = status_after if isinstance(status_after, dict) else {}
-    preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+    if cfg_before_bytes is None or cfg_after_bytes is None:
+        preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+    else:
+        preserved = judge_files_preserved_with_p290_migration(
+            check_id, cfg_before, cfg_after,
+            before_bytes=cfg_before_bytes, after_bytes=cfg_after_bytes,
+            expected_overwrites=expected_overwrites,
+            candidate_python=candidate_python, fallback_python=fallback_python,
+        )
     detail = {"setup_rc": setup_rc, "op": report.get("op"), "to_version": report.get("to_version"),
               "legacy_stop": legacy, "started_by_setup": started, "old_pids": list(old_pids),
               "old_alive_after": list(old_alive_after), "daemon_version_after": status.get("version"),

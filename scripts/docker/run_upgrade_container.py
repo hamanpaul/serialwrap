@@ -244,6 +244,8 @@ class Driver:
         self.rows: list[dict[str, Any]] = []
         self.observations: list[dict[str, Any]] = []
         self.samples: list[tuple[float, list[int]]] = []
+        self.cfg_before_bytes: dict[str, bytes] = {}
+        self.cfg_after_migration: dict[str, str] | None = None
         self._stop = threading.Event()
         self.proc_root = pathlib.Path("/proc")
         self.stop_wait_s = STOP_WAIT_S
@@ -588,6 +590,18 @@ class Driver:
             files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()})
         return files
 
+    def cfg_file_bytes(self) -> dict[str, bytes]:
+        """與 cfg_files 相同路徑集合的原始 bytes，供 p290 精確遷移判準使用。"""
+        files = uc.snapshot_file_bytes(CONFIG)
+        if self.mode == "systemd-system":
+            files.update({f"/etc/serialwrap/profiles/{k}": v
+                          for k, v in uc.snapshot_file_bytes(SYSTEM_PROFILE_DIR).items()})
+        return files
+
+    def capture_post_migration_config(self) -> None:
+        """setup 成功後保存 rollback／降級必須逐位元組保留的基線。"""
+        self.cfg_after_migration = self.cfg_files()
+
     def expected_overwrites(self) -> dict[str, str]:
         """S1-f3c66b4-1：system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 同名檔（0.3.2 `sudo cp -r`
         同語意）。只允許這些檔案變成新 bundle 的權威內容（bundle 內 sw_core/assets/profiles）；其餘逐位元組比較。"""
@@ -632,6 +646,7 @@ class Driver:
         ]
         self.baseline = self.state_view()
         self.cfg_before = self.cfg_files()
+        self.cfg_before_bytes = self.cfg_file_bytes()
         seed = uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
                              config_files=self.cfg_before)
         if self.mode == "on-demand":
@@ -662,6 +677,7 @@ class Driver:
         proc = self.run([str(self.new_cli), "setup", *self.setup_args], label=f"{NEW_VERSION} setup（舊 daemon 執行中）", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
+            self.capture_post_migration_config()
             # OD-48：在 driver 任何啟動動作之前取樣，確認新 daemon 由 setup 自己啟動。
             status = self.wait_daemon(version=NEW_VERSION, timeout=20.0)
             t1 = time.monotonic()
@@ -673,7 +689,10 @@ class Driver:
                 "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
                 old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(self.proc_root),
                 cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=overlaps,
-                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
+                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites(),
+                cfg_before_bytes=self.cfg_before_bytes, cfg_after_bytes=self.cfg_file_bytes(),
+                candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+                fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python"))
             return True
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
@@ -686,7 +705,10 @@ class Driver:
             "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
             old_alive_after=sorted(after["daemon_pids"]), status_after=None, instances_after=after["daemon_pids"],
             cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=[],
-            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
+            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites(),
+            cfg_before_bytes=self.cfg_before_bytes, cfg_after_bytes=self.cfg_file_bytes(),
+            candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+            fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python"))
         return False
 
     def phase_upgrade_after_stop(self, already: bool) -> None:
@@ -701,6 +723,8 @@ class Driver:
             install = body.get("install") or {}
             ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
                 and install.get("op") == "install" and install.get("to_version") == NEW_VERSION
+            if proc.returncode == 0 and body.get("ok") is True:
+                self.capture_post_migration_config()
             start_step = next((s for s in install.get("steps") or [] if s.get("step") == "start_and_verify"), {})
             if (start_step.get("detail") or {}).get("started") is False:
                 self.observations.append({"id": "OBS-UPGRADE-NOT-STARTED", "phase": "upgrade_after_stop",
@@ -728,8 +752,13 @@ class Driver:
         self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else f"入口未切到 {NEW_VERSION} 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
-        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files(),
-                                       self.expected_overwrites())
+        cfg = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade", self.cfg_before, self.cfg_files(),
+            before_bytes=self.cfg_before_bytes, after_bytes=self.cfg_file_bytes(),
+            expected_overwrites=self.expected_overwrites(),
+            candidate_python=self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3",
+            fallback_python=HOME / ".local/share/pipx/venvs/serialwrap/bin/python",
+        )
         self.add(cfg)
 
     def phase_install_sh(self) -> None:
@@ -751,6 +780,8 @@ class Driver:
         finally:
             del self.env["TMPDIR"]
         body = self.parse(proc) or {}
+        if proc.returncode == 0 and body.get("ok") is True:
+            self.capture_post_migration_config()
         pipx_left = any((HOME / rel / "venvs" / "serialwrap").is_dir() for rel in (".local/share/pipx", ".local/pipx"))
         leftover = sorted(str(p) for p in tmpdir.glob("serialwrap-install.*"))
         self.add(uc.judge_install_sh("install_sh_upgrade", rc=proc.returncode, body=body,
@@ -849,9 +880,11 @@ class Driver:
         if proc.returncode == 0 and body.get("ok"):
             # 回滾成功時 CLI、daemon 都必須回到 0.3.2 且設定保留；之後的手動降級照常執行並另行判定
             status = self.wait_daemon(version=OLD_VERSION) or {}
-            self.add(uc.judge_rollback_success("rollback_command", cli_version=self.cli_version(),
-                                               daemon_version=status.get("version"), cfg_before=self.cfg_before,
-                                               cfg_after=uc.snapshot_files(CONFIG), old_version=OLD_VERSION))
+            self.add(uc.judge_rollback_success(
+                "rollback_command", cli_version=self.cli_version(), daemon_version=status.get("version"),
+                cfg_before=self.cfg_after_migration or self.cfg_before, cfg_after=self.cfg_files(),
+                old_version=OLD_VERSION,
+            ))
             return
         self.observations.append({"id": "OBS-UPGRADE-ROLLBACK-PIPX", "phase": "rollback_command",
                                   "error_code": body.get("error_code"), "reason": body.get("reason"),
@@ -884,7 +917,9 @@ class Driver:
                         rcs=[p.returncode for p in steps], old_gone=gone, removed_entries=removed,
                         cli_version=version, daemon_version=status.get("version"), entries=self.entries(),
                         stop_wait=wait))
-        self.add(uc.judge_files_preserved("config_preserved_downgrade", self.cfg_before, uc.snapshot_files(CONFIG)))
+        self.add(uc.judge_files_preserved(
+            "config_preserved_downgrade", self.cfg_after_migration or self.cfg_before, self.cfg_files(),
+        ))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_downgrade"))
         self.add(self.judge_doctor("doctor_green_downgrade", "0.3.2 doctor（降級）", require_pairing=False,
                                    profile_policy=self.profile_policies["downgrade"]))

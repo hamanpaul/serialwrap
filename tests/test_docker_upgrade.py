@@ -13,6 +13,7 @@ host runner `scripts/docker/run-upgrade.sh` 以 `--dry-run` 檢查不碰 docker 
 from __future__ import annotations
 
 import importlib.util
+import base64
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import types
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +40,10 @@ UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
 NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "regression"))
 
 from scripts.docker import upgrade_checks as uc  # noqa: E402
+from serialwrap_regression.cases import f09_prpl_timeout_recovery as p290_case  # noqa: E402
 
 
 def _proc(root: Path, pid: int, argv: list[str], ppid: int = 1) -> None:
@@ -2030,6 +2034,181 @@ def test_system_driver_keeps_managed_profiles_in_snapshot():
     text = UPGRADE_CONTAINER.read_text(encoding="utf-8")
     assert "if k not in managed" not in text
     assert "expected_overwrites" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_migration_preservation_is_exact():
+    """p290 只核准 prpl template 缺欄位到 `[CTRL_C]` 的插入；其他 bytes 與已有值嚴格保留。"""
+    import hashlib
+
+    path = "profiles/custom.yaml"
+    before = (
+        b"# user comment\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\ntargets: []\n"
+    )
+    migrated = (
+        b"# user comment\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\n    timeout_recovery_keys: [CTRL_C]\ntargets: []\n"
+    )
+    before_hashes = {path: hashlib.sha256(before).hexdigest()}
+    after_hashes = {path: hashlib.sha256(migrated).hexdigest()}
+    exact = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade", before_hashes, after_hashes,
+        before_bytes={path: before}, after_bytes={path: migrated},
+    )
+    assert exact["verdict"] == "PASS", exact
+    assert exact["detail"]["p290_migrated"] == [path]
+
+    sequence_before = (
+        b"profiles:\n  - name: renamed-prpl\n    platform: prpl\n    prompt_regex: x\n"
+        b"targets: []\n"
+    )
+    sequence_after = (
+        b"profiles:\n  - name: renamed-prpl\n    platform: prpl\n    prompt_regex: x\n"
+        b"    timeout_recovery_keys: [CTRL_C]\ntargets: []\n"
+    )
+    sequence = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(sequence_before).hexdigest()},
+        {path: hashlib.sha256(sequence_after).hexdigest()},
+        before_bytes={path: sequence_before}, after_bytes={path: sequence_after},
+    )
+    assert sequence["verdict"] == "PASS", sequence
+    package_mismatch = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade", before_hashes, after_hashes,
+        before_bytes={path: before}, after_bytes={path: migrated},
+        expected_overwrites={path: hashlib.sha256(b"authoritative package asset").hexdigest()},
+    )
+    assert package_mismatch["verdict"] == "FAIL", package_mismatch
+
+    for invalid in (
+        migrated.replace(b"root@board", b"root@changed"),
+        migrated.replace(b"[CTRL_C]", b"[CTRL_D]"),
+        migrated.replace(b"    timeout_recovery_keys", b"      timeout_recovery_keys"),
+    ):
+        rejected = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade", before_hashes,
+            {path: hashlib.sha256(invalid).hexdigest()},
+            before_bytes={path: before}, after_bytes={path: invalid},
+        )
+        assert rejected["verdict"] == "FAIL", rejected
+
+    already_set = b"profiles:\n  prpl:\n    platform: prpl\n    timeout_recovery_keys: []\n"
+    overwritten = already_set.replace(b"[]", b"[CTRL_C]")
+    rejected = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(already_set).hexdigest()},
+        {path: hashlib.sha256(overwritten).hexdigest()},
+        before_bytes={path: already_set}, after_bytes={path: overwritten},
+    )
+    assert rejected["verdict"] == "FAIL", rejected
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_post_setup_expectation_rejects_missing_recovery_keys(tmp_path):
+    """遷移後 p289 gate 必須見到欄位；該補未補仍判 FAIL。"""
+    asset = tmp_path / "asset.yaml"
+    live = tmp_path / "live.yaml"
+    asset.write_text("profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n", encoding="utf-8")
+    live.write_text("profiles:\n  prpl-template:\n    platform: prpl\n", encoding="utf-8")
+    row = uc.judge_p290_profile_migration(
+        "p290_profile_migration", asset, live,
+        migration_policy_id="p290-template-migration-v1",
+    )
+    assert row["verdict"] == "FAIL", row
+    assert row["detail"]["live_profile_has_field"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_downgrade_preserves_post_migration_profiles():
+    """rollback 與降級以成功遷移後 snapshot 作保存基準，且不可刪掉新增欄位。"""
+    import hashlib
+
+    before = b"profiles:\n  prpl:\n    platform: prpl\n"
+    migrated = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+    post_migration = {"profiles/default.yaml": hashlib.sha256(migrated).hexdigest()}
+    kept = uc.judge_rollback_success(
+        "rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.3.2",
+        cfg_before=post_migration, cfg_after=dict(post_migration),
+    )
+    assert kept["verdict"] == "PASS", kept
+    removed = uc.judge_rollback_success(
+        "rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.3.2",
+        cfg_before=post_migration,
+        cfg_after={"profiles/default.yaml": hashlib.sha256(before).hexdigest()},
+    )
+    assert removed["verdict"] == "FAIL", removed
+    assert uc.judge_files_preserved("config_preserved_downgrade", post_migration,
+                                    dict(post_migration))["verdict"] == "PASS"
+    assert uc.judge_files_preserved(
+        "config_preserved_downgrade", post_migration,
+        {"profiles/default.yaml": hashlib.sha256(before).hexdigest()},
+    )["verdict"] == "FAIL"
+
+
+def _p290_wal_record(seq: int, payload: bytes) -> dict[str, Any]:
+    return {"seq": seq, "dir": "TX", "payload_b64": base64.b64encode(payload).decode("ascii")}
+
+
+class _P290RecoveryFakeSw:
+    def __init__(self, recovery: dict[str, Any]) -> None:
+        self.recovery = recovery
+        self.commands: list[str] = []
+
+    def session(self, _com: str) -> dict[str, Any]:
+        return {"state": "READY"}
+
+    def run(self, *args: str) -> dict[str, Any]:
+        if args[:2] == ("wal", "current-seq"):
+            return {"ok": True, "seq": 100}
+        if args[:2] == ("log", "tail-raw"):
+            return {"ok": True, "wal_file_exists": True, "truncated": False,
+                    "records": [_p290_wal_record(101, b"\x03")]}
+        raise AssertionError(args)
+
+    def submit_and_wait(self, _com: str, command: str, **_kwargs: Any) -> dict[str, Any]:
+        self.commands.append(command)
+        if command == "sleep 30":
+            return self.recovery
+        marker = command.removeprefix("echo ")
+        return {"status": "done", "stdout": marker}
+
+
+def _p290_case_context(recovery: dict[str, Any]) -> SimpleNamespace:
+    sw = _P290RecoveryFakeSw(recovery)
+    notes: dict[str, str] = {}
+    return SimpleNamespace(
+        sw=sw,
+        cfg={"boards": [{"com": "COM0", "platform": "prpl"}]},
+        note=lambda name, body: notes.setdefault(name, body) or name,
+        notes=notes,
+    )
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_accepts_done_ctrl_c_recovery():
+    """回歸 driver 依 command status 契約接受 done／null error_code／CTRL_C。"""
+    ctx = _p290_case_context({"status": "done", "error_code": None, "recovery_action": "CTRL_C"})
+    result = p290_case._run(ctx)
+    assert result.verdict == "PASS", result
+    assert ctx.sw.commands[0] == "sleep 30"
+    assert ctx.sw.commands[1].startswith("echo P290_ALIVE_")
+    assert "keys=[3]" in ctx.notes["recovery-key-sequence.txt"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_rejects_failed_recovery():
+    """fake driver 的失敗 command status 不得被誤判成 Ctrl-C 已恢復。"""
+    ctx = _p290_case_context({"status": "failed", "error_code": "PROMPT_TIMEOUT", "recovery_action": "NONE"})
+    result = p290_case._run(ctx)
+    assert result.verdict == "FAIL", result
+    assert result.reason_code == "timeout_not_recovered_by_ctrl_c"
+    assert ctx.sw.commands == ["sleep 30"]
 
 
 @pytest.mark.core_portable

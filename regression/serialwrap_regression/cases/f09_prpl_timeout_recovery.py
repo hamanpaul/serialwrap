@@ -61,8 +61,10 @@ def _run(ctx) -> CaseResult:
     if wal_problem:
         return CaseResult("FAIL", reason=f"無法從 WAL 驗證救援鍵：{wal_problem}",
                           category="environment", reason_code=wal_problem)
-    if result.get("error_code") != "PROMPT_TIMEOUT_RECOVERED" or result.get("recovery_action") != "CTRL_C":
+    if (result.get("status") != "done" or "error_code" not in result
+            or result.get("error_code") is not None or result.get("recovery_action") != "CTRL_C"):
         return CaseResult("FAIL", reason=("prpl 逾時未以 Ctrl-C 恢復 prompt："
+                                           f"status={result.get('status')!r} "
                                            f"error_code={result.get('error_code')!r} "
                                            f"recovery_action={result.get('recovery_action')!r}"),
                           category="test", reason_code="timeout_not_recovered_by_ctrl_c")

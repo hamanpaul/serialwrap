@@ -1671,6 +1671,82 @@ fn setup_backfills_only_missing_prpl_template_keys_without_rewriting_other_bytes
 }
 
 #[test]
+fn setup_migration_preserves_valid_four_space_incremental_indentation() {
+    let t = TestEnv::posix().with_real_service();
+    let profiles = t.config_dir().join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    let profile = profiles.join("default.yaml");
+    let before = b"profiles:\n    board:\n        platform: prpl\n        prompt_regex: x\ntargets: []\n";
+    let expected = b"profiles:\n    board:\n        platform: prpl\n        prompt_regex: x\n        timeout_recovery_keys: [CTRL_C]\ntargets: []\n";
+    std::fs::write(&profile, before).unwrap();
+
+    let (rc, out, err) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "合法縮排的 YAML 遷移失敗：stdout={out:?}, stderr={err:?}");
+    let after = std::fs::read(&profile).unwrap();
+    assert_eq!(after, expected);
+    sw_proto::yaml11::safe_load(std::str::from_utf8(&after).unwrap())
+        .expect("遷移後必須仍是合法 YAML");
+}
+
+#[test]
+fn setup_force_migrates_custom_prpl_profile_without_replacing_other_bytes() {
+    let t = TestEnv::posix().with_real_service();
+    let env_snap = sw_proto::runtime_paths::EnvSnapshot::from_pairs(vec![]);
+    let dirs = sw_cli::setup_cmd::user_dirs(&env_snap, &t.home());
+    let profile = dirs.config.join("profiles/default.yaml");
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    let before = b"# user data\nprofiles:\n  renamed-board:\n    platform: prpl\n    prompt_regex: 'root@board'\ntargets: []\n";
+    let expected = b"# user data\nprofiles:\n  renamed-board:\n    platform: prpl\n    prompt_regex: 'root@board'\n    timeout_recovery_keys: [CTRL_C]\ntargets: []\n";
+    std::fs::write(&profile, before).unwrap();
+
+    t.with_cli_ctx(|ctx| sw_cli::setup_cmd::materialize_assets(ctx, &dirs, true).unwrap());
+    assert_eq!(std::fs::read(&profile).unwrap(), expected);
+
+    let malformed = b"profiles:\n  renamed-board:\n    platform: prpl\n    broken: [\n";
+    std::fs::write(&profile, malformed).unwrap();
+    let result = t.with_cli_ctx(|ctx| sw_cli::setup_cmd::materialize_assets(ctx, &dirs, true));
+    assert!(result.is_err(), "force 遇到無法安全遷移的 profile 必須失敗");
+    assert_eq!(std::fs::read(&profile).unwrap(), malformed, "失敗不得覆寫原檔");
+}
+
+#[test]
+fn setup_system_migration_failure_stops_before_copy_and_service_install() {
+    let executable = std::env::current_exe().unwrap();
+    let executable = executable.to_string_lossy();
+    let t = TestEnv::posix()
+        .with_real_service()
+        .with_systemd(true)
+        .with_command(
+            &[
+                "sudo",
+                "env",
+                "SW_INTERNAL_P290_MIGRATE_SYSTEM_PROFILES=1",
+                executable.as_ref(),
+            ],
+            1,
+            "",
+            "injected profile migration failure",
+        );
+
+    let (rc, out, err) = t.run(&["setup", "--system", "--with-sudo"]);
+    assert_ne!(rc, 0, "system profile 遷移失敗不得回成功：stdout={out:?}, stderr={err:?}");
+    assert!(err.contains("injected profile migration failure"), "須回報遷移失敗：{err:?}");
+    let calls = t.calls();
+    let migration = calls
+        .iter()
+        .position(|argv| argv.iter().any(|arg| arg == "SW_INTERNAL_P290_MIGRATE_SYSTEM_PROFILES=1"))
+        .expect("應執行受控 system profile 遷移子行程");
+    assert!(
+        !calls.iter().skip(migration + 1).any(|argv| {
+            argv.first().is_some_and(|program| program == "sudo")
+                && (argv.iter().any(|arg| arg == "cp")
+                    || argv.iter().any(|arg| arg == "systemctl"))
+        }),
+        "遷移失敗後不得複製 profile 或執行 systemd 命令：{calls:?}"
+    );
+}
+
+#[test]
 fn setup_force_preserves_explicit_timeout_recovery_keys() {
     let t = TestEnv::posix().with_real_service();
     let env_snap = sw_proto::runtime_paths::EnvSnapshot::from_pairs(vec![]);

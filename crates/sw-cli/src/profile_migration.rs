@@ -1,5 +1,6 @@
 //! p290：只對管理目錄的 prpl template 精確補入逾時救援鍵。
 
+use sw_proto::config_types::TimeoutRecoveryKey;
 use sw_proto::pycompat::py_strip;
 use sw_proto::yaml11::{py_str_of, py_truthy_of, safe_load, YMap, YValue};
 
@@ -43,6 +44,7 @@ pub(crate) fn migrate_bytes(bytes: &[u8]) -> Result<Option<MigratedProfile>, Str
         return Ok(None);
     }
 
+    let validation_targets = candidates.clone();
     let lines = lines(text)?;
     let mut insertions = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -62,14 +64,59 @@ pub(crate) fn migrate_bytes(bytes: &[u8]) -> Result<Option<MigratedProfile>, Str
             insertion.push_str(newline);
         }
         insertion.push_str(&" ".repeat(indent));
-        insertion.push_str("timeout_recovery_keys: [CTRL_C]");
+        insertion.push_str("timeout_recovery_keys: [");
+        insertion.push_str(TimeoutRecoveryKey::CtrlC.name());
+        insertion.push(']');
         if needs_suffix {
             insertion.push_str(newline);
         }
         changed.insert_str(position, &insertion);
         labels.push(label);
     }
+    validate_migrated_document(&changed, &validation_targets)?;
     Ok(Some((changed.into_bytes(), labels)))
+}
+
+fn validate_migrated_document(text: &str, targets: &[Candidate]) -> Result<(), String> {
+    let parsed_text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let root = safe_load(parsed_text).map_err(|error| format!("遷移結果 YAML 無法解析：{error}"))?;
+    for target in targets {
+        let template = candidate_template(&root, &target.source)
+            .ok_or_else(|| format!("遷移結果找不到 template {}", target.label))?;
+        let expected = YValue::Seq(vec![YValue::Str(
+            TimeoutRecoveryKey::CtrlC.name().to_string(),
+        )]);
+        if template.get_str("timeout_recovery_keys") != Some(&expected) {
+            return Err(format!(
+                "遷移結果 template {} 的 timeout_recovery_keys 不符",
+                target.label
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn candidate_template<'a>(root: &'a YValue, source: &SourceTemplate) -> Option<&'a YMap> {
+    match source {
+        SourceTemplate::Root => as_map(root),
+        SourceTemplate::Mapping(name) => {
+            let profiles = as_map(root)?.get_str("profiles")?;
+            let profiles = as_map(profiles)?;
+            profiles
+                .0
+                .iter()
+                .find(|(key, _)| py_str_of(key) == *name)
+                .and_then(|(_, value)| as_map(value))
+        }
+        SourceTemplate::Sequence(index) => {
+            let profiles = as_map(root)?.get_str("profiles")?;
+            let rows = match profiles {
+                YValue::Seq(rows) => rows,
+                _ => return None,
+            };
+            rows.get(*index).and_then(as_map)
+        }
+    }
 }
 
 /// `--force` 與 system staging 在取代 asset 前使用；只要 YAML 任一層已含該鍵便保留原檔。
@@ -352,7 +399,8 @@ fn locate_profile_mapping(
                     "template {name} 使用 flow mapping 或 alias，拒絕改寫"
                 ));
             }
-            locate_block_end(text, lines, *index, indent, indent + 2)
+            let field_indent = child_indent(lines, *index, indent)?;
+            locate_block_end(text, lines, *index, indent, field_indent)
         }
         [] => Err(format!("找不到 template {name} 的原始位置")),
         _ => Err(format!("template {name} 重複，拒絕不確定遷移")),
@@ -387,7 +435,24 @@ fn locate_profile_sequence(lines: &[Line], target: usize) -> Result<(usize, usiz
             "profiles list 第 {target} 個 template 使用 flow mapping 或 alias，拒絕改寫"
         ));
     }
-    locate_block_end_from_sequence(lines, index, indent, indent + 2)
+    let field_indent = sequence_mapping_indent(line, indent)
+        .or_else(|| child_indent(lines, index, indent).ok())
+        .ok_or_else(|| format!("profiles list 第 {target} 個 template 沒有可定位的欄位縮排"))?;
+    locate_block_end_from_sequence(lines, index, indent, field_indent)
+}
+
+fn sequence_mapping_indent(line: &Line, item_indent: usize) -> Option<usize> {
+    let content = &line.content[item_indent..];
+    if !is_sequence_entry(content) {
+        return None;
+    }
+    let after_dash = &content[1..];
+    let spaces = after_dash.bytes().take_while(|byte| *byte == b' ').count();
+    let tail = &after_dash[spaces..];
+    if tail.is_empty() || tail.starts_with('#') || top_level_colon(tail).is_none() {
+        return None;
+    }
+    Some(item_indent + 1 + spaces)
 }
 
 fn locate_root_insertion(lines: &[Line]) -> Result<(usize, usize), String> {

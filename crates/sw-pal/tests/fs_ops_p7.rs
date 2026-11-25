@@ -3,6 +3,32 @@
 //! Windows 原生執行：`scripts/rust/win-test.sh --package sw-pal --test fs_ops_p7`（LOCAL-WINDOWS-TODO）。
 use std::fs;
 
+#[cfg(unix)]
+#[test]
+fn atomic_replace_preserves_owner_group_and_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("managed-profile.yaml");
+    fs::write(&path, b"before\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&path).unwrap();
+    let expected = (before.uid(), before.gid(), before.mode() & 0o777);
+
+    sw_pal::native()
+        .fs
+        .atomic_replace_preserving_metadata(&path, b"after\n")
+        .unwrap();
+
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"after\n");
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode() & 0o777),
+        expected,
+        "原子遷移須保留既有 profile owner、group 與 mode"
+    );
+}
+
 #[test]
 fn create_truncate_overwrites_stale_tmp() {
     let tmp = tempfile::tempdir().unwrap();
