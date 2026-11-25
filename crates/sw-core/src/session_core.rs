@@ -8690,26 +8690,6 @@ impl SessionCore {
                     "recovery_action" => "NONE",
                 })
             }
-            OpOutcome::CompletionDeadlineTimeout {
-                stdout,
-                recovery_action,
-                recovered,
-            } => {
-                self.set_terminal_capture(cmd_id, Some(stdout.clone()), Some("PROMPT_TIMEOUT"), now);
-                if recovered {
-                    // 保留基線成功救援後的佇列收斂與 READY 狀態；命令本身仍依截止裁決回 PROMPT_TIMEOUT。
-                    self.flush_queue();
-                } else if !self.is_passthrough() {
-                    self.transition_to_attached("PROMPT_TIMEOUT", now);
-                }
-                CmdOutcome::Result(pydict! {
-                    "ok" => false,
-                    "error_code" => "PROMPT_TIMEOUT",
-                    "stdout" => stdout,
-                    "partial" => true,
-                    "recovery_action" => recovery_action.unwrap_or("NONE"),
-                })
-            }
             // P6 Task 7（D-10）／OD-74：可信 human 的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner`
             // human 分支，`session_manager.py:6476-6504`）；可信判定同上，不看 source 字首。
             OpOutcome::RebootExpected if self.fg_origin_is_human() => {

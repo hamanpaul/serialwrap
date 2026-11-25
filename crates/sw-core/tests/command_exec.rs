@@ -545,6 +545,7 @@ fn i294_r8_completion_decided_before_deadline_remains_done() {
 fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
     let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
     h.rx
@@ -572,8 +573,21 @@ fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
     resume_tx.send(()).expect("deadline waiter remains paused");
 
     let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "截止 snapshot 仍未完成；期限後由 Ctrl-C 救援成功時沿用基線終態：{result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo LATE\n\x03".to_vec());
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "逾時救援成功時保留基線 recovery code：{recovered:?}"
+    );
 }
 
 #[test]
@@ -670,15 +684,28 @@ fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
     resume_tx.send(()).expect("釋放 evaluator barrier");
 
     let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("error"), "跨過截止點才完成評估時依 2026-11-26 預先裁決回 timeout：{result:?}");
-    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
-    assert_eq!(result["stdout"], PyValue::from("DEADLINE_RX"), "期限內可用輸出仍須保留：{result:?}");
+    assert_eq!(result["status"], PyValue::from("done"), "期限後不得事後採用 RX 完成判定；只有 Ctrl-C 找回 prompt 才回成功：{result:?}");
+    assert!(
+        result["stdout"] == PyValue::from("DEADLINE_RX"),
+        "期限內可用輸出仍須保留"
+    );
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "無 human TX 時保留基線救援：{result:?}");
     assert_eq!(
         wal_tx_bytes_since(&h, tx_count),
         b"echo DEADLINE_RX\n\x03".to_vec(),
         "期限內尚未判定完成且無 human TX 時維持基線 Ctrl-C 救援"
+    );
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "期限前 RX 不得事後改判正常完成：{recovered:?}"
     );
 }
 
@@ -704,11 +731,21 @@ fn i294_r8_expired_before_first_wait_returns_timeout_partial() {
     resume_tx.send(()).expect("釋放首次 snapshot wait");
 
     let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
-    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["status"], PyValue::from("done"), "期限前尚未完成；期限後只有救援 prompt 才使命令成功：{result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
     assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n\x03".to_vec());
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "逾期後由 recovery 找回 prompt：{recovered:?}"
+    );
 }
 
 #[test]
@@ -739,11 +776,21 @@ fn i294_r8_timeout_after_deadline_snapshot_keeps_partial_and_baseline_recovery()
     resume_tx.send(()).expect("釋放逾時結算");
 
     let result = h.wait_done(&id);
-    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
-    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
     assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_OUTPUT\n\x03".to_vec());
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "只有救援鍵找回 prompt 才回報基線 recovery code：{recovered:?}"
+    );
 }
 
 #[test]
@@ -1160,6 +1207,7 @@ fn i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line()
 fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
     let slow = h.submit_with("sleep 20", |r| r.timeout_s = 1.0);
     let queued = h.submit_ok("echo later");
     wait_tx(&h, b"sleep 20\n");
@@ -1174,12 +1222,34 @@ fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
             rec["recovery_action"].clone()
         ),
         (
-            PyValue::from("error"),
-            PyValue::from("PROMPT_TIMEOUT"),
+            PyValue::from("done"),
+            PyValue::Null,
             PyValue::from("CTRL_C")
         )
-    ); // recovery 維持，但 operation deadline 一律回 PROMPT_TIMEOUT。
+    ); // 命令紀錄沿用基線成功終態；recovery code 保存在結果 capture。
     assert_eq!(rec["partial"], PyValue::Bool(true));
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: slow,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "救援成功的錯誤碼必須與基線相同：{recovered:?}"
+    );
+    let tx: Vec<u8> = h
+        .wal_tx_payloads()
+        .into_iter()
+        .skip(tx_count)
+        .flatten()
+        .collect();
+    assert_eq!(tx, b"sleep 20\n\x03".to_vec(), "TX 序列為原命令再加成功救援的 Ctrl-C");
+    println!(
+        "i294-r8b baseline tuple: status={:?}, error_code={:?}, partial={:?}, recovery_action={:?}, tx={tx:?}",
+        rec["status"], recovered["error_code"], rec["partial"], rec["recovery_action"]
+    );
     assert_eq!(
         h.command_get(&queued)["error_code"],
         PyValue::from("FLUSHED_BY_RECOVERY")
@@ -1268,6 +1338,13 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
         PyValue::from(c.source),
         "{label}：紀錄 source：{rec:?}"
     );
+    if matches!(c.expect, Wp61Expect::Rescue { .. }) {
+        assert_eq!(
+            rec["error_code"],
+            PyValue::Null,
+            "{label}：成功救援的命令紀錄沿用基線不記 error_code：{rec:?}"
+        );
+    }
     assert_eq!(rec["partial"], PyValue::Bool(true), "{label}：{rec:?}");
     assert_eq!(
         state_of(&h),
@@ -1327,11 +1404,6 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
             );
         }
         Wp61Expect::Rescue { key } => {
-            assert_eq!(
-                rec["error_code"],
-                PyValue::from("PROMPT_TIMEOUT"),
-                "{label}：逾時救援成功後 operation 仍回 PROMPT_TIMEOUT：{rec:?}"
-            );
             let mut expected = b"sleep 20\n".to_vec();
             let mut expected_wal = vec![(c.source.to_string(), b"sleep 20\n".to_vec())];
             expected.push(0x03);
@@ -1348,7 +1420,7 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
                 wal, expected_wal,
                 "{label}：WAL TX 依序為命令、system:recover 救援鍵（{key}）"
             );
-            assert_eq!(rec["status"], PyValue::from("error"), "{label}：{rec:?}");
+            assert_eq!(rec["status"], PyValue::from("done"), "{label}：{rec:?}");
             assert_eq!(
                 rec["execution_mode"],
                 PyValue::from("line"),
@@ -1538,8 +1610,8 @@ fn ctrl_d_after_ctrl_c_fails() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
-    assert_eq!(rec["status"], PyValue::from("error"));
-    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["error_code"], PyValue::Null);
     assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_D"));
     assert!(wal_tx_has(&h, b"\x03") && wal_tx_has(&h, b"\x04"));
@@ -1549,6 +1621,7 @@ fn ctrl_d_after_ctrl_c_fails() {
 #[test]
 fn both_keys_fail_prompt_timeout_to_attached() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("cat", |r| r.timeout_s = 1.0);
     let queued = h.submit_ok("echo later");
     wait_tx(&h, b"cat\n");
@@ -1556,9 +1629,11 @@ fn both_keys_fail_prompt_timeout_to_attached() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
     assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
     assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(rec["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"cat\n\x03\x04".to_vec());
     let s = h.get_state();
     assert_eq!(s["state"], PyValue::from("ATTACHED"));
     assert_eq!(s["last_error"], PyValue::from("PROMPT_TIMEOUT"));
@@ -3144,8 +3219,8 @@ fn wp53_route_without_flag_keeps_timeout_recovery() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
-    assert_eq!(rec["status"], PyValue::from("error"), "{rec:?}");
-    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{rec:?}");
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
     assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
     assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");

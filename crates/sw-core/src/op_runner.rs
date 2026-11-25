@@ -93,12 +93,6 @@ pub enum OpOutcome {
     CompletionUncertain {
         stdout: String,
     },
-    /// 一般命令 operation deadline 到時尚未判定完成。保留 timeout 結果；`recovered` 只記錄救援流程是否恢復 prompt。
-    CompletionDeadlineTimeout {
-        stdout: String,
-        recovery_action: Option<&'static str>,
-        recovered: bool,
-    },
     ToAttached {
         reason: &'static str,
     },
@@ -1127,7 +1121,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 return OpOutcome::CompletionUncertain { stdout };
             }
 
-            // 沒有 human 交錯時維持既有 Ctrl-C／Ctrl-D 救援與 session 收斂；外層命令仍按 deadline 回 timeout。
+            // 沒有 human 交錯時沿用基線 recovery 的終態與錯誤碼。輸出只取 cutoff snapshot，
+            // 避免救援期間的 late RX 覆蓋 deadline 前已保留的 partial stdout。
             return match recover_after_failure(
                 ctx,
                 grant,
@@ -1139,16 +1134,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 Some((cmd_id, confirmed_of(&report))),
                 false,
             ) {
-                OpOutcome::Recovered { key, .. } => OpOutcome::CompletionDeadlineTimeout {
-                    stdout,
-                    recovery_action: Some(key),
-                    recovered: true,
-                },
-                OpOutcome::PromptTimeout { .. } => OpOutcome::CompletionDeadlineTimeout {
-                    stdout,
-                    recovery_action: None,
-                    recovered: false,
-                },
+                OpOutcome::Recovered { key, .. } => OpOutcome::Recovered { key, stdout },
+                OpOutcome::PromptTimeout { .. } => OpOutcome::PromptTimeout { stdout },
                 other => other,
             };
         }
