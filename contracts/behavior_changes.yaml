@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 20
+revision: 21
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -212,15 +212,15 @@ changes:
       python: null
       rust:
         stage: "slice-2.2"
-    approved_at_revision: 20
+    approved_at_revision: 21
     spec_refs: ["openspec/specs/session-interactive/spec.md", "openspec/specs/session-selftest/spec.md", "docs/serialwrap-spec.md"]
     reconciliation_refs: []
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P6", "P7"]
-    case_ids: ["bc23-tcp-owner-mirror", "bc23-tcp-lifetime-eof-reconnect", "bc23-tcp-agent-preempt-restore"]
+    case_ids: ["bc23-tcp-owner-mirror", "bc23-tcp-lifetime-eof-reconnect", "bc23-tcp-agent-preempt-restore", "bc23-tcp-telnet-second-console-line-busy"]
     compatibility_impact: "Rust 0.5.1 將 Windows／native TCP Telnet raw owner 以內部 lifetime-bound InteractiveLease 鏡像到 session 層，使 self-test 的 human_attached／human_active、60 秒 reprobe 暫緩與 agent interactive 仲裁能辨識同一位 human。accept 同事件建立鏡像；active／suspended／pending owner 均維持同一鏡像，不改 raw ownership、owner_gen 或 RPC schema。mirror kind 只記於內部 LeaseIndex；它不產生 AdmissionFlag::Lease，handoff 不會只因 TCP console 持續連線而被阻擋。有效 EOF／detach 依 client lifetime 立即撤除 mirror；舊 A 的收尾不得清除 B 的 raw owner、mirror 或 deferred input。明確 interactive_close 關閉仍登記 TCP client 的 human lease（不論是 mirror 或普通 lease）後，同步不會立即補回 mirror。self-heal、retained／stash 還原與 interactive_open 等既有授權路徑重新授予該 client 時，以目前 console lifetime 清除撤權，並維持各路徑修前的 Lease／LeaseIndex 記法；interactive_open 的普通 human lease 仍是 Insert，不帶 mirror_client_lifetime。detach、EOF、stale prune 與 release close-all 在 lifetime 離開 human.consoles 時立即清除撤權，不必等待 EOF。foreground agent command 沿既有 suspend／resume 回放一次；idle soft preempt close／expiry 沿既有 execute_post_close／resume 路徑恢復 raw owner，之後由同步路徑依 live TCP 連線重建 mirror。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease，既有 mirror 簿記會在同步路徑撤除；raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由維持修前 Rust 基線。guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。PTY 路徑與 Python 基線語意不變。已有 human lease 時，預設 line mode 的 bare human command.submit 於執行 gate 回 SESSION_INTERACTIVE_BUSY 且零 TX；file.push／file.pull 仍為 agent RPC 路徑。本包以 Linux native TCP 加 fake UART／WAL 驗證，Windows 原生與 Tera Term 證據不在本條宣稱範圍。"
-    approval_conditions: "保留作者歷史並撤回其 Python production／測試／機械同步 golden 差分；同事件 mirror 接受、guards、lifetime EOF／A→B、agent foreground 與 soft-preempt stash、self-test／reprobe、第二 console BUSY＋零 TX 均由新增 Rust 測試鎖定。mirror 不產生 AdmissionFlag::Lease。schema、Python golden 與錯誤碼全集不變；Windows 原生／COM／Tera Term smoke 另行驗證，不得標記為本包 PASS。"
+    approval_conditions: "保留作者歷史並撤回其 Python production／測試／機械同步 golden 差分；同事件 mirror 接受、guards、lifetime EOF／A→B、agent foreground 與 soft-preempt stash、self-test／reprobe、第二 console BUSY＋零 TX 均由新增 Rust 測試鎖定。既有黑箱節點 tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line 為獲准分輪調整的既有節點：Rust 輪斷言第二 console BUSY＋零 TX，Python 輪保留原送出斷言。mirror 不產生 AdmissionFlag::Lease。schema、Python golden 與錯誤碼全集不變；Windows 原生／COM／Tera Term smoke 另行驗證，不得標記為本包 PASS。"
     related_decisions: ["OD-111", "OD-112"]
   - id: "SC-01"
     kind: "SC"
