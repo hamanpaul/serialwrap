@@ -1047,3 +1047,57 @@ def test_added_asset_requires_refreshed_sums_before_archive(tmp_path, target):
             sums_text = tf.extractfile(member).read().decode("utf-8")
     assert sums_text == (bundle / "SHA256SUMS").read_text(encoding="utf-8")
     assert "  assets/skill/SKILL.md\n" in sums_text
+
+
+_SEED_ATTACHMENTS = (
+    "docs/rust-refactor/evidence/denominators/cases.yaml",
+    "docs/rust-refactor/evidence/denominators/cases.lock.json",
+)
+
+
+def test_fake_repo_seed_attachments_are_byte_identical(tmp_path):
+    """seed 附件逐位元組複製，不改寫行尾（R7-01）。"""
+    fakes = _fakes()
+    repo = fakes.write_fake_repo(tmp_path / "repo")
+    for rel in _SEED_ATTACHMENTS:
+        assert (repo / rel).read_bytes() == (REPO_ROOT / rel).read_bytes(), rel
+
+
+def _copy_repo_subset(dest: Path) -> Path:
+    """複製 write_fake_repo 會讀取的 repo 檔案到隔離根目錄，不改動正式來源。"""
+    files = [
+        "contracts/behavior_changes.yaml",
+        "tests/acceptance/cases.yaml",
+        "tests/acceptance/cases.lock.json",
+        "tests/acceptance/stage_exits.json",
+        "tests/acceptance/stage3_required_cases.lock.json",
+        "docs/rust-refactor/evidence/denominators/source-manifest.json",
+        "realhw/acceptance/longrun_acceptance.yaml",
+        "realhw/acceptance/longrun_acceptance.schema.json",
+        "crates/sw-pal/src/service_ctl.rs",
+        "tools/uart_stdio_bridge/APPROVED_REVISION.json",
+        *_SEED_ATTACHMENTS,
+    ]
+    for rel in files:
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO_ROOT / rel, dest / rel)
+    shutil.copytree(REPO_ROOT / "tools/uart_stdio_bridge/src", dest / "tools/uart_stdio_bridge/src")
+    shutil.copytree(REPO_ROOT / "tests/acceptance/examples", dest / "tests/acceptance/examples")
+    return dest
+
+
+def test_fake_repo_rejects_seed_source_with_changed_line_endings(tmp_path, monkeypatch):
+    """只改 seed 來源的行尾、保留原 manifest／鎖時，fixture 構建必須拒絕，而不是自動修好（R7-01）。"""
+    fakes = _fakes()
+    source_root = _copy_repo_subset(tmp_path / "source")
+    monkeypatch.setattr(fakes, "REPO_ROOT", source_root)
+    # 對照組：未改動的隔離來源可正常構建，證明拒絕不是因為缺檔。
+    fakes.write_fake_repo(tmp_path / "control")
+
+    seed = source_root / _SEED_ATTACHMENTS[0]
+    original = seed.read_bytes()
+    assert b"\r\n" not in original
+    seed.write_bytes(original.replace(b"\n", b"\r\n"))
+
+    with pytest.raises(ValueError, match="seed"):
+        fakes.write_fake_repo(tmp_path / "repo")

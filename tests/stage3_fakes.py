@@ -591,15 +591,20 @@ def _copy_repo_file(root: Path, rel: str) -> None:
 
 
 def _copy_seed_attachment(root: Path, rel: str) -> None:
-    """複製文字 seed 附件並正規化 Git checkout 的 CRLF，還原凍結 blob bytes。"""
-    source = REPO_ROOT / rel
-    target = root / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(source.read_bytes().replace(b"\r\n", b"\n"))
+    """逐位元組複製 seed 附件；不正規化行尾。
+
+    ``.gitattributes`` 已把 ``docs/rust-refactor/evidence/**`` 設為 ``-text``，checkout 不會改寫；
+    來源位元組若與 source manifest 不符，應在 fixture 構建時由 T1 checker 拒絕，而不是被修好。
+    """
+    _copy_repo_file(root, rel)
 
 
 def _seed_source_reader(root: Path, revision: str, repo_path: str) -> bytes | None:
-    """從已複製的公開 seed 附件提供 T1 checker 所需的指定來源 bytes。"""
+    """提供 T1 checker 的指定 revision 來源 bytes。
+
+    來源取自本 repo 已提交的公開 seed 附件（``REPO_ROOT``），與假 repo 內待驗的附件複本分開，
+    避免以待驗附件自證；純記憶體 fixture 不啟動 Git。
+    """
     from tools.stage3 import required_cases
 
     if revision != required_cases.SEED_REVISION:
@@ -610,7 +615,7 @@ def _seed_source_reader(root: Path, revision: str, repo_path: str) -> bytes | No
     }.get(repo_path)
     if source is None:
         return None
-    path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / source
+    path = REPO_ROOT / "docs" / "rust-refactor" / "evidence" / "denominators" / source
     return path.read_bytes() if path.is_file() else None
 
 
