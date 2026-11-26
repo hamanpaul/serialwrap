@@ -769,11 +769,13 @@ fn send(
     };
     let human_submit_guard = (class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
     let queued = ctx.tx.jobs.send(job);
-    drop(human_submit_guard);
     if queued.is_err() {
+        drop(human_submit_guard);
         return frozen;
     }
-    ctx.tx.wait_report(&report).unwrap_or(frozen)
+    let tx_report = ctx.tx.wait_report(&report).unwrap_or(frozen);
+    drop(human_submit_guard);
+    tx_report
 }
 
 fn compile_or_never(pattern: &str) -> PyRegex {
@@ -1064,7 +1066,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     }
 
                     let (rescue_guard, submit_window_has_human_tx) =
-                        ctx.rx.begin_timeout_rescue(human_submit_start_before);
+                        ctx.rx.begin_timeout_rescue(
+                            human_submit_start_before,
+                            human_tx_before.generation,
+                        );
                     let human_tx_seen = pending_human_before || submit_window_has_human_tx;
                     let human_tx_state = snapshot.human_tx_state;
                     let raw_half_line =
@@ -1127,7 +1132,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             let snapshot = completion_timeout_snapshot
                 .expect("absolute deadline wait returns its filtered timeout snapshot");
             let (rescue_guard, submit_window_has_human_tx) =
-                ctx.rx.begin_timeout_rescue(human_submit_start_before);
+                ctx.rx.begin_timeout_rescue(
+                    human_submit_start_before,
+                    human_tx_before.generation,
+                );
             let human_tx_seen = pending_human_before || submit_window_has_human_tx;
             let human_tx_state = snapshot.human_tx_state;
             let raw_half_line =

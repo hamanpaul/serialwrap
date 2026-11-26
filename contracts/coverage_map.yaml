@@ -139,6 +139,9 @@ entries:
     - cargo:sw-core::command_exec::i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_without_echo
     - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_with_echo
     - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_without_echo
+    - cargo:sw-core::command_exec::i294_r11_human_job_queued_before_command_submit_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r11_fence_rejected_human_job_before_report_suppresses_rescue
     - cargo:sw-core::command_completion::tests::i294_r9_direct_echo_search_has_linear_work_bound
     - cargo:sw-core::i294_r9_baseline_diff::i294_r9_no_human_timeout_stdout_matches_baseline_for_both_echo_states
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo

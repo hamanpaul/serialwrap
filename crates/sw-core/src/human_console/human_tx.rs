@@ -244,13 +244,13 @@ impl HumanTxPump {
                     };
                     let start_guard = rx.begin_human_submit();
                     let queued = tx.jobs.send(job);
-                    drop(start_guard);
                     let report = match queued {
                         Ok(()) => tx
                             .wait_report(&report_rx)
                             .unwrap_or_else(|| not_submitted(&permit)),
                         Err(_) => not_submitted(&permit),
                     };
+                    drop(start_guard);
                     if control
                         .send(ControlEvent::HumanTxCompleted { tag, report })
                         .is_err()

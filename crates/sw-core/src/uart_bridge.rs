@@ -67,6 +67,7 @@ struct RxWindow {
     rate: VecDeque<(Mono, u64)>,
     human_tx_generation: u64,
     human_submit_start_count: u64,
+    human_in_flight: usize,
     last_human_tx_rx_offset: u64,
     human_raw_line_open: bool,
     rx_events: VecDeque<RxEvent>,
@@ -228,6 +229,9 @@ pub struct RxShared {
     /// 測試交錯：timeout 已判定無 human、尚未送第一個救援鍵時暫停。
     #[cfg(feature = "test-fakes")]
     timeout_rescue_decision_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
+    /// 測試交錯：human writer 已建立最終 report、尚未交給 submitter 前暫停。
+    #[cfg(feature = "test-fakes")]
+    human_tx_report_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
     /// 測試觀察：human pump 已開始 submit、正等待 rescue gate 或 writer queue。
     #[cfg(feature = "test-fakes")]
     human_submit_attempts: AtomicU64,
@@ -272,30 +276,35 @@ impl RxShared {
             #[cfg(feature = "test-fakes")]
             timeout_rescue_decision_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            human_tx_report_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             human_submit_attempts: AtomicU64::new(0),
         })
     }
 
-    /// human pump 在把 job 放入唯一 TX writer 前建立 submit 起點；guard 與 timeout rescue 共用。
-    pub(crate) fn begin_human_submit(&self) -> HumanSubmitRescueGuard<'_> {
+    /// human submit 排入唯一 TX writer 前建立起點；計數 guard 持有到 writer report 回傳。
+    pub(crate) fn begin_human_submit(&self) -> HumanInFlightGuard<'_> {
         #[cfg(feature = "test-fakes")]
         self.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
-        let guard = self
+        let rescue_guard = self
             .human_submit_rescue_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
+        window.human_in_flight = window.human_in_flight.saturating_add(1);
         window.revision = window.revision.saturating_add(1);
         drop(window);
+        drop(rescue_guard);
         self.wake_all();
-        HumanSubmitRescueGuard { _guard: guard }
+        HumanInFlightGuard { rx: self }
     }
 
     /// Timeout 決策與第一個救援鍵排入 writer 之間，阻止新的 human submit 起點插入。
     pub(crate) fn begin_timeout_rescue(
         &self,
         command_start_count: u64,
+        command_human_generation: u64,
     ) -> (HumanSubmitRescueGuard<'_>, bool) {
         let guard = self
             .human_submit_rescue_gate
@@ -303,7 +312,9 @@ impl RxShared {
             .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let human_submit_seen = window.human_submit_start_count > command_start_count
-            || window.tx_submit_pending;
+            || window.human_in_flight > 0
+            || window.tx_submit_pending
+            || window.human_tx_generation > command_human_generation;
         (HumanSubmitRescueGuard { _guard: guard }, human_submit_seen)
     }
 
@@ -333,6 +344,14 @@ impl RxShared {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .human_submit_start_count
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn human_in_flight_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_in_flight
     }
 
     #[cfg(feature = "test-fakes")]
@@ -374,6 +393,26 @@ impl RxShared {
     pub fn timeout_rescue_decision_hook_for_test(&self) {
         if let Some(hook) = self
             .timeout_rescue_decision_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_human_tx_report_hook_for_test(&self, hook: Option<SnapshotWaitDeadlineHook>) {
+        *self
+            .human_tx_report_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub(crate) fn human_tx_report_hook_for_test(&self) {
+        if let Some(hook) = self
+            .human_tx_report_hook
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -1218,6 +1257,11 @@ struct TxSubmitPendingGuard<'a> {
     accepted_or_pending: bool,
 }
 
+/// human writer job 的在途身分；涵蓋佇列等待、OS submit 與 writer report 等待。
+pub(crate) struct HumanInFlightGuard<'a> {
+    rx: &'a RxShared,
+}
+
 /// human submit 起點與 timeout 救援排程共用的短期仲裁鎖。
 pub(crate) struct HumanSubmitRescueGuard<'a> {
     _guard: std::sync::MutexGuard<'a, ()>,
@@ -1245,6 +1289,16 @@ impl Drop for TxSubmitPendingGuard<'_> {
         }
         window.tx_submit_pending = false;
         window.tx_submit_pending_started_at = None;
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.rx.wake_all();
+    }
+}
+
+impl Drop for HumanInFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut window = self.rx.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.human_in_flight = window.human_in_flight.saturating_sub(1);
         window.revision = window.revision.saturating_add(1);
         drop(window);
         self.rx.wake_all();

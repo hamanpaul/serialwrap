@@ -1599,6 +1599,10 @@ impl TxWriter {
                 wal: tx_wal,
                 reject,
             };
+            #[cfg(feature = "test-fakes")]
+            if is_trusted_human_tx(job.permit.class) {
+                self.rx.human_tx_report_hook_for_test();
+            }
             if job.reply.send(report).is_err() {
                 op_ledger.reply_lost = true;
             }

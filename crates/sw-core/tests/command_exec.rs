@@ -1428,6 +1428,379 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
     assert_eq!(wal_tx_bytes_since(&h, tx_count), expected_tx);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum I294R11HumanState {
+    QueuedAtDecision,
+    RegisteredBeforeDecision,
+    FenceRejectedBeforeReport,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R11TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+static I294_R11_MATRIX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct I294R11HumanSubmission {
+    completed_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+fn i294_r11_permit(
+    h: &ActorRig,
+    op_id: u64,
+    class: sw_core::tx_writer::TxClass,
+) -> sw_core::tx_writer::TxPermit {
+    let (epoch, owner_gen, fsm_gen, input_epoch) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+            state.input_epoch,
+        )
+    });
+    sw_core::tx_writer::TxPermit {
+        op_id: OpId(op_id),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        class,
+        source: "human:r11-test".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: matches!(class, sw_core::tx_writer::TxClass::HumanRaw | sw_core::tx_writer::TxClass::HumanReplay)
+            .then_some(input_epoch),
+        replay_hold: None,
+        probe_id: None,
+    }
+}
+
+fn i294_r11_enqueue_human(
+    h: &ActorRig,
+    class: sw_core::tx_writer::TxClass,
+    reply_capacity: usize,
+    hold_until_report: bool,
+) -> I294R11HumanSubmission {
+    let tx = h.tx_handle();
+    let permit = i294_r11_permit(h, 9_294_110, class);
+    let (reply, report_rx) = crossbeam_channel::bounded(reply_capacity);
+    let report_waiter = report_rx.clone();
+    let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+    let (queued_tx, queued_rx) = crossbeam_channel::bounded(1);
+    let rx = Arc::clone(&h.rx);
+    let join = std::thread::spawn(move || {
+        let report = rx.with_human_submit_start_for_test(|| {
+            tx.jobs
+                .send(sw_core::tx_writer::TxJob {
+                    permit,
+                    payload: b"echo HUMAN\n".to_vec(),
+                    reply,
+                    aggregate: None,
+                })
+                .expect("human job 已排入 TX writer");
+            queued_tx.send(()).expect("回報 human job 已排入 writer");
+            if hold_until_report {
+                Some(report_waiter
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("Human TX writer report"))
+            } else {
+                None
+            }
+        });
+        if let Some(report) = report {
+            completed_tx.send(report).expect("回報 Human TX 結算");
+        }
+    });
+    queued_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human submit 已開始並排入 writer");
+    I294R11HumanSubmission {
+        completed_rx,
+        join: Some(join),
+    }
+}
+
+fn i294_r11_enqueue_blocker(
+    h: &ActorRig,
+    op_id: u64,
+) -> crossbeam_channel::Receiver<sw_core::tx_writer::TxReport> {
+    let tx = h.tx_handle();
+    let permit = i294_r11_permit(h, op_id, sw_core::tx_writer::TxClass::LeaseOwner);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    tx.jobs
+        .send(sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"\n".to_vec(),
+            reply,
+            aggregate: None,
+        })
+        .expect("writer blocker 已排入 TX queue");
+    report_rx
+}
+
+fn i294_r11_run_timeout_case(
+    human_state: I294R11HumanState,
+    timeout_entry: I294R11TimeoutEntry,
+    echo_found: bool,
+) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R11_HUMAN";
+    let tx_count = h.wal_tx_payloads().len();
+    let writes_before = h.dev.write_calls();
+    let mut steps = vec![FakeWriteStep::BlockForever, FakeWriteStep::Accept(usize::MAX)];
+    if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        steps.push(FakeWriteStep::BlockForever);
+    }
+    h.dev.script_write(steps);
+    let initial_blocker_report = i294_r11_enqueue_blocker(&h, 9_294_109);
+    h.dev.wait_blocked();
+
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n")
+    } else {
+        "partial output\r\n".to_string()
+    };
+    let rx_before_command = h.rx.total_bytes();
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+    let (command_write_tx, command_write_rx) = crossbeam_channel::bounded(1);
+    let (release_command_tx, release_command_rx) = crossbeam_channel::bounded(1);
+    let command_hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let command_hook_called_once = Arc::clone(&command_hook_called);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if command_hook_called_once.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        command_write_tx
+            .send(())
+            .expect("command OS submit 已完成");
+        release_command_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放 command OS submit barrier");
+    }));
+
+    let (wait_entered_tx, wait_entered_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_entered_tx.send(()).expect("completion waiter 已開始");
+        })));
+
+    let (report_paused_tx, report_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        h.rx
+            .set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+                report_paused_tx
+                    .send(())
+                    .expect("human rejection report 到達 barrier");
+                release_report_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("測試釋放 human rejection report");
+            })));
+    }
+
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R11TimeoutEntry::Silence => {
+            request.timeout_s = 30.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R11TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    h.wait_for("command job 已排在 writer 前方", |rig| {
+        rig.tx_handle().jobs.len() == 1
+    });
+
+    let blocker_report_rx = if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        Some(i294_r11_enqueue_blocker(&h, 9_294_113))
+    } else {
+        None
+    };
+    let human_class = if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        sw_core::tx_writer::TxClass::HumanRaw
+    } else {
+        sw_core::tx_writer::TxClass::HumanLine
+    };
+    let hold_until_report = true;
+    let report_capacity = if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        0
+    } else {
+        1
+    };
+    let human = i294_r11_enqueue_human(&h, human_class, report_capacity, hold_until_report);
+    let submitted_count = h.rx.human_submit_start_count_for_test();
+    assert_eq!(submitted_count, 1, "human submit 在 command OS submit 前開始");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "writer report 前 human job 保持在途");
+
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        let permit = i294_r11_permit(
+            &h,
+            9_294_112,
+            sw_core::tx_writer::TxClass::HumanRaw,
+        );
+        assert_eq!(
+            h.tx_handle().fence_verdict(&permit),
+            Err(sw_core::tx_writer::FenceReject::HumanAdmissionClosed),
+            "actor foreground 已關閉 HumanRaw admission；排隊 permit 會由 writer fence 拒絕"
+        );
+    }
+
+    h.dev.release_block();
+    initial_blocker_report
+        .recv_timeout(Duration::from_secs(5))
+        .expect("初始 writer barrier 已收斂");
+    command_write_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已到 OS submit 後置 barrier");
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        rx_before_command + response.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_command_tx
+        .send(())
+        .expect("釋放 command OS submit barrier");
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        h.dev.wait_blocked();
+        assert_eq!(
+            h.dev.write_calls(),
+            writes_before + 3,
+            "writer 正停在 command 後的 blocker，human job 仍留在佇列"
+        );
+    }
+    if matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        let report = human
+            .completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human TX 已完成 observer 登錄與 writer report");
+        assert_eq!(report.result.outcome, sw_pal::TxOutcome::Completed(b"echo HUMAN\n".len()));
+        assert!(report.reject.is_none());
+        assert!(h.rx.human_tx_state().generation > 0);
+        assert!(!h.rx.snapshot_from(0).tx_submit_pending);
+        assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 回來後 guard 已釋放");
+    }
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        report_paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer 已拒絕 human permit，report 尚未回傳 submitter");
+        assert_eq!(h.rx.human_tx_state().generation, 0);
+        assert!(!h.rx.snapshot_from(0).tx_submit_pending);
+        assert_eq!(h.rx.human_in_flight_for_test(), 1, "拒絕 report 尚未回傳時仍在途");
+    }
+
+    wait_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("命令 TX 後 completion waiter 已建立");
+    match timeout_entry {
+        I294R11TimeoutEntry::Silence => i294_r10_advance_clock(&h, Duration::from_secs(31)),
+        I294R11TimeoutEntry::OperationDeadline => {
+            i294_r10_advance_clock(&h, Duration::from_millis(201))
+        }
+    }
+
+    let decision_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if is_done(&h, &id) || !h.rx.timeout_rescue_gate_available_for_test() {
+            break;
+        }
+        assert!(Instant::now() < decision_deadline, "timeout decision 未抵達 human／rescue 分流");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if !matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        assert_eq!(h.rx.human_in_flight_for_test(), 1, "timeout 決策時 human report 尚未回來");
+    }
+
+    if let Some(blocker_report) = blocker_report_rx.as_ref() {
+        h.dev.release_block();
+        blocker_report
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer blocker 已收斂");
+    }
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        release_report_tx
+            .send(())
+            .expect("釋放 fence rejection report barrier");
+        h.rx.set_human_tx_report_hook_for_test(None);
+    }
+    if !matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        let report = human
+            .completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human writer report 已回來且 in-flight guard 已釋放");
+        match human_state {
+            I294R11HumanState::FenceRejectedBeforeReport => assert_eq!(
+                report.reject,
+                Some(sw_core::tx_writer::FenceReject::HumanAdmissionClosed)
+            ),
+            I294R11HumanState::QueuedAtDecision => {
+                assert!(report.reject.is_none());
+                assert_eq!(
+                    report.result.outcome,
+                    sw_pal::TxOutcome::Completed(b"echo HUMAN\n".len())
+                );
+            }
+            I294R11HumanState::RegisteredBeforeDecision => unreachable!(),
+        }
+        assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 回來後 in-flight 清零");
+    }
+    if let Some(join) = human.join {
+        join.join().expect("human submit worker 正常結束");
+    }
+
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        format!("{command}\npartial output")
+    } else {
+        "partial output\n".to_string()
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+
+    let tx_bytes = wal_tx_bytes_since(&h, tx_count);
+    assert!(!tx_bytes.contains(&0x03) && !tx_bytes.contains(&0x04), "timeout human route has zero rescue TX: {tx_bytes:?}");
+}
+
+fn i294_r11_run_matrix(human_state: I294R11HumanState) {
+    for timeout_entry in [
+        I294R11TimeoutEntry::Silence,
+        I294R11TimeoutEntry::OperationDeadline,
+    ] {
+        for echo_found in [true, false] {
+            i294_r11_run_timeout_case(human_state, timeout_entry, echo_found);
+        }
+    }
+}
+
+#[test]
+fn i294_r11_human_job_queued_before_command_submit_suppresses_rescue() {
+    let _serial = I294_R11_MATRIX_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    i294_r11_run_matrix(I294R11HumanState::QueuedAtDecision);
+}
+
+#[test]
+fn i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue() {
+    let _serial = I294_R11_MATRIX_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    i294_r11_run_matrix(I294R11HumanState::RegisteredBeforeDecision);
+}
+
+#[test]
+fn i294_r11_fence_rejected_human_job_before_report_suppresses_rescue() {
+    let _serial = I294_R11_MATRIX_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    i294_r11_run_matrix(I294R11HumanState::FenceRejectedBeforeReport);
+}
+
 fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
