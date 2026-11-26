@@ -31,10 +31,6 @@ impl<'a> CompletionEvaluator<'a> {
         Self { command, prompt }
     }
 
-    pub(crate) fn has_tail_prompt(&self, raw: &str) -> bool {
-        tail_prompt_range(&clean_text(raw), self.prompt).is_some()
-    }
-
     pub(crate) fn evaluate(
         &self,
         raw: &str,

@@ -966,11 +966,6 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let pre_tx_offset = ctx.rx.snapshot_len();
     let human_tx_before_send = ctx.rx.human_tx_state();
     let human_submit_start_before_send = ctx.rx.human_submit_start_count();
-    let human_snapshot_before_send = if human_tx_before_send.generation > 0 {
-        ctx.rx.snapshot_from(human_tx_before_send.rx_offset).text
-    } else {
-        String::new()
-    };
     let echo_prompt_re = (!passthrough
         && completion_regex.is_none()
         && !q.req.is_trusted_human()
@@ -1029,14 +1024,9 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let watermark_before = command_boundary
         .as_ref()
         .map_or_else(|| ctx.rx.watermark(), |boundary| boundary.watermark);
-    let human_snapshot_at_boundary = command_boundary
-        .map(|boundary| boundary.human_snapshot.text)
-        .unwrap_or(human_snapshot_before_send);
-    let pending_human_before = echo_evaluator.as_ref().is_some_and(|evaluator| {
-        human_tx_before.generation > 0
-            && (human_tx_before.raw_line_open
-                || !evaluator.has_tail_prompt(&human_snapshot_at_boundary))
-    });
+    let pending_human_before = echo_evaluator
+        .as_ref()
+        .is_some_and(|_| human_tx_before.pending_human);
 
     let effective_timeout = match q.req.expected_duration_s {
         Some(expected) => timeout_s.max(expected),

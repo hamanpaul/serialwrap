@@ -1036,6 +1036,8 @@ pub(crate) struct TxQueueCapacity {
     wait_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "test-fakes")]
     enqueue_hook: Mutex<Option<TxQueueEnqueueHook>>,
+    #[cfg(feature = "test-fakes")]
+    panic_on_dequeue_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TxQueueCapacity {
@@ -1047,6 +1049,8 @@ impl TxQueueCapacity {
             wait_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             enqueue_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            panic_on_dequeue_hook: Mutex::new(None),
         })
     }
 
@@ -1116,6 +1120,27 @@ impl TxQueueCapacity {
     #[cfg(feature = "test-fakes")]
     fn set_enqueue_hook(&self, hook: Option<TxQueueEnqueueHook>) {
         *self.enqueue_hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn panic_before_capacity_notify_for_test(&self) {
+        let hook = self
+            .panic_on_dequeue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+            panic!("test-fakes injected TxWriter panic after dequeue");
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_panic_on_dequeue_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .panic_on_dequeue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
     }
 
     #[cfg(feature = "test-fakes")]
@@ -1304,6 +1329,19 @@ impl TxWriterHandle {
     ) {
         self.capacity.set_enqueue_hook(hook);
     }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_panic_on_dequeue_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.capacity.set_panic_on_dequeue_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn close_capacity_for_test(&self) {
+        self.capacity.close();
+    }
     /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
     pub fn fence_verdict(&self, permit: &TxPermit) -> Result<(), FenceReject> {
@@ -1349,6 +1387,38 @@ impl TxWriterHandle {
                 }
             }
         }
+    }
+}
+
+/// 確保 writer 無論正常 return 或 unwind，都會發布 closed 並喚醒容量等待者。
+struct TxWriterCloseGuard {
+    gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
+    closed: bool,
+}
+
+impl TxWriterCloseGuard {
+    fn new(gauge: Arc<LedgerGaugeCells>, capacity: Arc<TxQueueCapacity>) -> Self {
+        Self {
+            gauge,
+            capacity,
+            closed: false,
+        }
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.gauge.closed.store(true, Ordering::Release);
+        self.capacity.close();
+        self.closed = true;
+    }
+}
+
+impl Drop for TxWriterCloseGuard {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1517,6 +1587,10 @@ impl TxWriter {
     }
 
     fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
+        let mut close_guard = TxWriterCloseGuard::new(
+            Arc::clone(&self.gauge),
+            Arc::clone(&self.capacity),
+        );
         let mut ledger = TxLedger {
             epoch: self.epoch,
             ..TxLedger::default()
@@ -1534,6 +1608,8 @@ impl TxWriter {
                 },
                 recv(self.jobs) -> queued => match queued {
                     Ok(job) => {
+                        #[cfg(feature = "test-fakes")]
+                        self.capacity.panic_before_capacity_notify_for_test();
                         self.capacity.notify_capacity();
                         job
                     }
@@ -1783,8 +1859,7 @@ impl TxWriter {
             ledger.settle(op_id);
         }
         // P5-T14：先標記 closed，再收斂佇列；之後才送入的 job 由 `wait_report` 依 closed 旗標收尾。
-        self.gauge.closed.store(true, Ordering::Release);
-        self.capacity.close();
+        close_guard.close();
         let queued: Vec<TxJob> = self.jobs.try_iter().collect();
         for job in queued {
             // P8 Task 5：佇列中的 Finish 照常落 WAL（它不提交 bytes）；Append 與其他 job 一樣以 Frozen 收斂。

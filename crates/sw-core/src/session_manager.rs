@@ -2149,7 +2149,9 @@ impl Shared {
             f.handoff_frozen = handoff_frozen;
         });
         self.fanout.register(fence.clone());
-        let actor_dispatch_gate = crate::uart_bridge::ActorDispatchGate::new_for_session();
+        let actor_dispatch_gate = crate::uart_bridge::ActorDispatchGate::new_for_session(
+            &profile.template.prompt_regex,
+        );
         let rx = RxShared::new_with_actor_dispatch_gate(
             RX_WINDOW_MAX_CHARS,
             self.clock.mono_ns(),

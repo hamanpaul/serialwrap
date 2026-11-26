@@ -8481,3 +8481,331 @@ fn wp73_reboot_clears_rx_for_console_unlock_avoids_stale_prompt_evidence() {
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+enum I1R16TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+impl I1R16TimeoutEntry {
+    fn configure(self, request: &mut sw_core::arbiter::SubmitReq) {
+        match self {
+            Self::Silence => {
+                request.timeout_s = 30.0;
+                request.expected_duration_s = Some(120.0);
+            }
+            Self::OperationDeadline => request.timeout_s = 0.2,
+        }
+    }
+
+    fn advance(self, manager: &ManagerRig) {
+        match self {
+            Self::Silence => manager.clock.advance(Duration::from_secs(31)),
+            Self::OperationDeadline => manager.clock.advance(Duration::from_millis(201)),
+        }
+    }
+}
+
+fn i1_r16_manager_tx_payloads(manager: &ManagerRig) -> Vec<Vec<u8>> {
+    manager
+        .wal_rows()
+        .into_iter()
+        .filter(|row| row.get("dir").and_then(PyValue::as_str) == Some("TX"))
+        .map(|row| b64(&row))
+        .collect()
+}
+
+fn i1_r16_reconnect_after_old_human(
+    prompt_returned: bool,
+) -> (
+    ManagerRig,
+    Arc<sw_core::uart_bridge::RxShared>,
+    sw_pal::fakes::serial::FakeDevice,
+) {
+    let manager = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let (old_rx, _, _, old_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 bridge snapshot");
+    old_rx.record_human_tx_for_test(b"echo R16_OLD\n", &*manager.clock);
+
+    if prompt_returned {
+        let reply = b"echo R16_OLD\r\nR16_OLD\r\nroot@t:/# ";
+        let expected = old_rx.total_bytes().saturating_add(reply.len() as u64);
+        manager.dev.push_rx(reply);
+        assert!(
+            old_rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)),
+            "舊 epoch human prompt 已經由 reader 收到"
+        );
+    }
+
+    manager.retarget_by_id(DEVICE_BY_ID, "/dev/ttyNEW-R16");
+    manager.wait_state("COM0", "READY");
+    let (new_rx, _, _, new_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("新 bridge snapshot");
+    assert!(!Arc::ptr_eq(&old_rx, &new_rx), "重接流程建立新 RX epoch");
+    assert_ne!(old_epoch, new_epoch, "重接流程前進 bridge epoch");
+    assert!(
+        Arc::ptr_eq(&old_rx.actor_dispatch_gate(), &new_rx.actor_dispatch_gate()),
+        "同一 session 的兩個 bridge 共用 session gate"
+    );
+    let new_device = manager.device("/dev/ttyNEW-R16");
+    (manager, new_rx, new_device)
+}
+
+fn i1_r16_submit_manager_command(
+    manager: &ManagerRig,
+    command: &str,
+    timeout_entry: I1R16TimeoutEntry,
+) -> String {
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let mut request = agent_submit(command);
+    timeout_entry.configure(&mut request);
+    let response = manager
+        .mgr
+        .route(&sid, SessionRequest::Submit(request), Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("command.submit: {}", error.message));
+    response
+        .get("cmd_id")
+        .and_then(PyValue::as_str)
+        .expect("command.submit 回傳 cmd_id")
+        .to_string()
+}
+
+fn i1_r16_push_rx_and_wait(
+    rx: &sw_core::uart_bridge::RxShared,
+    device: &sw_pal::fakes::serial::FakeDevice,
+    data: &[u8],
+    checks_before: u64,
+) {
+    let expected_bytes = rx.total_bytes().saturating_add(data.len() as u64);
+    let expected_end = rx
+        .snapshot_len()
+        .saturating_add(String::from_utf8_lossy(data).chars().count() as u64);
+    device.push_rx(data);
+    assert!(
+        rx.wait_for_reader_bytes_for_test(expected_bytes, Duration::from_secs(5)),
+        "RX reader 已追加指定 bytes"
+    );
+    assert!(
+        rx.wait_for_snapshot_wait_progress_for_test(
+            checks_before,
+            expected_end,
+            Duration::from_secs(5)
+        ),
+        "completion evaluator 已檢查本次 RX snapshot"
+    );
+}
+
+fn i1_r16_wait_for_command_tx(manager: &ManagerRig, command: &str) {
+    let payload = format!("{command}\n").into_bytes();
+    wait_until("i294 R16 command TX", || {
+        i1_r16_manager_tx_payloads(manager)
+            .iter()
+            .any(|written| written == &payload)
+    });
+}
+
+fn i1_r16_finish_if_running(
+    manager: &ManagerRig,
+    rx: &sw_core::uart_bridge::RxShared,
+    cmd_id: &str,
+    timeout_entry: I1R16TimeoutEntry,
+) -> PyDict {
+    let current = manager.reg.get(cmd_id).expect("command record");
+    let mut is_terminal = current
+        .get("done_at")
+        .is_some_and(|done| !done.is_null());
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    while !is_terminal {
+        timeout_entry.advance(manager);
+        // RX snapshot wait 以 50 ms 實時切片重看 FakeClock；留出一個切片讓 waiter 收斂，
+        // silence 入口若先觀察到命令窗口 RX，下一輪仍需再越過一個 silence interval。
+        std::thread::sleep(Duration::from_millis(80));
+        let record = manager.reg.get(cmd_id).expect("command record");
+        is_terminal = record.get("done_at").is_some_and(|done| !done.is_null());
+        assert!(
+            is_terminal || Instant::now() < wait_deadline,
+            "i294 R16 command terminal wait expired: {record:?}, state={:?}, rx_tail={:?}, clock_ns={}, progress={:?}",
+            manager.session("COM0").get("state"),
+            rx_tail(manager),
+            manager.clock.mono_ns(),
+            rx.snapshot_wait_progress_for_test()
+        );
+    }
+    manager.reg.get(cmd_id).expect("terminal command record")
+}
+
+fn rx_tail(manager: &ManagerRig) -> Option<String> {
+    let sid = manager.mgr.resolve("COM0")?;
+    let (rx, _, _, _) = manager.mgr.actor_snapshot_for_test(&sid)?;
+    Some(rx.tail(80))
+}
+
+fn i1_r16_close_manager(manager: ManagerRig) {
+    let _ = manager.mgr.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn i294_r16_epoch_human_counter_domain_matrix() {
+    let mut mismatches = Vec::new();
+
+    for timeout_entry in [
+        I1R16TimeoutEntry::Silence,
+        I1R16TimeoutEntry::OperationDeadline,
+    ] {
+        // 舊 epoch human 已收到 prompt；新 epoch 無 human TX。無 echo 的新命令仍須正常完成。
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(true);
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_SETTLED_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"SETTLED_RESULT\r\nroot@t:/# ",
+            checks_before,
+        );
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("done"))
+            || record.get("stdout") != Some(&PyValue::from("SETTLED_RESULT"))
+            || record.get("partial") != Some(&PyValue::Bool(false))
+        {
+            mismatches.push(format!(
+                "settled old epoch／{timeout_entry:?}: status={:?}, stdout={:?}, partial={:?}",
+                record.get("status"),
+                record.get("stdout"),
+                record.get("partial")
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("settled old epoch／{timeout_entry:?}: unexpected TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+
+        // 新 epoch 已有完成的人類 prompt；command TX 後的 human TX 仍使無 echo prompt 保持歧義。
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(true);
+        rx.record_human_tx_for_test(b"echo R16_BASELINE\n", &*manager.clock);
+        let baseline_prompt = b"echo R16_BASELINE\r\nR16_BASELINE\r\nroot@t:/# ";
+        let expected = rx.total_bytes().saturating_add(baseline_prompt.len() as u64);
+        device.push_rx(baseline_prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_INTERLEAVED_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        rx.record_human_tx_for_test(b"echo R16_WINDOW\n", &*manager.clock);
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"echo R16_WINDOW\r\nR16_WINDOW\r\nroot@t:/# ",
+            checks_before,
+        );
+        let after_prompt = manager.reg.get(&cmd_id).expect("command record");
+        if after_prompt.get("status") != Some(&PyValue::from("running")) {
+            mismatches.push(format!(
+                "window human／{timeout_entry:?}: command left running at human prompt: {after_prompt:?}"
+            ));
+        }
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("error"))
+            || record.get("error_code") != Some(&PyValue::from("PROMPT_TIMEOUT"))
+            || record.get("partial") != Some(&PyValue::Bool(true))
+            || record.get("recovery_action") != Some(&PyValue::from("NONE"))
+        {
+            mismatches.push(format!(
+                "window human／{timeout_entry:?}: expected timeout partial, got {record:?}"
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("window human／{timeout_entry:?}: rescue or retry TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+    }
+
+    assert!(mismatches.is_empty(), "R16 計數域回歸：\n{}", mismatches.join("\n"));
+}
+
+#[test]
+fn i294_r16_unsettled_human_remains_pending_after_reconnect() {
+    let mut mismatches = Vec::new();
+    for timeout_entry in [
+        I1R16TimeoutEntry::Silence,
+        I1R16TimeoutEntry::OperationDeadline,
+    ] {
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(false);
+        // 新 epoch 也有一筆已收到 prompt 的 human TX，不能解除舊 epoch 接管時尚未結案的狀態。
+        rx.record_human_tx_for_test(b"echo R16_NEW_EPOCH\n", &*manager.clock);
+        let new_epoch_prompt = b"echo R16_NEW_EPOCH\r\nR16_NEW_EPOCH\r\nroot@t:/# ";
+        let expected = rx.total_bytes().saturating_add(new_epoch_prompt.len() as u64);
+        device.push_rx(new_epoch_prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_PENDING_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"PENDING_RESULT\r\nroot@t:/# ",
+            checks_before,
+        );
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("error"))
+            || record.get("error_code") != Some(&PyValue::from("PROMPT_TIMEOUT"))
+            || record.get("partial") != Some(&PyValue::Bool(true))
+            || record.get("recovery_action") != Some(&PyValue::from("NONE"))
+        {
+            mismatches.push(format!(
+                "pending old human／{timeout_entry:?}: expected conservative partial, got {record:?}"
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("pending old human／{timeout_entry:?}: rescue or retry TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+    }
+    assert!(mismatches.is_empty(), "未結案 human 接管規則：\n{}", mismatches.join("\n"));
+}
+

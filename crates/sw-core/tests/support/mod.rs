@@ -228,6 +228,7 @@ impl CoreHarness {
         wal.set_health_sink(fanout);
 
         let rx = RxShared::new(131_072, clock.mono_ns());
+        rx.set_human_prompt_regex_for_test(&profile.template.prompt_regex);
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
         let fake_device = serial.add_device(REAL_PATH);
@@ -1493,6 +1494,7 @@ impl ActorRig {
         fanout.register(fence.clone());
         wal.set_health_sink(fanout);
         let rx = RxShared::new(131_072, clock.mono_ns());
+        rx.set_human_prompt_regex_for_test(&profile.template.prompt_regex);
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
         let dev = serial.add_device(REAL_PATH);

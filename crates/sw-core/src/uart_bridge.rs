@@ -13,8 +13,8 @@ use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
     SerialReader, SerialWriter, SubmitStep,
 };
-use sw_proto::pycompat::decode_utf8_replace;
-use sw_proto::pyre::PyRegex;
+use sw_proto::pycompat::{clean_text, decode_utf8_replace};
+use sw_proto::pyre::{compile, PyFlags, PyRegex};
 
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
@@ -54,6 +54,14 @@ struct ActorDispatchGateState {
     human_submit_start_count: u64,
     human_in_flight: usize,
     human_tx_generation: u64,
+    human_tx_epoch: Option<u64>,
+    last_human_tx_rx_offset: u64,
+    human_raw_line_open: bool,
+    pending_human: bool,
+    /// 最早仍未由其所屬 epoch prompt 結案的人類 TX epoch。
+    pending_human_epoch: Option<u64>,
+    completion_capture_op_id: Option<u64>,
+    human_state_events: VecDeque<HumanStateEvent>,
     #[cfg(feature = "test-fakes")]
     actor_waits: u64,
     #[cfg(feature = "test-fakes")]
@@ -67,6 +75,7 @@ struct ActorDispatchGateState {
 pub struct ActorDispatchGate {
     state: Mutex<ActorDispatchGateState>,
     changed: Condvar,
+    prompt_regex: Mutex<Option<Arc<PyRegex>>>,
     #[cfg(feature = "test-fakes")]
     hook: Mutex<Option<ActorDispatchGateHook>>,
 }
@@ -76,13 +85,34 @@ impl ActorDispatchGate {
         Arc::new(Self {
             state: Mutex::new(ActorDispatchGateState::default()),
             changed: Condvar::new(),
+            prompt_regex: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             hook: Mutex::new(None),
         })
     }
 
-    pub(crate) fn new_for_session() -> Arc<Self> {
-        Self::new()
+    pub(crate) fn new_for_session(prompt_pattern: &str) -> Arc<Self> {
+        let gate = Self::new();
+        gate.set_prompt_regex(prompt_pattern);
+        gate
+    }
+
+    fn set_prompt_regex(&self, pattern: &str) {
+        let compiled = compile(pattern, PyFlags(0))
+            .or_else(|_| compile("(?!)", PyFlags(0)))
+            .ok()
+            .map(Arc::new);
+        *self
+            .prompt_regex
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = compiled;
+    }
+
+    fn prompt_regex(&self) -> Option<Arc<PyRegex>> {
+        self.prompt_regex
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     fn event(&self, event: ActorDispatchGateEvent) {
@@ -178,11 +208,7 @@ impl ActorDispatchGate {
         state.human_submit_start_count = state.human_submit_start_count.saturating_add(1);
     }
 
-    fn note_human_tx_generation(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.human_tx_generation = state.human_tx_generation.saturating_add(1);
-    }
-
+    #[cfg(feature = "test-fakes")]
     fn human_signals(&self) -> (u64, usize, u64) {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         (state.human_submit_start_count, state.human_in_flight, state.human_tx_generation)
@@ -253,7 +279,7 @@ struct RxEvent {
 }
 
 #[derive(Clone, Copy)]
-struct HumanTxEvent {
+struct HumanStateEvent {
     mono_ns: Mono,
     state: HumanTxState,
 }
@@ -271,14 +297,8 @@ struct RxWindow {
     watermark: (u64, u64),
     revision: u64,
     rate: VecDeque<(Mono, u64)>,
-    human_tx_generation: u64,
-    human_submit_start_count: u64,
-    human_in_flight: usize,
-    last_human_tx_rx_offset: u64,
-    human_raw_line_open: bool,
     rx_events: VecDeque<RxEvent>,
     rx_event_chars: usize,
-    human_tx_events: VecDeque<HumanTxEvent>,
     completion_capture_op_id: Option<u64>,
     completion_deadline: Option<Mono>,
     command_tx_boundary: Option<(u64, CommandTxBoundary)>,
@@ -541,6 +561,11 @@ impl RxShared {
         Arc::clone(&self.actor_dispatch_gate)
     }
 
+    #[cfg(feature = "test-fakes")]
+    pub fn set_human_prompt_regex_for_test(&self, pattern: &str) {
+        self.actor_dispatch_gate.set_prompt_regex(pattern);
+    }
+
     /// human line submit 的在途 guard；實際成功排入 TX writer 後才更新 submit 起點計數。
     #[doc(hidden)]
     pub fn begin_human_submit(self: &Arc<Self>) -> HumanInFlightGuard {
@@ -594,7 +619,14 @@ impl RxShared {
     fn register_human_in_flight(&self) {
         self.actor_dispatch_gate.note_human_in_flight(1);
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        window.human_in_flight = window.human_in_flight.saturating_add(1);
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
+    }
+
+    fn unregister_human_in_flight(&self) {
+        self.actor_dispatch_gate.note_human_in_flight(-1);
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.revision = window.revision.saturating_add(1);
         drop(window);
         self.wake_all();
@@ -603,7 +635,6 @@ impl RxShared {
     fn register_human_submit_start(&self) {
         self.actor_dispatch_gate.note_human_submit_start();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
         window.revision = window.revision.saturating_add(1);
         drop(window);
         self.wake_all();
@@ -626,17 +657,19 @@ impl RxShared {
         self.timeout_rescue_attempt_hook_for_test();
         // 等待 dispatch 或 human enqueue 前先發布 timeout 意圖；後續 human producer 必須讓此決策先選定結果。
         let dispatch_guard = self.actor_dispatch_gate.enter_timeout_decision();
-        let (submit_start_count, human_in_flight, human_generation) =
-            self.actor_dispatch_gate.human_signals();
+        // 全 session human counters 與目前 RX 的 submit pending 在 gate → RX 鎖序中一次讀取。
+        let state = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let human_submit_seen = submit_start_count > command_start_count
-            || human_in_flight > 0
-            || window.human_submit_start_count > command_start_count
-            || window.human_in_flight > 0
+        let human_submit_seen = state.human_submit_start_count > command_start_count
+            || state.human_in_flight > 0
             || window.tx_submit_pending
-            || human_generation > command_human_generation
-            || window.human_tx_generation > command_human_generation;
+            || state.human_tx_generation > command_human_generation;
         drop(window);
+        drop(state);
         let rescue_guard = if human_submit_seen {
             HumanSubmitRescueGuard { gate: Arc::clone(&self.actor_dispatch_gate), active: false }
         } else {
@@ -662,7 +695,11 @@ impl RxShared {
     }
 
     pub(crate) fn human_submit_start_count(&self) -> u64 {
-        self.actor_dispatch_gate.human_signals().0
+        self.actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_submit_start_count
     }
 
     #[cfg(test)]
@@ -1126,6 +1163,17 @@ impl RxShared {
         epoch: u64,
         rx_seq: u64,
     ) {
+        let prompt_regex = self
+            .actor_dispatch_gate
+            .prompt_regex
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let now = event_time();
         window.watermark = (epoch, rx_seq);
@@ -1158,7 +1206,18 @@ impl RxShared {
                 });
             }
         }
+        if !data.is_empty()
+            && human.pending_human
+            && human.pending_human_epoch == Some(epoch)
+            && prompt_regex
+                .as_deref()
+                .is_some_and(|prompt| has_tail_prompt(&window.text, prompt))
+        {
+            human.pending_human = false;
+            push_human_state_event(&mut human, now);
+        }
         drop(window);
+        drop(human);
         if !data.is_empty() {
             let capture = self
                 .capture
@@ -1208,17 +1267,24 @@ impl RxShared {
 
     /// 取得同一個 RX watermark 下的 snapshot；若窗口已修剪會把 `base` 推進到保留資料起點。
     pub fn snapshot_from(&self, from: u64) -> RxSnapshot {
+        let human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        snapshot_from_window(&window, from)
+        snapshot_from_window(&window, from, &human)
     }
 
     /// 回傳最近可信 human TX 世代、其 TX 前 RX offset 與目前 raw 輸入是否仍是半行。
     pub fn human_tx_state(&self) -> HumanTxState {
-        let generation = self.actor_dispatch_gate.human_signals().2;
+        let human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let mut state = human_tx_state(&window);
-        state.generation = generation;
-        state
+        human_tx_state(&human, window.watermark.0)
     }
 
     /// 測試控制尚未完成的 submit 窗口；用於重現 OS submit 與 human TX observer 登錄間的交錯。
@@ -1235,15 +1301,29 @@ impl RxShared {
     pub fn record_human_tx_for_test(self: &Arc<Self>, payload: &[u8], clock: &dyn Clock) {
         let mut submit_guard = self.begin_human_submit();
         submit_guard.mark_human_submit_started();
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let event_mono = clock.mono_ns();
+        let epoch = window.watermark.0;
         let rx_offset = window
             .trimmed
             .saturating_add(window.text.chars().count() as u64);
-        record_human_tx_locked(&mut window, payload, true, rx_offset, event_mono);
+        record_human_tx_locked(
+            &mut human,
+            payload,
+            true,
+            rx_offset,
+            epoch,
+            event_mono,
+            false,
+        );
         window.revision = window.revision.saturating_add(1);
         drop(window);
-        self.actor_dispatch_gate.note_human_tx_generation();
+        drop(human);
         drop(submit_guard);
         self.wake_all();
     }
@@ -1258,25 +1338,28 @@ impl RxShared {
         clock: &dyn Clock,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
-        let (session_submit_count, _, session_generation) =
-            self.actor_dispatch_gate.human_signals();
-        let (candidate_boundary, candidate_human_rx_offset) = {
+        let prompt_regex = human_payload.and_then(|_| self.actor_dispatch_gate.prompt_regex());
+        let (candidate_boundary, candidate_human_rx) = {
+            let human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let boundary = command_op_id.filter(|_| !command_boundary_recorded).map(|_| {
-                let mut boundary = command_boundary(&window);
-                boundary.human_submit_start_count = session_submit_count;
-                boundary.human_tx_state.generation = session_generation;
-                boundary.human_snapshot.human_tx_state.generation = session_generation;
-                boundary
+                command_boundary(&human, &window)
             });
-            let human_rx_offset = human_payload.map(|_| {
-                window
-                    .trimmed
-                    .saturating_add(window.text.chars().count() as u64)
+            let human_rx = human_payload.map(|_| {
+                (
+                    window.watermark.0,
+                    window
+                        .trimmed
+                        .saturating_add(window.text.chars().count() as u64),
+                )
             });
             window.tx_submit_pending = true;
             window.tx_submit_pending_started_at = Some(clock.mono_ns());
-            (boundary, human_rx_offset)
+            (boundary, human_rx)
         };
         let mut pending_guard = TxSubmitPendingGuard {
             rx: self,
@@ -1292,11 +1375,15 @@ impl RxShared {
 
         if submitted {
             {
+                let mut human = self
+                    .actor_dispatch_gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 let event_mono = clock.mono_ns();
                 if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
                     if !command_boundary_recorded {
-                        window.human_tx_events.clear();
                         window.command_tx_boundary = Some((op_id, boundary));
                         boundary_recorded = true;
                     }
@@ -1306,32 +1393,37 @@ impl RxShared {
                         let start = offset.min(payload.len());
                         let end = start.saturating_add(*count).min(payload.len());
                         if end > start {
-                            let rx_offset = candidate_human_rx_offset
+                            let (epoch, rx_offset) = candidate_human_rx
                                 .expect("human submit 前應擷取 RX offset");
+                            let prompt_already_returned = prompt_regex
+                                .as_deref()
+                                .is_some_and(|prompt| {
+                                    has_prompt_after_offset(&window, epoch, rx_offset, prompt)
+                                });
                             record_human_tx_locked(
-                                &mut window,
+                                &mut human,
                                 &payload[start..end],
                                 raw_input,
                                 rx_offset,
+                                epoch,
                                 event_mono,
+                                prompt_already_returned,
                             );
                         }
                     }
                     (Some((_, raw_input, _)), SubmitStep::Pending) => {
-                        let rx_offset = candidate_human_rx_offset
+                        let (epoch, rx_offset) = candidate_human_rx
                             .expect("human submit 前應擷取 RX offset");
                         record_human_tx_unknown_locked(
-                            &mut window,
+                            &mut human,
                             raw_input,
                             rx_offset,
+                            epoch,
                             event_mono,
                         );
                     }
                     _ => {}
                 }
-            }
-            if human_payload.is_some() {
-                self.actor_dispatch_gate.note_human_tx_generation();
             }
         }
 
@@ -1341,21 +1433,30 @@ impl RxShared {
 
     /// TX writer 完成後以確認的 human raw bytes 校正半行；結果不明時保持保守開啟。
     pub(crate) fn finish_human_raw_tx(&self, payload: &[u8], confirmed: usize, unknown: bool) {
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if unknown {
-            window.human_raw_line_open = true;
+            human.human_raw_line_open = true;
         } else {
             let accepted = confirmed.min(payload.len());
             if accepted > 0 {
-                update_raw_line_state(&mut window, &payload[..accepted]);
+                update_raw_line_state(&mut human, &payload[..accepted]);
             }
         }
-        let state = human_tx_state(&window);
-        if let Some(event) = window.human_tx_events.back_mut() {
+        let state = human_tx_state(&human, window.watermark.0);
+        if let Some(event) = human.human_state_events.back_mut() {
             if event.state.generation == state.generation {
                 event.state = state;
             }
         }
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        drop(human);
+        self.wake_all();
     }
 
     /// agent 命令確實送到換行時，該換行已結束由 human 開啟的板端半行。
@@ -1370,14 +1471,26 @@ impl RxShared {
         if confirmed < line_end {
             return;
         }
-        self.inner
+        let mut human = self
+            .actor_dispatch_gate
+            .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .human_raw_line_open = false;
+            .unwrap_or_else(|error| error.into_inner());
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        human.human_raw_line_open = false;
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        drop(human);
+        self.wake_all();
     }
 
     /// 讀取指定 op 的 command TX 邊界；下一筆 agent command 會覆寫此單一在途記錄。
     pub fn command_tx_boundary(&self, op_id: u64) -> Option<CommandTxBoundary> {
+        let _human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window
             .command_tx_boundary
@@ -1387,7 +1500,14 @@ impl RxShared {
     }
 
     pub(crate) fn begin_command_completion_observation(&self, op_id: u64) {
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        human.completion_capture_op_id = Some(op_id);
+        human.human_state_events.clear();
         window.clear_rx_events();
         window.completion_capture_op_id = Some(op_id);
         window.completion_deadline = None;
@@ -1410,7 +1530,16 @@ impl RxShared {
     }
 
     pub(crate) fn finish_command_completion_observation(&self, op_id: u64) {
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if human.completion_capture_op_id == Some(op_id) {
+            human.completion_capture_op_id = None;
+            human.human_state_events.clear();
+        }
         if window.completion_capture_op_id == Some(op_id) {
             window.completion_capture_op_id = None;
             window.completion_deadline = None;
@@ -1423,8 +1552,10 @@ impl RxShared {
             .is_some_and(|(recorded_op, _)| *recorded_op == op_id)
         {
             window.command_tx_boundary = None;
-            window.human_tx_events.clear();
         }
+        drop(window);
+        drop(human);
+        self.wake_all();
     }
 
     pub fn tail(&self, max_chars: usize) -> String {
@@ -1527,8 +1658,16 @@ impl RxShared {
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
         let (human_tx_before, watermark_before) = {
+            let human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            (human_tx_state(&window), window.watermark)
+            (
+                human_tx_state(&human, window.watermark.0),
+                window.watermark,
+            )
         };
         self.wait_for_snapshot_until_from(
             from,
@@ -1560,24 +1699,33 @@ impl RxShared {
             hook();
         }
 
-        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        while clock.mono_ns() < deadline {
+        loop {
+            let human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if clock.mono_ns() >= deadline {
+                drop(window);
+                drop(human);
+                break;
+            }
             if window.tx_submit_pending {
                 let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
                 let wait_for = remaining.min(RX_WAIT_CLOCK_SLICE);
+                drop(human);
                 let (next, _) = self
                     .changed
                     .wait_timeout(window, wait_for)
                     .unwrap_or_else(|error| error.into_inner());
-                window = next;
+                drop(next);
                 continue;
             }
-            if clock.mono_ns() >= deadline {
-                break;
-            }
-            let snapshot = snapshot_from_window(&window, from);
+            let snapshot = snapshot_from_window(&window, from, &human);
             let revision = window.revision;
             drop(window);
+            drop(human);
 
             let value = matches(&snapshot);
             #[cfg(feature = "test-fakes")]
@@ -1590,6 +1738,11 @@ impl RxShared {
                 {
                     hook(&snapshot);
                 }
+                let _human = self
+                    .actor_dispatch_gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 let _window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 self.snapshot_wait_end.store(
                     snapshot
@@ -1600,19 +1753,30 @@ impl RxShared {
                 self.snapshot_wait_checks.fetch_add(1, Ordering::AcqRel);
                 self.changed.notify_all();
             }
-            window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if clock.mono_ns() >= deadline {
+                drop(window);
+                drop(human);
                 break;
             }
             let stale_snapshot = window.revision != revision
-                || human_tx_state(&window) != snapshot.human_tx_state
+                || human_tx_state(&human, window.watermark.0) != snapshot.human_tx_state
                 || window.tx_submit_pending != snapshot.tx_submit_pending
-                || window.human_submit_start_count != snapshot.human_submit_start_count;
+                || human.human_submit_start_count != snapshot.human_submit_start_count
+                || human.human_in_flight != snapshot.human_in_flight;
             if stale_snapshot {
+                drop(window);
+                drop(human);
                 continue;
             }
             if let Some(value) = value {
                 drop(window);
+                drop(human);
                 #[cfg(feature = "test-fakes")]
                 if let Some(hook) = self
                     .snapshot_wait_match_hook
@@ -1626,13 +1790,13 @@ impl RxShared {
             }
             let remaining = Duration::from_nanos(deadline.saturating_sub(clock.mono_ns()));
             let wait_for = remaining.min(RX_WAIT_CLOCK_SLICE);
+            drop(human);
             let (next, _) = self
                 .changed
                 .wait_timeout(window, wait_for)
                 .unwrap_or_else(|error| error.into_inner());
-            window = next;
+            drop(next);
         }
-        drop(window);
         #[cfg(feature = "test-fakes")]
         if let Some(hook) = self
             .snapshot_wait_before_deadline_snapshot_hook
@@ -1643,6 +1807,11 @@ impl RxShared {
             hook();
         }
         let deadline_snapshot = {
+            let human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             snapshot_from_window_at(
                 &window,
@@ -1650,6 +1819,7 @@ impl RxShared {
                 deadline,
                 human_tx_before,
                 watermark_before,
+                &human,
             )
         };
         #[cfg(feature = "test-fakes")]
@@ -1756,6 +1926,8 @@ pub struct RxSnapshot {
     pub human_tx_state: HumanTxState,
     /// 同一個 RX watermark 下的單調 human submit 開始計數。
     pub human_submit_start_count: u64,
+    /// 同一個 RX watermark 下的 session human 在途數。
+    pub human_in_flight: usize,
     /// snapshot 建立時是否仍有尚未完成 observer 登錄的 OS submit。
     pub tx_submit_pending: bool,
     /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
@@ -1771,8 +1943,12 @@ pub enum SnapshotWaitResult<T> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HumanTxState {
     pub generation: u64,
+    /// 最近 human TX 所屬 epoch；跨 epoch snapshot 不會沿用其 RX offset。
+    pub epoch: Option<u64>,
     pub rx_offset: u64,
     pub raw_line_open: bool,
+    /// session 是否仍有 human TX 等待其所屬 epoch 的 prompt。
+    pub pending_human: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1785,8 +1961,6 @@ pub struct CommandTxBoundary {
     pub human_submit_start_count: u64,
     /// command TX 前 RX watermark，供 deadline settlement 作為無後續事件時的基線。
     pub watermark: (u64, u64),
-    /// TX 邊界當時，自最近 human TX 起累積的 RX 輸出。
-    pub human_snapshot: RxSnapshot,
 }
 
 struct TxSubmitPendingGuard<'a> {
@@ -1839,12 +2013,7 @@ impl Drop for TxSubmitPendingGuard<'_> {
 
 impl Drop for HumanInFlightGuard {
     fn drop(&mut self) {
-        self.rx.actor_dispatch_gate.note_human_in_flight(-1);
-        let mut window = self.rx.inner.lock().unwrap_or_else(|error| error.into_inner());
-        window.human_in_flight = window.human_in_flight.saturating_sub(1);
-        window.revision = window.revision.saturating_add(1);
-        drop(window);
-        self.rx.wake_all();
+        self.rx.unregister_human_in_flight();
     }
 }
 
@@ -1877,14 +2046,19 @@ impl Drop for HumanSubmitRescueGuard {
     }
 }
 
-fn snapshot_from_window(window: &RxWindow, from: u64) -> RxSnapshot {
+fn snapshot_from_window(
+    window: &RxWindow,
+    from: u64,
+    human: &ActorDispatchGateState,
+) -> RxSnapshot {
     let base = from.max(window.trimmed);
     RxSnapshot {
         base,
         text: window.text_from(base).to_string(),
         watermark: window.watermark,
-        human_tx_state: human_tx_state(window),
-        human_submit_start_count: window.human_submit_start_count,
+        human_tx_state: human_tx_state(human, window.watermark.0),
+        human_submit_start_count: human.human_submit_start_count,
+        human_in_flight: human.human_in_flight,
         tx_submit_pending: window.tx_submit_pending,
         trimmed_before_from: base > from,
     }
@@ -1896,6 +2070,7 @@ fn snapshot_from_window_at(
     deadline: Mono,
     human_tx_before: HumanTxState,
     watermark_before: (u64, u64),
+    human: &ActorDispatchGateState,
 ) -> RxSnapshot {
     let events: Vec<_> = window
         .rx_events
@@ -1911,8 +2086,8 @@ fn snapshot_from_window_at(
     let skip_chars = usize::try_from(base.saturating_sub(history_start)).unwrap_or(usize::MAX);
     let take_chars = usize::try_from(end.saturating_sub(base)).unwrap_or(usize::MAX);
     let text: String = history.chars().skip(skip_chars).take(take_chars).collect();
-    let human_tx_state = window
-        .human_tx_events
+    let human_tx_state = human
+        .human_state_events
         .iter()
         .rev()
         .find(|event| event.mono_ns <= deadline)
@@ -1924,92 +2099,145 @@ fn snapshot_from_window_at(
         watermark: last_event
             .map(|event| event.watermark)
             .unwrap_or(watermark_before),
-        human_tx_state,
-        human_submit_start_count: window.human_submit_start_count,
+        human_tx_state: human_tx_state_for_epoch(human_tx_state, window.watermark.0),
+        human_submit_start_count: human.human_submit_start_count,
+        human_in_flight: human.human_in_flight,
         tx_submit_pending: window.tx_submit_pending || window.completion_tx_submit_crossed_deadline,
         trimmed_before_from: base > from,
     }
 }
 
-fn human_tx_state(window: &RxWindow) -> HumanTxState {
-    HumanTxState {
-        generation: window.human_tx_generation,
-        rx_offset: window.last_human_tx_rx_offset,
-        raw_line_open: window.human_raw_line_open,
-    }
+fn human_tx_state(human: &ActorDispatchGateState, rx_epoch: u64) -> HumanTxState {
+    human_tx_state_for_epoch(
+        HumanTxState {
+            generation: human.human_tx_generation,
+            epoch: human.human_tx_epoch,
+            rx_offset: human.last_human_tx_rx_offset,
+            raw_line_open: human.human_raw_line_open,
+            pending_human: human.pending_human,
+        },
+        rx_epoch,
+    )
 }
 
-fn command_boundary(window: &RxWindow) -> CommandTxBoundary {
-    let human_tx_state = human_tx_state(window);
-    let human_snapshot = if human_tx_state.generation == 0 {
-        RxSnapshot {
-            base: window.trimmed,
-            text: String::new(),
-            watermark: window.watermark,
-            human_tx_state,
-            human_submit_start_count: window.human_submit_start_count,
-            tx_submit_pending: window.tx_submit_pending,
-            trimmed_before_from: false,
-        }
-    } else {
-        snapshot_from_window(window, human_tx_state.rx_offset)
-    };
+fn human_tx_state_for_epoch(mut state: HumanTxState, rx_epoch: u64) -> HumanTxState {
+    if state.epoch != Some(rx_epoch) {
+        state.rx_offset = 0;
+    }
+    state
+}
+
+fn command_boundary(human: &ActorDispatchGateState, window: &RxWindow) -> CommandTxBoundary {
+    let human_tx_state = human_tx_state(human, window.watermark.0);
     CommandTxBoundary {
         rx_offset: window
             .trimmed
             .saturating_add(window.text.chars().count() as u64),
         human_tx_state,
-        human_submit_start_count: window.human_submit_start_count,
+        human_submit_start_count: human.human_submit_start_count,
         watermark: window.watermark,
-        human_snapshot,
     }
 }
 
 fn record_human_tx_locked(
-    window: &mut RxWindow,
+    human: &mut ActorDispatchGateState,
     payload: &[u8],
     raw_input: bool,
     rx_offset: u64,
+    epoch: u64,
     mono_ns: Mono,
+    prompt_already_returned: bool,
 ) {
-    window.human_tx_generation = window.human_tx_generation.saturating_add(1);
-    window.last_human_tx_rx_offset = rx_offset;
+    human.human_tx_generation = human.human_tx_generation.saturating_add(1);
+    human.human_tx_epoch = Some(epoch);
+    human.last_human_tx_rx_offset = rx_offset;
+    match (human.pending_human, prompt_already_returned) {
+        (true, true) if human.pending_human_epoch == Some(epoch) => {
+            human.pending_human = false;
+            human.pending_human_epoch = None;
+        }
+        (true, _) => {}
+        (false, true) => {}
+        (false, false) => {
+            human.pending_human = true;
+            human.pending_human_epoch = Some(epoch);
+        }
+    }
     if raw_input && !payload.is_empty() {
-        update_raw_line_state(window, payload);
+        update_raw_line_state(human, payload);
     }
-    if window.command_tx_boundary.is_some() {
-        window.human_tx_events.push_back(HumanTxEvent {
-            mono_ns,
-            state: human_tx_state(window),
-        });
+    push_human_state_event(human, mono_ns);
+}
+
+fn has_prompt_after_offset(
+    window: &RxWindow,
+    epoch: u64,
+    rx_offset: u64,
+    prompt: &PyRegex,
+) -> bool {
+    if window.watermark.0 != epoch || rx_offset < window.trimmed {
+        return false;
     }
+    has_tail_prompt(window.text_from(rx_offset), prompt)
 }
 
 fn record_human_tx_unknown_locked(
-    window: &mut RxWindow,
+    human: &mut ActorDispatchGateState,
     raw_input: bool,
     rx_offset: u64,
+    epoch: u64,
     mono_ns: Mono,
 ) {
-    window.human_tx_generation = window.human_tx_generation.saturating_add(1);
-    window.last_human_tx_rx_offset = rx_offset;
-    if raw_input {
-        window.human_raw_line_open = true;
+    human.human_tx_generation = human.human_tx_generation.saturating_add(1);
+    human.human_tx_epoch = Some(epoch);
+    human.last_human_tx_rx_offset = rx_offset;
+    if !human.pending_human {
+        human.pending_human = true;
+        human.pending_human_epoch = Some(epoch);
     }
-    if window.command_tx_boundary.is_some() {
-        window.human_tx_events.push_back(HumanTxEvent {
-            mono_ns,
-            state: human_tx_state(window),
-        });
+    if raw_input {
+        human.human_raw_line_open = true;
+    }
+    push_human_state_event(human, mono_ns);
+}
+
+fn update_raw_line_state(human: &mut ActorDispatchGateState, payload: &[u8]) {
+    if let Some(last_line_break) = payload.iter().rposition(|byte| matches!(*byte, b'\r' | b'\n')) {
+        human.human_raw_line_open = last_line_break + 1 < payload.len();
+    } else if !payload.is_empty() {
+        human.human_raw_line_open = true;
     }
 }
 
-fn update_raw_line_state(window: &mut RxWindow, payload: &[u8]) {
-    if let Some(last_line_break) = payload.iter().rposition(|byte| matches!(*byte, b'\r' | b'\n')) {
-        window.human_raw_line_open = last_line_break + 1 < payload.len();
-    } else if !payload.is_empty() {
-        window.human_raw_line_open = true;
+fn push_human_state_event(human: &mut ActorDispatchGateState, mono_ns: Mono) {
+    if human.completion_capture_op_id.is_none() {
+        return;
     }
+    human.human_state_events.push_back(HumanStateEvent {
+        mono_ns,
+        state: HumanTxState {
+            generation: human.human_tx_generation,
+            epoch: human.human_tx_epoch,
+            rx_offset: human.last_human_tx_rx_offset,
+            raw_line_open: human.human_raw_line_open,
+            pending_human: human.pending_human,
+        },
+    });
+}
+
+fn has_tail_prompt(raw: &str, prompt: &PyRegex) -> bool {
+    let cleaned = clean_text(raw);
+    let len = cleaned.chars().count();
+    let line_start = cleaned
+        .chars()
+        .enumerate()
+        .filter_map(|(index, ch)| (ch == '\n').then_some(index + 1))
+        .last()
+        .unwrap_or(0);
+    let tail: String = cleaned.chars().skip(line_start).take(len - line_start).collect();
+    prompt
+        .search(&tail)
+        .is_some_and(|matched| matched.start == 0 && matched.end == tail.chars().count())
 }
 
 /// reader thread 的依賴（Task 10 Produces）。
