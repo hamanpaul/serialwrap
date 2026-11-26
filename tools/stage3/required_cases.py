@@ -118,6 +118,29 @@ def _read_bytes(path: Path, read_bytes: ReadBytes | None = None) -> bytes:
     return (read_bytes or Path.read_bytes)(Path(path))
 
 
+def _per_call_reader(read_bytes: ReadBytes | None = None) -> ReadBytes:
+    """包一層單次呼叫快取：同一次呼叫內，每個解析後路徑只向底層讀取器取一次位元組。
+
+    未注入讀取器的獨立入口（例如 CLI）也因此符合「讀一次」原則；已注入快照讀取器時，
+    快照本身已快取，這層只避免重複轉呼叫。讀取錯誤同樣快取，讓同一路徑的後續讀取得到一致結果。
+    """
+    values: dict[Path, bytes | Exception] = {}
+
+    def read(path: Path) -> bytes:
+        key = Path(path).resolve()
+        if key not in values:
+            try:
+                values[key] = _read_bytes(key, read_bytes)
+            except Exception as exc:
+                values[key] = exc
+        value = values[key]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return read
+
+
 def _relative_path(value: object) -> str | None:
     if not isinstance(value, str) or not value or "\\" in value:
         return None
@@ -692,6 +715,7 @@ def validate_current_lock(
     """
     root = Path(repo_root).resolve()
     reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
+    read_bytes = _per_call_reader(read_bytes)
     try:
         cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root, read_bytes=read_bytes)
         # 與 4b71d2db 的 `--check` 順序一致：鎖 schema 失敗時立即停止，

@@ -3202,6 +3202,27 @@ def test_required_cases_entry_reads_each_path_at_most_once(tmp_path, monkeypatch
     )
 
 
+def test_validate_current_lock_standalone_reads_each_path_at_most_once(tmp_path, monkeypatch):
+    """T1 的獨立入口未注入讀取器時，同一次呼叫內每個路徑也只讀一次。"""
+    from tools.stage3 import required_cases as required_cases_module
+
+    fakes.write_ab_manifest(tmp_path, platform="linux", layer="l1.5", stage="3")
+    counts = _track_open_reads(monkeypatch, [tmp_path])
+    errors = required_cases_module.validate_current_lock(
+        tmp_path, base_revision="t3-trusted-base", source_reader=_trusted_source_reader(tmp_path),
+    )
+
+    evidence = tmp_path / "docs" / "rust-refactor" / "evidence"
+    _assert_open_read_audit(
+        errors, counts,
+        required_paths=[
+            tmp_path / "tests" / "acceptance" / "cases.yaml",
+            tmp_path / "tests" / "acceptance" / "stage3_required_cases.lock.json",
+            evidence / "denominators" / "source-manifest.json",
+        ],
+    )
+
+
 def _write_case_catalog(path: Path, catalog: dict) -> None:
     cases_path = path.parent / "tests" / "acceptance" / "cases.yaml"
     cases_path.write_text(
