@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Sender};
@@ -58,8 +58,14 @@ struct ActorDispatchGateState {
     last_human_tx_rx_offset: u64,
     human_raw_line_open: bool,
     pending_human: bool,
-    /// 最早仍未由其所屬 epoch prompt 結案的人類 TX epoch。
+    /// 最新已寫出 human TX 的 RX epoch 與絕對 RX 字元邊界。
     pending_human_epoch: Option<u64>,
+    pending_human_rx_offset: Option<u64>,
+    /// 有既存 pending 的 session 正在等舊 writer guard 收斂後，才可重設到新 epoch。
+    pending_handoff_epoch: Option<u64>,
+    /// 此 session 當前接管的 RX window；舊 writer 的晚到回報也在這個 window 線性化。
+    active_rx: Option<Weak<RxShared>>,
+    active_rx_epoch: Option<u64>,
     completion_capture_op_id: Option<u64>,
     human_state_events: VecDeque<HumanStateEvent>,
     #[cfg(feature = "test-fakes")]
@@ -497,13 +503,13 @@ impl RxShared {
         created_mono: u64,
         actor_dispatch_gate: Arc<ActorDispatchGate>,
     ) -> Arc<RxShared> {
-        Arc::new(RxShared {
+        let rx = Arc::new(RxShared {
             inner: Mutex::new(RxWindow {
                 max_chars,
                 last_rx_mono: created_mono,
                 ..RxWindow::default()
             }),
-            actor_dispatch_gate,
+            actor_dispatch_gate: actor_dispatch_gate.clone(),
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
@@ -553,7 +559,17 @@ impl RxShared {
             human_submit_attempts: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
             human_pump_submissions: AtomicU64::new(0),
-        })
+        });
+        {
+            let mut state = actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.active_rx.as_ref().and_then(Weak::upgrade).is_none() {
+                state.active_rx = Some(Arc::downgrade(&rx));
+            }
+        }
+        rx
     }
 
     #[doc(hidden)]
@@ -563,7 +579,50 @@ impl RxShared {
 
     #[cfg(feature = "test-fakes")]
     pub fn set_human_prompt_regex_for_test(&self, pattern: &str) {
+        self.set_human_prompt_regex(pattern);
+    }
+
+    /// 同步更新 session gate 使用的 prompt 身分。鎖序為 gate state → prompt regex → RX window，
+    /// 與 RX append／epoch 接管一致，避免 append 以舊 regex 配對已切換的 profile。
+    pub(crate) fn set_human_prompt_regex(&self, pattern: &str) {
+        let _state = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.actor_dispatch_gate.set_prompt_regex(pattern);
+        self.actor_dispatch_gate.changed.notify_all();
+    }
+
+    /// 將 session gate 的 active window 線性化到已接管的 bridge epoch。
+    pub(crate) fn activate_epoch(self: &Arc<Self>, epoch: u64) {
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        human.active_rx = Some(Arc::downgrade(self));
+        human.active_rx_epoch = Some(epoch);
+        if human.pending_human {
+            if human.human_in_flight == 0 {
+                human.pending_human_epoch = Some(epoch);
+                human.pending_human_rx_offset = Some(0);
+                human.pending_handoff_epoch = None;
+            } else {
+                human.pending_handoff_epoch = Some(epoch);
+            }
+        } else {
+            human.pending_handoff_epoch = None;
+        }
+        let prompt_regex = self.actor_dispatch_gate.prompt_regex();
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.watermark.0 = epoch;
+        window.revision = window.revision.saturating_add(1);
+        let now = window.last_rx_mono;
+        settle_pending_human_locked(&mut human, &window, prompt_regex.as_deref(), epoch, now);
+        drop(window);
+        drop(human);
+        self.wake_all();
     }
 
     /// human line submit 的在途 guard；實際成功排入 TX writer 後才更新 submit 起點計數。
@@ -625,11 +684,50 @@ impl RxShared {
     }
 
     fn unregister_human_in_flight(&self) {
-        self.actor_dispatch_gate.note_human_in_flight(-1);
-        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut human = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        human.human_in_flight = human.human_in_flight.saturating_sub(1);
+        let handoff_epoch = if human.human_in_flight == 0 {
+            human.pending_handoff_epoch.take()
+        } else {
+            None
+        };
+        if let Some(epoch) = handoff_epoch {
+            if human.pending_human && human.pending_human_epoch != Some(epoch) {
+                // 舊 pending TX 以新 window 起點重設；若在途 writer 實際寫出，
+                // record_human_tx_locked 已先用它的 TX 邊界取代此位置。
+                human.pending_human_epoch = Some(epoch);
+                human.pending_human_rx_offset = Some(0);
+            }
+        }
+        let prompt_regex = self.actor_dispatch_gate.prompt_regex();
+        let active_rx = human.active_rx.as_ref().and_then(Weak::upgrade);
+        let active_window = active_rx.as_deref().unwrap_or(self);
+        let mut window = active_window
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         window.revision = window.revision.saturating_add(1);
+        let now = window.last_rx_mono;
+        let epoch = human.active_rx_epoch.unwrap_or(window.watermark.0);
+        settle_pending_human_locked(
+            &mut human,
+            &window,
+            prompt_regex.as_deref(),
+            epoch,
+            now,
+        );
         drop(window);
+        drop(human);
         self.wake_all();
+        if let Some(active_rx) = active_rx {
+            if !std::ptr::eq(Arc::as_ptr(&active_rx), self) {
+                active_rx.wake_all();
+            }
+        }
     }
 
     fn register_human_submit_start(&self) {
@@ -1163,18 +1261,22 @@ impl RxShared {
         epoch: u64,
         rx_seq: u64,
     ) {
-        let prompt_regex = self
-            .actor_dispatch_gate
-            .prompt_regex
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
         let mut human = self
             .actor_dispatch_gate
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let prompt_regex = self.actor_dispatch_gate.prompt_regex();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if human.active_rx_epoch.is_none()
+            && human
+                .active_rx
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|active| std::ptr::eq(Arc::as_ptr(&active), self))
+        {
+            human.active_rx_epoch = Some(epoch);
+        }
         let now = event_time();
         window.watermark = (epoch, rx_seq);
         window.revision = window.revision.saturating_add(1);
@@ -1206,15 +1308,8 @@ impl RxShared {
                 });
             }
         }
-        if !data.is_empty()
-            && human.pending_human
-            && human.pending_human_epoch == Some(epoch)
-            && prompt_regex
-                .as_deref()
-                .is_some_and(|prompt| has_tail_prompt(&window.text, prompt))
-        {
-            human.pending_human = false;
-            push_human_state_event(&mut human, now);
+        if !data.is_empty() {
+            settle_pending_human_locked(&mut human, &window, prompt_regex.as_deref(), epoch, now);
         }
         drop(window);
         drop(human);
@@ -1308,7 +1403,7 @@ impl RxShared {
             .unwrap_or_else(|error| error.into_inner());
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let event_mono = clock.mono_ns();
-        let epoch = window.watermark.0;
+        let epoch = human.active_rx_epoch.unwrap_or(window.watermark.0);
         let rx_offset = window
             .trimmed
             .saturating_add(window.text.chars().count() as u64);
@@ -1319,7 +1414,6 @@ impl RxShared {
             rx_offset,
             epoch,
             event_mono,
-            false,
         );
         window.revision = window.revision.saturating_add(1);
         drop(window);
@@ -1338,7 +1432,9 @@ impl RxShared {
         clock: &dyn Clock,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
-        let prompt_regex = human_payload.and_then(|_| self.actor_dispatch_gate.prompt_regex());
+        // 寫入前在 gate → RX 鎖序內讀 watermark 並發布 submit-pending，隨即釋放鎖再呼叫 OS。
+        // human guard／submit-pending 使交錯 RX 不能在 write 結果確定前清除 pending；OS write
+        // 可能等待 RX reader，因此不可跨越 write closure 持有 gate 或 RX mutex。
         let (candidate_boundary, candidate_human_rx) = {
             let human = self
                 .actor_dispatch_gate
@@ -1349,16 +1445,23 @@ impl RxShared {
             let boundary = command_op_id.filter(|_| !command_boundary_recorded).map(|_| {
                 command_boundary(&human, &window)
             });
-            let human_rx = human_payload.map(|_| {
-                (
-                    window.watermark.0,
-                    window
-                        .trimmed
-                        .saturating_add(window.text.chars().count() as u64),
-                )
-            });
             window.tx_submit_pending = true;
             window.tx_submit_pending_started_at = Some(clock.mono_ns());
+            drop(window);
+            let human_rx = human_payload.map(|_| {
+                let active_rx = human.active_rx.as_ref().and_then(Weak::upgrade);
+                let active_window = active_rx.as_deref().unwrap_or(self);
+                let active_window = active_window
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (
+                    human.active_rx_epoch.unwrap_or(active_window.watermark.0),
+                    active_window
+                        .trimmed
+                        .saturating_add(active_window.text.chars().count() as u64),
+                )
+            });
             (boundary, human_rx)
         };
         let mut pending_guard = TxSubmitPendingGuard {
@@ -1374,12 +1477,12 @@ impl RxShared {
         let mut boundary_recorded = command_boundary_recorded;
 
         if submitted {
+            let mut human = self
+                .actor_dispatch_gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             {
-                let mut human = self
-                    .actor_dispatch_gate
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
                 let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 let event_mono = clock.mono_ns();
                 if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
@@ -1395,11 +1498,6 @@ impl RxShared {
                         if end > start {
                             let (epoch, rx_offset) = candidate_human_rx
                                 .expect("human submit 前應擷取 RX offset");
-                            let prompt_already_returned = prompt_regex
-                                .as_deref()
-                                .is_some_and(|prompt| {
-                                    has_prompt_after_offset(&window, epoch, rx_offset, prompt)
-                                });
                             record_human_tx_locked(
                                 &mut human,
                                 &payload[start..end],
@@ -1407,7 +1505,6 @@ impl RxShared {
                                 rx_offset,
                                 epoch,
                                 event_mono,
-                                prompt_already_returned,
                             );
                         }
                     }
@@ -2146,23 +2243,13 @@ fn record_human_tx_locked(
     rx_offset: u64,
     epoch: u64,
     mono_ns: Mono,
-    prompt_already_returned: bool,
 ) {
     human.human_tx_generation = human.human_tx_generation.saturating_add(1);
     human.human_tx_epoch = Some(epoch);
     human.last_human_tx_rx_offset = rx_offset;
-    match (human.pending_human, prompt_already_returned) {
-        (true, true) if human.pending_human_epoch == Some(epoch) => {
-            human.pending_human = false;
-            human.pending_human_epoch = None;
-        }
-        (true, _) => {}
-        (false, true) => {}
-        (false, false) => {
-            human.pending_human = true;
-            human.pending_human_epoch = Some(epoch);
-        }
-    }
+    human.pending_human = true;
+    human.pending_human_epoch = Some(epoch);
+    human.pending_human_rx_offset = Some(rx_offset);
     if raw_input && !payload.is_empty() {
         update_raw_line_state(human, payload);
     }
@@ -2175,10 +2262,43 @@ fn has_prompt_after_offset(
     rx_offset: u64,
     prompt: &PyRegex,
 ) -> bool {
-    if window.watermark.0 != epoch || rx_offset < window.trimmed {
+    let end_offset = window
+        .trimmed
+        .saturating_add(window.text.chars().count() as u64);
+    if window.watermark.0 != epoch || rx_offset > end_offset {
         return false;
     }
-    has_tail_prompt(window.text_from(rx_offset), prompt)
+    has_tail_prompt(window.text_from(rx_offset.max(window.trimmed)), prompt)
+}
+
+fn settle_pending_human_locked(
+    human: &mut ActorDispatchGateState,
+    window: &RxWindow,
+    prompt: Option<&PyRegex>,
+    epoch: u64,
+    mono_ns: Mono,
+) -> bool {
+    if human.human_in_flight != 0 || !human.pending_human {
+        return false;
+    }
+    let Some(boundary_epoch) = human.pending_human_epoch else {
+        return false;
+    };
+    let Some(rx_offset) = human.pending_human_rx_offset else {
+        return false;
+    };
+    if boundary_epoch != epoch
+        || !prompt.is_some_and(|prompt| {
+            has_prompt_after_offset(window, boundary_epoch, rx_offset, prompt)
+        })
+    {
+        return false;
+    }
+    human.pending_human = false;
+    human.pending_human_epoch = None;
+    human.pending_human_rx_offset = None;
+    push_human_state_event(human, mono_ns);
+    true
 }
 
 fn record_human_tx_unknown_locked(
@@ -2191,10 +2311,9 @@ fn record_human_tx_unknown_locked(
     human.human_tx_generation = human.human_tx_generation.saturating_add(1);
     human.human_tx_epoch = Some(epoch);
     human.last_human_tx_rx_offset = rx_offset;
-    if !human.pending_human {
-        human.pending_human = true;
-        human.pending_human_epoch = Some(epoch);
-    }
+    human.pending_human = true;
+    human.pending_human_epoch = Some(epoch);
+    human.pending_human_rx_offset = Some(rx_offset);
     if raw_input {
         human.human_raw_line_open = true;
     }

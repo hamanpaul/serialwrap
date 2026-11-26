@@ -3604,6 +3604,9 @@ impl SessionCore {
                     return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
                 }
                 let binding_changed = self.profile.device_by_id != profile.device_by_id;
+                self.deps
+                    .rx
+                    .set_human_prompt_regex(&profile.template.prompt_regex);
                 self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
                 self.profile = profile;
                 self.profile_source = profile_source;

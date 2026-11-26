@@ -164,6 +164,10 @@ entries:
     - cargo:sw-core::command_exec::i294_r15_human_line_full_queue_timeout_entries_finish_before_writer_release
     - cargo:sw-core::session_manager::i294_r15_handoff_replay_keeps_effect_guard_and_timeout_gate_on_current_rx
     - cargo:sw-core::uart_bridge::r15_tests::i294_r15_blocked_human_enqueue_does_not_hold_rescue_gate
+    - cargo:sw-core::command_exec::i294_r17_human_prompt_must_follow_tx_boundary
+    - cargo:sw-core::command_exec::i294_r17_profile_switch_new_prompt_settles_old_human
+    - cargo:sw-core::command_exec::i294_r17_profile_switch_rejects_old_regex_prompt_for_both_timeouts
+    - cargo:sw-core::command_exec::i294_r17_reconnect_waits_for_old_guard_then_unblocks_commands
     owner_phase: P5
   bc:DF-01:
     nodeids:

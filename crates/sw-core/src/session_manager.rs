@@ -5983,6 +5983,7 @@ impl EffectExecutor for ManagerExec {
             match effect {
                 Effect::AdoptBridge { epoch, .. } => {
                     if let Some(next_rx) = lock(&self.opened_rx).get(epoch).cloned() {
+                        next_rx.activate_epoch(*epoch);
                         effect_rx = next_rx;
                     }
                 }
