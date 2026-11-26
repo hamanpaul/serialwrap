@@ -30,6 +30,48 @@
       ],
       "type": "object"
     },
+    "CaseTransportRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "decision_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transport": {
+          "enum": [
+            "windows-native-com",
+            "od08-physical",
+            "docker",
+            "pty",
+            "local-process"
+          ]
+        }
+      },
+      "required": [
+        "transport",
+        "port_id",
+        "decision_ref"
+      ],
+      "type": "object"
+    },
     "Dut": {
       "additionalProperties": false,
       "properties": {
@@ -590,6 +632,52 @@
           "required": [
             "test_device_allowlist"
           ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "exit_item_id": {
+            "const": "S3-L15-RELEASE-AB-WINDOWS"
+          },
+          "layer": {
+            "const": "l1.5"
+          },
+          "platform": {
+            "const": "windows"
+          },
+          "stage": {
+            "const": "3"
+          }
+        },
+        "required": [
+          "exit_item_id",
+          "layer",
+          "platform",
+          "stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "platform_settings": {
+            "properties": {
+              "case_transport_map": {
+                "$ref": "#/$defs/FrozenFile"
+              },
+              "case_transports": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/CaseTransportRecord"
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "case_transport_map",
+              "case_transports"
+            ],
+            "type": "object"
+          }
         }
       }
     },

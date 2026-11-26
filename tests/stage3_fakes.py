@@ -1189,6 +1189,7 @@ class RecordingRunner:
         env: Mapping[str, str] | None = None,
         timeout: float | None = None,
         cwd: Path | None = None,
+        bytes_output: bool = False,
     ) -> CmdResult:
         call_argv = list(argv)
         call_env = dict(env or {})
@@ -1203,6 +1204,7 @@ class RecordingRunner:
             "round": call_env.get("SW_STAGE3_ROUND"),
             "timeout": timeout,
             "cwd": cwd,
+            "bytes_output": bytes_output,
         }
         self.calls.append(call)
         for prefix, exc in self._raises:
@@ -1221,10 +1223,18 @@ class RecordingRunner:
             position = self._positions.get(script_key, 0)
             result = sequence[min(position, len(sequence) - 1)] if sequence else {"rc": 0, "stdout": "{}", "stderr": ""}
             self._positions[script_key] = position + 1
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
+        if bytes_output:
+            stdout = stdout if isinstance(stdout, bytes) else str(stdout).encode("utf-8")
+            stderr = stderr if isinstance(stderr, bytes) else str(stderr).encode("utf-8")
+        else:
+            stdout = str(stdout)
+            stderr = str(stderr)
         return CmdResult(
             rc=int(result.get("rc", 0)),
-            stdout=str(result.get("stdout", "")),
-            stderr=str(result.get("stderr", "")),
+            stdout=stdout,
+            stderr=stderr,
             elapsed_s=float(result.get("elapsed_s", 0.0)),
             timed_out=bool(result.get("timed_out", False)),
         )

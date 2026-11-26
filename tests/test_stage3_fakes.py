@@ -1140,3 +1140,14 @@ def test_fake_repo_rejects_consistently_rewritten_seed(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="seed"):
         fakes.write_fake_repo(tmp_path / "repo")
+
+
+def test_recording_runner_supports_bytes_output_for_nul_git_paths():
+    fakes = _fakes()
+    payload = "reports/name\rpart.json\0reports/next\nname.json\0"
+    runner = fakes.RecordingRunner({"git:ls-files": [{"rc": 0, "stdout": payload}]})
+
+    result = runner(["git", "ls-files", "-z"], bytes_output=True)
+
+    assert result.stdout == payload.encode("utf-8")
+    assert runner.calls[-1]["bytes_output"] is True

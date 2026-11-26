@@ -145,7 +145,12 @@ def _example(name: str) -> dict:
     return _load(ACC / "examples" / name)
 
 
-AB_EXAMPLES = ("ab_manifest.l15.example.json", "ab_manifest.l2.example.json", "ab_manifest.l3.example.json")
+AB_EXAMPLES = (
+    "ab_manifest.l15.example.json",
+    "ab_manifest.l15.windows.example.json",
+    "ab_manifest.l2.example.json",
+    "ab_manifest.l3.example.json",
+)
 
 
 @pytest.mark.parametrize("example", AB_EXAMPLES)
@@ -153,6 +158,17 @@ def test_ab_manifest_requires_stage3_tool_tree(example):
     doc = _example(example)
     doc["tools"] = [t for t in doc["tools"] if t["path"] != "tools/stage3"]
     assert list(_validator("ab_manifest.schema.json").iter_errors(doc))
+
+
+def test_ab_manifest_transport_setting_names_remain_open_for_other_exits():
+    doc = _example("ab_manifest.l15.example.json")
+    doc["platform_settings"]["case_transport_map"] = "legacy opaque value"
+    doc["platform_settings"]["case_transports"] = ["old-format", {"transport": "unrecognized"}]
+    assert not list(_validator("ab_manifest.schema.json").iter_errors(doc))
+
+    windows = _example("ab_manifest.l15.windows.example.json")
+    windows["platform_settings"]["case_transport_map"] = "wrong type for the Windows exit"
+    assert list(_validator("ab_manifest.schema.json").iter_errors(windows))
 
 
 @pytest.mark.parametrize("example,wrong", [

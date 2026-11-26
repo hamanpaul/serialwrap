@@ -1135,7 +1135,7 @@ def render_argv(template: Sequence[str], values: Mapping[str, str]) -> list[str]
 
 R4-01 的 T3 紅燈驗收另加 `test_required_case_ids_frozen_across_family_change`：只改必要 native 案 family，重算 case_list 的 FrozenFile SHA 讓一般檔案 hash 檢查通過，原 cases.lock.json、集合及其他案例屬性皆不變，T1 鎖仍含該 ID，`verify_frozen` 必報分母契約違規，不能取得較小 required。再驗 manifest 缺鎖／鎖 SHA 錯／context 指另一份鎖、新案未登記、竄改鎖刪舊 ID 均拒收；合法只增且 case_ids 覆蓋新集合的對照才通過。沿用現有 `HARNESS_CASE_SET_INCOMPLETE`，不新增原因碼。
 
-`verify_case_coverage`（§11.3「不得刪除案例、縮小分母」、§11.6 Stage 3「完整契約＋L1.5」）回傳：`"required case missing: <id>"`（`required_cases` 中不在 `case_ids` 者）；`"unknown case: <id>"`（`case_ids` 中不在 `cases.yaml` 者）；`"invariant not covered: <invariant_id>"`（`cases.yaml.invariant_ids` 六項中，沒有任何 `case_ids` 內、且 layer 相符的案例引用者；該 layer 在 `cases.yaml` 原本就沒有任何案例引用的 invariant 不列）；`"destructive case without authorization: <id>"`（`authorization` 為 null、`allow_destructive` 為 false 或 `decision_ref` 為 null）；`"authorization board not in dut: <com>"`；`"windows com0com instance without test_device_allowlist"`。任何一筆都使 Task 6 以 `HARNESS_CASE_SET_INCOMPLETE`（授權類為 `HARNESS_AUTHORIZATION_MISSING`）拒絕執行。
+`verify_case_coverage`（§11.3「不得刪除案例、縮小分母」、§11.6 Stage 3「完整契約＋L1.5」）回傳：`"required case missing: <id>"`（`required_cases` 中不在 `case_ids` 者）；`"unknown case: <id>"`（`case_ids` 中不在 `cases.yaml` 者）；`"invariant not covered: <invariant_id>"`（`cases.yaml.invariant_ids` 六項中，沒有任何 `case_ids` 內且 layer 相符、並適用 manifest platform 的案例引用者；判斷例外時也同時要求 layer 相符且案例適用 manifest platform，即該 layer／platform 在 `cases.yaml` 原本就沒有任何案例引用的 invariant 不列。此為協調者對本條文字的明確化）；`"destructive case without authorization: <id>"`（`case_ids` 中任何可在 `cases.yaml` 找到且 `destructive: true` 的案例都需授權，不因 layer 或 platform 不符而跳過；`authorization` 為 null、`allow_destructive` 為 false 或 `decision_ref` 為 null 時回報）；`"authorization board not in dut: <com>"`；`"windows com0com instance without test_device_allowlist"`。任何一筆都使 Task 6 以 `HARNESS_CASE_SET_INCOMPLETE`（授權類為 `HARNESS_AUTHORIZATION_MISSING`）拒絕執行。
 
 `render_argv`：每個元素以 `str.format_map` 取代；遇到 `TEMPLATE_KEYS` 以外或缺值的鍵 → `HarnessError("HARNESS_MANIFEST_INVALID")`。
 
@@ -1695,7 +1695,7 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
 
 **執行序（逐字實作；任何 abort 都寫出 `out_dir/ab-report.json` 後回傳）：**
 
-1. `m = load_manifest(manifest_path)`；`out_dir.mkdir(parents=True, exist_ok=False)`（已存在 → `HARNESS_MANIFEST_INVALID`，避免覆寫舊證據）。
+1. `m = load_manifest(manifest_path, repo_root=repo_root)`；`out_dir.mkdir(parents=True, exist_ok=False)`（已存在 → `HARNESS_MANIFEST_INVALID`，避免覆寫舊證據）。載入與後續 `verify_frozen` 必須使用同一個 `repo_root`；不傳根目錄會綁定執行模組所在 checkout，之後會被 fail closed 拒絕。
 2. `violations = verify_frozen(m, repo_root=repo_root, run=run)`；非空 → verdict `INFRA_ERROR`，reason 依第一筆違規類別：案例涵蓋類 → `HARNESS_CASE_SET_INCOMPLETE`、授權類 → `HARNESS_AUTHORIZATION_MISSING`、其他 → `HARNESS_MANIFEST_DRIFT`；此時**不得**執行任何 `activate`、suite、`cli` 命令。通過後對兩側各記一次受測內容指紋（R3-F2）：`trees[label] = {"bundle_tree_sha256": ab_manifest.bundle_tree_sha256(side.bundle_dir), "runtime_tree_sha256": ab_manifest.runtime_tree_sha256(side.bundle_dir)}`；拋 `HARNESS_ARTIFACT_MISMATCH`（非一般檔）→ `INFRA_ERROR`、`HARNESS_MANIFEST_DRIFT`，同樣不執行任何命令。
 3. Stage 3 非長跑（含 P0＋P1＋remote）不呼叫候選長跑 registration。只有歷史／未來另經裁決的長跑路徑，才先核對 acceptance 已凍結，並在第一次 B 前向 §0.4-2 的受控外部帳本登記一次；run context 固定帳本與歷史錨點，複驗不重複，登記失敗不啟動 B。不得替 1.0.0 恢復已撤銷的長跑 item。
 4. `rounds = [("A","B")] + ([("B","A")] if m.reverify.enabled else [])`。複驗是否執行在 manifest 預先決定，不看第一輪結果。
