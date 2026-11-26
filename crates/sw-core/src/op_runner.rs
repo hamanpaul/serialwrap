@@ -1075,6 +1075,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     let raw_half_line =
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open;
                     if human_tx_seen {
+                        #[cfg(feature = "test-fakes")]
+                        ctx.rx.human_timeout_decision_hook_for_test();
                         return OpOutcome::CompletionUncertain {
                             stdout: evaluator.partial_stdout(
                                 &snapshot.text,
@@ -1143,6 +1145,8 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
             let stdout = evaluator.partial_stdout(&snapshot.text, human_tx_seen, raw_half_line);
             if human_tx_seen {
+                #[cfg(feature = "test-fakes")]
+                ctx.rx.human_timeout_decision_hook_for_test();
                 return OpOutcome::CompletionUncertain { stdout };
             }
 

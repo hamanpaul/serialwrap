@@ -36,6 +36,11 @@ impl SessionCore {
     /// 或使回放進入 lane 時才列為候選，不把 suspend 期間尚未送出的輸入當作在途 submit。
     #[doc(hidden)]
     pub fn human_tx_may_start_before_event(&self, item: &MailboxItem, now: Mono) -> bool {
+        // Open 狀態下 dispatch 會先重放先前因 handoff freeze 延後的 mailbox event，再處理目前 item。
+        // 目前 item 本身無法描述那些 transition；只要 queue 非空便保守建立暫時 guard。
+        if !self.deferred_handoff_events.is_empty() {
+            return true;
+        }
         match item {
             MailboxItem::Data(DataEvent::ConsoleInputBytes {
                 client_id,
@@ -115,38 +120,15 @@ impl SessionCore {
         {
             return true;
         }
-        if self
-            .human
-            .lane
-            .backlog_front()
-            .is_some_and(|item| self.backlog_item_may_emit_human_tx(item))
-        {
+        // pump_lane 會持續略過 stale／不可路由的項目，直到找到可送出的後續項目；只看首項會漏掉該路徑。
+        // backlog 的內容是否可送在 transition 內才結算，因此任何非空 backlog 都視為候選。
+        if !self.human.lane.backlog_is_empty() {
             return true;
         }
         self.human.replay_after_revoked
             && self.deferred_replay_context_open()
             && !self.human.replay_hold.as_ref().is_some_and(|hold| hold.revoked)
             && self.has_live_deferred_input()
-    }
-
-    fn backlog_item_may_emit_human_tx(&self, item: &BacklogItem) -> bool {
-        match item.kind {
-            BacklogKind::Replay { .. } => true,
-            BacklogKind::Input => {
-                if item.tag.input_epoch != self.generations.input_epoch
-                    || !self.human.is_live(&item.tag.client_id, item.tag.client_lifetime)
-                {
-                    return false;
-                }
-                match self.human.ownership.peek_route(&item.tag.client_id) {
-                    InputRoute::Raw { .. } => {
-                        self.human.deferred_len_for(&item.tag.client_id) == 0
-                            || self.immediate_replay_allowed(&item.tag.client_id)
-                    }
-                    InputRoute::DropFlash | InputRoute::Defer | InputRoute::Line => false,
-                }
-            }
-        }
     }
 
     fn op_finished_may_replay_human(&self, op_id: crate::tx_writer::OpId, epoch: u64) -> bool {

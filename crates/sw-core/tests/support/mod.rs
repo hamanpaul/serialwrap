@@ -1324,10 +1324,12 @@ impl EffectExecutor for RigExec {
                 permit,
                 payload,
             } => {
-                let in_flight = self
+                self.rx.human_tx_before_effect_hook_for_test();
+                let mut in_flight = self
                     .pending_human_guard
                     .take()
-                    .unwrap_or_else(|| self.rx.begin_human_submit());
+                    .expect("Effect::HumanTx 缺少 transition 前建立的 in-flight guard");
+                in_flight.mark_human_submit_started();
                 let epoch = permit.epoch;
                 if !self.pumps.contains_key(&epoch) {
                     if let Some(worker) = self.workers.get(&epoch) {

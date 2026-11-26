@@ -70,6 +70,9 @@ use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 /// 引擎盡快返回，不以此上限阻塞停止序。
 const FILE_TRANSFER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
+#[cfg(not(any(feature = "test-fakes", debug_assertions)))]
+static MISSING_PRE_EVENT_HUMAN_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
 const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
 
@@ -5292,10 +5295,27 @@ impl ManagerExec {
         payload: Vec<u8>,
         control: &Sender<ControlEvent>,
     ) {
-        let in_flight = self
+        #[cfg(feature = "test-fakes")]
+        self.rx.human_tx_before_effect_hook_for_test();
+        #[cfg(any(feature = "test-fakes", debug_assertions))]
+        let mut in_flight = self
             .pending_human_guard
             .take()
-            .unwrap_or_else(|| self.rx.begin_human_submit());
+            .expect("Effect::HumanTx 缺少 transition 前建立的 in-flight guard");
+        #[cfg(not(any(feature = "test-fakes", debug_assertions)))]
+        let mut in_flight = match self.pending_human_guard.take() {
+            Some(guard) => guard,
+            None => {
+                if !MISSING_PRE_EVENT_HUMAN_GUARD_WARNED.swap(true, Ordering::AcqRel) {
+                    self.shared.warn(format!(
+                        "Effect::HumanTx 缺少 transition 前建立的 guard，使用後備 submit guard（com={}）",
+                        self.com()
+                    ));
+                }
+                self.rx.begin_human_submit()
+            }
+        };
+        in_flight.mark_human_submit_started();
         let epoch = permit.epoch;
         if !self.pumps.contains_key(&epoch) {
             if let Some(worker) = lock(&self.workers).get(&epoch) {

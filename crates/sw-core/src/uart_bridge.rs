@@ -232,6 +232,12 @@ pub struct RxShared {
     /// 測試交錯：human writer 已建立最終 report、尚未交給 submitter 前暫停。
     #[cfg(feature = "test-fakes")]
     human_tx_report_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
+    /// 測試交錯：actor transition 已產生 HumanTx effect、executor 尚未處理 effect 前暫停。
+    #[cfg(feature = "test-fakes")]
+    human_tx_before_effect_hook: Mutex<Option<SnapshotWaitEnterHook>>,
+    /// 測試交錯：timeout 已辨識 human TX、即將回傳 CompletionUncertain 前暫停。
+    #[cfg(feature = "test-fakes")]
+    human_timeout_decision_hook: Mutex<Option<SnapshotWaitEnterHook>>,
     /// 測試交錯：human pump 在取件前與取件後分別暫停。
     #[cfg(feature = "test-fakes")]
     human_pump_before_take_hook: Mutex<Option<SnapshotWaitDeadlineHook>>,
@@ -286,6 +292,10 @@ impl RxShared {
             #[cfg(feature = "test-fakes")]
             human_tx_report_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            human_tx_before_effect_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            human_timeout_decision_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             human_pump_before_take_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             human_pump_after_take_hook: Mutex::new(None),
@@ -307,7 +317,7 @@ impl RxShared {
             .unwrap_or_else(|error| error.into_inner());
         self.register_human_submit();
         drop(rescue_guard);
-        self.new_human_in_flight_guard()
+        self.new_human_in_flight_guard(true)
     }
 
     /// 在 actor 套用可能產生 HumanTx 的事件前登記 guard。
@@ -316,10 +326,8 @@ impl RxShared {
     /// 因此 actor 不等待 rescue／writer，而 timeout 決策仍以 gate → RX inner 順序線性化。
     #[doc(hidden)]
     pub fn begin_human_submit_before_actor_step(self: &Arc<Self>) -> HumanInFlightGuard {
-        #[cfg(feature = "test-fakes")]
-        self.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
-        self.register_human_submit();
-        self.new_human_in_flight_guard()
+        self.register_human_in_flight();
+        self.new_human_in_flight_guard(false)
     }
 
     fn register_human_submit(&self) {
@@ -331,9 +339,26 @@ impl RxShared {
         self.wake_all();
     }
 
-    fn new_human_in_flight_guard(self: &Arc<Self>) -> HumanInFlightGuard {
+    fn register_human_in_flight(&self) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.human_in_flight = window.human_in_flight.saturating_add(1);
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
+    }
+
+    fn register_human_submit_start(&self) {
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
+        window.revision = window.revision.saturating_add(1);
+        drop(window);
+        self.wake_all();
+    }
+
+    fn new_human_in_flight_guard(self: &Arc<Self>, submit_started: bool) -> HumanInFlightGuard {
         HumanInFlightGuard {
             rx: Arc::clone(self),
+            submit_started,
         }
     }
 
@@ -489,6 +514,52 @@ impl RxShared {
             .timeout_rescue_decision_hook
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_human_tx_before_effect_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitEnterHook>,
+    ) {
+        *self
+            .human_tx_before_effect_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn human_tx_before_effect_hook_for_test(&self) {
+        if let Some(hook) = self
+            .human_tx_before_effect_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_human_timeout_decision_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitEnterHook>,
+    ) {
+        *self
+            .human_timeout_decision_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn human_timeout_decision_hook_for_test(&self) {
+        if let Some(hook) = self
+            .human_timeout_decision_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
     }
 
     #[cfg(feature = "test-fakes")]
@@ -1363,6 +1434,7 @@ struct TxSubmitPendingGuard<'a> {
 #[doc(hidden)]
 pub struct HumanInFlightGuard {
     rx: Arc<RxShared>,
+    submit_started: bool,
 }
 
 /// human submit 起點與 timeout 救援排程共用的短期仲裁鎖。
@@ -1405,6 +1477,19 @@ impl Drop for HumanInFlightGuard {
         window.revision = window.revision.saturating_add(1);
         drop(window);
         self.rx.wake_all();
+    }
+}
+
+impl HumanInFlightGuard {
+    /// 把 transition 前的預判 guard 升級為實際 HumanTx submit；只在 effect 已產生時呼叫。
+    pub fn mark_human_submit_started(&mut self) {
+        if self.submit_started {
+            return;
+        }
+        self.rx.register_human_submit_start();
+        #[cfg(feature = "test-fakes")]
+        self.rx.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
+        self.submit_started = true;
     }
 }
 

@@ -144,6 +144,14 @@ entries:
     - cargo:sw-core::command_exec::i294_r11_fence_rejected_human_job_before_report_suppresses_rescue
     - cargo:sw-core::command_exec::i294_r12_human_job_guarded_before_pump_take_suppresses_rescue
     - cargo:sw-core::command_exec::i294_r12_human_job_guarded_after_pump_take_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r13_actor_transition_effect_barrier_holds_unstarted_guard
+    - cargo:sw-core::command_exec::i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states
+    - cargo:sw-core::command_exec::i294_r13_transition_to_effect_barrier_guards_both_timeout_entries
+    - cargo:sw-core::human_tx_lane::i294_r13_handoff_replay_is_included_in_preflight
+    - cargo:sw-core::human_tx_lane::i294_r13_human_completion_preflight_covers_later_backlog_job
+    - cargo:sw-core::human_tx_lane::i294_r13_overprediction_without_effect_drops_guard_and_history
+    - cargo:sw-core::human_tx_lane::i294_r13_pre_event_guard_cleans_up_on_panic_refusal_and_cancel
+    - cargo:sw-core::human_tx_lane::i294_r13_pre_event_guard_does_not_record_submit_without_human_tx
     - cargo:sw-core::human_console::human_tx::tests::i294_r12_pump_full_and_writer_channel_closed_drop_guards
     - cargo:sw-core::command_completion::tests::i294_r9_direct_echo_search_has_linear_work_bound
     - cargo:sw-core::i294_r9_baseline_diff::i294_r9_no_human_timeout_stdout_matches_baseline_for_both_echo_states
