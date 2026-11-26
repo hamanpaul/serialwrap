@@ -130,18 +130,20 @@ pub struct RxShared {
 #[derive(Default)]
 struct SecretEchoWindow {
     armed: Option<ArmedSecretEcho>,
-    /// 已分類的後續 secret 行；目前項目完整回顯或安全結算後才啟用。
-    queued_human: VecDeque<ArmedSecretEcho>,
     released: VecDeque<ReleasedSecretByte>,
+    /// 人工密碼輸入的 bounded pattern 集合；未安全匹配的 pattern 跨提示世代保留。
+    human_patterns: Vec<HumanSecretPattern>,
+    /// 尚可能是任一 secret 前綴的 RX 後綴；最長不超過已登記 pattern 的長度。
+    human_pending: Vec<PendingHumanEchoByte>,
+    human_current_pattern: Option<usize>,
     human_generation: Option<u64>,
     human_writes_in_flight: usize,
-    /// 最近一筆 TX matcher 尚未確認該 actor 輸入的行尾。
     human_line_open: bool,
-    /// 尚未由 RX 安全結算的 actor secret 輸入行數；超限時用來避免第一個行尾解除後續遮罩。
-    human_echo_lines_pending: usize,
-    overflow_mask_line: bool,
-    /// 超限遮罩狀態下，CRLF 的 LF 已隨前一個 CR 結算過行數。
-    overflow_after_cr: bool,
+    /// 超過保存上限後，保留各 secret 的首 byte 作為有界行遮罩觸發器。
+    human_fallback_prefixes: [u64; 4],
+    human_fallback_active: bool,
+    human_fallback_masking_line: bool,
+    human_ready_to_clear: bool,
 }
 
 const HUMAN_SECRET_ECHO_MAX_BYTES: usize = 1024;
@@ -150,23 +152,21 @@ struct ReleasedSecretByte {
     byte: u8,
 }
 
+struct HumanSecretPattern {
+    secret: Vec<u8>,
+    matched: bool,
+    prefix_seen: bool,
+    input_open: bool,
+}
+
+struct PendingHumanEchoByte {
+    byte: u8,
+    masked: bool,
+}
+
 struct ArmedSecretEcho {
     secret: Vec<u8>,
     pending: Vec<u8>,
-    dynamic: bool,
-    after_cr: bool,
-    /// reader 已先看到行尾；下一筆 actor secret 到達時允許切到 queued matcher。
-    rx_line_ended: bool,
-}
-
-fn empty_human_secret_echo() -> ArmedSecretEcho {
-    ArmedSecretEcho {
-        secret: Vec::new(),
-        pending: Vec::new(),
-        dynamic: true,
-        after_cr: false,
-        rx_line_ended: false,
-    }
 }
 
 #[derive(Default)]
@@ -364,23 +364,20 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut previous);
             previous.secret.fill(0);
         }
-        while let Some(mut queued) = window.queued_human.pop_front() {
-            Self::mask_pending(&mut window, &mut queued);
-            queued.secret.fill(0);
-        }
+        Self::mask_human_pending(&mut window);
+        Self::clear_human_patterns(&mut window);
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
-        window.human_echo_lines_pending = 0;
-        window.overflow_mask_line = false;
-        window.overflow_after_cr = false;
+        window.human_current_pattern = None;
+        window.human_fallback_prefixes = [0; 4];
+        window.human_fallback_active = false;
+        window.human_fallback_masking_line = false;
+        window.human_ready_to_clear = false;
         if !secret.is_empty() {
             window.armed = Some(ArmedSecretEcho {
                 secret: secret.to_vec(),
                 pending: Vec::with_capacity(secret.len().saturating_sub(1)),
-                dynamic: false,
-                after_cr: false,
-                rx_line_ended: false,
             });
         }
         drop(window);
@@ -450,74 +447,60 @@ impl RxShared {
     fn register_human_secret_echo(&self, generation: u64, bytes: &[u8]) -> usize {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if window.human_generation != Some(generation) {
-            if let Some(mut previous) = window.armed.take() {
-                Self::mask_pending(&mut window, &mut previous);
-                previous.secret.fill(0);
-            }
-            while let Some(mut queued) = window.queued_human.pop_front() {
-                Self::mask_pending(&mut window, &mut queued);
-                queued.secret.fill(0);
+            if let Some(pattern_index) = window.human_current_pattern {
+                if let Some(pattern) = window.human_patterns.get_mut(pattern_index) {
+                    pattern.input_open = false;
+                }
             }
             window.human_generation = Some(generation);
             window.human_line_open = false;
-            window.human_echo_lines_pending = 0;
-            window.overflow_mask_line = false;
-            window.overflow_after_cr = false;
+            window.human_current_pattern = None;
+            window.human_ready_to_clear = false;
         }
         window.human_writes_in_flight = window.human_writes_in_flight.saturating_add(1);
         if !window.human_line_open {
-            if !window.overflow_mask_line {
-                let next = empty_human_secret_echo();
-                if window.armed.is_none() {
-                    window.armed = Some(next);
-                } else {
-                    window.queued_human.push_back(next);
-                }
-            }
             window.human_line_open = true;
-            window.human_echo_lines_pending =
-                window.human_echo_lines_pending.saturating_add(1);
+            if !window.human_fallback_active {
+                window.human_patterns.push(HumanSecretPattern {
+                    secret: Vec::new(),
+                    matched: false,
+                    prefix_seen: false,
+                    input_open: true,
+                });
+                window.human_current_pattern = Some(window.human_patterns.len() - 1);
+            }
         }
-        if window.overflow_mask_line {
+        window.human_ready_to_clear = false;
+        if window.human_fallback_active {
+            if let Some(&first) = bytes.first() {
+                Self::add_human_fallback_prefix(&mut window, first);
+            }
+            drop(window);
+            self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+            self.wake_all();
             return 0;
         }
-        let prior_len = window
-            .queued_human
-            .back()
-            .or(window.armed.as_ref())
-            .filter(|armed| armed.dynamic)
-            .map_or(0, |armed| armed.secret.len());
+        let pattern_index = window
+            .human_current_pattern
+            .expect("human input line has a registered matcher");
+        let prior_len = window.human_patterns[pattern_index].secret.len();
         let stored_len = window
-            .armed
-            .as_ref()
-            .map_or(0, |armed| armed.secret.len())
-            .saturating_add(
-                window
-                    .queued_human
-                    .iter()
-                    .map(|armed| armed.secret.len())
-                    .sum::<usize>(),
-            );
+            .human_patterns
+            .iter()
+            .map(|pattern| pattern.secret.len())
+            .sum::<usize>()
+            .saturating_add(window.human_pending.len());
         if stored_len.saturating_add(bytes.len()) > HUMAN_SECRET_ECHO_MAX_BYTES {
-            if let Some(mut armed) = window.armed.take() {
-                Self::mask_pending(&mut window, &mut armed);
-                armed.secret.fill(0);
-                window.armed = Some(empty_human_secret_echo());
-            }
-            while let Some(mut queued) = window.queued_human.pop_front() {
-                Self::mask_pending(&mut window, &mut queued);
-                queued.secret.fill(0);
-            }
-            window.overflow_mask_line = true;
+            let pending = Self::enter_human_fallback(&mut window, bytes);
+            window.released.extend(
+                pending
+                    .into_iter()
+                    .map(|byte| ReleasedSecretByte { byte }),
+            );
         } else {
-            let target = if window.queued_human.is_empty() {
-                window.armed.as_mut()
-            } else {
-                window.queued_human.back_mut()
-            };
-            if let Some(armed) = target.filter(|armed| armed.dynamic) {
-                armed.secret.extend_from_slice(bytes);
-            }
+            let pattern = &mut window.human_patterns[pattern_index];
+            pattern.secret.extend_from_slice(bytes);
+            pattern.matched = false;
         }
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
@@ -529,32 +512,281 @@ impl RxShared {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         window.human_writes_in_flight = window.human_writes_in_flight.saturating_sub(1);
         if line_finished && window.human_generation == Some(generation) {
+            if let Some(pattern_index) = window.human_current_pattern {
+                if let Some(pattern) = window.human_patterns.get_mut(pattern_index) {
+                    pattern.input_open = false;
+                }
+            }
             window.human_line_open = false;
+            window.human_current_pattern = None;
         }
+        Self::clear_matched_human_patterns_if_ready(&mut window);
     }
 
     fn finish_human_secret_echo_line(&self, generation: u64) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if window.human_generation == Some(generation) {
+            if let Some(pattern_index) = window.human_current_pattern {
+                if let Some(pattern) = window.human_patterns.get_mut(pattern_index) {
+                    pattern.input_open = false;
+                }
+            }
             window.human_line_open = false;
+            window.human_current_pattern = None;
         }
+        Self::clear_matched_human_patterns_if_ready(&mut window);
     }
 
     fn truncate_human_secret_echo(&self, generation: u64, len: usize) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if window.human_generation == Some(generation) && !window.overflow_mask_line {
-            let target = if window.queued_human.is_empty() {
-                window.armed.as_mut()
-            } else {
-                window.queued_human.back_mut()
-            };
-            if let Some(armed) = target.filter(|armed| armed.dynamic) {
-                armed.secret.truncate(len);
+        if window.human_generation == Some(generation) && !window.human_fallback_active {
+            if let Some(pattern_index) = window.human_current_pattern {
+                if let Some(pattern) = window.human_patterns.get_mut(pattern_index) {
+                    pattern.secret.truncate(len);
+                    pattern.matched = false;
+                    if pattern.secret.is_empty() {
+                        pattern.matched = true;
+                    }
+                }
             }
         }
+        Self::clear_matched_human_patterns_if_ready(&mut window);
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
+    }
+
+    fn add_human_fallback_prefix(window: &mut SecretEchoWindow, byte: u8) {
+        let bucket = usize::from(byte / 64);
+        let bit = 1u64 << (byte % 64);
+        window.human_fallback_prefixes[bucket] |= bit;
+    }
+
+    fn has_human_fallback_prefix(window: &SecretEchoWindow, byte: u8) -> bool {
+        let bucket = usize::from(byte / 64);
+        let bit = 1u64 << (byte % 64);
+        window.human_fallback_prefixes[bucket] & bit != 0
+    }
+
+    fn enter_human_fallback(
+        window: &mut SecretEchoWindow,
+        additional: &[u8],
+    ) -> Vec<u8> {
+        let prefixes = window
+            .human_patterns
+            .iter()
+            .filter_map(|pattern| pattern.secret.first().copied())
+            .collect::<Vec<_>>();
+        for first in prefixes {
+            Self::add_human_fallback_prefix(window, first);
+        }
+        if let Some(pattern_index) = window.human_current_pattern {
+            if window.human_patterns[pattern_index].secret.is_empty() {
+                if let Some(&first) = additional.first() {
+                    Self::add_human_fallback_prefix(window, first);
+                }
+            }
+        } else if let Some(&first) = additional.first() {
+            Self::add_human_fallback_prefix(window, first);
+        }
+        for pattern in &mut window.human_patterns {
+            pattern.secret.fill(0);
+        }
+        window.human_patterns.clear();
+        window.human_current_pattern = None;
+        window.human_ready_to_clear = false;
+        window.human_fallback_active = true;
+        window.human_fallback_masking_line = !window.human_pending.is_empty();
+        window.human_pending
+            .drain(..)
+            .map(|_| b'*')
+            .collect()
+    }
+
+    fn mask_human_pending(window: &mut SecretEchoWindow) {
+        for _ in window.human_pending.drain(..) {
+            window
+                .released
+                .push_back(ReleasedSecretByte { byte: b'*' });
+        }
+    }
+
+    fn clear_human_patterns(window: &mut SecretEchoWindow) {
+        for pattern in &mut window.human_patterns {
+            pattern.secret.fill(0);
+        }
+        window.human_patterns.clear();
+        window.human_pending.clear();
+        window.human_current_pattern = None;
+        window.human_ready_to_clear = false;
+    }
+
+    fn clear_matched_human_patterns_if_ready(window: &mut SecretEchoWindow) {
+        if window.human_ready_to_clear
+            && window.human_writes_in_flight == 0
+            && !window.human_line_open
+        {
+            Self::clear_human_patterns(window);
+        }
+    }
+
+    fn mask_human_secret_echo(
+        window: &mut SecretEchoWindow,
+        data: &[u8],
+    ) -> MaskedRxChunk {
+        let mut visible = Vec::with_capacity(data.len());
+        for (data_index, &byte) in data.iter().enumerate() {
+            if window.human_fallback_active {
+                if matches!(byte, b'\r' | b'\n') {
+                    visible.push(byte);
+                    window.human_fallback_masking_line = false;
+                    continue;
+                }
+                if window.human_fallback_masking_line {
+                    visible.push(b'*');
+                } else if Self::has_human_fallback_prefix(window, byte) {
+                    window.human_fallback_masking_line = true;
+                    visible.push(b'*');
+                } else {
+                    visible.push(byte);
+                }
+                continue;
+            }
+
+            if matches!(byte, b'\r' | b'\n') {
+                let pending = window
+                    .human_pending
+                    .iter()
+                    .map(|pending| pending.byte)
+                    .collect::<Vec<_>>();
+                for pattern in &mut window.human_patterns {
+                    if !pending.is_empty() && pattern.secret == pending {
+                        pattern.matched = true;
+                        pattern.prefix_seen = true;
+                    }
+                }
+                for pending in window.human_pending.drain(..) {
+                    visible.push(if pending.masked { b'*' } else { pending.byte });
+                }
+                visible.push(byte);
+                let mut next_line_start = data_index + 1;
+                if byte == b'\r' && data.get(next_line_start) == Some(&b'\n') {
+                    next_line_start += 1;
+                }
+                let next_line = &data[next_line_start..];
+                for pattern in &mut window.human_patterns {
+                    let prefix_len = next_line.len().min(pattern.secret.len());
+                    if prefix_len > 0 && next_line[..prefix_len] == pattern.secret[..prefix_len] {
+                        pattern.prefix_seen = true;
+                    }
+                }
+                let any_prefix_seen = window
+                    .human_patterns
+                    .iter()
+                    .any(|pattern| pattern.prefix_seen);
+                let all_patterns_matched = !window.human_patterns.is_empty()
+                    && window.human_patterns.iter().all(|pattern| pattern.matched);
+                if (!any_prefix_seen || all_patterns_matched)
+                    && window.human_writes_in_flight == 0
+                    && !window.human_line_open
+                {
+                    window.human_ready_to_clear = true;
+                    Self::clear_matched_human_patterns_if_ready(window);
+                }
+                continue;
+            }
+
+            let stored_len = window
+                .human_patterns
+                .iter()
+                .map(|pattern| pattern.secret.len())
+                .sum::<usize>()
+                .saturating_add(window.human_pending.len());
+            if stored_len.saturating_add(1) > HUMAN_SECRET_ECHO_MAX_BYTES {
+                visible.extend(Self::enter_human_fallback(window, &[]));
+                if Self::has_human_fallback_prefix(window, byte) {
+                    window.human_fallback_masking_line = true;
+                    visible.push(b'*');
+                } else if window.human_fallback_masking_line {
+                    visible.push(b'*');
+                } else {
+                    visible.push(byte);
+                }
+                continue;
+            }
+
+            window.human_pending.push(PendingHumanEchoByte {
+                byte,
+                masked: false,
+            });
+            loop {
+                if window.human_pending.is_empty() {
+                    break;
+                }
+                let candidate = window
+                    .human_pending
+                    .iter()
+                    .map(|pending| pending.byte)
+                    .collect::<Vec<_>>();
+                let candidate_len = candidate.len();
+                let mut prefix_matches = Vec::new();
+                let mut exact_matches = Vec::new();
+                for (index, pattern) in window.human_patterns.iter().enumerate() {
+                    if pattern.secret.len() >= candidate_len
+                        && pattern.secret[..candidate_len] == candidate
+                    {
+                        prefix_matches.push(index);
+                        if pattern.secret.len() == candidate_len {
+                            exact_matches.push(index);
+                        }
+                    }
+                }
+                if !prefix_matches.is_empty() {
+                    for pending in &mut window.human_pending {
+                        pending.masked = true;
+                    }
+                    for index in &prefix_matches {
+                        let pattern = &mut window.human_patterns[*index];
+                        pattern.prefix_seen = true;
+                        if exact_matches.contains(index) && !pattern.input_open {
+                            pattern.matched = true;
+                        }
+                    }
+                    if exact_matches
+                        .iter()
+                        .any(|index| window.human_patterns[*index].input_open)
+                    {
+                        break;
+                    }
+                    if !exact_matches.is_empty() {
+                        let retained_len = (1..candidate_len)
+                            .rev()
+                            .find(|length| {
+                                window.human_patterns.iter().any(|pattern| {
+                                    pattern.secret.len() > *length
+                                        && pattern.secret[..*length]
+                                            == candidate[candidate_len - *length..]
+                                })
+                            })
+                            .unwrap_or_default();
+                        let flush_len = candidate_len - retained_len;
+                        for _ in 0..flush_len {
+                            let pending = window.human_pending.remove(0);
+                            visible.push(if pending.masked { b'*' } else { pending.byte });
+                        }
+                        continue;
+                    }
+                    break;
+                }
+
+                let pending = window.human_pending.remove(0);
+                visible.push(if pending.masked { b'*' } else { pending.byte });
+            }
+        }
+        MaskedRxChunk {
+            rx_window: visible.clone(),
+            bytes: visible,
+        }
     }
 
     pub(crate) fn human_password_window_active(&self) -> bool {
@@ -593,133 +825,14 @@ impl RxShared {
         let mut index = 0;
         while index < data.len() {
             let byte = data[index];
-            if window.overflow_mask_line {
-                let crlf_tail = window.overflow_after_cr && byte == b'\n';
-                window.overflow_after_cr = false;
-                if matches!(byte, b'\r' | b'\n') {
-                    visible.push(byte);
-                    rx_window.push(byte);
-                    if !crlf_tail {
-                        if window.human_writes_in_flight == 0 {
-                            window.human_echo_lines_pending =
-                                window.human_echo_lines_pending.saturating_sub(1);
-                        }
-                        window.overflow_after_cr = byte == b'\r';
-                    }
-                    if window.human_echo_lines_pending == 0
-                        && window.human_writes_in_flight == 0
-                    {
-                        window.overflow_mask_line = false;
-                        window.human_generation = None;
-                        window.human_line_open = false;
-                        window.overflow_after_cr = false;
-                        if let Some(mut armed) = window.armed.take() {
-                            armed.secret.fill(0);
-                            armed.pending.fill(0);
-                        }
-                        window.queued_human.clear();
-                    }
-                } else {
-                    visible.push(b'*');
-                    rx_window.push(b'*');
-                }
-                index += 1;
-                continue;
-            }
-
             let Some(mut armed) = window.armed.take() else {
                 visible.extend_from_slice(&data[index..]);
                 rx_window.extend_from_slice(&data[index..]);
                 break;
             };
-            if armed.dynamic && armed.after_cr {
-                armed.after_cr = false;
-                if byte == b'\n' {
-                    visible.push(byte);
-                    rx_window.push(byte);
-                    index += 1;
-                    window.armed = Some(armed);
-                    continue;
-                }
-            }
-            if armed.dynamic && matches!(byte, b'\r' | b'\n') {
-                let pending_len = armed.pending.len();
-                visible.resize(visible.len().saturating_add(pending_len), b'*');
-                rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
-                armed.pending.fill(0);
-                armed.pending.clear();
-                visible.push(byte);
-                rx_window.push(byte);
-                index += 1;
-                let next_line_start = if byte == b'\r' && data.get(index) == Some(&b'\n') {
-                    index + 1
-                } else {
-                    index
-                };
-                let next_line = &data[next_line_start..];
-                let next_prefix_len = next_line.len().min(armed.secret.len());
-                let next_line_has_secret_prefix = next_prefix_len > 0
-                    && next_line[..next_prefix_len] == armed.secret[..next_prefix_len];
-                let full_match = pending_len == armed.secret.len();
-                let safe_to_advance = full_match
-                    || (window.human_writes_in_flight == 0
-                        && pending_len == 0
-                        && !next_line_has_secret_prefix);
-                if safe_to_advance {
-                    window.human_echo_lines_pending =
-                        window.human_echo_lines_pending.saturating_sub(1);
-                    if let Some(mut next) = window.queued_human.pop_front() {
-                        armed.secret.fill(0);
-                        armed.pending.fill(0);
-                        next.after_cr = byte == b'\r';
-                        window.armed = Some(next);
-                        continue;
-                    }
-                    armed.secret.fill(0);
-                    if window.human_echo_lines_pending == 0 {
-                        window.human_generation = None;
-                        window.human_line_open = false;
-                        if index < data.len() {
-                            visible.extend_from_slice(&data[index..]);
-                            rx_window.extend_from_slice(&data[index..]);
-                        }
-                        break;
-                    }
-                    window.overflow_mask_line = true;
-                    window.overflow_after_cr = byte == b'\r';
-                    window.armed = Some(empty_human_secret_echo());
-                    continue;
-                }
-                // 未決前綴跨 CR/LF 時保留 matcher；CRLF 是一個行尾，第二個 byte 不得再次清除。
-                // 若同一讀取 chunk 的下一行已以 secret 前綴開始，也要略過此前緩衝的舊行尾。
-                armed.after_cr = byte == b'\r';
-                armed.rx_line_ended = true;
-                window.armed = Some(armed);
-                continue;
-            }
 
             let mut prior_prefix_len = armed.pending.len();
             armed.pending.push(byte);
-            if armed.rx_line_ended
-                && !armed.secret.starts_with(&armed.pending)
-                && window
-                    .queued_human
-                    .front()
-                    .is_some_and(|next| next.secret.starts_with(&armed.pending))
-            {
-                let pending = std::mem::take(&mut armed.pending);
-                armed.secret.fill(0);
-                window.human_echo_lines_pending =
-                    window.human_echo_lines_pending.saturating_sub(1);
-                let mut next = window
-                    .queued_human
-                    .pop_front()
-                    .expect("queued human matcher exists");
-                next.pending = pending;
-                window.armed = Some(next);
-                index += 1;
-                continue;
-            }
             while !armed.secret.starts_with(&armed.pending) {
                 let released = armed.pending.remove(0);
                 if prior_prefix_len > 0 {
@@ -731,7 +844,7 @@ impl RxShared {
                     rx_window.push(released);
                 }
             }
-            if armed.pending.len() == armed.secret.len() && !armed.dynamic {
+            if armed.pending.len() == armed.secret.len() {
                 let matched_len = armed.secret.len();
                 visible.resize(visible.len().saturating_add(matched_len), b'*');
                 rx_window.resize(rx_window.len().saturating_add(matched_len), b'*');
@@ -745,6 +858,10 @@ impl RxShared {
             window.armed = Some(armed);
             index += 1;
         }
+
+        let human_masked = Self::mask_human_secret_echo(&mut window, &visible);
+        visible = human_masked.bytes;
+        rx_window = human_masked.rx_window;
 
         drop(window);
         if !data.is_empty() {
@@ -783,17 +900,15 @@ impl RxShared {
             armed.secret.fill(0);
             armed.pending.clear();
         }
-        while let Some(mut queued) = window.queued_human.pop_front() {
-            unresolved |= !queued.pending.is_empty();
-            queued.secret.fill(0);
-            queued.pending.clear();
-        }
+        unresolved |= !window.human_pending.is_empty();
+        Self::clear_human_patterns(&mut window);
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
-        window.human_echo_lines_pending = 0;
-        window.overflow_mask_line = false;
-        window.overflow_after_cr = false;
+        window.human_current_pattern = None;
+        window.human_fallback_prefixes = [0; 4];
+        window.human_fallback_active = false;
+        window.human_fallback_masking_line = false;
         let mut bytes = Vec::new();
         let mut rx_window = Vec::new();
         for released in window.released.drain(..) {
@@ -812,16 +927,15 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut armed);
             armed.secret.fill(0);
         }
-        while let Some(mut queued) = window.queued_human.pop_front() {
-            Self::mask_pending(&mut window, &mut queued);
-            queued.secret.fill(0);
-        }
+        Self::mask_human_pending(&mut window);
+        Self::clear_human_patterns(&mut window);
         window.human_generation = None;
         window.human_writes_in_flight = 0;
         window.human_line_open = false;
-        window.human_echo_lines_pending = 0;
-        window.overflow_mask_line = false;
-        window.overflow_after_cr = false;
+        window.human_current_pattern = None;
+        window.human_fallback_prefixes = [0; 4];
+        window.human_fallback_active = false;
+        window.human_fallback_masking_line = false;
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
@@ -840,16 +954,22 @@ impl RxShared {
             .as_ref()
             .map(|armed| armed.secret.len().saturating_add(armed.pending.len()))
             .unwrap_or_default();
-        let queued = window
-            .queued_human
+        let human = window
+            .human_patterns
             .iter()
-            .map(|armed| armed.secret.len().saturating_add(armed.pending.len()))
-            .sum::<usize>();
+            .map(|pattern| pattern.secret.len())
+            .sum::<usize>()
+            .saturating_add(window.human_pending.len())
+            .saturating_add(if window.human_fallback_active {
+                std::mem::size_of_val(&window.human_fallback_prefixes)
+            } else {
+                0
+            });
         window
             .released
             .len()
             .saturating_add(armed)
-            .saturating_add(queued)
+            .saturating_add(human)
     }
 
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
