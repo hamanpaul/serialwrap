@@ -49,6 +49,11 @@ struct ActorDispatchGateState {
     dispatching: bool,
     decision_waiters: usize,
     decision_active: bool,
+    human_enqueue_active: bool,
+    rescue_pending: usize,
+    human_submit_start_count: u64,
+    human_in_flight: usize,
+    human_tx_generation: u64,
     #[cfg(feature = "test-fakes")]
     actor_waits: u64,
     #[cfg(feature = "test-fakes")]
@@ -74,6 +79,10 @@ impl ActorDispatchGate {
             #[cfg(feature = "test-fakes")]
             hook: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn new_for_session() -> Arc<Self> {
+        Self::new()
     }
 
     fn event(&self, event: ActorDispatchGateEvent) {
@@ -111,14 +120,14 @@ impl ActorDispatchGate {
     fn enter_timeout_decision(self: &Arc<Self>) -> ActorDispatchGuard {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.decision_waiters = state.decision_waiters.saturating_add(1);
-        if state.dispatching || state.decision_active {
+        if state.dispatching || state.decision_active || state.human_enqueue_active {
             #[cfg(feature = "test-fakes")]
             {
                 state.decision_waits = state.decision_waits.saturating_add(1);
             }
             self.event(ActorDispatchGateEvent::DecisionWaiting);
         }
-        while state.dispatching || state.decision_active {
+        while state.dispatching || state.decision_active || state.human_enqueue_active {
             state = self
                 .changed
                 .wait(state)
@@ -131,6 +140,52 @@ impl ActorDispatchGate {
             gate: Arc::clone(self),
             decision: true,
         }
+    }
+
+    fn enter_human_enqueue(self: &Arc<Self>) -> HumanEnqueueGuard {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.decision_waiters > 0
+            || state.decision_active
+            || state.rescue_pending > 0
+            || state.human_enqueue_active
+        {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.human_enqueue_active = true;
+        HumanEnqueueGuard { gate: Arc::clone(self) }
+    }
+
+    fn reserve_rescue(self: &Arc<Self>) -> HumanSubmitRescueGuard {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.rescue_pending = state.rescue_pending.saturating_add(1);
+        HumanSubmitRescueGuard { gate: Arc::clone(self), active: true }
+    }
+
+    fn note_human_in_flight(&self, delta: isize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if delta >= 0 {
+            state.human_in_flight = state.human_in_flight.saturating_add(delta as usize);
+        } else {
+            state.human_in_flight = state.human_in_flight.saturating_sub(delta.unsigned_abs());
+        }
+    }
+
+    fn note_human_submit_start(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.human_submit_start_count = state.human_submit_start_count.saturating_add(1);
+    }
+
+    fn note_human_tx_generation(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.human_tx_generation = state.human_tx_generation.saturating_add(1);
+    }
+
+    fn human_signals(&self) -> (u64, usize, u64) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (state.human_submit_start_count, state.human_in_flight, state.human_tx_generation)
     }
 
     #[cfg(feature = "test-fakes")]
@@ -148,6 +203,19 @@ impl ActorDispatchGate {
 pub struct ActorDispatchGuard {
     gate: Arc<ActorDispatchGate>,
     decision: bool,
+}
+
+struct HumanEnqueueGuard {
+    gate: Arc<ActorDispatchGate>,
+}
+
+impl Drop for HumanEnqueueGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.human_enqueue_active = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
 }
 
 impl Drop for ActorDispatchGuard {
@@ -319,7 +387,6 @@ impl RxWindow {
 /// RX 視窗（絕對偏移；跨 epoch 的 watermark 以 `(epoch, rx_seq)` 表示）。
 pub struct RxShared {
     inner: Mutex<RxWindow>,
-    human_submit_rescue_gate: Mutex<()>,
     actor_dispatch_gate: Arc<ActorDispatchGate>,
     changed: Condvar,
     /// P7 Task 3：`wait_for_regex_cancellable` 的喚醒通道（append／clear／`RunCancel::trigger` 時 `try_send`）。
@@ -401,14 +468,22 @@ pub struct RxShared {
 
 impl RxShared {
     pub fn new(max_chars: usize, created_mono: u64) -> Arc<RxShared> {
+        Self::new_with_actor_dispatch_gate(max_chars, created_mono, ActorDispatchGate::new())
+    }
+
+    /// 建立同一 session 的新 epoch RX；actor dispatch 與 timeout 決策沿用 session gate。
+    pub fn new_with_actor_dispatch_gate(
+        max_chars: usize,
+        created_mono: u64,
+        actor_dispatch_gate: Arc<ActorDispatchGate>,
+    ) -> Arc<RxShared> {
         Arc::new(RxShared {
             inner: Mutex::new(RxWindow {
                 max_chars,
                 last_rx_mono: created_mono,
                 ..RxWindow::default()
             }),
-            human_submit_rescue_gate: Mutex::new(()),
-            actor_dispatch_gate: ActorDispatchGate::new(),
+            actor_dispatch_gate,
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
@@ -484,24 +559,40 @@ impl RxShared {
 
     /// 對 writer enqueue 與 timeout rescue 決策互斥。計數只在 enqueue 成功後更新；guard 已提供
     /// 在途訊號，故 writer 可在計數更新前開始處理而不會被誤判為無 human。
-    pub(crate) fn with_human_submit_gate<T, E>(
+    pub(crate) fn with_human_submit_gate<T>(
         &self,
         in_flight: &mut HumanInFlightGuard,
-        enqueue: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, ()> {
-        let rescue_guard = self
-            .human_submit_rescue_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let result = enqueue();
-        if result.is_ok() {
-            in_flight.mark_human_submit_started();
+        mut job: T,
+        mut try_enqueue: impl FnMut(T) -> Result<(), crate::tx_writer::QueueEnqueueError<T>>,
+        mut capacity_generation: impl FnMut() -> u64,
+        mut wait_for_capacity: impl FnMut(u64),
+    ) -> Result<(), ()> {
+        loop {
+            // gate 內只執行非阻塞 try_send。
+            let enqueue_guard = self.actor_dispatch_gate.enter_human_enqueue();
+            let observed_capacity = capacity_generation();
+            match try_enqueue(job) {
+                Ok(()) => {
+                    in_flight.mark_human_submit_started();
+                    drop(enqueue_guard);
+                    return Ok(());
+                }
+                Err(crate::tx_writer::QueueEnqueueError::Full(returned)) => {
+                    job = *returned;
+                    drop(enqueue_guard);
+                    // 等待 writer 容量時不持有救援 gate 或 dispatch gate。
+                    wait_for_capacity(observed_capacity);
+                }
+                Err(crate::tx_writer::QueueEnqueueError::Disconnected) => {
+                    drop(enqueue_guard);
+                    return Err(());
+                }
+            }
         }
-        drop(rescue_guard);
-        result.map_err(|_| ())
     }
 
     fn register_human_in_flight(&self) {
+        self.actor_dispatch_gate.note_human_in_flight(1);
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.human_in_flight = window.human_in_flight.saturating_add(1);
         window.revision = window.revision.saturating_add(1);
@@ -510,6 +601,7 @@ impl RxShared {
     }
 
     fn register_human_submit_start(&self) {
+        self.actor_dispatch_gate.note_human_submit_start();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
         window.revision = window.revision.saturating_add(1);
@@ -526,36 +618,51 @@ impl RxShared {
 
     /// Timeout 決策與第一個救援鍵排入 writer 之間，阻止新的 human submit 起點插入。
     pub(crate) fn begin_timeout_rescue(
-        &self,
+        self: &Arc<Self>,
         command_start_count: u64,
         command_human_generation: u64,
-    ) -> (HumanSubmitRescueGuard<'_>, bool) {
+    ) -> (HumanSubmitRescueGuard, bool) {
         #[cfg(feature = "test-fakes")]
         self.timeout_rescue_attempt_hook_for_test();
-        let guard = self
-            .human_submit_rescue_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // Lock order: rescue gate → dispatch decision reservation → RX inner. The reservation only
-        // blocks actor dispatch admission; it holds no manager/custody lock or state mutex while reading.
+        // 等待 dispatch 或 human enqueue 前先發布 timeout 意圖；後續 human producer 必須讓此決策先選定結果。
         let dispatch_guard = self.actor_dispatch_gate.enter_timeout_decision();
+        let (submit_start_count, human_in_flight, human_generation) =
+            self.actor_dispatch_gate.human_signals();
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let human_submit_seen = window.human_submit_start_count > command_start_count
+        let human_submit_seen = submit_start_count > command_start_count
+            || human_in_flight > 0
+            || window.human_submit_start_count > command_start_count
             || window.human_in_flight > 0
             || window.tx_submit_pending
+            || human_generation > command_human_generation
             || window.human_tx_generation > command_human_generation;
         drop(window);
+        let rescue_guard = if human_submit_seen {
+            HumanSubmitRescueGuard { gate: Arc::clone(&self.actor_dispatch_gate), active: false }
+        } else {
+            self.actor_dispatch_gate.reserve_rescue()
+        };
         drop(dispatch_guard);
         #[cfg(feature = "test-fakes")]
         self.timeout_rescue_read_hook_for_test();
-        (HumanSubmitRescueGuard { _guard: guard }, human_submit_seen)
+        (rescue_guard, human_submit_seen)
+    }
+
+    /// 以正式 timeout 線性化讀取器驗證任一 bridge epoch 的 session 訊號。
+    #[cfg(feature = "test-fakes")]
+    pub fn timeout_rescue_human_seen_for_test(
+        self: &Arc<Self>,
+        command_start_count: u64,
+        command_human_generation: u64,
+    ) -> bool {
+        let (rescue_guard, human_seen) =
+            self.begin_timeout_rescue(command_start_count, command_human_generation);
+        drop(rescue_guard);
+        human_seen
     }
 
     pub(crate) fn human_submit_start_count(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .human_submit_start_count
+        self.actor_dispatch_gate.human_signals().0
     }
 
     #[cfg(test)]
@@ -573,18 +680,12 @@ impl RxShared {
 
     #[cfg(feature = "test-fakes")]
     pub fn human_submit_start_count_for_test(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .human_submit_start_count
+        self.actor_dispatch_gate.human_signals().0
     }
 
     #[cfg(feature = "test-fakes")]
     pub fn human_in_flight_for_test(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .human_in_flight
+        self.actor_dispatch_gate.human_signals().1
     }
 
     #[cfg(feature = "test-fakes")]
@@ -644,19 +745,27 @@ impl RxShared {
     }
 
     #[cfg(feature = "test-fakes")]
-    pub fn submit_human_for_test<T, E>(
+    pub fn submit_human_job_for_test(
         self: &Arc<Self>,
-        enqueue: impl FnOnce() -> Result<T, E>,
-    ) -> Option<(T, HumanInFlightGuard)> {
+        tx: &crate::tx_writer::TxWriterHandle,
+        job: crate::tx_writer::TxJob,
+    ) -> Option<((), HumanInFlightGuard)> {
         let mut guard = self.begin_human_submit();
-        self.with_human_submit_gate(&mut guard, enqueue)
-            .ok()
-            .map(|value| (value, guard))
+        self.with_human_submit_gate(
+            &mut guard,
+            job,
+            |job| tx.try_enqueue_job(job),
+            || tx.capacity_generation(),
+            |generation| tx.wait_for_capacity(generation),
+        )
+        .ok()
+        .map(|()| ((), guard))
     }
 
     #[cfg(feature = "test-fakes")]
     pub fn timeout_rescue_gate_available_for_test(&self) -> bool {
-        self.human_submit_rescue_gate.try_lock().is_ok()
+        let state = self.actor_dispatch_gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        !state.human_enqueue_active && state.rescue_pending == 0
     }
 
     #[cfg(feature = "test-fakes")]
@@ -1105,8 +1214,11 @@ impl RxShared {
 
     /// 回傳最近可信 human TX 世代、其 TX 前 RX offset 與目前 raw 輸入是否仍是半行。
     pub fn human_tx_state(&self) -> HumanTxState {
+        let generation = self.actor_dispatch_gate.human_signals().2;
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        human_tx_state(&window)
+        let mut state = human_tx_state(&window);
+        state.generation = generation;
+        state
     }
 
     /// 測試控制尚未完成的 submit 窗口；用於重現 OS submit 與 human TX observer 登錄間的交錯。
@@ -1131,6 +1243,7 @@ impl RxShared {
         record_human_tx_locked(&mut window, payload, true, rx_offset, event_mono);
         window.revision = window.revision.saturating_add(1);
         drop(window);
+        self.actor_dispatch_gate.note_human_tx_generation();
         drop(submit_guard);
         self.wake_all();
     }
@@ -1145,11 +1258,17 @@ impl RxShared {
         clock: &dyn Clock,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
+        let (session_submit_count, _, session_generation) =
+            self.actor_dispatch_gate.human_signals();
         let (candidate_boundary, candidate_human_rx_offset) = {
             let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let boundary = command_op_id
-                .filter(|_| !command_boundary_recorded)
-                .map(|_| command_boundary(&window));
+            let boundary = command_op_id.filter(|_| !command_boundary_recorded).map(|_| {
+                let mut boundary = command_boundary(&window);
+                boundary.human_submit_start_count = session_submit_count;
+                boundary.human_tx_state.generation = session_generation;
+                boundary.human_snapshot.human_tx_state.generation = session_generation;
+                boundary
+            });
             let human_rx_offset = human_payload.map(|_| {
                 window
                     .trimmed
@@ -1172,42 +1291,47 @@ impl RxShared {
         let mut boundary_recorded = command_boundary_recorded;
 
         if submitted {
-            let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let event_mono = clock.mono_ns();
-            if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
-                if !command_boundary_recorded {
-                    window.human_tx_events.clear();
-                    window.command_tx_boundary = Some((op_id, boundary));
-                    boundary_recorded = true;
+            {
+                let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                let event_mono = clock.mono_ns();
+                if let (Some(op_id), Some(boundary)) = (command_op_id, candidate_boundary) {
+                    if !command_boundary_recorded {
+                        window.human_tx_events.clear();
+                        window.command_tx_boundary = Some((op_id, boundary));
+                        boundary_recorded = true;
+                    }
                 }
-            }
-            match (human_payload, &step) {
-                (Some((payload, raw_input, offset)), SubmitStep::Accepted(count)) if *count > 0 => {
-                    let start = offset.min(payload.len());
-                    let end = start.saturating_add(*count).min(payload.len());
-                    if end > start {
+                match (human_payload, &step) {
+                    (Some((payload, raw_input, offset)), SubmitStep::Accepted(count)) if *count > 0 => {
+                        let start = offset.min(payload.len());
+                        let end = start.saturating_add(*count).min(payload.len());
+                        if end > start {
+                            let rx_offset = candidate_human_rx_offset
+                                .expect("human submit 前應擷取 RX offset");
+                            record_human_tx_locked(
+                                &mut window,
+                                &payload[start..end],
+                                raw_input,
+                                rx_offset,
+                                event_mono,
+                            );
+                        }
+                    }
+                    (Some((_, raw_input, _)), SubmitStep::Pending) => {
                         let rx_offset = candidate_human_rx_offset
                             .expect("human submit 前應擷取 RX offset");
-                        record_human_tx_locked(
+                        record_human_tx_unknown_locked(
                             &mut window,
-                            &payload[start..end],
                             raw_input,
                             rx_offset,
                             event_mono,
                         );
                     }
+                    _ => {}
                 }
-                (Some((_, raw_input, _)), SubmitStep::Pending) => {
-                    let rx_offset =
-                        candidate_human_rx_offset.expect("human submit 前應擷取 RX offset");
-                    record_human_tx_unknown_locked(
-                        &mut window,
-                        raw_input,
-                        rx_offset,
-                        event_mono,
-                    );
-                }
-                _ => {}
+            }
+            if human_payload.is_some() {
+                self.actor_dispatch_gate.note_human_tx_generation();
             }
         }
 
@@ -1680,8 +1804,9 @@ pub struct HumanInFlightGuard {
 }
 
 /// human submit 起點與 timeout 救援排程共用的短期仲裁鎖。
-pub(crate) struct HumanSubmitRescueGuard<'a> {
-    _guard: std::sync::MutexGuard<'a, ()>,
+pub(crate) struct HumanSubmitRescueGuard {
+    gate: Arc<ActorDispatchGate>,
+    active: bool,
 }
 
 impl Drop for TxSubmitPendingGuard<'_> {
@@ -1714,6 +1839,7 @@ impl Drop for TxSubmitPendingGuard<'_> {
 
 impl Drop for HumanInFlightGuard {
     fn drop(&mut self) {
+        self.rx.actor_dispatch_gate.note_human_in_flight(-1);
         let mut window = self.rx.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.human_in_flight = window.human_in_flight.saturating_sub(1);
         window.revision = window.revision.saturating_add(1);
@@ -1732,6 +1858,22 @@ impl HumanInFlightGuard {
         #[cfg(feature = "test-fakes")]
         self.rx.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
         self.submit_started = true;
+    }
+
+    pub(crate) fn belongs_to(&self, rx: &Arc<RxShared>) -> bool {
+        Arc::ptr_eq(&self.rx, rx)
+    }
+}
+
+impl Drop for HumanSubmitRescueGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.gate.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.rescue_pending = state.rescue_pending.saturating_sub(1);
+        drop(state);
+        self.gate.changed.notify_all();
     }
 }
 
@@ -2786,4 +2928,67 @@ pub fn wait_for_rx_dispatch_with_timeout_for_test(
     timeout: Duration,
 ) -> Result<(), PalError> {
     wait_for_rx_dispatch_with_timeout(safety, epoch, rx_seq, timeout)
+}
+
+#[cfg(all(test, feature = "test-fakes"))]
+mod r15_tests {
+    use super::RxShared;
+    use crossbeam_channel::bounded;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn i294_r15_blocked_human_enqueue_does_not_hold_rescue_gate() {
+        let rx = RxShared::new(1024, 0);
+        let (jobs_tx, jobs_rx) = bounded(1);
+        jobs_tx.send(10_u8).expect("先佔滿 writer queue");
+        let (capacity_wait_tx, capacity_wait_rx) = bounded(1);
+        let (capacity_release_tx, capacity_release_rx) = bounded(1);
+        let producer_rx = Arc::clone(&rx);
+        let producer = std::thread::spawn(move || {
+            let mut in_flight = producer_rx.begin_human_submit();
+            let result = producer_rx.with_human_submit_gate(
+                &mut in_flight,
+                20_u8,
+                |job| {
+                    jobs_tx.try_send(job).map_err(|error| match error {
+                        crossbeam_channel::TrySendError::Full(job) => {
+                            crate::tx_writer::QueueEnqueueError::Full(Box::new(job))
+                        }
+                        crossbeam_channel::TrySendError::Disconnected(_) => {
+                            crate::tx_writer::QueueEnqueueError::Disconnected
+                        }
+                    })
+                },
+                || 0,
+                |_| {
+                    capacity_wait_tx.send(()).expect("容量等待 hook");
+                    capacity_release_rx.recv().expect("釋放容量等待");
+                },
+            );
+            drop(in_flight);
+            result
+        });
+
+        capacity_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer queue 滿載後 producer 已在 gate 外等待容量");
+        assert!(rx.timeout_rescue_gate_available_for_test());
+
+        let decision_rx = Arc::clone(&rx);
+        let decision = std::thread::spawn(move || {
+            decision_rx.timeout_rescue_human_seen_for_test(0, 0)
+        });
+        assert!(
+            decision.join().expect("timeout decision thread 正常結束"),
+            "尚未排入 writer 的 HumanInFlightGuard 仍須使決策選 human tuple"
+        );
+        assert_eq!(jobs_rx.recv().expect("取出 queue blocker"), 10);
+        capacity_release_tx.send(()).expect("producer 等待容量中");
+        assert_eq!(
+            jobs_rx.recv_timeout(Duration::from_secs(5)).expect("human job 重試後入列"),
+            20
+        );
+        assert!(producer.join().expect("producer thread 正常結束").is_ok());
+    }
 }

@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -1014,6 +1014,126 @@ pub struct TxJob {
     pub aggregate: Option<AggregateOp>,
 }
 
+pub(crate) enum QueueEnqueueError<T> {
+    Full(Box<T>),
+    Disconnected,
+}
+
+#[cfg(feature = "test-fakes")]
+type TxQueueEnqueueHook = Arc<dyn Fn(TxClass, OpId) + Send + Sync>;
+
+struct TxQueueCapacityState {
+    generation: u64,
+    closed: bool,
+}
+
+/// writer queue 容量通知。Human producer 在 session enqueue reservation 外等待世代變化，
+/// 因此有界 queue 滿載時不會持有救援 gate。
+pub(crate) struct TxQueueCapacity {
+    state: Mutex<TxQueueCapacityState>,
+    changed: Condvar,
+    #[cfg(feature = "test-fakes")]
+    wait_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(feature = "test-fakes")]
+    enqueue_hook: Mutex<Option<TxQueueEnqueueHook>>,
+}
+
+impl TxQueueCapacity {
+    fn new() -> Arc<TxQueueCapacity> {
+        Arc::new(TxQueueCapacity {
+            state: Mutex::new(TxQueueCapacityState { generation: 0, closed: false }),
+            changed: Condvar::new(),
+            #[cfg(feature = "test-fakes")]
+            wait_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            enqueue_hook: Mutex::new(None),
+        })
+    }
+
+    fn notify_capacity(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn try_enqueue(
+        &self,
+        jobs: &Sender<TxJob>,
+        job: TxJob,
+    ) -> Result<(), QueueEnqueueError<TxJob>> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(QueueEnqueueError::Disconnected);
+        }
+        let class = job.permit.class;
+        let op_id = job.permit.op_id;
+        match jobs.try_send(job) {
+            Ok(()) => {
+                self.record_enqueue(class, op_id);
+                Ok(())
+            }
+            Err(crossbeam_channel::TrySendError::Full(job)) => {
+                Err(QueueEnqueueError::Full(Box::new(job)))
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(QueueEnqueueError::Disconnected),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).generation
+    }
+
+    fn wait_for_change(&self, observed: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(feature = "test-fakes")]
+        if state.generation == observed && !state.closed {
+            let hook = self.wait_hook.lock().unwrap_or_else(|error| error.into_inner()).take();
+            if let Some(hook) = hook {
+                drop(state);
+                hook();
+                state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            }
+        }
+        while state.generation == observed && !state.closed {
+            state = self.changed.wait(state).unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_wait_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.wait_hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_enqueue_hook(&self, hook: Option<TxQueueEnqueueHook>) {
+        *self.enqueue_hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn record_enqueue(&self, class: TxClass, op_id: OpId) {
+        if let Some(hook) = self
+            .enqueue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            hook(class, op_id);
+        }
+    }
+
+    #[cfg(not(feature = "test-fakes"))]
+    fn record_enqueue(&self, _class: TxClass, _op_id: OpId) {}
+}
+
 #[derive(Debug, Clone)]
 pub struct TxReport {
     pub op_id: OpId,
@@ -1121,6 +1241,7 @@ pub struct TxWriterHandle {
     pub jobs: Sender<TxJob>,
     settle: Sender<OpId>,
     gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
     /// P8 Task 5：本 writer 的 Fence（只供 [`TxWriterHandle::fence_verdict`] 分類拒絕原因，不作授權）。
     fence: Arc<Fence>,
 }
@@ -1136,8 +1257,52 @@ impl TxWriterHandle {
             jobs,
             settle,
             gauge,
+            capacity: TxQueueCapacity::new(),
             fence,
         }
+    }
+
+    pub(crate) fn try_enqueue_job(
+        &self,
+        job: TxJob,
+    ) -> Result<(), QueueEnqueueError<TxJob>> {
+        self.capacity.try_enqueue(&self.jobs, job)
+    }
+
+    pub(crate) fn enqueue_job_blocking(
+        &self,
+        job: TxJob,
+    ) -> Result<(), ()> {
+        let class = job.permit.class;
+        let op_id = job.permit.op_id;
+        match self.jobs.send(job) {
+            Ok(()) => {
+                self.capacity.record_enqueue(class, op_id);
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    pub(crate) fn capacity_generation(&self) -> u64 {
+        self.capacity.generation()
+    }
+
+    pub(crate) fn wait_for_capacity(&self, generation: u64) {
+        self.capacity.wait_for_change(generation);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_capacity_wait_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.capacity.set_wait_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_enqueue_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn(TxClass, OpId) + Send + Sync>>,
+    ) {
+        self.capacity.set_enqueue_hook(hook);
     }
     /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
@@ -1208,6 +1373,7 @@ struct TxWriter {
     settle: Receiver<OpId>,
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
     rx: Arc<crate::uart_bridge::RxShared>,
     clock: Arc<dyn Clock>,
     /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
@@ -1367,7 +1533,10 @@ impl TxWriter {
                     Err(_) => break,
                 },
                 recv(self.jobs) -> queued => match queued {
-                    Ok(job) => job,
+                    Ok(job) => {
+                        self.capacity.notify_capacity();
+                        job
+                    }
                     Err(_) => break,
                 },
             };
@@ -1615,6 +1784,7 @@ impl TxWriter {
         }
         // P5-T14：先標記 closed，再收斂佇列；之後才送入的 job 由 `wait_report` 依 closed 旗標收尾。
         self.gauge.closed.store(true, Ordering::Release);
+        self.capacity.close();
         let queued: Vec<TxJob> = self.jobs.try_iter().collect();
         for job in queued {
             // P8 Task 5：佇列中的 Finish 照常落 WAL（它不提交 bytes）；Append 與其他 job 一樣以 Frozen 收斂。
@@ -1792,6 +1962,7 @@ pub fn spawn_tx_writer(
     let (settle_tx, settle_rx) = crossbeam_channel::bounded(TX_SETTLE_QUEUE_MAX);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let gauge = Arc::new(LedgerGaugeCells::default());
+    let capacity = TxQueueCapacity::new();
     let TxWriterContext {
         rx,
         epoch,
@@ -1802,6 +1973,7 @@ pub fn spawn_tx_writer(
         jobs: job_tx,
         settle: settle_tx,
         gauge: gauge.clone(),
+        capacity: capacity.clone(),
         fence: fence.clone(),
     };
     let stop = TxWriterStop(stop_tx);
@@ -1817,6 +1989,7 @@ pub fn spawn_tx_writer(
         settle: settle_rx,
         stop: stop_rx,
         gauge,
+        capacity,
         rx,
         clock,
         aggregates: IndexMap::new(),

@@ -1387,6 +1387,7 @@ pub struct ActorRig {
     pub fence: Arc<Fence>,
     /// Task 14：RX 視窗（`screen` 等斷言用）。
     pub rx: Arc<RxShared>,
+    profile: SessionProfile,
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
     wal: Arc<WalWriter>,
     wfs: Arc<FakeWalFs>,
@@ -1524,6 +1525,7 @@ impl ActorRig {
             unconfirmed_closes: sw_core::session_core::UnconfirmedCloses::new(),
         };
         let exec_profile = profile.clone();
+        let rig_profile = exec_profile.clone();
         let mut core = SessionCore::new(profile, "yaml-target", deps);
         setup(&mut core);
         let current_tx: Arc<Mutex<Option<TxWriterHandle>>> = Arc::new(Mutex::new(None));
@@ -1584,6 +1586,7 @@ impl ActorRig {
             env,
             fence: rig_fence,
             rx: rig_rx,
+            profile: rig_profile,
             current_tx,
             wal,
             wfs,
@@ -1749,6 +1752,26 @@ impl ActorRig {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .expect("尚未開出 bridge")
+    }
+
+    /// 建立直接呼叫 OpRunner `send` 測試入口所需的正式 OpCtx。
+    pub fn op_ctx_for_test(&self) -> sw_core::op_runner::OpCtx {
+        sw_core::op_runner::OpCtx {
+            com: "COM0".into(),
+            sid: "actor-rig".into(),
+            profile: self.profile.clone(),
+            rx: self.rx.clone(),
+            tx: self.tx_handle(),
+            wal: self.wal.clone(),
+            clock: self.clock.clone(),
+            control: self.actor.control.clone(),
+            rng: Arc::new(|buf: &mut [u8]| {
+                for (index, byte) in buf.iter_mut().enumerate() {
+                    *byte = index as u8;
+                }
+            }),
+            registry: self.reg.clone(),
+        }
     }
 
     /// Task 14（R1-F8）：現行 worker 的 TX 帳本 gauge。

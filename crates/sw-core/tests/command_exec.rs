@@ -1092,7 +1092,7 @@ fn i294_r10_begin_human_submit_after_write(
     };
     let (_, guard) = h
         .rx
-        .submit_human_for_test(|| tx.jobs.send(job).map_err(|_| ()))
+        .submit_human_job_for_test(&tx, job)
         .expect("human job 已排入 TX writer");
     accepted_rx
         .recv_timeout(Duration::from_secs(5))
@@ -1350,6 +1350,12 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
     wait_started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("command quiet deadline 已建立");
+    let (enqueue_order_tx, enqueue_order_rx) = crossbeam_channel::unbounded();
+    h.tx_handle().set_enqueue_hook_for_test(Some(Arc::new(move |class, op_id| {
+        enqueue_order_tx
+            .send((class, op_id))
+            .expect("記錄 writer enqueue 次序");
+    })));
     i294_r10_advance_clock(&h, Duration::from_secs(31));
     decision_rx
         .recv_timeout(Duration::from_secs(5))
@@ -1386,7 +1392,7 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
             aggregate: None,
         };
         let (_, guard) = submit_rx
-            .submit_human_for_test(|| tx.jobs.send(job).map_err(|_| ()))
+            .submit_human_job_for_test(&tx, job)
             .expect("human submit 已排入 TX writer");
         enqueued_tx.send(()).expect("回報 human job 已排入 writer");
         report_rx
@@ -1432,6 +1438,22 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
             .expect("rescue key 後的 human TX 已結算");
     }
     human_submit.join().expect("human submit worker 正常結束");
+    let enqueue_order = [
+        enqueue_order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一個救援鍵已進 writer queue"),
+        enqueue_order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("後到 HumanLine 已進 writer queue"),
+    ];
+    assert_eq!(
+        enqueue_order.map(|(class, _)| class),
+        [
+            sw_core::tx_writer::TxClass::SystemRecoverKey,
+            sw_core::tx_writer::TxClass::HumanLine,
+        ],
+        "timeout 讀取完成且無 human 後，第一個救援鍵必須先進 writer queue"
+    );
     let result = h.wait_done(&id);
     assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
     assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
@@ -1498,6 +1520,225 @@ fn i294_r11_permit(
     }
 }
 
+fn i294_r15_enqueue_writer_job(
+    h: &ActorRig,
+    op_id: u64,
+    payload: &[u8],
+) -> crossbeam_channel::Receiver<sw_core::tx_writer::TxReport> {
+    let mut permit = i294_r11_permit(h, op_id, sw_core::tx_writer::TxClass::LeaseOwner);
+    permit.log = false;
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .jobs
+        .send(sw_core::tx_writer::TxJob {
+            permit,
+            payload: payload.to_vec(),
+            reply,
+            aggregate: None,
+        })
+        .expect("測試 writer job 已入列");
+    report_rx
+}
+
+fn i294_r15_fill_writer_queue(h: &ActorRig, first_op_id: u64) {
+    let tx = h.tx_handle();
+    let capacity = tx.jobs.capacity().expect("writer queue 為有界 channel");
+    for index in 0..capacity {
+        let mut permit = i294_r11_permit(
+            h,
+            first_op_id + index as u64,
+            sw_core::tx_writer::TxClass::LeaseOwner,
+        );
+        permit.log = false;
+        let (reply, _report_rx) = crossbeam_channel::bounded(1);
+        tx.jobs
+            .try_send(sw_core::tx_writer::TxJob {
+                permit,
+                payload: b"FILL".to_vec(),
+                reply,
+                aggregate: None,
+            })
+            .expect("writer queue 尚有容量時可塞入 filler");
+    }
+    assert_eq!(tx.jobs.len(), capacity, "writer queue 已確實滿載");
+}
+
+struct I294R15ReleaseWriterOnDrop(sw_pal::fakes::serial::FakeDevice);
+
+impl Drop for I294R15ReleaseWriterOnDrop {
+    fn drop(&mut self) {
+        self.0.release_block();
+    }
+}
+
+#[test]
+fn i294_r15_pump_yields_timeout_decision_while_writer_queue_is_full() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r15-pump-full");
+    let tx_count = h.wal_tx_payloads().len();
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let blocker = i294_r15_enqueue_writer_job(&h, 9_294_150, b"BLOCK");
+    h.dev.wait_blocked();
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    i294_r15_fill_writer_queue(&h, 9_294_200);
+
+    let (pump_take_tx, pump_take_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_after_take_hook_for_test(Some(Arc::new(move || {
+            pump_take_tx.send(()).expect("human pump 已取出 job");
+        })));
+    let (capacity_wait_tx, capacity_wait_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .set_capacity_wait_hook_for_test(Some(Arc::new(move || {
+            capacity_wait_tx.send(()).expect("pump 已在 rescue gate 外等待 writer 容量");
+        })));
+    console.push_input(b"P");
+    pump_take_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pump 已取出 human job");
+    capacity_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("滿載 enqueue 已讓出 rescue gate 並等待容量");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "effect guard 在 pump 等容量期間仍在途");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "未成功 enqueue 不記 submit 起點");
+
+    let decision_rx = Arc::clone(&h.rx);
+    let (decision_tx, decision_done_rx) = crossbeam_channel::bounded(1);
+    let decision = std::thread::spawn(move || {
+        decision_tx
+            .send(decision_rx.timeout_rescue_human_seen_for_test(0, 0))
+            .expect("timeout 訊號讀取結果已回傳");
+    });
+    assert!(
+        decision_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer 尚未釋放時 timeout 已讀完訊號"),
+        "pump 的實際 HumanTx guard 使結果走 human tuple"
+    );
+    assert_eq!(h.dev.tx_since(0).iter().filter(|byte| **byte == 3 || **byte == 4).count(), 0);
+    decision.join().expect("timeout decision thread 正常結束");
+
+    h.dev.release_block();
+    blocker
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer blocker 已收斂");
+    h.wait_for("pump job 在容量恢復後送出", |rig| wal_tx_has(rig, b"P"));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count)
+            .iter()
+            .filter(|byte| **byte == 3 || **byte == 4)
+            .count(),
+        0,
+        "滿載 pump 案例不得送出救援鍵"
+    );
+}
+
+fn i294_r15_human_line_full_queue_case(timeout_entry: I294R11TimeoutEntry) {
+    use sw_core::session_core::OpGrant;
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let command = "printf R15_HUMAN_LINE";
+    let response = format!("{command}\r\npartial output\r\n").into_bytes();
+    h.dev.on_tx_reply(format!("{command}\n").as_bytes(), &response);
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx.send(()).expect("command completion wait 已開始");
+    })));
+    let (decision_read_tx, decision_read_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+        decision_read_tx
+            .send(())
+            .expect("timeout 已完成四項訊號讀取");
+    })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R11TimeoutEntry::Silence => {
+            request.timeout_s = 30.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R11TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已進入 timeout 等待");
+
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let blocker = i294_r15_enqueue_writer_job(&h, 9_294_300, b"BLOCK");
+    h.dev.wait_blocked();
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    i294_r15_fill_writer_queue(&h, 9_294_400);
+
+    let ctx = h.op_ctx_for_test();
+    let (epoch, owner_gen, fsm_gen) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+        )
+    });
+    let grant = OpGrant {
+        op_id: OpId(9_294_399),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        cmd_id: None,
+    };
+    let (capacity_wait_tx, capacity_wait_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .set_capacity_wait_hook_for_test(Some(Arc::new(move || {
+            capacity_wait_tx.send(()).expect("HumanLine 已讓出 gate 等 writer 容量");
+        })));
+    let human = std::thread::spawn(move || {
+        sw_core::op_runner::send_human_line_for_test(&ctx, &grant, b"echo HUMAN_LINE\n")
+    });
+    capacity_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanLine 已在 writer 滿載時讓出 rescue gate");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "HumanLine guard 在容量等待期間仍在途");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "滿載時尚未記錄成功 enqueue");
+
+    match timeout_entry {
+        I294R11TimeoutEntry::Silence => h.clock.advance(Duration::from_secs(31)),
+        I294R11TimeoutEntry::OperationDeadline => h.clock.advance(Duration::from_millis(201)),
+    }
+    decision_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer 尚未釋放時 timeout 已讀完四項訊號");
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "timeout 讀取完成至 writer 釋放前沒有救援 TX"
+    );
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "HumanLine 仍在容量等待中");
+
+    h.dev.release_block();
+    blocker
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer blocker 已收斂");
+    let report = human
+        .join()
+        .expect("HumanLine sender 正常結束");
+    assert!(report.reject.is_none(), "HumanLine 在容量恢復後獲 writer 處理");
+    assert!(
+        wal_tx_bytes_since(&h, tx_count).ends_with(b"echo HUMAN_LINE\n"),
+        "HumanLine 實際入列並保留 WAL：{:?}",
+        wal_tx_bytes_since(&h, tx_count)
+    );
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 後釋放 HumanLine guard");
+}
+
+#[test]
+fn i294_r15_human_line_full_queue_timeout_entries_finish_before_writer_release() {
+    i294_r15_human_line_full_queue_case(I294R11TimeoutEntry::Silence);
+    i294_r15_human_line_full_queue_case(I294R11TimeoutEntry::OperationDeadline);
+}
+
 fn i294_r11_enqueue_human(
     h: &ActorRig,
     class: sw_core::tx_writer::TxClass,
@@ -1513,16 +1754,15 @@ fn i294_r11_enqueue_human(
     let rx = Arc::clone(&h.rx);
     let join = std::thread::spawn(move || {
         let (_, guard) = rx
-            .submit_human_for_test(|| {
-                tx.jobs
-                    .send(sw_core::tx_writer::TxJob {
-                        permit,
-                        payload: b"echo HUMAN\n".to_vec(),
-                        reply,
-                        aggregate: None,
-                    })
-                    .map_err(|_| ())
-            })
+            .submit_human_job_for_test(
+                &tx,
+                sw_core::tx_writer::TxJob {
+                    permit,
+                    payload: b"echo HUMAN\n".to_vec(),
+                    reply,
+                    aggregate: None,
+                },
+            )
             .expect("human job 已排入 TX writer");
         queued_tx.send(()).expect("回報 human job 已排入 writer");
         let report = if hold_until_report {

@@ -207,8 +207,8 @@ type PumpItem = (HumanTxTag, TxPermit, Vec<u8>, HumanInFlightGuard);
 
 /// per-session human TX pump thread（`serialwrap-human-tx-<COM>`）。
 ///
-/// actor 只 `try_submit`（容量 1，永不阻塞）；pump 對 `TxWriterHandle.jobs` 阻塞送出、等 `TxReport`，
-/// 再以 control lane 回 `HumanTxCompleted`。TxWriter 已結束（`Disconnected`／writer 收尾）時回 `NotSubmitted`。
+/// actor 只 `try_submit`（容量 1，永不阻塞）；pump 以非阻塞方式送入 writer queue，容量不足時在
+/// rescue gate 外等待出列通知，再以 control lane 回 `HumanTxCompleted`。TxWriter 已結束時回 `NotSubmitted`。
 pub struct HumanTxPump {
     tx: Sender<PumpItem>,
     rx: std::sync::Arc<RxShared>,
@@ -255,9 +255,13 @@ impl HumanTxPump {
                         reply,
                         aggregate: None,
                     };
-                    let queued = rx.with_human_submit_gate(&mut in_flight, || {
-                        tx.jobs.send(job).map_err(|_| ())
-                    });
+                    let queued = rx.with_human_submit_gate(
+                        &mut in_flight,
+                        job,
+                        |job| tx.try_enqueue_job(job),
+                        || tx.capacity_generation(),
+                        |generation| tx.wait_for_capacity(generation),
+                    );
                     let report = match queued {
                         Ok(()) => tx
                             .wait_report(&report_rx)
@@ -289,6 +293,22 @@ impl HumanTxPump {
         payload: Vec<u8>,
         in_flight: HumanInFlightGuard,
     ) -> Result<(), PumpFull> {
+        let in_flight = if in_flight.belongs_to(&self.rx) {
+            in_flight
+        } else {
+            #[cfg(any(feature = "test-fakes", debug_assertions))]
+            panic!("HumanTx guard RX 與 pump RX 不同");
+            #[cfg(not(any(feature = "test-fakes", debug_assertions)))]
+            {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    eprintln!("WARN HumanTx guard RX 與 pump RX 不同，使用 pump RX 後備 guard");
+                }
+                drop(in_flight);
+                self.rx.begin_human_tx_effect()
+            }
+        };
         let sent = self.tx.try_send((tag, permit, payload, in_flight));
         if sent.is_ok() {
             #[cfg(feature = "test-fakes")]

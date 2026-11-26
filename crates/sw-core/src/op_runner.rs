@@ -727,6 +727,13 @@ pub(crate) fn self_test_probe_payload(probe: &str, marker_nonce: &str) -> Vec<u8
 }
 
 /// 經 TxWriter 送出一筆 TX 並等待 `TxReport`（writer 已停止時視為 `Frozen` 拒絕）。
+struct SendMeta<'a> {
+    class: TxClass,
+    source: &'a str,
+    cmd_id: Option<&'a str>,
+    log: bool,
+}
+
 fn send(
     ctx: &OpCtx,
     grant: &OpGrant,
@@ -736,16 +743,32 @@ fn send(
     cmd_id: Option<&str>,
     log: bool,
 ) -> TxReport {
+    send_with_enqueue_hook(
+        ctx,
+        grant,
+        payload,
+        SendMeta { class, source, cmd_id, log },
+        || {},
+    )
+}
+
+fn send_with_enqueue_hook(
+    ctx: &OpCtx,
+    grant: &OpGrant,
+    payload: &[u8],
+    meta: SendMeta<'_>,
+    after_enqueue: impl FnOnce(),
+) -> TxReport {
     let (reply, report) = crossbeam_channel::bounded(1);
     let permit = TxPermit {
         op_id: grant.op_id,
         epoch: grant.epoch,
         owner_gen: grant.owner_gen,
         fsm_gen: grant.fsm_gen,
-        class,
-        source: source.to_string(),
-        cmd_id: cmd_id.map(str::to_string),
-        log,
+        class: meta.class,
+        source: meta.source.to_string(),
+        cmd_id: meta.cmd_id.map(str::to_string),
+        log: meta.log,
         // 07 D-03：06 既有 permit 建構點一律 `None`。
         input_epoch: None,
         replay_hold: None,
@@ -767,20 +790,32 @@ fn send(
         reply,
         aggregate: None,
     };
-    let mut human_submit_guard = (class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
+    let mut human_submit_guard = (meta.class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
     let queued = if let Some(guard) = human_submit_guard.as_mut() {
-        ctx.rx
-            .with_human_submit_gate(guard, || ctx.tx.jobs.send(job).map_err(|_| ()))
+        ctx.rx.with_human_submit_gate(
+            guard,
+            job,
+            |job| ctx.tx.try_enqueue_job(job),
+            || ctx.tx.capacity_generation(),
+            |generation| ctx.tx.wait_for_capacity(generation),
+        )
     } else {
-        ctx.tx.jobs.send(job).map_err(|_| ())
+        ctx.tx.enqueue_job_blocking(job)
     };
     if queued.is_err() {
         drop(human_submit_guard);
         return frozen;
     }
+    after_enqueue();
     let tx_report = ctx.tx.wait_report(&report).unwrap_or(frozen);
     drop(human_submit_guard);
     tx_report
+}
+
+/// `test-fakes` 對 trusted-human `HumanLine` enqueue 的入口覆蓋；共用正式 `send` 的容量等待與 submit guard。
+#[cfg(feature = "test-fakes")]
+pub fn send_human_line_for_test(ctx: &OpCtx, grant: &OpGrant, payload: &[u8]) -> TxReport {
+    send(ctx, grant, payload, TxClass::HumanLine, "human:i294-r15-test", None, true)
 }
 
 fn compile_or_never(pattern: &str) -> PyRegex {
@@ -1296,7 +1331,7 @@ fn recover_after_failure(
     passthrough: bool,
     aborted: Option<(&str, usize)>,
     shutdown_cancellable: bool,
-    mut timeout_rescue_guard: Option<crate::uart_bridge::HumanSubmitRescueGuard<'_>>,
+    mut timeout_rescue_guard: Option<crate::uart_bridge::HumanSubmitRescueGuard>,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -1306,20 +1341,30 @@ fn recover_after_failure(
     let prompt_re = compile_or_never(prompt_regex);
     for (name, key) in [("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")] {
         let offset = ctx.rx.snapshot_len();
-        let report = send(
-            ctx,
-            grant,
-            key,
-            TxClass::SystemRecoverKey,
-            "system:recover",
-            None,
-            true,
-        );
-        if name == "CTRL_C" {
-            // Decision-to-first-rescue-key is serialized with human submit admission. `send`
-            // returns only after the writer reports whether the key reached the OS.
-            drop(timeout_rescue_guard.take());
-        }
+        let report = if name == "CTRL_C" {
+            send_with_enqueue_hook(
+                ctx,
+                grant,
+                key,
+                SendMeta {
+                    class: TxClass::SystemRecoverKey,
+                    source: "system:recover",
+                    cmd_id: None,
+                    log: true,
+                },
+                || drop(timeout_rescue_guard.take()),
+            )
+        } else {
+            send(
+                ctx,
+                grant,
+                key,
+                TxClass::SystemRecoverKey,
+                "system:recover",
+                None,
+                true,
+            )
+        };
         if !fully_sent(&report, 1) {
             match report.reject {
                 Some(FenceReject::Quiet | FenceReject::ReconfirmPending) => break,

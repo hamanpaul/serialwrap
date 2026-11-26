@@ -240,6 +240,10 @@ impl SerialHandle for ReassembledHandle {
 struct SessionIo {
     sid: Mutex<String>,
     profile: Mutex<SessionProfile>,
+    /// 穩定的 actor gate；每個 bridge epoch 的 RxShared 都共用此 instance。
+    actor_dispatch_gate: Arc<crate::uart_bridge::ActorDispatchGate>,
+    #[cfg(feature = "test-fakes")]
+    current_rx: Mutex<Arc<RxShared>>,
     preopened: Mutex<Option<Preopened>>,
     /// P6 Task 10：RPC thread 預建、等待 core `ConsoleAdopt`／`ConsoleDiscard` 的 PTY（token → PtyPair）。
     pending_pty: Mutex<HashMap<u64, sw_pal::PtyPair>>,
@@ -879,6 +883,14 @@ pub struct SessionManager {
     _console: Arc<dyn ConsoleTransportFactory>,
     _caps: Capabilities,
 }
+
+#[cfg(feature = "test-fakes")]
+pub type ActorSnapshotForTest = (
+    Arc<RxShared>,
+    crossbeam_channel::Sender<crate::mailbox::DataEvent>,
+    Arc<crate::actor::ActorLatencyProbe>,
+    Option<u64>,
+);
 
 /// console／interactive_open 查無 session（Python `{"ok":False,"error_code":"SESSION_NOT_READY","selector":selector}`）。
 fn console_not_ready(selector: &str) -> PyDict {
@@ -2137,7 +2149,12 @@ impl Shared {
             f.handoff_frozen = handoff_frozen;
         });
         self.fanout.register(fence.clone());
-        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
+        let actor_dispatch_gate = crate::uart_bridge::ActorDispatchGate::new_for_session();
+        let rx = RxShared::new_with_actor_dispatch_gate(
+            RX_WINDOW_MAX_CHARS,
+            self.clock.mono_ns(),
+            actor_dispatch_gate.clone(),
+        );
         let clock = self.clock.clone();
         let fs = self.fs.clone();
         let input_epoch_pub = Arc::new(AtomicU64::new(0));
@@ -2233,6 +2250,9 @@ impl Shared {
         let io = Arc::new(SessionIo {
             sid: Mutex::new(sid.clone()),
             profile: Mutex::new(profile.clone()),
+            actor_dispatch_gate,
+            #[cfg(feature = "test-fakes")]
+            current_rx: Mutex::new(rx.clone()),
             preopened: Mutex::new(None),
             pending_pty: Mutex::new(HashMap::new()),
             next_pty_token: AtomicU64::new(0),
@@ -5193,7 +5213,11 @@ impl OpenCtx {
         }
         let observers = lock(&self.shared.rx_observers).clone();
         // Python 每次 attach 新建 `UARTBridge`：RX 視窗、速率、總量、最後 RX 時刻一律歸零（審查 F51）。
-        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.shared.clock.mono_ns());
+        let rx = RxShared::new_with_actor_dispatch_gate(
+            RX_WINDOW_MAX_CHARS,
+            self.shared.clock.mono_ns(),
+            self.io.actor_dispatch_gate.clone(),
+        );
         let worker = IoWorker::start_observed(
             handle,
             IoWorkerArgs {
@@ -5952,10 +5976,19 @@ impl EffectExecutor for ManagerExec {
         debug_assert!(self.prepared_human_guards.is_empty());
         #[cfg(feature = "test-fakes")]
         self.rx.dispatch_before_guard_registration_hook_for_test();
+        let mut effect_rx = self.rx.clone();
         for effect in effects {
-            if matches!(effect, Effect::HumanTx { .. }) {
-                self.prepared_human_guards
-                    .push_back(self.rx.begin_human_tx_effect());
+            match effect {
+                Effect::AdoptBridge { epoch, .. } => {
+                    if let Some(next_rx) = lock(&self.opened_rx).get(epoch).cloned() {
+                        effect_rx = next_rx;
+                    }
+                }
+                Effect::HumanTx { .. } => {
+                    self.prepared_human_guards
+                        .push_back(effect_rx.begin_human_tx_effect());
+                }
+                _ => {}
             }
         }
     }
@@ -6155,6 +6188,10 @@ impl EffectExecutor for ManagerExec {
             Effect::AdoptBridge { epoch, worker, .. } => {
                 if let Some(rx) = lock(&self.opened_rx).remove(&epoch) {
                     self.rx = rx;
+                    #[cfg(feature = "test-fakes")]
+                    {
+                        *lock(&self.io.current_rx) = self.rx.clone();
+                    }
                 }
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
@@ -8174,6 +8211,22 @@ impl SessionManager {
     ) -> Option<crossbeam_channel::Sender<crate::mailbox::ControlEvent>> {
         let inner = lock(&self.shared.inner);
         inner.sessions.get(sid).map(|e| e.actor.control.clone())
+    }
+
+    /// 只供測試（test-fakes）：取得同一 actor 的現行 RX、data lane、dispatch probe 與 active epoch。
+    #[cfg(feature = "test-fakes")]
+    pub fn actor_snapshot_for_test(
+        &self,
+        sid: &str,
+    ) -> Option<ActorSnapshotForTest> {
+        let (io, actor, fence) = {
+            let inner = lock(&self.shared.inner);
+            let entry = inner.sessions.get(sid)?;
+            (Arc::clone(&entry.io), Arc::clone(&entry.actor), Arc::clone(&entry.fence))
+        };
+        let rx = lock(&io.current_rx).clone();
+        let epoch = fence.with(|state| state.active_epoch);
+        Some((rx, actor.data.clone(), Arc::clone(&actor.probe), epoch))
     }
 
     /// 只供測試：取得 release 真正使用的 safety lane，以確定性重現「請求未入列」。
