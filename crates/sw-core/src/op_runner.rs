@@ -1095,11 +1095,12 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         continue;
                     }
 
-                    let (rescue_guard, submit_window_has_human_tx) =
-                        ctx.rx.begin_timeout_rescue(
-                            human_submit_start_before,
-                            human_tx_before.generation,
-                        );
+                    let (rescue_guard, submit_window_has_human_tx) = ctx.rx.begin_timeout_decision(
+                        human_submit_start_before,
+                        human_tx_before,
+                        pending_human_before,
+                        ctx.clock.mono_ns(),
+                    );
                     let human_tx_seen = pending_human_before || submit_window_has_human_tx;
                     let human_tx_state = snapshot.human_tx_state;
                     let raw_half_line =
@@ -1163,11 +1164,12 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             }
             let snapshot = completion_timeout_snapshot
                 .expect("absolute deadline wait returns its filtered timeout snapshot");
-            let (rescue_guard, submit_window_has_human_tx) =
-                ctx.rx.begin_timeout_rescue(
-                    human_submit_start_before,
-                    human_tx_before.generation,
-                );
+            let (rescue_guard, submit_window_has_human_tx) = ctx.rx.begin_timeout_decision(
+                human_submit_start_before,
+                human_tx_before,
+                pending_human_before,
+                ctx.clock.mono_ns(),
+            );
             let human_tx_seen = pending_human_before || submit_window_has_human_tx;
             let human_tx_state = snapshot.human_tx_state;
             let raw_half_line =

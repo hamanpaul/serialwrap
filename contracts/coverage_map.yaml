@@ -96,6 +96,7 @@ entries:
     - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
     - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
     owner_phase: P7
+  # i294 i1：write 後 watermark、完整視窗真實行首（trimmed > 0 的窗口開頭不算行首）、接管 tuple 單調遞增與 close fence；穩定 pending 於 timeout 臨界區有界消耗，含其基線取捨與四項各最多一筆 partial 的保守代價。
   bc:BC-22:
     nodeids:
     - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
@@ -177,6 +178,11 @@ entries:
     - cargo:sw-core::command_exec::i294_r18_late_old_writer_accepted_prompt_uses_active_epoch
     - cargo:sw-core::command_exec::i294_r18_real_human_writer_handoff_result_matrix
     - cargo:sw-core::command_exec::i294_r18_real_writer_reconnect_unblocks_consecutive_no_echo_commands
+    - cargo:sw-core::command_exec::i294_r19_trimmed_window_head_never_counts_as_a_real_line_start
+    - cargo:sw-core::command_exec::i294_r19_stale_pending_timeout_consumes_after_one_partial
+    - cargo:sw-core::command_exec::i294_r19_pending_timeout_keeps_new_human_submit_until_next_timeout
+    - cargo:sw-core::command_exec::i294_r19_pending_timeout_keeps_inflight_human_writer
+    - cargo:sw-core::command_exec::i294_r19_timeout_submit_interleavings_preserve_pending
     owner_phase: P5
   bc:DF-01:
     nodeids:

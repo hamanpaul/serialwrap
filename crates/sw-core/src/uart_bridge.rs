@@ -286,6 +286,15 @@ struct RxEvent {
 struct HumanStateEvent {
     mono_ns: Mono,
     state: HumanTxState,
+    kind: HumanStateEventKind,
+}
+
+/// human pending 狀態結案事件的來源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanStateEventKind {
+    TxRegistered,
+    PromptSettled,
+    TimeoutConsumed,
 }
 
 /// 哨兵 console（POSIX 內部 PTY）的 I/O 介面：與 PAL 的 `ConsoleIo`（arch §4.7）為同一型別。
@@ -759,6 +768,81 @@ impl RxShared {
             self.actor_dispatch_gate.reserve_rescue()
         };
         drop(dispatch_guard);
+        #[cfg(feature = "test-fakes")]
+        self.timeout_rescue_read_hook_for_test();
+        (rescue_guard, human_submit_seen)
+    }
+
+    /// 決定 echo timeout 是否走 human partial；穩定的舊 pending 只在此決策點消耗一次。
+    pub(crate) fn begin_timeout_decision(
+        self: &Arc<Self>,
+        command_start_count: u64,
+        command_human_before: HumanTxState,
+        pending_human_before: bool,
+        mono_ns: Mono,
+    ) -> (HumanSubmitRescueGuard, bool) {
+        #[cfg(feature = "test-fakes")]
+        self.timeout_rescue_attempt_hook_for_test();
+        let dispatch_guard = self.actor_dispatch_gate.enter_timeout_decision();
+        let mut state = self
+            .actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let active_rx = state.active_rx.as_ref().and_then(Weak::upgrade);
+        let active_window_rx = active_rx.as_deref().unwrap_or(self);
+        let mut window = active_window_rx
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current_boundary = state
+            .pending_human_epoch
+            .zip(state.pending_human_rx_offset);
+        let start_boundary = command_human_before
+            .epoch
+            .map(|epoch| (epoch, command_human_before.rx_offset));
+        let no_new_boundary = state.human_tx_generation == command_human_before.generation
+            && current_boundary == start_boundary;
+        let human_submit_seen = state.human_submit_start_count > command_start_count
+            || state.human_in_flight > 0
+            || window.tx_submit_pending
+            || state.human_tx_generation > command_human_before.generation;
+        let mut pending_consumed = false;
+        if pending_human_before
+            && state.pending_human
+            && state.human_submit_start_count == command_start_count
+            && no_new_boundary
+            && state.human_in_flight == 0
+            && !window.tx_submit_pending
+        {
+            state.pending_human = false;
+            state.pending_human_epoch = None;
+            state.pending_human_rx_offset = None;
+            push_human_state_event(&mut state, mono_ns, HumanStateEventKind::TimeoutConsumed);
+            window.revision = window.revision.saturating_add(1);
+            pending_consumed = true;
+        }
+        drop(window);
+        let rescue_guard = if pending_human_before || human_submit_seen {
+            HumanSubmitRescueGuard {
+                gate: Arc::clone(&self.actor_dispatch_gate),
+                active: false,
+            }
+        } else {
+            state.rescue_pending = state.rescue_pending.saturating_add(1);
+            HumanSubmitRescueGuard {
+                gate: Arc::clone(&self.actor_dispatch_gate),
+                active: true,
+            }
+        };
+        drop(state);
+        drop(dispatch_guard);
+        if pending_consumed {
+            active_window_rx.wake_all();
+            if !std::ptr::eq(active_window_rx, self.as_ref()) {
+                self.wake_all();
+            }
+        }
         #[cfg(feature = "test-fakes")]
         self.timeout_rescue_read_hook_for_test();
         (rescue_guard, human_submit_seen)
@@ -1365,6 +1449,17 @@ impl RxShared {
             .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         human_tx_state(&human, window.watermark.0)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn last_human_state_event_kind_for_test(&self) -> Option<HumanStateEventKind> {
+        self.actor_dispatch_gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .human_state_events
+            .back()
+            .map(|event| event.kind)
     }
 
     /// 測試控制尚未完成的 submit 窗口；用於重現 OS submit 與 human TX observer 登錄間的交錯。
@@ -2271,7 +2366,7 @@ fn record_human_tx_locked(
     if raw_input && !payload.is_empty() {
         update_raw_line_state(human, payload);
     }
-    push_human_state_event(human, mono_ns);
+    push_human_state_event(human, mono_ns, HumanStateEventKind::TxRegistered);
 }
 
 fn has_prompt_after_offset(
@@ -2297,7 +2392,7 @@ fn has_prompt_after_offset(
         return false;
     };
     let line_start_absolute = if line_start == 0 {
-        if window.trimmed > rx_offset {
+        if window.trimmed > 0 {
             // 修剪後無法證明目前最後一行的真正行首仍在窗口內。
             return false;
         }
@@ -2348,7 +2443,7 @@ fn settle_pending_human_locked(
     human.pending_human = false;
     human.pending_human_epoch = None;
     human.pending_human_rx_offset = None;
-    push_human_state_event(human, mono_ns);
+    push_human_state_event(human, mono_ns, HumanStateEventKind::PromptSettled);
     true
 }
 
@@ -2368,7 +2463,7 @@ fn record_human_tx_unknown_locked(
     if raw_input {
         human.human_raw_line_open = true;
     }
-    push_human_state_event(human, mono_ns);
+    push_human_state_event(human, mono_ns, HumanStateEventKind::TxRegistered);
 }
 
 fn update_raw_line_state(human: &mut ActorDispatchGateState, payload: &[u8]) {
@@ -2379,12 +2474,17 @@ fn update_raw_line_state(human: &mut ActorDispatchGateState, payload: &[u8]) {
     }
 }
 
-fn push_human_state_event(human: &mut ActorDispatchGateState, mono_ns: Mono) {
+fn push_human_state_event(
+    human: &mut ActorDispatchGateState,
+    mono_ns: Mono,
+    kind: HumanStateEventKind,
+) {
     if human.completion_capture_op_id.is_none() {
         return;
     }
     human.human_state_events.push_back(HumanStateEvent {
         mono_ns,
+        kind,
         state: HumanTxState {
             generation: human.human_tx_generation,
             epoch: human.human_tx_epoch,
