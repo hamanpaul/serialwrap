@@ -44,6 +44,6 @@
   "fix/279-tcp-console-lease": "b8483d9",
   "fix/290-timeout-recovery-keys": "b1fb7e6",
   "fix/inst4-install-upgrade": "2363457",
-  "fix/281-alias-persistence": "282d713",
+  "fix/281-alias-persistence": "a4970e8",
   "feature/304-config-wal-dir": "8c15e87"
 }
