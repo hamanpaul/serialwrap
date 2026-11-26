@@ -2992,9 +2992,10 @@ def test_open_read_tracker_counts_all_supported_entry_points_once(tmp_path, monk
     root = tmp_path / "repo"
     root.mkdir()
     target = root / "input.yaml"
-    target.write_text("value: tracked\n", encoding="utf-8")
+    # 以 bytes 寫入，避免 Windows 文字模式把 LF 轉成 CRLF，影響下方的位元組比對。
+    target.write_bytes(b"value: tracked\n")
     outside = tmp_path / "outside.yaml"
-    outside.write_text("value: ignored\n", encoding="utf-8")
+    outside.write_bytes(b"value: ignored\n")
     counts = _track_open_reads(monkeypatch, [root])
 
     if entry_point == "read_bytes":
