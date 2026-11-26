@@ -2292,6 +2292,7 @@ impl Shared {
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
             actor_id,
+            pending_human_guard: None,
         };
         let actor = match try_spawn_actor_with_reaper(
             core,
@@ -4486,6 +4487,8 @@ struct ManagerExec {
     opened_listener: Arc<Mutex<HashSet<u64>>>,
     /// actor 的不可變身分。
     actor_id: crate::custody::ActorId,
+    /// 套用可能產生 HumanTx 的事件前建立，HumanTx effect 產生時轉交給 pump。
+    pending_human_guard: Option<crate::uart_bridge::HumanInFlightGuard>,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -5289,6 +5292,10 @@ impl ManagerExec {
         payload: Vec<u8>,
         control: &Sender<ControlEvent>,
     ) {
+        let in_flight = self
+            .pending_human_guard
+            .take()
+            .unwrap_or_else(|| self.rx.begin_human_submit());
         let epoch = permit.epoch;
         if !self.pumps.contains_key(&epoch) {
             if let Some(worker) = lock(&self.workers).get(&epoch) {
@@ -5303,9 +5310,12 @@ impl ManagerExec {
         }
         let refused = match self.pumps.get(&epoch) {
             Some(pump) => pump
-                .try_submit(tag.clone(), permit.clone(), payload)
+                .try_submit(tag.clone(), permit.clone(), payload, in_flight)
                 .is_err(),
-            None => true,
+            None => {
+                drop(in_flight);
+                true
+            }
         };
         if refused {
             if self.pumps.contains_key(&epoch) {
@@ -5915,6 +5925,20 @@ impl EffectExecutor for ManagerExec {
     fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> {
         let by_id = lock(&self.io.profile).device_by_id.clone();
         lock(&self.shared.inner).custody.pending_for(&by_id)
+    }
+    fn before_event(
+        &mut self,
+        core: &crate::session_core::SessionCore,
+        item: &crate::mailbox::MailboxItem,
+        now: u64,
+    ) {
+        debug_assert!(self.pending_human_guard.is_none());
+        if core.human_tx_may_start_before_event(item, now) {
+            self.pending_human_guard = Some(self.rx.begin_human_submit_before_actor_step());
+        }
+    }
+    fn finish_event(&mut self) {
+        self.pending_human_guard.take();
     }
     /// `Effect::ClaimForStop` 在 actor 執行緒上、manager 鎖內處理本 session 的帳本紀錄，結果以立即回饋
     /// `CustodyClaimed` 先於下一個 mailbox 事件交回 actor（設計 §3.1.2 C4、C5）；交出的 handle 交關閉工作者。

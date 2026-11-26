@@ -1003,6 +1003,8 @@ struct RigExec {
     registry: Arc<CommandRegistry>,
     /// 測試用：在 BeginDrain 前後暫停 actor，建立可控的 data lane backlog。
     drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
+    /// 套用可能產生 HumanTx 的事件前建立，HumanTx effect 產生時轉交給 pump。
+    pending_human_guard: Option<sw_core::uart_bridge::HumanInFlightGuard>,
 }
 
 struct DrainPauseState {
@@ -1051,6 +1053,22 @@ fn rig_nonce() -> String {
 }
 
 impl EffectExecutor for RigExec {
+    fn before_event(
+        &mut self,
+        core: &SessionCore,
+        item: &sw_core::mailbox::MailboxItem,
+        now: u64,
+    ) {
+        debug_assert!(self.pending_human_guard.is_none());
+        if core.human_tx_may_start_before_event(item, now) {
+            self.pending_human_guard = Some(self.rx.begin_human_submit_before_actor_step());
+        }
+    }
+
+    fn finish_event(&mut self) {
+        self.pending_human_guard.take();
+    }
+
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
         match e {
             Effect::Reply(reply, result) => {
@@ -1306,6 +1324,10 @@ impl EffectExecutor for RigExec {
                 permit,
                 payload,
             } => {
+                let in_flight = self
+                    .pending_human_guard
+                    .take()
+                    .unwrap_or_else(|| self.rx.begin_human_submit());
                 let epoch = permit.epoch;
                 if !self.pumps.contains_key(&epoch) {
                     if let Some(worker) = self.workers.get(&epoch) {
@@ -1320,9 +1342,12 @@ impl EffectExecutor for RigExec {
                 }
                 let refused = match self.pumps.get(&epoch) {
                     Some(pump) => pump
-                        .try_submit(tag.clone(), permit.clone(), payload)
+                        .try_submit(tag.clone(), permit.clone(), payload, in_flight)
                         .is_err(),
-                    None => true,
+                    None => {
+                        drop(in_flight);
+                        true
+                    }
                 };
                 if refused {
                     let report = sw_core::tx_writer::TxReport {
@@ -1545,6 +1570,7 @@ impl ActorRig {
             pending_pty: pending_pty.clone(),
             registry: reg.clone(),
             drain_pause: drain_pause.clone(),
+            pending_human_guard: None,
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {

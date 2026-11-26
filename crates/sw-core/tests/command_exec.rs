@@ -412,8 +412,18 @@ fn i294_human_reply_arriving_inside_submit_does_not_poison_next_no_echo_command(
     });
 
     let tx_count = h.wal_tx_payloads().len();
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let id = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf NO_ECHO\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx_processed(b"NO_ECHO\r\nroot@t:/# ");
     h.advance(Duration::from_millis(200));
     let result = h.wait_done(&id);
@@ -432,8 +442,18 @@ fn i294_incomplete_human_reply_still_makes_no_echo_command_partial() {
     wait_tx(&h, b"echo HUMAN\n");
     h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
 
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let id = h.submit_with("printf AGENT", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx_processed(b"AGENT\r\nroot@t:/# ");
     assert_eq!(
         h.command_get(&id)["status"],
@@ -1441,8 +1461,6 @@ enum I294R11TimeoutEntry {
     OperationDeadline,
 }
 
-static I294_R11_MATRIX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 struct I294R11HumanSubmission {
     completed_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -1779,34 +1797,165 @@ fn i294_r11_run_matrix(human_state: I294R11HumanState) {
 
 #[test]
 fn i294_r11_human_job_queued_before_command_submit_suppresses_rescue() {
-    let _serial = I294_R11_MATRIX_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     i294_r11_run_matrix(I294R11HumanState::QueuedAtDecision);
 }
 
 #[test]
 fn i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue() {
-    let _serial = I294_R11_MATRIX_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     i294_r11_run_matrix(I294R11HumanState::RegisteredBeforeDecision);
 }
 
 #[test]
 fn i294_r11_fence_rejected_human_job_before_report_suppresses_rescue() {
-    let _serial = I294_R11_MATRIX_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     i294_r11_run_matrix(I294R11HumanState::FenceRejectedBeforeReport);
+}
+
+#[derive(Clone, Copy)]
+enum I294R12PumpPause {
+    BeforeTake,
+    AfterTake,
+}
+
+#[derive(Clone, Copy)]
+enum I294R12TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+fn i294_r12_run_pump_timeout_case(
+    pump_pause: I294R12PumpPause,
+    timeout_entry: I294R12TimeoutEntry,
+    echo_found: bool,
+) {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (pump_paused_tx, pump_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    let pause = Arc::new(move || {
+        pump_paused_tx
+            .send(())
+            .expect("human pump 到達指定 pause point");
+        let _ = release_pump_rx.recv_timeout(Duration::from_secs(10));
+    });
+    match pump_pause {
+        I294R12PumpPause::BeforeTake => {
+            h.rx.set_human_pump_before_take_hook_for_test(Some(pause));
+        }
+        I294R12PumpPause::AfterTake => {
+            h.rx.set_human_pump_after_take_hook_for_test(Some(pause));
+        }
+    }
+
+    let console = h.attach_pty_console("i294-r12-pump");
+    let submitted_before = h.rx.human_pump_submissions_for_test();
+    console.push_input(b"echo HUMAN\n");
+    pump_paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pump 到達受控 pause point");
+    h.wait_for("human job 已排入 pump channel", |rig| {
+        rig.rx.human_pump_submissions_for_test() > submitted_before
+    });
+    let in_flight_at_pause = h.rx.human_in_flight_for_test();
+
+    let command = "printf R12_PUMP_HUMAN";
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n")
+    } else {
+        "partial output\r\n".to_string()
+    };
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R12TimeoutEntry::Silence => {
+            request.timeout_s = 2.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R12TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("operation deadline 已建立，現在才推進假時鐘");
+    match timeout_entry {
+        I294R12TimeoutEntry::Silence => h.advance(Duration::from_secs(3)),
+        I294R12TimeoutEntry::OperationDeadline => h.advance(Duration::from_millis(201)),
+    }
+
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        format!("{command}\npartial output")
+    } else {
+        "partial output\n".to_string()
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(
+        in_flight_at_pause, 1,
+        "actor lane 已產生 HumanTx effect 且 job 位於 pump channel／pump local 時，guard 必須已可見"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "human job 在途時 timeout 不可送救援 TX"
+    );
+
+    release_pump_tx.send(()).expect("釋放 human pump");
+    h.rx.set_human_pump_before_take_hook_for_test(None);
+    h.rx.set_human_pump_after_take_hook_for_test(None);
+    h.wait_for("human writer report 收尾後 guard 清零", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+    });
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "pump report 後不可洩漏 guard");
+}
+
+fn i294_r12_run_pump_timeout_matrix(pump_pause: I294R12PumpPause) {
+    for timeout_entry in [
+        I294R12TimeoutEntry::Silence,
+        I294R12TimeoutEntry::OperationDeadline,
+    ] {
+        for echo_found in [true, false] {
+            i294_r12_run_pump_timeout_case(pump_pause, timeout_entry, echo_found);
+        }
+    }
+}
+
+#[test]
+fn i294_r12_human_job_guarded_before_pump_take_suppresses_rescue() {
+    i294_r12_run_pump_timeout_matrix(I294R12PumpPause::BeforeTake);
+}
+
+#[test]
+fn i294_r12_human_job_guarded_after_pump_take_suppresses_rescue() {
+    i294_r12_run_pump_timeout_matrix(I294R12PumpPause::AfterTake);
 }
 
 fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("printf R9_DEADLINE", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf R9_DEADLINE\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     if pending_submit {
         h.rx.set_tx_submit_pending_for_test(true);
     } else {
@@ -1924,8 +2073,18 @@ fn i294_r9_stale_no_echo_completion_rechecked_after_pending_submit() {
 fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     let tx_count = h.wal_tx_payloads().len();
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let id = h.submit_with("echo x", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"echo x\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
 
     if human_tx {
         h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
@@ -2111,8 +2270,18 @@ fn i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx() {
     console.push_input(b"echo HUMAN\n");
     wait_tx(&h, b"echo HUMAN\n");
 
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
     wait_tx(&h, b"printf x\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx(b"root@t:/# ");
     assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
 
@@ -2142,8 +2311,18 @@ fn i294_raw_half_line_does_not_anchor_agent_echo() {
     console.push_input(b"e");
     wait_tx(&h, b"e");
 
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let id = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
     wait_tx(&h, b"cho AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
     h.advance(Duration::from_millis(200));
 
@@ -2171,8 +2350,18 @@ fn i294_raw_half_line_does_not_poison_next_agent_echo() {
     console.push_input(b"e");
     wait_tx(&h, b"e");
 
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
     let first = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
     wait_tx(&h, b"cho AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
     h.advance(Duration::from_millis(200));
     let first_result = h.wait_done(&first);
@@ -2238,15 +2427,23 @@ fn i294_busybox_wrap_after_command_space_keeps_actor_completion_anchored() {
     let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
     let cut = 5 + 40 + 1;
     let tx_count = h.wal_tx_payloads().len();
+    let (completion_matched_tx, completion_matched_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |_| {
+        completion_matched_tx
+            .send(())
+            .expect("completion evaluator 已判定完整 echo 與 prompt");
+    })));
     let id = h.submit_with(&command, |r| r.timeout_s = 0.2);
     wait_tx(&h, format!("{command}\n").as_bytes());
-
     let raw = format!(
         "{}\r\r\n{}\r\nOUT\r\nroot@t:/# ",
         &command[..cut],
         &command[cut..]
     );
     h.inject_rx_processed(raw.as_bytes());
+    completion_matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("operation deadline 已建立，且完成判定先於假時鐘推進");
     h.advance(Duration::from_millis(200));
     let result = h.wait_done(&id);
     assert_eq!(result["status"], PyValue::from("done"));

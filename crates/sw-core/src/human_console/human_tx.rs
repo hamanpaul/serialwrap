@@ -12,7 +12,7 @@ use sw_proto::constants::HUMAN_TX_BACKLOG_MAX_BYTES;
 
 use crate::mailbox::ControlEvent;
 use crate::tx_writer::{TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::RxShared;
+use crate::uart_bridge::{HumanInFlightGuard, RxShared};
 
 /// 一筆 human TX job 的識別（結算時以 `HumanTxCompleted { tag, .. }` 帶回）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +136,10 @@ impl HumanLane {
         self.backlog.is_empty()
     }
 
+    pub fn backlog_front(&self) -> Option<&BacklogItem> {
+        self.backlog.front()
+    }
+
     /// 取出（依原順序）屬於某 hold 的回放項目（D-22(4) 撤銷時放回 deferred 前端）。
     pub fn take_replays_of(&mut self, hold: u64) -> Vec<BacklogItem> {
         let mut out = Vec::new();
@@ -199,7 +203,7 @@ impl HumanLane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PumpFull;
 
-type PumpItem = (HumanTxTag, TxPermit, Vec<u8>);
+type PumpItem = (HumanTxTag, TxPermit, Vec<u8>, HumanInFlightGuard);
 
 /// per-session human TX pump thread（`serialwrap-human-tx-<COM>`）。
 ///
@@ -207,6 +211,7 @@ type PumpItem = (HumanTxTag, TxPermit, Vec<u8>);
 /// 再以 control lane 回 `HumanTxCompleted`。TxWriter 已結束（`Disconnected`／writer 收尾）時回 `NotSubmitted`。
 pub struct HumanTxPump {
     tx: Sender<PumpItem>,
+    rx: std::sync::Arc<RxShared>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -231,10 +236,18 @@ impl HumanTxPump {
         control: Sender<ControlEvent>,
     ) -> HumanTxPump {
         let (sender, receiver) = bounded::<PumpItem>(1);
+        let pump_rx = std::sync::Arc::clone(&rx);
         let join = std::thread::Builder::new()
             .name(format!("serialwrap-human-tx-{com}"))
             .spawn(move || {
-                while let Ok((tag, permit, payload)) = receiver.recv() {
+                loop {
+                    #[cfg(feature = "test-fakes")]
+                    rx.human_pump_before_take_for_test();
+                    let Ok((tag, permit, payload, in_flight)) = receiver.recv() else {
+                        break;
+                    };
+                    #[cfg(feature = "test-fakes")]
+                    rx.human_pump_after_take_for_test();
                     let (reply, report_rx) = bounded::<TxReport>(1);
                     let job = TxJob {
                         permit: permit.clone(),
@@ -242,7 +255,7 @@ impl HumanTxPump {
                         reply,
                         aggregate: None,
                     };
-                    let start_guard = rx.begin_human_submit();
+                    rx.wait_for_timeout_rescue_gate();
                     let queued = tx.jobs.send(job);
                     let report = match queued {
                         Ok(()) => tx
@@ -250,7 +263,7 @@ impl HumanTxPump {
                             .unwrap_or_else(|| not_submitted(&permit)),
                         Err(_) => not_submitted(&permit),
                     };
-                    drop(start_guard);
+                    drop(in_flight);
                     if control
                         .send(ControlEvent::HumanTxCompleted { tag, report })
                         .is_err()
@@ -262,17 +275,117 @@ impl HumanTxPump {
             .expect("spawn human tx pump");
         HumanTxPump {
             tx: sender,
+            rx: pump_rx,
             join: Some(join),
         }
     }
 
     /// bounded(1)；actor 永不阻塞。
-    pub fn try_submit(&self, tag: HumanTxTag, permit: TxPermit, payload: Vec<u8>) -> Result<(), PumpFull> {
-        self.tx.try_send((tag, permit, payload)).map_err(|_| PumpFull)
+    pub fn try_submit(
+        &self,
+        tag: HumanTxTag,
+        permit: TxPermit,
+        payload: Vec<u8>,
+        in_flight: HumanInFlightGuard,
+    ) -> Result<(), PumpFull> {
+        let sent = self.tx.try_send((tag, permit, payload, in_flight));
+        if sent.is_ok() {
+            #[cfg(feature = "test-fakes")]
+            self.rx.note_human_pump_submission_for_test();
+        }
+        sent.map_err(|_| PumpFull)
     }
 
     /// 關閉入口；pump 送完手上那筆後結束（不阻塞呼叫端）。
     pub fn stop(mut self) {
         drop(self.join.take());
+    }
+}
+
+#[cfg(all(test, feature = "test-fakes"))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crossbeam_channel::bounded;
+    use super::{HumanTxPump, HumanTxTag};
+    use crate::tx_writer::{
+        Fence, LedgerGaugeCells, OpId, TxClass, TxJob, TxPermit, TxWriterHandle,
+    };
+    use crate::uart_bridge::RxShared;
+
+    fn tag(seq: u64) -> HumanTxTag {
+        HumanTxTag {
+            seq,
+            client_id: "i294-r12".into(),
+            client_lifetime: 1,
+            input_epoch: 0,
+            class: TxClass::HumanRaw,
+            len: 1,
+        }
+    }
+
+    fn permit(seq: u64) -> TxPermit {
+        TxPermit {
+            op_id: OpId(seq),
+            epoch: 0,
+            owner_gen: 0,
+            fsm_gen: 0,
+            class: TxClass::HumanRaw,
+            source: "human:i294-r12".into(),
+            cmd_id: None,
+            log: false,
+            input_epoch: Some(0),
+            replay_hold: None,
+            probe_id: None,
+        }
+    }
+
+    #[test]
+    fn i294_r12_pump_full_and_writer_channel_closed_drop_guards() {
+        let rx = RxShared::new(1024, 0);
+        let (pause_tx, pause_rx) = bounded(1);
+        let (resume_tx, resume_rx) = bounded(1);
+        rx.set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+            pause_tx.send(()).expect("pump 到達取件屏障");
+            resume_rx.recv().expect("釋放 pump 取件屏障");
+        })));
+
+        let (writer_jobs, writer_receiver) = bounded::<TxJob>(1);
+        drop(writer_receiver);
+        let (settle, _settle_receiver) = bounded(1);
+        let writer = TxWriterHandle::new(
+            writer_jobs,
+            settle,
+            Arc::new(LedgerGaugeCells::default()),
+            Fence::new(),
+        );
+        let (control, control_receiver) = bounded(1);
+        drop(control_receiver);
+        let mut pump = HumanTxPump::spawn("i294-r12", writer, Arc::clone(&rx), control);
+        pause_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pump 尚未取件");
+
+        assert!(pump
+            .try_submit(tag(1), permit(1), b"a".to_vec(), rx.begin_human_submit())
+            .is_ok());
+        assert_eq!(rx.human_in_flight_for_test(), 1);
+        assert!(pump
+            .try_submit(tag(2), permit(2), b"b".to_vec(), rx.begin_human_submit())
+            .is_err());
+        assert_eq!(rx.human_in_flight_for_test(), 1, "channel 滿載時拒絕的 guard 已釋放");
+
+        resume_tx.send(()).expect("釋放 pump");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rx.human_in_flight_for_test() != 0 {
+            assert!(Instant::now() < deadline, "writer channel 關閉後 guard 未歸零");
+            std::thread::yield_now();
+        }
+        assert_eq!(rx.human_in_flight_for_test(), 0, "writer channel 關閉時 pump 已釋放 guard");
+
+        let join = pump.join.take().expect("pump thread");
+        drop(pump);
+        join.join().expect("channel 關閉後 pump 正常結束");
     }
 }

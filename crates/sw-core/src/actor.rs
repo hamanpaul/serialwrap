@@ -391,6 +391,13 @@ pub trait EffectExecutor: Send {
     fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> {
         None
     }
+    /// 在 actor 套用事件前建立需要跨越 transition 的執行期 guard。
+    ///
+    /// Human console pump job 會先在 `SessionCore` 標成 lane in-flight，再由下方 effect executor 送進 pump；
+    /// 此 hook 讓實作在前一刻先登記 guard，避免其他執行緒的 timeout 在兩步之間看不到該 job。
+    fn before_event(&mut self, _core: &SessionCore, _item: &MailboxItem, _now: u64) {}
+    /// 釋放沒有轉交給 effect 的暫存 guard（例如 event 未產生 HumanTx 或 transition panic）。
+    fn finish_event(&mut self) {}
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
     /// S2-PAR-wp510r R1: 效果立即回饋佇列（executor 推回的事件先於下一次 mailbox 收取被處理）。
     ///
@@ -822,6 +829,7 @@ fn dispatch(
         MailboxItem::Data(_) => (None, "Data"),
     };
 
+    exec.before_event(core, &item, now);
     let result = catch_unwind(AssertUnwindSafe(|| {
         // 只在可能開埠、交還或結算資源的事件讀帳本；RX／Tick 不可因查詢 manager 鎖而堵住唯讀 RPC。
         let observes_custody = match &item {
@@ -953,5 +961,6 @@ fn dispatch(
             }
         }
     }
+    exec.finish_event();
     core.shutdown_complete()
 }

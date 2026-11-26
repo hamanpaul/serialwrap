@@ -19,6 +19,7 @@ use crate::human_console::line_mode::human_console_mode;
 use crate::human_console::ownership::InputRoute;
 use crate::human_console::{ConsoleRecord, ConsoleScanSnapshot, ConsoleTransportKind, ReplayHold};
 use crate::human_console::line_editor::LineEditor;
+use crate::mailbox::{ControlEvent, DataEvent, MailboxItem, TimerEvent};
 use crate::tx_writer::{TxClass, TxReport};
 
 /// D-19 限速表上限（超過時整批清空；只影響 WARNING 次數）。
@@ -28,6 +29,201 @@ const DROP_WARN_KEYS_MAX: usize = 1024;
 const LINE_REJECT_WARN_CODES: [&str; 3] = ["CMD_TOO_LONG", "SESSION_QUEUE_FULL", "SESSION_NOT_READY"];
 
 impl SessionCore {
+    /// 判斷套用 actor event 前是否可能建立新的 pump job。
+    ///
+    /// Actor 以此在套用 sans-IO transition 前先登記在途 guard；真正沒有產生 HumanTx effect 時，
+    /// executor 會在同一個 dispatch 結束時釋放 guard。Deferred bytes 只有在該 event 確實開啟回放
+    /// 或使回放進入 lane 時才列為候選，不把 suspend 期間尚未送出的輸入當作在途 submit。
+    #[doc(hidden)]
+    pub fn human_tx_may_start_before_event(&self, item: &MailboxItem, now: Mono) -> bool {
+        match item {
+            MailboxItem::Data(DataEvent::ConsoleInputBytes {
+                client_id,
+                client_lifetime,
+                input_epoch,
+                bytes,
+            }) => self.console_input_may_emit_human_tx(
+                client_id,
+                *client_lifetime,
+                *input_epoch,
+                bytes,
+            ),
+            MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
+                self.human_tx_completion_may_emit(tag, report)
+            }
+            MailboxItem::Control(ControlEvent::OpFinished { op_id, epoch, .. }) => {
+                self.op_finished_may_replay_human(*op_id, *epoch)
+            }
+            MailboxItem::Control(ControlEvent::Tick) => {
+                self.lease_expiry_may_replay_human(now)
+            }
+            MailboxItem::Control(ControlEvent::Timer(TimerEvent::LeaseExpiry {
+                lease_id,
+                deadline,
+            })) => {
+                self.lease_matches(lease_id)
+                    && now > *deadline
+                    && self.lease.as_ref().is_some_and(|lease| {
+                        !lease.is_human() && lease.deadline() == *deadline
+                    })
+                    && self.lease_close_may_replay_human(now)
+            }
+            MailboxItem::Control(ControlEvent::Request { req, .. }) => {
+                self.request_may_replay_human(req, now)
+            }
+            _ => false,
+        }
+    }
+
+    fn console_input_may_emit_human_tx(
+        &self,
+        client_id: &str,
+        lifetime: u64,
+        input_epoch: u64,
+        bytes: &[u8],
+    ) -> bool {
+        if bytes.is_empty()
+            || input_epoch != self.generations.input_epoch
+            || !self.human.is_live(client_id, lifetime)
+            || self.human.lane.is_busy_for(client_id)
+            || self.human.lane.in_flight().is_some()
+            || self.generations.conn_epoch.is_none()
+        {
+            return false;
+        }
+        match self.human.ownership.peek_route(client_id) {
+            InputRoute::Raw { .. } => {
+                self.human.deferred_len_for(client_id) == 0
+                    || self.immediate_replay_allowed(client_id)
+            }
+            InputRoute::DropFlash | InputRoute::Defer | InputRoute::Line => false,
+        }
+    }
+
+    fn human_tx_completion_may_emit(&self, tag: &HumanTxTag, report: &TxReport) -> bool {
+        let Some(job) = self.human.lane.in_flight_job() else {
+            return false;
+        };
+        if job.tag.seq != tag.seq || report.op_id != job.ledger.0 || report.epoch != job.ledger.1 {
+            return false;
+        }
+        if report.result.outcome == TxOutcome::NotSubmitted
+            && job.tag.class == TxClass::HumanRaw
+            && job.tag.input_epoch == self.generations.input_epoch
+            && self.human.is_live(&job.tag.client_id, job.tag.client_lifetime)
+            && self.immediate_replay_allowed(&job.tag.client_id)
+        {
+            return true;
+        }
+        if self
+            .human
+            .lane
+            .backlog_front()
+            .is_some_and(|item| self.backlog_item_may_emit_human_tx(item))
+        {
+            return true;
+        }
+        self.human.replay_after_revoked
+            && self.deferred_replay_context_open()
+            && !self.human.replay_hold.as_ref().is_some_and(|hold| hold.revoked)
+            && self.has_live_deferred_input()
+    }
+
+    fn backlog_item_may_emit_human_tx(&self, item: &BacklogItem) -> bool {
+        match item.kind {
+            BacklogKind::Replay { .. } => true,
+            BacklogKind::Input => {
+                if item.tag.input_epoch != self.generations.input_epoch
+                    || !self.human.is_live(&item.tag.client_id, item.tag.client_lifetime)
+                {
+                    return false;
+                }
+                match self.human.ownership.peek_route(&item.tag.client_id) {
+                    InputRoute::Raw { .. } => {
+                        self.human.deferred_len_for(&item.tag.client_id) == 0
+                            || self.immediate_replay_allowed(&item.tag.client_id)
+                    }
+                    InputRoute::DropFlash | InputRoute::Defer | InputRoute::Line => false,
+                }
+            }
+        }
+    }
+
+    fn op_finished_may_replay_human(&self, op_id: crate::tx_writer::OpId, epoch: u64) -> bool {
+        if self.human.lane.in_flight().is_some() || !self.has_live_deferred_input() {
+            return false;
+        }
+        let foreground_finishes = self
+            .foreground
+            .as_ref()
+            .is_some_and(|grant| grant.op_id == op_id && grant.epoch == epoch)
+            && self.fg_adm.is_some();
+        let side_self_test_resumes = self.side_ops.get(&op_id).is_some_and(|grant| {
+            grant.epoch == epoch
+                && PendingOp::self_test_suspend_token(self.pending_ops.get(&op_id))
+                    == Some(self.self_test_suspend_gen)
+        });
+        foreground_finishes || side_self_test_resumes
+    }
+
+    fn lease_expiry_may_replay_human(&self, now: Mono) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
+            && self.lease_close_may_replay_human(now)
+    }
+
+    fn lease_close_may_replay_human(&self, now: Mono) -> bool {
+        self.human.lane.in_flight().is_none()
+            && self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.suspended_human)
+            && self.stashed_human.as_ref().is_some_and(|stash| {
+                !stash.expired(now)
+                    && stash
+                        .human_client_id()
+                        .is_some_and(|client_id| self.human_peer_present(client_id))
+            })
+            && self.has_live_deferred_input()
+    }
+
+    fn has_live_deferred_input(&self) -> bool {
+        self.human.consoles.iter().any(|(client_id, record)| {
+            self.human.deferred_len_for(client_id) > 0
+                && self.human.is_live(client_id, record.client_lifetime)
+        })
+    }
+
+    fn request_may_replay_human(&self, req: &SessionRequest, now: Mono) -> bool {
+        if self.human.lane.in_flight().is_some() || !self.has_live_deferred_input() {
+            return false;
+        }
+        match req {
+            SessionRequest::Submit(submit) => {
+                submit.mode == "interactive"
+                    && submit.command.is_empty()
+                    && self.state == SessionState::Ready
+                    && self.foreground.is_none()
+                    && self.queue.len() == 0
+            }
+            SessionRequest::InteractiveClose { interactive_id } => {
+                self.lease_matches(interactive_id) && self.lease_close_may_replay_human(now)
+            }
+            SessionRequest::InteractiveStatus { interactive_id, .. }
+            | SessionRequest::InteractiveSend { interactive_id, .. } => {
+                self.lease_matches(interactive_id)
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.is_human() && lease.expired(now))
+                    && self.lease_close_may_replay_human(now)
+            }
+            SessionRequest::Recover { .. } => self.lease_close_may_replay_human(now),
+            _ => false,
+        }
+    }
+
     // ---------------- 公開入口（07 Task 6 Produces） ----------------
 
     /// 07 Task 6：admission 關；agent 且有 human lease 時 suspend；先撤銷 `replay_auth`（D-22(4)）。

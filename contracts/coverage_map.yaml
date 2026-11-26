@@ -142,6 +142,9 @@ entries:
     - cargo:sw-core::command_exec::i294_r11_human_job_queued_before_command_submit_suppresses_rescue
     - cargo:sw-core::command_exec::i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue
     - cargo:sw-core::command_exec::i294_r11_fence_rejected_human_job_before_report_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r12_human_job_guarded_before_pump_take_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r12_human_job_guarded_after_pump_take_suppresses_rescue
+    - cargo:sw-core::human_console::human_tx::tests::i294_r12_pump_full_and_writer_channel_closed_drop_guards
     - cargo:sw-core::command_completion::tests::i294_r9_direct_echo_search_has_linear_work_bound
     - cargo:sw-core::i294_r9_baseline_diff::i294_r9_no_human_timeout_stdout_matches_baseline_for_both_echo_states
     - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo
