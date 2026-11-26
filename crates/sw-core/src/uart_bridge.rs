@@ -13,7 +13,7 @@ use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
     SerialReader, SerialWriter, SubmitStep,
 };
-use sw_proto::pycompat::{clean_text, decode_utf8_replace};
+use sw_proto::pycompat::{clean_text_with_source_ranges, decode_utf8_replace};
 use sw_proto::pyre::{compile, PyFlags, PyRegex};
 
 use crate::drain::StopId;
@@ -61,8 +61,6 @@ struct ActorDispatchGateState {
     /// 最新已寫出 human TX 的 RX epoch 與絕對 RX 字元邊界。
     pending_human_epoch: Option<u64>,
     pending_human_rx_offset: Option<u64>,
-    /// 有既存 pending 的 session 正在等舊 writer guard 收斂後，才可重設到新 epoch。
-    pending_handoff_epoch: Option<u64>,
     /// 此 session 當前接管的 RX window；舊 writer 的晚到回報也在這個 window 線性化。
     active_rx: Option<Weak<RxShared>>,
     active_rx_epoch: Option<u64>,
@@ -604,15 +602,10 @@ impl RxShared {
         human.active_rx = Some(Arc::downgrade(self));
         human.active_rx_epoch = Some(epoch);
         if human.pending_human {
-            if human.human_in_flight == 0 {
-                human.pending_human_epoch = Some(epoch);
-                human.pending_human_rx_offset = Some(0);
-                human.pending_handoff_epoch = None;
-            } else {
-                human.pending_handoff_epoch = Some(epoch);
-            }
-        } else {
-            human.pending_handoff_epoch = None;
+            let (boundary_epoch, boundary_offset) =
+                advance_pending_human_boundary(&mut human, epoch, 0);
+            human.human_tx_epoch = Some(boundary_epoch);
+            human.last_human_tx_rx_offset = boundary_offset;
         }
         let prompt_regex = self.actor_dispatch_gate.prompt_regex();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -623,6 +616,11 @@ impl RxShared {
         drop(window);
         drop(human);
         self.wake_all();
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn activate_epoch_for_test(self: &Arc<Self>, epoch: u64) {
+        self.activate_epoch(epoch);
     }
 
     /// human line submit 的在途 guard；實際成功排入 TX writer 後才更新 submit 起點計數。
@@ -690,19 +688,6 @@ impl RxShared {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         human.human_in_flight = human.human_in_flight.saturating_sub(1);
-        let handoff_epoch = if human.human_in_flight == 0 {
-            human.pending_handoff_epoch.take()
-        } else {
-            None
-        };
-        if let Some(epoch) = handoff_epoch {
-            if human.pending_human && human.pending_human_epoch != Some(epoch) {
-                // 舊 pending TX 以新 window 起點重設；若在途 writer 實際寫出，
-                // record_human_tx_locked 已先用它的 TX 邊界取代此位置。
-                human.pending_human_epoch = Some(epoch);
-                human.pending_human_rx_offset = Some(0);
-            }
-        }
         let prompt_regex = self.actor_dispatch_gate.prompt_regex();
         let active_rx = human.active_rx.as_ref().and_then(Weak::upgrade);
         let active_window = active_rx.as_deref().unwrap_or(self);
@@ -1422,20 +1407,22 @@ impl RxShared {
         self.wake_all();
     }
 
-    /// 在 RX 鎖下於 OS submit 前擷取 watermark；只在已接受或結果不明時提交 human TX 觀察。
-    /// WouldBlock 不留下 human TX，也不固定 command 起點，下一次實際提交會重新取 watermark。
+    /// agent command 邊界於 OS submit 前候選擷取；human TX 邊界則在成功 submit 返回後取 active RX watermark。
+    /// WouldBlock／NotSubmitted 不建立 human TX 邊界，也不固定 command 起點，下一次實際提交會重新取 watermark。
     pub(crate) fn observe_tx_submit(
         &self,
         command_op_id: Option<u64>,
         command_boundary_recorded: bool,
+        writer_epoch: u64,
         human_payload: Option<(&[u8], bool, usize)>,
         clock: &dyn Clock,
         submit: &mut dyn FnMut() -> SubmitStep,
     ) -> (SubmitStep, bool) {
-        // 寫入前在 gate → RX 鎖序內讀 watermark 並發布 submit-pending，隨即釋放鎖再呼叫 OS。
-        // human guard／submit-pending 使交錯 RX 不能在 write 結果確定前清除 pending；OS write
-        // 可能等待 RX reader，因此不可跨越 write closure 持有 gate 或 RX mutex。
-        let (candidate_boundary, candidate_human_rx) = {
+        // agent command 的候選起點在 submit 前取值；human 的有效邊界稍後在 submit 成功返回後取值。
+        // 此處先發布 submit-pending，隨即釋放鎖再呼叫 OS。human guard／submit-pending 使交錯 RX
+        // 不能在 write 結果確定前清除 pending；OS write 可能等待 RX reader，因此不可跨 write closure
+        // 持有 gate 或 RX mutex。
+        let candidate_boundary = {
             let human = self
                 .actor_dispatch_gate
                 .state
@@ -1448,21 +1435,7 @@ impl RxShared {
             window.tx_submit_pending = true;
             window.tx_submit_pending_started_at = Some(clock.mono_ns());
             drop(window);
-            let human_rx = human_payload.map(|_| {
-                let active_rx = human.active_rx.as_ref().and_then(Weak::upgrade);
-                let active_window = active_rx.as_deref().unwrap_or(self);
-                let active_window = active_window
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                (
-                    human.active_rx_epoch.unwrap_or(active_window.watermark.0),
-                    active_window
-                        .trimmed
-                        .saturating_add(active_window.text.chars().count() as u64),
-                )
-            });
-            (boundary, human_rx)
+            boundary
         };
         let mut pending_guard = TxSubmitPendingGuard {
             rx: self,
@@ -1482,6 +1455,8 @@ impl RxShared {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let human_boundary = human_payload
+                .map(|_| human_boundary_after_submit(self, &human, writer_epoch));
             {
                 let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 let event_mono = clock.mono_ns();
@@ -1496,8 +1471,8 @@ impl RxShared {
                         let start = offset.min(payload.len());
                         let end = start.saturating_add(*count).min(payload.len());
                         if end > start {
-                            let (epoch, rx_offset) = candidate_human_rx
-                                .expect("human submit 前應擷取 RX offset");
+                            let (epoch, rx_offset) = human_boundary
+                                .expect("human submit 成功返回後應擷取 RX watermark");
                             record_human_tx_locked(
                                 &mut human,
                                 &payload[start..end],
@@ -1509,8 +1484,8 @@ impl RxShared {
                         }
                     }
                     (Some((_, raw_input, _)), SubmitStep::Pending) => {
-                        let (epoch, rx_offset) = candidate_human_rx
-                            .expect("human submit 前應擷取 RX offset");
+                        let (epoch, rx_offset) = human_boundary
+                            .expect("human submit 成功返回後應擷取 RX watermark");
                         record_human_tx_unknown_locked(
                             &mut human,
                             raw_input,
@@ -2236,6 +2211,49 @@ fn command_boundary(human: &ActorDispatchGateState, window: &RxWindow) -> Comman
     }
 }
 
+fn human_boundary_after_submit(
+    rx: &RxShared,
+    human: &ActorDispatchGateState,
+    writer_epoch: u64,
+) -> (u64, u64) {
+    let active_rx = human.active_rx.as_ref().and_then(Weak::upgrade);
+    let active_window = active_rx.as_deref().unwrap_or(rx);
+    let window = active_window
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let active_epoch = human.active_rx_epoch.unwrap_or(window.watermark.0);
+    if writer_epoch < active_epoch {
+        // 舊 handle 關閉先於新 handle 開啟；舊 epoch 的已接受 TX 必定位於新 epoch RX 之前。
+        (active_epoch, 0)
+    } else {
+        let end_offset = window
+            .trimmed
+            .saturating_add(window.text.chars().count() as u64);
+        if writer_epoch == active_epoch {
+            (active_epoch, end_offset)
+        } else {
+            // Fence 不允許未來 epoch 的 permit；若內部狀態違反此前提，保守要求後續新行才可結案。
+            (active_epoch, end_offset.saturating_add(1))
+        }
+    }
+}
+
+fn advance_pending_human_boundary(
+    human: &mut ActorDispatchGateState,
+    epoch: u64,
+    rx_offset: u64,
+) -> (u64, u64) {
+    let current = human
+        .pending_human_epoch
+        .zip(human.pending_human_rx_offset);
+    let candidate = (epoch, rx_offset);
+    let latest = current.map_or(candidate, |current| current.max(candidate));
+    human.pending_human_epoch = Some(latest.0);
+    human.pending_human_rx_offset = Some(latest.1);
+    latest
+}
+
 fn record_human_tx_locked(
     human: &mut ActorDispatchGateState,
     payload: &[u8],
@@ -2245,11 +2263,11 @@ fn record_human_tx_locked(
     mono_ns: Mono,
 ) {
     human.human_tx_generation = human.human_tx_generation.saturating_add(1);
-    human.human_tx_epoch = Some(epoch);
-    human.last_human_tx_rx_offset = rx_offset;
     human.pending_human = true;
-    human.pending_human_epoch = Some(epoch);
-    human.pending_human_rx_offset = Some(rx_offset);
+    let (boundary_epoch, boundary_offset) =
+        advance_pending_human_boundary(human, epoch, rx_offset);
+    human.human_tx_epoch = Some(boundary_epoch);
+    human.last_human_tx_rx_offset = boundary_offset;
     if raw_input && !payload.is_empty() {
         update_raw_line_state(human, payload);
     }
@@ -2268,7 +2286,40 @@ fn has_prompt_after_offset(
     if window.watermark.0 != epoch || rx_offset > end_offset {
         return false;
     }
-    has_tail_prompt(window.text_from(rx_offset.max(window.trimmed)), prompt)
+    let (cleaned, sources) = clean_text_with_source_ranges(&window.text);
+    let cleaned_chars = cleaned.chars().collect::<Vec<_>>();
+    let Some(line_start) = cleaned_chars
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map(|index| index + 1)
+        .or_else(|| (!cleaned_chars.is_empty()).then_some(0))
+    else {
+        return false;
+    };
+    let line_start_absolute = if line_start == 0 {
+        if window.trimmed > rx_offset {
+            // 修剪後無法證明目前最後一行的真正行首仍在窗口內。
+            return false;
+        }
+        window.trimmed
+    } else {
+        let newline_source_end = sources[line_start - 1].end;
+        window
+            .trimmed
+            .saturating_add(window.text[..newline_source_end].chars().count() as u64)
+    };
+    if line_start_absolute < rx_offset {
+        return false;
+    }
+
+    let line_start_byte = cleaned
+        .char_indices()
+        .nth(line_start)
+        .map_or(cleaned.len(), |(byte, _)| byte);
+    let tail = &cleaned[line_start_byte..];
+    prompt
+        .search(tail)
+        .is_some_and(|matched| matched.start == 0 && matched.end == tail.chars().count())
 }
 
 fn settle_pending_human_locked(
@@ -2309,11 +2360,11 @@ fn record_human_tx_unknown_locked(
     mono_ns: Mono,
 ) {
     human.human_tx_generation = human.human_tx_generation.saturating_add(1);
-    human.human_tx_epoch = Some(epoch);
-    human.last_human_tx_rx_offset = rx_offset;
     human.pending_human = true;
-    human.pending_human_epoch = Some(epoch);
-    human.pending_human_rx_offset = Some(rx_offset);
+    let (boundary_epoch, boundary_offset) =
+        advance_pending_human_boundary(human, epoch, rx_offset);
+    human.human_tx_epoch = Some(boundary_epoch);
+    human.last_human_tx_rx_offset = boundary_offset;
     if raw_input {
         human.human_raw_line_open = true;
     }
@@ -2342,21 +2393,6 @@ fn push_human_state_event(human: &mut ActorDispatchGateState, mono_ns: Mono) {
             pending_human: human.pending_human,
         },
     });
-}
-
-fn has_tail_prompt(raw: &str, prompt: &PyRegex) -> bool {
-    let cleaned = clean_text(raw);
-    let len = cleaned.chars().count();
-    let line_start = cleaned
-        .chars()
-        .enumerate()
-        .filter_map(|(index, ch)| (ch == '\n').then_some(index + 1))
-        .last()
-        .unwrap_or(0);
-    let tail: String = cleaned.chars().skip(line_start).take(len - line_start).collect();
-    prompt
-        .search(&tail)
-        .is_some_and(|matched| matched.start == 0 && matched.end == tail.chars().count())
 }
 
 /// reader thread 的依賴（Task 10 Produces）。

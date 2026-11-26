@@ -411,6 +411,10 @@ fn i294_human_reply_arriving_inside_submit_does_not_poison_next_no_echo_command(
     h.wait_for("human TX observation 已提交", |rig| {
         rig.rx.human_tx_state().generation > before_generation
     });
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+    h.wait_for("write 後的新 prompt 結清 human pending", |rig| {
+        !rig.rx.human_tx_state().pending_human
+    });
 
     let tx_count = h.wal_tx_payloads().len();
     let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
@@ -8973,6 +8977,536 @@ fn i294_r17_human_prompt_must_follow_tx_boundary() {
             );
         }
     }
+}
+
+#[test]
+fn i294_r18_prompt_received_before_human_os_write_return_is_before_boundary() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-write-boundary");
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    let first_submit = Arc::new(AtomicBool::new(false));
+    let first_submit_hook = Arc::clone(&first_submit);
+    let (prompt_seen_tx, prompt_seen_rx) = crossbeam_channel::bounded(1);
+    h.dev.on_os_submit(Box::new(move || {
+        if first_submit_hook.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let prompt = b"root@t:/# ";
+        let expected = rx.total_bytes().saturating_add(prompt.len() as u64);
+        dev.push_rx(prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+        prompt_seen_tx.send(()).expect("OS write 前 prompt 已由 reader 收到");
+    }));
+
+    console.push_input(b"echo R18_WRITE_BOUNDARY\n");
+    prompt_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human writer 在 OS write 之前收到完整 prompt");
+    wait_tx(&h, b"echo R18_WRITE_BOUNDARY\n");
+    h.wait_for("human writer report 與 guard 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().generation > 0
+    });
+
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "write 返回前已追加的 prompt 必須位於 post-write watermark 之前，不能結案"
+    );
+}
+
+#[test]
+fn i294_r18_split_prompt_settles_only_after_complete_post_boundary_line() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-split-prompt");
+    console.push_input(b"echo R18_SPLIT\n");
+    wait_tx(&h, b"echo R18_SPLIT\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+
+    h.inject_rx_reader_processed(b"\r\nroot@t:/");
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "分包 prompt 尚未形成完整尾端行時保持 pending"
+    );
+    h.inject_rx_reader_processed(b"# ");
+    assert!(
+        !h.rx.human_tx_state().pending_human,
+        "清理後完整 prompt 位於邊界之後時應結案"
+    );
+}
+
+#[test]
+fn i294_r18_prompt_line_start_before_tx_boundary_does_not_settle() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-cross-boundary-line");
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_CROSS_BOUNDARY\n");
+    wait_tx(&h, b"echo R18_CROSS_BOUNDARY\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+    h.inject_rx_reader_processed(b"root@t:/# ");
+
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "完整清理視窗的最後一行起點在 TX 邊界之前，不得用切片開頭當行首"
+    );
+}
+
+#[test]
+fn i294_r18_trimmed_line_start_does_not_settle() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-trimmed-line-start");
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_TRIMMED\n");
+    wait_tx(&h, b"echo R18_TRIMMED\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+
+    let mut redraw = vec![b'x'; 131_072];
+    redraw.extend(std::iter::repeat_n(b'\x08', 131_072));
+    redraw.extend_from_slice(b"root@t:/# ");
+    h.inject_rx_reader_processed(&redraw);
+    assert!(h.rx.snapshot_from(0).trimmed_before_from, "RX window 確實已修剪");
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "行首被修剪且無法證明位於邊界之後時保持 pending"
+    );
+}
+
+fn i294_r18_cross_boundary_timeout(timeout_entry: I294R17TimeoutEntry) {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console(&format!("i294-r18-cross-timeout-{timeout_entry:?}"));
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_TIMEOUT_HUMAN\n");
+    wait_tx(&h, b"echo R18_TIMEOUT_HUMAN\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+    h.inject_rx_reader_processed(b"root@t:/# ");
+
+    let (timeout_seen_tx, timeout_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_timeout_tx, release_timeout_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            timeout_seen_tx.send(()).expect("指定 timeout 入口已到期");
+            release_timeout_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 timeout barrier");
+        })));
+    let id = i294_r17_submit_no_echo_actor(&h, "printf R18_NO_ECHO", timeout_entry);
+    timeout_entry.advance_actor(&h);
+    timeout_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("指定 timeout 入口抵達受控 barrier");
+    release_timeout_tx.send(()).expect("釋放 timeout barrier");
+    let record = h.wait_done(&id);
+    i294_r17_assert_timeout_partial(&record);
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo R18_TIMEOUT_HUMAN\nprintf R18_NO_ECHO\n",
+        "human／agent 真實路徑不得重送或送救援 TX"
+    );
+}
+
+#[test]
+fn i294_r18_cross_boundary_prompt_silence_timeout_has_no_rescue_tx() {
+    i294_r18_cross_boundary_timeout(I294R17TimeoutEntry::Silence);
+}
+
+#[test]
+fn i294_r18_cross_boundary_prompt_operation_deadline_has_no_rescue_tx() {
+    i294_r18_cross_boundary_timeout(I294R17TimeoutEntry::OperationDeadline);
+}
+
+#[test]
+fn i294_r18_late_old_writer_accepted_prompt_uses_active_epoch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let old_rx = Arc::clone(&h.rx);
+    let old_epoch = old_rx.watermark().0;
+    let new_epoch = old_epoch.saturating_add(1);
+    let new_rx = sw_core::uart_bridge::RxShared::new_with_actor_dispatch_gate(
+        131_072,
+        h.clock.mono_ns(),
+        old_rx.actor_dispatch_gate(),
+    );
+    let (write_seen_tx, write_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_write_tx, release_write_rx) = crossbeam_channel::bounded(1);
+    let once = Arc::new(AtomicBool::new(false));
+    let once_hook = Arc::clone(&once);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if once_hook.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        write_seen_tx.send(()).expect("old human bytes 已寫入 OS");
+        release_write_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 observer 登錄前的 old writer barrier");
+    }));
+
+    let (report_seen_tx, report_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    old_rx.set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+        report_seen_tx.send(()).expect("old human report barrier");
+        release_report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 old writer report barrier");
+    })));
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_180);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: b"echo R18_LATE_OLD\n".to_vec(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = old_rx
+        .submit_human_job_for_test(&tx, job)
+        .expect("真實 TxWriter 接受 human job 入列");
+    write_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old OS write 已完成但 observer 尚未登錄");
+
+    new_rx.activate_epoch_for_test(new_epoch);
+    new_rx.append(b"root@t:/# ", h.clock.mono_ns(), new_epoch, 1);
+    release_write_tx.send(()).expect("釋放 old OS write closure");
+    report_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old writer 結果已形成，report 尚未釋放");
+    assert!(
+        new_rx.human_tx_state().pending_human,
+        "guard/report 未收斂前，新 epoch prompt 不得提前結案"
+    );
+    release_report_tx.send(()).expect("釋放 old writer report");
+    report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old human writer report 已交付");
+    drop(guard);
+
+    assert!(
+        !new_rx.human_tx_state().pending_human,
+        "old writer 的成功 submit 登錄到 active epoch offset 0 後，已有新 epoch prompt 應可結案"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R18WriterOutcome {
+    Accepted,
+    Pending,
+    WouldBlock,
+    NotSubmitted,
+}
+
+fn i294_r18_run_writer_handoff_case(
+    outcome: I294R18WriterOutcome,
+    had_pending: bool,
+    prompt_before_guard_release: bool,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let old_rx = Arc::clone(&h.rx);
+    let old_epoch = old_rx.watermark().0;
+    let new_epoch = old_epoch.saturating_add(1);
+    let new_rx = sw_core::uart_bridge::RxShared::new_with_actor_dispatch_gate(
+        131_072,
+        h.clock.mono_ns(),
+        old_rx.actor_dispatch_gate(),
+    );
+    if had_pending {
+        old_rx.record_human_tx_for_test(b"echo R18_PRIOR\n", &*h.clock);
+        if !old_rx.human_tx_state().pending_human {
+            return Err("前置條件：接管前 human pending 未建立".into());
+        }
+    }
+
+    let (report_seen_tx, report_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    old_rx.set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+        report_seen_tx.send(()).expect("human writer report 屏障");
+        release_report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 human writer report 屏障");
+    })));
+
+    let (submit_seen_tx, submit_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_submit_tx, release_submit_rx) = crossbeam_channel::bounded(1);
+    let tx_start = h.dev.tx_len();
+    match outcome {
+        I294R18WriterOutcome::Accepted => {
+            let once = Arc::new(AtomicBool::new(false));
+            let once_hook = Arc::clone(&once);
+            h.dev.on_os_submit_after_write(Box::new(move || {
+                if once_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                submit_seen_tx.send(()).expect("Accepted OS write 屏障");
+                release_submit_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("釋放 Accepted OS write 屏障");
+            }));
+        }
+        I294R18WriterOutcome::Pending => {
+            h.dev.script_write(vec![FakeWriteStep::Unknown {
+                confirmed: 0,
+                error: PalError::cancelled(),
+            }]);
+            let once = Arc::new(AtomicBool::new(false));
+            let once_hook = Arc::clone(&once);
+            h.dev.on_os_submit(Box::new(move || {
+                if once_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                submit_seen_tx.send(()).expect("Pending OS submit 屏障");
+                release_submit_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("釋放 Pending OS submit 屏障");
+            }));
+        }
+        I294R18WriterOutcome::WouldBlock => {
+            h.dev.script_write(vec![FakeWriteStep::WouldBlockThenPause]);
+        }
+        I294R18WriterOutcome::NotSubmitted => {
+            h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+        }
+    }
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_181);
+    let payload = b"echo R18_HANDOFF\n".to_vec();
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: payload.clone(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = old_rx
+        .submit_human_job_for_test(&tx, job)
+        .ok_or_else(|| "真實 human writer 未接受測試 job 入列".to_string())?;
+
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        if !h.dev.wait_paused(Duration::from_secs(5)) {
+            return Err(format!("{outcome:?} writer 未到控制屏障"));
+        }
+    } else if submit_seen_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        return Err(format!("{outcome:?} writer 未到提交屏障"));
+    }
+
+    new_rx.activate_epoch_for_test(new_epoch);
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        h.fence.with(|state| state.active_epoch = Some(new_epoch));
+    }
+    let prompt = b"\r\nroot@t:/# ";
+    if prompt_before_guard_release {
+        new_rx.append(prompt, h.clock.mono_ns(), new_epoch, 1);
+    }
+
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        h.dev.release_pause();
+    } else {
+        release_submit_tx
+            .send(())
+            .map_err(|_| format!("釋放 {outcome:?} submit 屏障失敗"))?;
+    }
+    if report_seen_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        return Err(format!("{outcome:?} writer report 未抵達受控屏障"));
+    }
+
+    let report_pending = new_rx.human_tx_state().pending_human;
+    let expect_pending_at_report = had_pending
+        || matches!(outcome, I294R18WriterOutcome::Accepted | I294R18WriterOutcome::Pending);
+    if report_pending != expect_pending_at_report {
+        return Err(format!(
+            "{outcome:?}, prior_pending={had_pending}, prompt_before={prompt_before_guard_release}: report 前 pending={report_pending}, 預期={expect_pending_at_report}"
+        ));
+    }
+
+    release_report_tx
+        .send(())
+        .map_err(|_| "釋放 writer report 失敗".to_string())?;
+    let report = report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "真實 human writer report 未交付".to_string())?;
+    drop(guard);
+
+    match outcome {
+        I294R18WriterOutcome::Accepted => {
+            if report.result.outcome != sw_pal::TxOutcome::Completed(payload.len())
+                || report.reject.is_some()
+            {
+                return Err(format!("Accepted writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::Pending => {
+            if report.result.outcome != (sw_pal::TxOutcome::Unknown { confirmed: 0 })
+                || report.reject.is_some()
+            {
+                return Err(format!("Pending writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::NotSubmitted => {
+            if report.reject.is_none()
+                || !matches!(report.result.outcome, sw_pal::TxOutcome::NotSubmitted)
+            {
+                return Err(format!("NotSubmitted writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::WouldBlock => {
+            if report.reject.is_none()
+                || !matches!(report.result.outcome, sw_pal::TxOutcome::NotSubmitted)
+            {
+                return Err(format!("WouldBlock 後的舊 epoch retry 應由 fence 拒絕：{report:?}"));
+            }
+        }
+    }
+
+    if prompt_before_guard_release {
+        if new_rx.human_tx_state().pending_human {
+            return Err(format!(
+                "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: prompt 在 guard 釋放前到達，結案未收斂"
+            ));
+        }
+    } else if expect_pending_at_report {
+        if !new_rx.human_tx_state().pending_human {
+            return Err(format!(
+                "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: prompt 尚未到達就提前結案"
+            ));
+        }
+        new_rx.append(prompt, h.clock.mono_ns(), new_epoch, 1);
+    }
+
+    if new_rx.human_tx_state().pending_human {
+        return Err(format!(
+            "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: 新 epoch prompt 後仍 pending"
+        ));
+    }
+    let expected_tx = match outcome {
+        I294R18WriterOutcome::Accepted => payload.as_slice(),
+        I294R18WriterOutcome::Pending
+        | I294R18WriterOutcome::WouldBlock
+        | I294R18WriterOutcome::NotSubmitted => &[],
+    };
+    if h.dev.tx_since(tx_start) != expected_tx {
+        return Err(format!(
+            "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: 發生重送或非預期 TX：{:?}",
+            h.dev.tx_since(tx_start)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn i294_r18_real_human_writer_handoff_result_matrix() {
+    let mut failures = Vec::new();
+    for outcome in [
+        I294R18WriterOutcome::Accepted,
+        I294R18WriterOutcome::Pending,
+        I294R18WriterOutcome::WouldBlock,
+        I294R18WriterOutcome::NotSubmitted,
+    ] {
+        for had_pending in [false, true] {
+            for prompt_before_guard_release in [false, true] {
+                if let Err(error) = i294_r18_run_writer_handoff_case(
+                    outcome,
+                    had_pending,
+                    prompt_before_guard_release,
+                ) {
+                    failures.push(error);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "R18 真實 human writer 接管矩陣：\n{}", failures.join("\n"));
+}
+
+#[test]
+fn i294_r18_real_writer_reconnect_unblocks_consecutive_no_echo_commands() {
+    let (manager, factory) = i294_r17_dynamic_manager();
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let (old_rx, _, _, old_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 bridge snapshot");
+    let old_epoch = old_epoch.expect("舊 bridge active epoch");
+    let console = i294_r17_manager_console(&manager, &factory);
+    console.push_input(b"echo R18_REAL_HUMAN\n");
+    wait_until("真實 human writer TX 已寫入 WAL", || {
+        i294_r17_manager_human_tx_payloads(&manager)
+            .iter()
+            .any(|payload| payload == b"echo R18_REAL_HUMAN\n")
+    });
+    wait_until("真實 human writer report 收斂且 pending", || {
+        old_rx.human_in_flight_for_test() == 0 && old_rx.human_tx_state().pending_human
+    });
+
+    let (new_rx, new_device) =
+        i294_r17_switch_manager_to_prpl(&manager, "/dev/ttyNEW-R18-REAL-WRITER");
+    assert_ne!(old_epoch, new_rx.watermark().0, "正式 reconnect 建立新 RX epoch");
+    assert!(
+        !new_rx.human_tx_state().pending_human,
+        "新 epoch READY prompt 應結清真實 writer 登記的舊 human TX"
+    );
+    assert_eq!(
+        i294_r17_manager_human_tx_payloads(&manager),
+        [b"echo R18_REAL_HUMAN\n".to_vec()],
+        "接管不重送 human TX"
+    );
+
+    let tx_before_commands = i1_r16_manager_tx_payloads(&manager).len();
+    for index in 0..3 {
+        let command = format!("printf R18_NO_ECHO_{index}");
+        let cmd_id = i1_r16_submit_manager_command(
+            &manager,
+            &command,
+            I1R16TimeoutEntry::OperationDeadline,
+        );
+        i1_r16_wait_for_command_tx(&manager, &command);
+        let (checks_before, _) = new_rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &new_rx,
+            &new_device,
+            format!("R18_NO_ECHO_{index}\r\nroot@prpl:/# ").as_bytes(),
+            checks_before,
+        );
+        wait_until("reconnect 後 no-echo 命令完成", || {
+            manager
+                .reg
+                .get(&cmd_id)
+                .and_then(|record| record.get("status").and_then(PyValue::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("done")
+        });
+        let record = manager.reg.get(&cmd_id).expect("no-echo command record");
+        assert_eq!(record.get("status"), Some(&PyValue::from("done")), "{record:?}");
+        assert_eq!(
+            record.get("stdout"),
+            Some(&PyValue::from(format!("R18_NO_ECHO_{index}"))),
+            "{record:?}"
+        );
+        assert_eq!(record.get("partial"), Some(&PyValue::Bool(false)), "{record:?}");
+    }
+    let command_tx = i1_r16_manager_tx_payloads(&manager)
+        .into_iter()
+        .skip(tx_before_commands)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command_tx,
+        (0..3)
+            .map(|index| format!("printf R18_NO_ECHO_{index}\n").into_bytes())
+            .collect::<Vec<_>>(),
+        "連續 no-echo 命令只送原命令，沒有重送或救援 TX"
+    );
 }
 
 fn i294_r17_dynamic_manager() -> (ManagerRig, sw_pal::fakes::console::FakeConsoleFactory) {

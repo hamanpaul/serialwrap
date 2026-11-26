@@ -168,6 +168,15 @@ entries:
     - cargo:sw-core::command_exec::i294_r17_profile_switch_new_prompt_settles_old_human
     - cargo:sw-core::command_exec::i294_r17_profile_switch_rejects_old_regex_prompt_for_both_timeouts
     - cargo:sw-core::command_exec::i294_r17_reconnect_waits_for_old_guard_then_unblocks_commands
+    - cargo:sw-core::command_exec::i294_r18_prompt_received_before_human_os_write_return_is_before_boundary
+    - cargo:sw-core::command_exec::i294_r18_split_prompt_settles_only_after_complete_post_boundary_line
+    - cargo:sw-core::command_exec::i294_r18_prompt_line_start_before_tx_boundary_does_not_settle
+    - cargo:sw-core::command_exec::i294_r18_trimmed_line_start_does_not_settle
+    - cargo:sw-core::command_exec::i294_r18_cross_boundary_prompt_silence_timeout_has_no_rescue_tx
+    - cargo:sw-core::command_exec::i294_r18_cross_boundary_prompt_operation_deadline_has_no_rescue_tx
+    - cargo:sw-core::command_exec::i294_r18_late_old_writer_accepted_prompt_uses_active_epoch
+    - cargo:sw-core::command_exec::i294_r18_real_human_writer_handoff_result_matrix
+    - cargo:sw-core::command_exec::i294_r18_real_writer_reconnect_unblocks_consecutive_no_echo_commands
     owner_phase: P5
   bc:DF-01:
     nodeids:

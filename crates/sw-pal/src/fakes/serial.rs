@@ -290,6 +290,8 @@ pub enum FakeWriteStep {
     PauseBeforeSubmit,
     /// R0-F1：gate 已重驗通過、`os_submit` 閉包內（持 Fence 鎖）暫停。
     PauseInsideSubmit,
+    /// 先讓 `gate.submit` 回 WouldBlock，再於 gate 外暫停；釋放後重試一次完整寫入。
+    WouldBlockThenPause,
     /// R0-F1：第一次 `gate.submit` 接受 n bytes，隨後回 WouldBlock 並於 gate 外暫停；`release_pause` 後經 gate 提交剩餘。
     AcceptThenWouldBlock(usize),
 }
@@ -1188,6 +1190,60 @@ impl SerialWriter for FakeSerialWriter {
                     SubmitStep::Accepted(data.len())
                 });
                 match submit_res {
+                    Ok(_) => TxResult {
+                        outcome: TxOutcome::Completed(committed),
+                        error: None,
+                    },
+                    Err(SubmitRevoked) => TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    },
+                }
+            }
+            FakeWriteStep::WouldBlockThenPause => {
+                let first_submit = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    SubmitStep::WouldBlock
+                });
+                if first_submit.is_err() {
+                    return TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    };
+                }
+
+                do_pause(&self.inner);
+                let mut committed = 0;
+                let retry_submit = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    self.inner
+                        .tx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(data);
+                    check_tx_triggers_and_matches(&self.inner);
+                    committed = data.len();
+                    SubmitStep::Accepted(data.len())
+                });
+                match retry_submit {
                     Ok(_) => TxResult {
                         outcome: TxOutcome::Completed(committed),
                         error: None,

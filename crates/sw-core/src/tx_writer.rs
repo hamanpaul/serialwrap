@@ -955,6 +955,7 @@ impl SubmitGate for ObservedTxSubmitGate<'_, '_> {
             let (step, command_boundary_recorded) = self.rx.observe_tx_submit(
                 self.command_op_id,
                 self.command_boundary_recorded.get(),
+                self.inner.permit.epoch,
                 human_payload,
                 self.clock,
                 os_submit,
