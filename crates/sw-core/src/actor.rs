@@ -18,6 +18,7 @@ use sw_proto::pyjson::PyDict;
 
 use crate::mailbox::{ControlEvent, DataEvent, Mailbox, MailboxItem, TimerEvent};
 use crate::session_core::{Effect, SessionCore, SessionRequest};
+use crate::uart_bridge::ActorDispatchGate;
 
 /// actor 的外部控制代碼（RPC 分派與測試共用）。
 pub struct ActorHandle {
@@ -391,11 +392,12 @@ pub trait EffectExecutor: Send {
     fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> {
         None
     }
-    /// 在 actor 套用事件前建立需要跨越 transition 的執行期 guard。
-    ///
-    /// Human console pump job 會先在 `SessionCore` 標成 lane in-flight，再由下方 effect executor 送進 pump；
-    /// 此 hook 讓實作在前一刻先登記 guard，避免其他執行緒的 timeout 在兩步之間看不到該 job。
-    fn before_event(&mut self, _core: &SessionCore, _item: &MailboxItem, _now: u64) {}
+    /// actor transition 與實際 HumanTx guard 登記共用的排他線性化 gate。
+    fn dispatch_gate(&self) -> Option<Arc<ActorDispatchGate>> {
+        None
+    }
+    /// transition 完成後、任何 effect 執行前，依實際輸出為每個 HumanTx 建立在途 guard。
+    fn prepare_effects(&mut self, _effects: &[Effect]) {}
     /// 釋放沒有轉交給 effect 的暫存 guard（例如 event 未產生 HumanTx 或 transition panic）。
     fn finish_event(&mut self) {}
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
@@ -829,7 +831,8 @@ fn dispatch(
         MailboxItem::Data(_) => (None, "Data"),
     };
 
-    exec.before_event(core, &item, now);
+    let dispatch_gate = exec.dispatch_gate();
+    let dispatch_guard = dispatch_gate.map(|gate| gate.enter_actor_dispatch());
     let result = catch_unwind(AssertUnwindSafe(|| {
         // 只在可能開埠、交還或結算資源的事件讀帳本；RX／Tick 不可因查詢 manager 鎖而堵住唯讀 RPC。
         let observes_custody = match &item {
@@ -901,17 +904,13 @@ fn dispatch(
         let observation = observes_custody.then(|| exec.pending_custody()).flatten();
         core.on_event_with_custody(item, now, observation)
     }));
+    let mut dispatch_effects = Vec::new();
+    let mut panic_reply = None;
     match result {
         Ok(effects) => {
             *panic_type = None;
             *panic_count = 0;
-            for effect in effects.0 {
-                if let Effect::Schedule { at, ev } = effect {
-                    timers.push((at, ev));
-                } else {
-                    exec.execute_with_feedback(effect, control, safety, feedback);
-                }
-            }
+            dispatch_effects = effects.0;
         }
         Err(payload) => {
             let message = payload
@@ -930,35 +929,37 @@ fn dispatch(
                 *panic_count = 1;
             }
             if let Some(reply) = reply {
-                let _ = reply.try_send(Err(PyErr::value_error(format!(
-                    "internal error: {message}"
-                ))));
+                panic_reply = Some((reply, message.clone()));
             }
             let com = core
                 .session_id()
                 .rsplit_once(':')
                 .map(|(_, com)| com)
                 .unwrap_or(core.session_id());
-            exec.execute(
-                Effect::Warn(format!(
-                    "session actor 事件處理例外（com={com}），略過此事件"
-                )),
-                control,
-                safety,
-            );
+            dispatch_effects.push(Effect::Warn(format!(
+                "session actor 事件處理例外（com={com}），略過此事件"
+            )));
             if *panic_count >= 3 {
                 let effects =
                     core.begin_stop(crate::drain::StopKind::IoError, None, clock.mono_ns());
-                for effect in effects.0 {
-                    if let Effect::Schedule { at, ev } = effect {
-                        timers.push((at, ev));
-                    } else {
-                        exec.execute_with_feedback(effect, control, safety, feedback);
-                    }
-                }
+                dispatch_effects.extend(effects.0);
                 *panic_count = 0;
                 *panic_type = None;
             }
+        }
+    }
+    // Guard registration is derived only from the completed transition output. Timeout decisions
+    // cannot observe this dispatch halfway through because `dispatch_guard` still reserves the step.
+    exec.prepare_effects(&dispatch_effects);
+    drop(dispatch_guard);
+    if let Some((reply, message)) = panic_reply {
+        let _ = reply.try_send(Err(PyErr::value_error(format!("internal error: {message}"))));
+    }
+    for effect in dispatch_effects {
+        if let Effect::Schedule { at, ev } = effect {
+            timers.push((at, ev));
+        } else {
+            exec.execute_with_feedback(effect, control, safety, feedback);
         }
     }
     exec.finish_event();

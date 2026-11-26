@@ -15,7 +15,7 @@
 //!   （`serialwrap-attach-<by_id>`）處理：**先獨占開埠一次**，PROBE 偵測直接在該 handle 上做，命中後把同一 handle
 //!   原樣交給正式 bridge（Python P1 T10 凍結「PROBE 與正式 bridge 共用同一預開 port」，parity #51）。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -71,7 +71,7 @@ use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 const FILE_TRANSFER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[cfg(not(any(feature = "test-fakes", debug_assertions)))]
-static MISSING_PRE_EVENT_HUMAN_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
+static MISSING_DISPATCH_HUMAN_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
 const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
@@ -2295,7 +2295,7 @@ impl Shared {
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
             actor_id,
-            pending_human_guard: None,
+            prepared_human_guards: VecDeque::new(),
         };
         let actor = match try_spawn_actor_with_reaper(
             core,
@@ -4490,8 +4490,8 @@ struct ManagerExec {
     opened_listener: Arc<Mutex<HashSet<u64>>>,
     /// actor 的不可變身分。
     actor_id: crate::custody::ActorId,
-    /// 套用可能產生 HumanTx 的事件前建立，HumanTx effect 產生時轉交給 pump。
-    pending_human_guard: Option<crate::uart_bridge::HumanInFlightGuard>,
+    /// transition 實際輸出的 HumanTx effect 對應 guard，依 effect 順序交給 pump。
+    prepared_human_guards: VecDeque<crate::uart_bridge::HumanInFlightGuard>,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -5298,24 +5298,23 @@ impl ManagerExec {
         #[cfg(feature = "test-fakes")]
         self.rx.human_tx_before_effect_hook_for_test();
         #[cfg(any(feature = "test-fakes", debug_assertions))]
-        let mut in_flight = self
-            .pending_human_guard
-            .take()
-            .expect("Effect::HumanTx 缺少 transition 前建立的 in-flight guard");
+        let in_flight = self
+            .prepared_human_guards
+            .pop_front()
+            .expect("Effect::HumanTx 缺少 dispatch 實際輸出建立的 in-flight guard");
         #[cfg(not(any(feature = "test-fakes", debug_assertions)))]
-        let mut in_flight = match self.pending_human_guard.take() {
+        let in_flight = match self.prepared_human_guards.pop_front() {
             Some(guard) => guard,
             None => {
-                if !MISSING_PRE_EVENT_HUMAN_GUARD_WARNED.swap(true, Ordering::AcqRel) {
+                if !MISSING_DISPATCH_HUMAN_GUARD_WARNED.swap(true, Ordering::AcqRel) {
                     self.shared.warn(format!(
-                        "Effect::HumanTx 缺少 transition 前建立的 guard，使用後備 submit guard（com={}）",
+                        "Effect::HumanTx 缺少 dispatch 建立的 guard，使用後備 submit guard（com={}）",
                         self.com()
                     ));
                 }
                 self.rx.begin_human_submit()
             }
         };
-        in_flight.mark_human_submit_started();
         let epoch = permit.epoch;
         if !self.pumps.contains_key(&epoch) {
             if let Some(worker) = lock(&self.workers).get(&epoch) {
@@ -5946,19 +5945,22 @@ impl EffectExecutor for ManagerExec {
         let by_id = lock(&self.io.profile).device_by_id.clone();
         lock(&self.shared.inner).custody.pending_for(&by_id)
     }
-    fn before_event(
-        &mut self,
-        core: &crate::session_core::SessionCore,
-        item: &crate::mailbox::MailboxItem,
-        now: u64,
-    ) {
-        debug_assert!(self.pending_human_guard.is_none());
-        if core.human_tx_may_start_before_event(item, now) {
-            self.pending_human_guard = Some(self.rx.begin_human_submit_before_actor_step());
+    fn dispatch_gate(&self) -> Option<Arc<crate::uart_bridge::ActorDispatchGate>> {
+        Some(self.rx.actor_dispatch_gate())
+    }
+    fn prepare_effects(&mut self, effects: &[Effect]) {
+        debug_assert!(self.prepared_human_guards.is_empty());
+        #[cfg(feature = "test-fakes")]
+        self.rx.dispatch_before_guard_registration_hook_for_test();
+        for effect in effects {
+            if matches!(effect, Effect::HumanTx { .. }) {
+                self.prepared_human_guards
+                    .push_back(self.rx.begin_human_tx_effect());
+            }
         }
     }
     fn finish_event(&mut self) {
-        self.pending_human_guard.take();
+        self.prepared_human_guards.clear();
     }
     /// `Effect::ClaimForStop` 在 actor 執行緒上、manager 鎖內處理本 session 的帳本紀錄，結果以立即回饋
     /// `CustodyClaimed` 先於下一個 mailbox 事件交回 actor（設計 §3.1.2 C4、C5）；交出的 handle 交關閉工作者。

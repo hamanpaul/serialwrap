@@ -19,7 +19,7 @@ pub mod handoff;
 /// P8 Task 5：`OpTransferPort` 測試台（`PortRig`／`FakeDut`）。
 pub mod transfer_port;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1003,8 +1003,8 @@ struct RigExec {
     registry: Arc<CommandRegistry>,
     /// 測試用：在 BeginDrain 前後暫停 actor，建立可控的 data lane backlog。
     drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
-    /// 套用可能產生 HumanTx 的事件前建立，HumanTx effect 產生時轉交給 pump。
-    pending_human_guard: Option<sw_core::uart_bridge::HumanInFlightGuard>,
+    /// transition 實際輸出的 HumanTx effect 對應 guard，依 effect 順序轉交給 pump。
+    prepared_human_guards: VecDeque<sw_core::uart_bridge::HumanInFlightGuard>,
 }
 
 struct DrainPauseState {
@@ -1053,20 +1053,23 @@ fn rig_nonce() -> String {
 }
 
 impl EffectExecutor for RigExec {
-    fn before_event(
-        &mut self,
-        core: &SessionCore,
-        item: &sw_core::mailbox::MailboxItem,
-        now: u64,
-    ) {
-        debug_assert!(self.pending_human_guard.is_none());
-        if core.human_tx_may_start_before_event(item, now) {
-            self.pending_human_guard = Some(self.rx.begin_human_submit_before_actor_step());
+    fn dispatch_gate(&self) -> Option<Arc<sw_core::uart_bridge::ActorDispatchGate>> {
+        Some(self.rx.actor_dispatch_gate())
+    }
+
+    fn prepare_effects(&mut self, effects: &[Effect]) {
+        debug_assert!(self.prepared_human_guards.is_empty());
+        self.rx.dispatch_before_guard_registration_hook_for_test();
+        for effect in effects {
+            if matches!(effect, Effect::HumanTx { .. }) {
+                self.prepared_human_guards
+                    .push_back(self.rx.begin_human_tx_effect());
+            }
         }
     }
 
     fn finish_event(&mut self) {
-        self.pending_human_guard.take();
+        self.prepared_human_guards.clear();
     }
 
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
@@ -1325,11 +1328,10 @@ impl EffectExecutor for RigExec {
                 payload,
             } => {
                 self.rx.human_tx_before_effect_hook_for_test();
-                let mut in_flight = self
-                    .pending_human_guard
-                    .take()
-                    .expect("Effect::HumanTx 缺少 transition 前建立的 in-flight guard");
-                in_flight.mark_human_submit_started();
+                let in_flight = self
+                    .prepared_human_guards
+                    .pop_front()
+                    .expect("Effect::HumanTx 缺少 dispatch 實際輸出建立的 in-flight guard");
                 let epoch = permit.epoch;
                 if !self.pumps.contains_key(&epoch) {
                     if let Some(worker) = self.workers.get(&epoch) {
@@ -1572,7 +1574,7 @@ impl ActorRig {
             pending_pty: pending_pty.clone(),
             registry: reg.clone(),
             drain_pause: drain_pause.clone(),
-            pending_human_guard: None,
+            prepared_human_guards: VecDeque::new(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -2029,7 +2031,7 @@ impl ActorRig {
 // - UART 獨占診斷與 console 工廠：固定回傳無持有者（測試只需要 PTY 形式）。
 // ===========================================================================
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Condvar;
 

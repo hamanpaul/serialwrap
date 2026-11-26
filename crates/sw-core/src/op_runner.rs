@@ -767,8 +767,13 @@ fn send(
         reply,
         aggregate: None,
     };
-    let human_submit_guard = (class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
-    let queued = ctx.tx.jobs.send(job);
+    let mut human_submit_guard = (class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
+    let queued = if let Some(guard) = human_submit_guard.as_mut() {
+        ctx.rx
+            .with_human_submit_gate(guard, || ctx.tx.jobs.send(job).map_err(|_| ()))
+    } else {
+        ctx.tx.jobs.send(job).map_err(|_| ())
+    };
     if queued.is_err() {
         drop(human_submit_guard);
         return frozen;

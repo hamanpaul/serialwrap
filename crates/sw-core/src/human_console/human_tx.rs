@@ -243,7 +243,7 @@ impl HumanTxPump {
                 loop {
                     #[cfg(feature = "test-fakes")]
                     rx.human_pump_before_take_for_test();
-                    let Ok((tag, permit, payload, in_flight)) = receiver.recv() else {
+                    let Ok((tag, permit, payload, mut in_flight)) = receiver.recv() else {
                         break;
                     };
                     #[cfg(feature = "test-fakes")]
@@ -255,8 +255,9 @@ impl HumanTxPump {
                         reply,
                         aggregate: None,
                     };
-                    rx.wait_for_timeout_rescue_gate();
-                    let queued = tx.jobs.send(job);
+                    let queued = rx.with_human_submit_gate(&mut in_flight, || {
+                        tx.jobs.send(job).map_err(|_| ())
+                    });
                     let report = match queued {
                         Ok(()) => tx
                             .wait_report(&report_rx)

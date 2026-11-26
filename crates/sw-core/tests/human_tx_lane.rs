@@ -9,10 +9,10 @@ use sw_core::admission::{AdmissionFlag, FreezeOutcome};
 use sw_core::deferred::InvalidateReason;
 use sw_core::human_console::human_tx::{BacklogItem, BacklogKind, HumanTxTag};
 use sw_core::human_console::ConsoleTransportKind;
-use sw_core::mailbox::{ControlEvent, MailboxItem};
+use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::*;
 use sw_core::tx_writer::{FenceReject, TxClass, TxReport};
-use sw_pal::traits::{Clock, TxOutcome, TxResult};
+use sw_pal::traits::{TxOutcome, TxResult};
 use sw_proto::constants::HUMAN_TX_BACKLOG_MAX_BYTES;
 
 fn human_txs(effects: &[Effect]) -> Vec<(TxClass, String, Vec<u8>)> {
@@ -456,25 +456,20 @@ fn i294_r13_human_completion_preflight_covers_later_backlog_job() {
             reject: None,
         },
     };
-    let predicted = h.core.human_tx_may_start_before_event(
-        &MailboxItem::Control(make_completion()),
-        h.clock.mono_ns(),
-    );
-    let mut pre_event_guard = predicted.then(|| h.rx.begin_human_submit_before_actor_step());
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "transition 前不建立預判 guard");
     let effects = h.feed(make_completion());
-    assert_eq!(h.rx.human_in_flight_for_test(), usize::from(predicted));
     assert_eq!(
         human_txs(&effects),
         vec![(TxClass::HumanReplay, "human:c1".into(), b"later".to_vec())],
         "首項因 stale epoch 略過後，transition 仍會送出後續 replay job"
     );
-    let mut effect_guard = pre_event_guard
-        .take()
-        .expect("產生的 Effect::HumanTx 必須在 transition 前已有 guard");
-    effect_guard.mark_human_submit_started();
-    assert_eq!(h.rx.human_submit_start_count_for_test(), 1);
+    let effect_guard = h.rx.begin_human_tx_effect();
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "只對實際輸出的 HumanTx 建 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
     drop(effect_guard);
     assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
 }
 
 #[test]
@@ -491,24 +486,19 @@ fn i294_r13_handoff_replay_is_included_in_preflight() {
     assert!(h.input("c1", b"echo HANDOFF\n").is_empty());
     assert!(gate.thaw(&token), "測試凍結已解除");
 
-    let item = MailboxItem::Control(ControlEvent::Tick);
-    let predicted = h
-        .core
-        .human_tx_may_start_before_event(&item, h.clock.mono_ns());
-    let mut pre_event_guard = predicted.then(|| h.rx.begin_human_submit_before_actor_step());
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
     let effects = h.feed(ControlEvent::Tick);
-    assert_eq!(h.rx.human_in_flight_for_test(), usize::from(predicted));
     assert_eq!(
         human_txs(&effects),
         vec![(TxClass::HumanRaw, "human:c1".into(), b"echo HANDOFF\n".to_vec())],
         "解凍後處理 Tick 前，core 先重放 handoff queue 中的 console event"
     );
-    let mut effect_guard = pre_event_guard
-        .take()
-        .expect("重放的 Effect::HumanTx 必須在目前 mailbox transition 前已有 guard");
-    effect_guard.mark_human_submit_started();
+    let effect_guard = h.rx.begin_human_tx_effect();
+    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0);
     drop(effect_guard);
     assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0);
 }
 
 #[test]
@@ -558,35 +548,25 @@ fn i294_r13_overprediction_without_effect_drops_guard_and_history() {
             reject: None,
         },
     };
-    let item = MailboxItem::Control(make_completion());
-    assert!(h.core.human_tx_may_start_before_event(&item, h.clock.mono_ns()));
     let starts_before = h.rx.human_submit_start_count_for_test();
-    let guard = h.rx.begin_human_submit_before_actor_step();
-    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
     let effects = h.feed(make_completion());
     assert!(human_txs(&effects).is_empty(), "唯一 backlog 項目因 stale epoch 被略過");
-    drop(guard);
     assert_eq!(h.rx.human_in_flight_for_test(), 0);
     assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
 }
 
 #[test]
 fn i294_r13_pre_event_guard_does_not_record_submit_without_human_tx() {
-    let h = manual_lease();
+    let mut h = manual_lease();
     let starts_before = h.rx.human_submit_start_count_for_test();
-    let guard = h.rx.begin_human_submit_before_actor_step();
-    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    let effects = h.feed(ControlEvent::Tick);
+    assert!(human_txs(&effects).is_empty());
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
     assert_eq!(
         h.rx.human_submit_start_count_for_test(),
         starts_before,
-        "預判 guard 只標記暫時在途，不建立 submit 歷史"
-    );
-    drop(guard);
-    assert_eq!(h.rx.human_in_flight_for_test(), 0, "無 effect 時立即清 guard");
-    assert_eq!(
-        h.rx.human_submit_start_count_for_test(),
-        starts_before,
-        "無 HumanTx effect 不留下歷史計數"
+        "沒有實際 HumanTx effect 的 transition 不碰 submit 訊號"
     );
 }
 
@@ -595,7 +575,7 @@ fn i294_r13_pre_event_guard_cleans_up_on_panic_refusal_and_cancel() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     let h = manual_lease();
-    let panic_guard = h.rx.begin_human_submit_before_actor_step();
+    let panic_guard = h.rx.begin_human_tx_effect();
     let panic_result = catch_unwind(AssertUnwindSafe(|| {
         let _guard = panic_guard;
         panic!("inject actor panic while transition guard is held");
@@ -603,13 +583,13 @@ fn i294_r13_pre_event_guard_cleans_up_on_panic_refusal_and_cancel() {
     assert!(panic_result.is_err());
     assert_eq!(h.rx.human_in_flight_for_test(), 0, "panic 展開時 guard 由 RAII 清理");
 
-    let mut refused_guard = h.rx.begin_human_submit_before_actor_step();
-    refused_guard.mark_human_submit_started();
+    let refused_guard = h.rx.begin_human_tx_effect();
     drop(refused_guard);
     assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer 拒絕後 drop 清理 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "拒絕 enqueue 不記 submit 起點");
 
-    let mut cancelled_guard = h.rx.begin_human_submit_before_actor_step();
-    cancelled_guard.mark_human_submit_started();
+    let cancelled_guard = h.rx.begin_human_tx_effect();
     drop(cancelled_guard);
     assert_eq!(h.rx.human_in_flight_for_test(), 0, "pump 取消後 drop 清理 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "取消且未 enqueue 不記 submit 起點");
 }

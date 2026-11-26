@@ -1063,6 +1063,7 @@ fn i294_r10_begin_human_submit_after_write(
     u64,
     crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
     crossbeam_channel::Sender<()>,
+    sw_core::uart_bridge::HumanInFlightGuard,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1089,10 +1090,10 @@ fn i294_r10_begin_human_submit_after_write(
         reply,
         aggregate: None,
     };
-    let queued = h.rx.with_human_submit_start_for_test(|| {
-        tx.jobs.send(job)
-    });
-    assert!(queued.is_ok());
+    let (_, guard) = h
+        .rx
+        .submit_human_for_test(|| tx.jobs.send(job).map_err(|_| ()))
+        .expect("human job 已排入 TX writer");
     accepted_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("human line 已由 fake OS 接受、observer 尚未登錄");
@@ -1102,7 +1103,7 @@ fn i294_r10_begin_human_submit_after_write(
         "OS accept barrier 尚未返回，human observer 尚未登錄"
     );
     assert!(h.rx.snapshot_from(0).tx_submit_pending);
-    (generation_before, report_rx, release_tx)
+    (generation_before, report_rx, release_tx, guard)
 }
 
 fn i294_r10_human_line_permit(h: &ActorRig, op_id: u64) -> sw_core::tx_writer::TxPermit {
@@ -1133,6 +1134,7 @@ fn i294_r10_release_human_submit(
     generation_before: u64,
     report_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
     release: crossbeam_channel::Sender<()>,
+    guard: sw_core::uart_bridge::HumanInFlightGuard,
 ) {
     release.send(()).expect("human OS submit barrier 尚在等待");
     h.wait_for("human observer 登錄並清除 submit pending", |rig| {
@@ -1142,6 +1144,7 @@ fn i294_r10_release_human_submit(
     report_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("HumanLine TxWriter report 已完成");
+    drop(guard);
     wait_tx(h, b"echo HUMAN\n");
 }
 
@@ -1203,7 +1206,7 @@ fn i294_r10_run_silence_submit_race(
 
     match point {
         I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot => {
-            let (before, _accepted_rx, release) =
+            let (before, _accepted_rx, release, guard) =
                 i294_r10_begin_human_submit_after_write(&h);
             i294_r10_advance_clock(&h, Duration::from_secs(29));
             assert!(
@@ -1215,17 +1218,17 @@ fn i294_r10_run_silence_submit_race(
                 .recv_timeout(Duration::from_secs(5))
                 .expect("quiet cutoff 已到，snapshot 建立前暫停");
             assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
-            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
         }
         I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes => {
-            let (before, _accepted_rx, release) =
+            let (before, _accepted_rx, release, guard) =
                 i294_r10_begin_human_submit_after_write(&h);
             i294_r10_advance_clock(&h, Duration::from_secs(31));
             timeout_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("timeout snapshot 已在 submit pending 時建立");
             assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
-            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
         }
         I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement => {
             i294_r10_advance_clock(&h, Duration::from_secs(31));
@@ -1233,9 +1236,9 @@ fn i294_r10_run_silence_submit_race(
                 .recv_timeout(Duration::from_secs(5))
                 .expect("無 human 的 timeout snapshot 已建立，settlement 暫停");
             assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
-            let (before, _accepted_rx, release) =
+            let (before, _accepted_rx, release, guard) =
                 i294_r10_begin_human_submit_after_write(&h);
-            i294_r10_release_human_submit(&h, before, _accepted_rx, release);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
         }
     }
 
@@ -1382,14 +1385,14 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
             reply,
             aggregate: None,
         };
-        let queued = submit_rx.with_human_submit_start_for_test(|| {
-            tx.jobs.send(job)
-        });
-        queued.expect("human submit 已排入 TX writer");
+        let (_, guard) = submit_rx
+            .submit_human_for_test(|| tx.jobs.send(job).map_err(|_| ()))
+            .expect("human submit 已排入 TX writer");
         enqueued_tx.send(()).expect("回報 human job 已排入 writer");
         report_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("HumanLine writer report");
+        drop(guard);
         human_done_tx.send(()).expect("回報 human TX 完成");
     });
 
@@ -1509,24 +1512,29 @@ fn i294_r11_enqueue_human(
     let (queued_tx, queued_rx) = crossbeam_channel::bounded(1);
     let rx = Arc::clone(&h.rx);
     let join = std::thread::spawn(move || {
-        let report = rx.with_human_submit_start_for_test(|| {
-            tx.jobs
-                .send(sw_core::tx_writer::TxJob {
-                    permit,
-                    payload: b"echo HUMAN\n".to_vec(),
-                    reply,
-                    aggregate: None,
-                })
-                .expect("human job 已排入 TX writer");
-            queued_tx.send(()).expect("回報 human job 已排入 writer");
-            if hold_until_report {
-                Some(report_waiter
+        let (_, guard) = rx
+            .submit_human_for_test(|| {
+                tx.jobs
+                    .send(sw_core::tx_writer::TxJob {
+                        permit,
+                        payload: b"echo HUMAN\n".to_vec(),
+                        reply,
+                        aggregate: None,
+                    })
+                    .map_err(|_| ())
+            })
+            .expect("human job 已排入 TX writer");
+        queued_tx.send(()).expect("回報 human job 已排入 writer");
+        let report = if hold_until_report {
+            Some(
+                report_waiter
                     .recv_timeout(Duration::from_secs(10))
-                    .expect("Human TX writer report"))
-            } else {
-                None
-            }
-        });
+                    .expect("Human TX writer report"),
+            )
+        } else {
+            None
+        };
+        drop(guard);
         if let Some(report) = report {
             completed_tx.send(report).expect("回報 Human TX 結算");
         }
@@ -1605,6 +1613,12 @@ fn i294_r11_run_timeout_case(
         .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
             wait_entered_tx.send(()).expect("completion waiter 已開始");
         })));
+    let (timeout_read_tx, timeout_read_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+        timeout_read_tx
+            .send(())
+            .expect("timeout 已完成四項 human 訊號讀取");
+    })));
 
     let (report_paused_tx, report_paused_rx) = crossbeam_channel::bounded(1);
     let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
@@ -1718,14 +1732,9 @@ fn i294_r11_run_timeout_case(
         }
     }
 
-    let decision_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if is_done(&h, &id) || !h.rx.timeout_rescue_gate_available_for_test() {
-            break;
-        }
-        assert!(Instant::now() < decision_deadline, "timeout decision 未抵達 human／rescue 分流");
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    timeout_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 已完成四項訊號讀取，human report 尚未釋放");
     if !matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
         assert_eq!(h.rx.human_in_flight_for_test(), 1, "timeout 決策時 human report 尚未回來");
     }
@@ -1943,152 +1952,135 @@ fn i294_r12_human_job_guarded_after_pump_take_suppresses_rescue() {
 #[test]
 fn i294_r13_actor_transition_effect_barrier_holds_unstarted_guard() {
     let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
-    let console = h.attach_pty_console("i294-r13-actor-barrier");
+    let console = h.attach_pty_console("i294-r14-actor-barrier");
     let starts_before = h.rx.human_submit_start_count_for_test();
-    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
     h.rx
-        .set_human_tx_before_effect_hook_for_test(Some(Arc::new(move || {
-            entered_tx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
                 .send(())
-                .expect("actor transition 已完成並產生 HumanTx effect");
-            release_rx
+                .expect("actor transition 已完成、guard 尚未登記");
+            release_dispatch_rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("測試釋放 transition/effect 屏障");
+                .expect("測試釋放 dispatch/guard 屏障");
+        })));
+    let (pump_entered_tx, pump_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+            pump_entered_tx.send(()).expect("human pump 已啟動");
+            release_pump_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放 human pump");
         })));
 
     console.push_input(b"echo HUMAN\n");
-    entered_rx
+    dispatch_entered_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("executor 在處理 effect 前進入屏障");
+        .expect("actor 在 transition 完成、guard 登記前進入屏障");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+    release_dispatch_tx
+        .send(())
+        .expect("actor dispatch 仍停在實際 guard 登記前");
+    pump_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanTx effect 已交給受控 pump");
     assert_eq!(h.rx.human_in_flight_for_test(), 1);
     assert_eq!(
         h.rx.human_submit_start_count_for_test(),
         starts_before,
-        "transition guard 在 HumanTx effect 執行前不增加 submit 歷史"
+        "guard 登記不提前增加 writer enqueue 計數"
     );
 
-    release_tx.send(()).expect("actor executor 仍在屏障上");
+    release_pump_tx.send(()).expect("human pump 仍在受控屏障");
     wait_tx(&h, b"echo HUMAN\n");
-    h.wait_for("HumanTx report 後 in-flight guard 清理", |rig| {
+    h.wait_for("HumanTx report 後 guard 清理", |rig| {
         rig.rx.human_in_flight_for_test() == 0
     });
     assert_eq!(
         h.rx.human_submit_start_count_for_test(),
         starts_before + 1,
-        "只有 effect executor 接手 job 後才增加 submit 歷史"
+        "writer enqueue 成功後才記錄 submit 起點"
     );
 }
 
 #[test]
 fn i294_r13_transition_to_effect_barrier_guards_both_timeout_entries() {
-    for timeout_entry in [
-        I294R12TimeoutEntry::Silence,
-        I294R12TimeoutEntry::OperationDeadline,
-    ] {
-        for echo_found in [true, false] {
-            let h = ActorRig::new(SHELL_PROFILE).ready();
-            let command = "printf R13_HUMAN";
-            let response = if echo_found {
-                format!("{command}\r\npartial output\r\n")
-            } else {
-                "partial output\r\n".to_string()
-            };
-            h.dev
-                .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R14_NO_HUMAN";
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), b"partial output\r\n");
+    let tx_count = h.wal_tx_payloads().len();
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx.send(()).expect("command completion waiter 已開始");
+        })));
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 completion waiter 已進入");
+    h.wait_for("命令已收到無 prompt 的部分輸出", |rig| {
+        rig.rx.text_from(0).contains("partial output")
+    });
 
-            let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
-            h.rx
-                .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
-                    wait_started_tx
-                        .send(())
-                        .expect("command completion waiter 已開始");
-                })));
-            let tx_count = h.wal_tx_payloads().len();
-            let starts_before = h.rx.human_submit_start_count_for_test();
-            let id = h.submit_with(command, |request| match timeout_entry {
-                I294R12TimeoutEntry::Silence => {
-                    request.timeout_s = 2.0;
-                    request.expected_duration_s = Some(120.0);
-                }
-                I294R12TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
-            });
-            wait_tx(&h, format!("{command}\n").as_bytes());
-            wait_started_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("推進假時鐘前 completion waiter 已進入");
-            h.wait_for("命令已收到無 prompt 的部分輸出", |rig| {
-                rig.rx.text_from(0).contains("partial output")
-            });
-
-            // 這個 guard 模擬 actor transition 已完成、Effect::HumanTx 尚未執行的窗口。
-            // 讓兩種操作 timeout 分流都在 effect barrier 期間讀取 guard，結果結算後再釋放它。
-            let transition_guard = h.rx.begin_human_submit_before_actor_step();
-            assert_eq!(h.rx.human_in_flight_for_test(), 1);
-            let (decision_entered_tx, decision_entered_rx) = crossbeam_channel::bounded(1);
-            let (release_decision_tx, release_decision_rx) = crossbeam_channel::bounded(1);
-            h.rx
-                .set_human_timeout_decision_hook_for_test(Some(Arc::new(move || {
-                    decision_entered_tx
-                        .send(())
-                        .expect("timeout 已把本窗口分類為 human 交錯");
-                    release_decision_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("測試釋放 timeout 分流屏障");
-                })));
-
-            assert_eq!(
-                h.rx.human_submit_start_count_for_test(),
-                starts_before,
-                "transition 前 guard 不可提前增加實際 submit 歷史"
-            );
-
-            match timeout_entry {
-                I294R12TimeoutEntry::Silence => h.clock.advance(Duration::from_secs(3)),
-                I294R12TimeoutEntry::OperationDeadline => {
-                    h.clock.advance(Duration::from_millis(201))
-                }
-            }
-            decision_entered_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("逾時入口在 effect 執行前讀到 transition guard");
-            assert_eq!(h.rx.human_in_flight_for_test(), 1);
-            assert_eq!(
-                wal_tx_bytes_since(&h, tx_count),
-                format!("{command}\n").as_bytes(),
-                "timeout 分流完成前不得送出救援鍵"
-            );
-
-            release_decision_tx
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
                 .send(())
-                .expect("timeout 決策仍停在受控屏障");
-            let result = h.wait_done(&id);
-            let expected_stdout = if echo_found {
-                format!("{command}\npartial output")
-            } else {
-                "partial output\n".to_string()
-            };
-            assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
-            assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
-            assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
-            assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
-            assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
-            assert_eq!(
-                h.rx.human_submit_start_count_for_test(),
-                starts_before,
-                "effect 尚未執行時，timeout 分流不留下 submit 歷史"
-            );
-            assert_eq!(
-                wal_tx_bytes_since(&h, tx_count),
-                format!("{command}\n").as_bytes(),
-                "echo 有無與 timeout 入口均不得增加救援 TX"
-            );
-            drop(transition_guard);
-            h.wait_for("HumanTx report 後 transition guard 清理", |rig| {
-                rig.rx.human_in_flight_for_test() == 0
-            });
-        }
-    }
+                .expect("actor 已進入實際 dispatch 區段");
+            release_dispatch_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放不含 HumanTx 的 dispatch");
+        })));
+    h.send_control(ControlEvent::Tick);
+    dispatch_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Tick transition 已完成、guard 登記前停在同一屏障");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+    let (attempt_tx, attempt_rx) = crossbeam_channel::bounded(1);
+    let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+            attempt_tx.send(()).expect("no-human timeout 已嘗試線性化判讀");
+        })));
+    h.rx
+        .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+            read_tx.send(()).expect("no-human timeout 已讀取四項訊號");
+        })));
+    h.clock.advance(Duration::from_millis(201));
+    attempt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 已嘗試進入線性化判讀");
+    assert!(read_rx.try_recv().is_err(), "dispatch 未結束前不得讀取 timeout 訊號");
+    assert!(!is_done(&h, &id), "dispatch 屏障期間 command 尚未完成");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "無 HumanTx 的 dispatch 不改變在途數");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n").as_bytes());
+
+    release_dispatch_tx
+        .send(())
+        .expect("no-human dispatch 仍停在 guard 登記屏障");
+    read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dispatch 完成後 timeout 讀取四項訊號");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n\x03").as_bytes());
 }
 
 fn i294_r13_wait_without_actor_rpc(
@@ -2124,7 +2116,7 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
     {
         for echo_found in [true, false] {
             let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
-            let command = "printf R13_EFFECT";
+            let command = "printf R14_EFFECT";
             let response = if echo_found {
                 format!("{command}\r\npartial output\r\n")
             } else {
@@ -2138,20 +2130,30 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
             let (effect_entered_tx, effect_entered_rx) = crossbeam_channel::bounded(1);
             let (release_effect_tx, release_effect_rx) = crossbeam_channel::bounded(1);
             h.rx
-                .set_human_tx_before_effect_hook_for_test(Some(Arc::new(move || {
+                .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
                     effect_entered_tx
                         .send(())
-                        .expect("actor transition 已產生 HumanTx effect");
+                        .expect("actor transition 已完成，尚未登記實際 HumanTx guard");
                     release_effect_rx
                         .recv_timeout(Duration::from_secs(10))
-                        .expect("測試釋放 actor transition/effect 屏障");
+                        .expect("測試釋放 actor dispatch/guard 屏障");
                 })));
             console.push_input(b"echo HUMAN\n");
             effect_entered_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("actor transition 完成、effect executor 尚未接手");
-            assert_eq!(h.rx.human_in_flight_for_test(), 1);
+                .expect("actor transition 完成、guard 尚未登記");
+            assert_eq!(h.rx.human_in_flight_for_test(), 0);
             assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+            let (pump_entered_tx, pump_entered_rx) = crossbeam_channel::bounded(1);
+            let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+            h.rx
+                .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+                    pump_entered_tx.send(()).expect("human pump 已啟動");
+                    release_pump_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("測試釋放 human pump queue 屏障");
+                })));
 
             let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
             h.rx
@@ -2225,16 +2227,30 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
                 rig.rx.text_from(0).contains("partial output")
             });
 
-            let (decision_entered_tx, decision_entered_rx) = crossbeam_channel::bounded(1);
-            let (release_decision_tx, release_decision_rx) = crossbeam_channel::bounded(1);
+            let (decision_attempt_tx, decision_attempt_rx) = crossbeam_channel::bounded(1);
+            let (decision_read_tx, decision_read_rx) = crossbeam_channel::bounded(1);
+            let (gate_event_tx, gate_event_rx) = crossbeam_channel::unbounded();
+            h.rx.set_actor_dispatch_gate_hook_for_test(Some(Arc::new(move |event| {
+                let _ = gate_event_tx.send(event);
+            })));
             h.rx
-                .set_human_timeout_decision_hook_for_test(Some(Arc::new(move || {
-                    decision_entered_tx
+                .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+                    decision_attempt_tx
                         .send(())
-                        .expect("timeout 分流已讀取真 actor transition guard");
-                    release_decision_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("測試釋放 timeout 決策屏障");
+                        .expect("timeout 已嘗試進入線性化判讀");
+                })));
+            let tuple_rx = Arc::clone(&h.rx);
+            h.rx
+                .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+                    let snapshot = tuple_rx.snapshot_from(0);
+                    decision_read_tx
+                        .send((
+                            snapshot.human_submit_start_count,
+                            tuple_rx.human_in_flight_for_test(),
+                            snapshot.tx_submit_pending,
+                            snapshot.human_tx_state.generation,
+                        ))
+                        .expect("timeout 已讀完完整 human 訊號 tuple");
                 })));
             match timeout_entry {
                 I294R12TimeoutEntry::Silence => h.clock.advance(Duration::from_secs(3)),
@@ -2242,20 +2258,36 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
                     h.clock.advance(Duration::from_millis(201))
                 }
             }
-            decision_entered_rx
+            decision_attempt_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("兩種 timeout 入口都在 HumanTx effect 執行前觀察到 guard");
-            assert_eq!(h.rx.human_in_flight_for_test(), 1);
+                .expect("timeout 已嘗試在 actor dispatch 中間讀訊號");
+            let gate_event = gate_event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout 等待中的 gate event");
+            assert_eq!(
+                gate_event,
+                sw_core::uart_bridge::ActorDispatchGateEvent::DecisionWaiting
+            );
+            assert!(decision_read_rx.try_recv().is_err(), "dispatch 屏障期間不得讀取訊號");
+            assert!(op_rx.try_recv().is_err(), "dispatch 屏障期間 timeout 尚未完成");
+            assert_eq!(h.rx.human_in_flight_for_test(), 0, "guard 尚未登記");
             assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
             assert_eq!(
                 wal_tx_bytes_since(&h, tx_count),
                 format!("{command}\n").as_bytes(),
-                "effect barrier 期間不得有 human 或救援 TX"
+                "dispatch barrier 期間不得有 human 或救援 TX"
             );
 
-            release_decision_tx
+            release_effect_tx
                 .send(())
-                .expect("timeout 決策仍在屏障上");
+                .expect("actor dispatch 仍停在 guard 登記屏障");
+            pump_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("human effect 已交給受控 pump");
+            let human_tuple = decision_read_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("dispatch 結束後 timeout 讀取完整 human 訊號 tuple");
+            assert_eq!(human_tuple, (starts_before, 1, false, 0));
             let finished = op_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("OpRunner 已回報 timeout 結果");
@@ -2268,15 +2300,15 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
                     };
                     assert_eq!(stdout, expected_stdout);
                 } else {
-                    panic!("human guard 下應回 CompletionUncertain");
+                    panic!("實際 Effect::HumanTx guard 下應回 CompletionUncertain");
                 }
             } else {
                 panic!("OpRunner 應回報 OpFinished");
             }
 
-            release_effect_tx
+            release_pump_tx
                 .send(())
-                .expect("actor effect executor 仍停在屏障");
+                .expect("human pump 仍停在 queue 屏障");
             wait_tx(&h, b"echo HUMAN\n");
             h.wait_for("HumanTx report 後 transition guard 清理", |rig| {
                 rig.rx.human_in_flight_for_test() == 0
@@ -2284,10 +2316,248 @@ fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
             assert_eq!(
                 h.rx.human_submit_start_count_for_test(),
                 starts_before + 1,
-                "只在 HumanTx effect 執行後建立 submit 歷史"
+                "只在 writer enqueue 成功後建立 submit 歷史"
+            );
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                format!("{command}\necho HUMAN\n").as_bytes(),
+                "兩種 timeout 入口與 echo 狀態都不得送救援 TX"
             );
         }
     }
+}
+
+#[test]
+fn i294_r14_timeout_decision_is_not_starved_by_queued_actor_dispatches() {
+    use sw_core::uart_bridge::ActorDispatchGateEvent;
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R14_STARVATION";
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), b"partial output\r\n");
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx.send(()).expect("completion waiter 已開始");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout worker 已進入 completion wait");
+
+    let (gate_event_tx, gate_event_rx) = crossbeam_channel::unbounded();
+    h.rx
+        .set_actor_dispatch_gate_hook_for_test(Some(Arc::new(move |event| {
+            let _ = gate_event_tx.send(event);
+        })));
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
+                .send(())
+                .expect("actor 已進入受控的無 HumanTx dispatch");
+            release_dispatch_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 actor dispatch");
+        })));
+    h.send_control(ControlEvent::Tick);
+    dispatch_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個 actor dispatch 已停在 hook");
+    assert_eq!(
+        gate_event_rx.recv_timeout(Duration::from_secs(5)),
+        Ok(ActorDispatchGateEvent::ActorEntered)
+    );
+    for _ in 0..32 {
+        h.send_control(ControlEvent::Tick);
+    }
+
+    let (attempt_tx, attempt_rx) = crossbeam_channel::bounded(1);
+    let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+            attempt_tx.send(()).expect("timeout 已開始線性化判讀");
+        })));
+    h.rx
+        .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+            read_tx.send(()).expect("timeout 已完成訊號判讀");
+        })));
+    h.clock.advance(Duration::from_millis(201));
+    attempt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 入口已觸發");
+    let decision_waiting = gate_event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout waiter gate event");
+    assert_eq!(
+        decision_waiting,
+        ActorDispatchGateEvent::DecisionWaiting,
+        "timeout waiter 先登記，避免 actor 連續 dispatch 插隊"
+    );
+    assert!(read_rx.try_recv().is_err(), "dispatch 區段未結束前不讀 timeout 訊號");
+
+    release_dispatch_tx
+        .send(())
+        .expect("actor dispatch 仍停在受控區段");
+    read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("決策只等候一次進行中的 dispatch 後完成讀取");
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n\x03").as_bytes());
+
+    let (decision_waits, actor_waits) = h.rx.actor_dispatch_gate_waits_for_test();
+    assert!(decision_waits <= 1, "decision 最多等候一次 dispatch：{decision_waits}");
+    assert!(actor_waits <= 1, "actor 最多等候一次訊號讀取區段：{actor_waits}");
+
+    let mut observed = vec![decision_waiting];
+    while let Ok(event) = gate_event_rx.try_recv() {
+        observed.push(event);
+    }
+    let waiting = observed
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionWaiting)
+        .expect("有 timeout waiter event");
+    let exited = observed[waiting + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::ActorExited)
+        .map(|index| waiting + 1 + index)
+        .expect("受控 actor dispatch 已結束");
+    let entered = observed[exited + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionEntered)
+        .map(|index| exited + 1 + index)
+        .expect("決策在線性化區段取得 gate");
+    let left = observed[entered + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionExited)
+        .map(|index| entered + 1 + index)
+        .expect("訊號讀取完成後釋放 gate");
+    assert!(
+        !observed[exited + 1..entered].contains(&ActorDispatchGateEvent::ActorEntered),
+        "queued actor dispatch 不得插入決策的訊號讀取區段：{observed:?}"
+    );
+    assert!(
+        observed[left + 1..].contains(&ActorDispatchGateEvent::ActorEntered),
+        "timeout 線性化完成後 actor 可繼續處理佇列"
+    );
+}
+
+fn i294_r14_wait_for_actor_data(h: &ActorRig, previous: u64, what: &str) {
+    let probe = h.actor_probe();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.data_items() <= previous {
+        assert!(Instant::now() < deadline, "等待 actor 處理資料事件逾時：{what}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn i294_r14_actor_guards_self_test_op_finished_human_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r14-self-test");
+    h.dev.clear_replies();
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 0.5,
+        strict_human_lock: false,
+    });
+    h.wait_for("self-test probe TX", |rig| {
+        rig.wal_tx_payloads().iter().any(|payload| {
+            String::from_utf8_lossy(payload).contains("__READY__")
+        })
+    });
+
+    let previous = h.actor_probe().data_items();
+    console.push_input(b"Q");
+    i294_r14_wait_for_actor_data(&h, previous, "self-test suspend 期間的 human 輸入");
+    h.clock.advance(Duration::from_secs(5));
+    let _reply = self_test
+        .recv_timeout(Duration::from_secs(5))
+        .expect("self-test probe 應經 OpFinished 收尾");
+    h.wait_for("OpFinished 回放的 human byte", |rig| wal_tx_has(rig, b"Q"));
+    assert!(wal_tx_has(&h, b"Q"), "self-test 收尾應恰好送出緩衝的 human byte");
+}
+
+fn i294_r14_open_agent_lease_with_deferred_human(
+    h: &ActorRig,
+    console_id: &str,
+) -> sw_pal::fakes::console::FakeConsoleRef {
+    let console = h.attach_pty_console(console_id);
+    let opened = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14".into(),
+        timeout_s: 1.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)), "{opened:?}");
+    console
+}
+
+fn i294_r14_buffer_human_until_actor_accepts(h: &ActorRig, console: &sw_pal::fakes::console::FakeConsoleRef) {
+    let previous = h.actor_probe().data_items();
+    console.push_input(b"Q");
+    i294_r14_wait_for_actor_data(h, previous, "agent lease 期間的 deferred human 輸入");
+}
+
+#[test]
+fn i294_r14_actor_guards_interactive_open_lazy_lease_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = i294_r14_open_agent_lease_with_deferred_human(&h, "i294-r14-open");
+    i294_r14_buffer_human_until_actor_accepts(&h, &console);
+    h.clock.advance(Duration::from_millis(900));
+    let pause = h.pause_before_event("Request");
+    let refresh = h.request_async(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14-next".into(),
+        timeout_s: 30.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("InteractiveOpen 已取出；停在 transition 前");
+    h.clock.advance(Duration::from_millis(600));
+    pause.resume.send(()).expect("釋放 InteractiveOpen transition");
+    let _reply = refresh.recv_timeout(Duration::from_secs(5));
+    h.wait_for("InteractiveOpen 惰性刷新回放的 human byte", |rig| wal_tx_has(rig, b"Q"));
+    assert!(wal_tx_has(&h, b"Q"), "InteractiveOpen refresh 應送出 deferred human byte");
+}
+
+#[test]
+fn i294_r14_actor_guards_submit_execute_time_lease_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r14-submit");
+    let opened = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14-submit".into(),
+        timeout_s: 1.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)), "{opened:?}");
+    i294_r14_buffer_human_until_actor_accepts(&h, &console);
+    h.clock.advance(Duration::from_millis(900));
+
+    h.dev.on_tx_reply(b"echo R14_SUBMIT\n", b"echo R14_SUBMIT\r\nR14_SUBMIT\r\nroot@t:/# ");
+    let pause = h.pause_before_event("Request");
+    let response = h.request_async(SessionRequest::Submit(agent_submit("echo R14_SUBMIT")));
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("一般 Submit 已取出；停在 transition 前");
+    h.clock.advance(Duration::from_millis(600));
+    pause.resume.send(()).expect("釋放 Submit transition");
+    let _reply = response.recv_timeout(Duration::from_secs(5));
+    h.wait_for("Submit execute-time lease refresh 回放的 human byte", |rig| {
+        wal_tx_has(rig, b"Q")
+    });
+    assert!(wal_tx_has(&h, b"Q"), "一般 Submit refresh 應送出 deferred human byte");
 }
 
 fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {

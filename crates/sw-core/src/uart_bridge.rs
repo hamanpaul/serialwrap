@@ -30,6 +30,144 @@ type SnapshotWaitHook = Arc<dyn Fn(&RxSnapshot) + Send + Sync>;
 type SnapshotWaitEnterHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(feature = "test-fakes")]
 type SnapshotWaitDeadlineHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(feature = "test-fakes")]
+type ActorDispatchGateHook = Arc<dyn Fn(ActorDispatchGateEvent) + Send + Sync>;
+
+/// actor dispatch 與 timeout 救援判讀之間的線性化事件（測試觀察）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorDispatchGateEvent {
+    ActorWaiting,
+    ActorEntered,
+    ActorExited,
+    DecisionWaiting,
+    DecisionEntered,
+    DecisionExited,
+}
+
+#[derive(Default)]
+struct ActorDispatchGateState {
+    dispatching: bool,
+    decision_waiters: usize,
+    decision_active: bool,
+    #[cfg(feature = "test-fakes")]
+    actor_waits: u64,
+    #[cfg(feature = "test-fakes")]
+    decision_waits: u64,
+}
+
+/// actor transition 到實際 HumanTx guard 登記之間的排他區段。
+///
+/// timeout waiter 先發布等待旗標；actor 之後不會插隊開始另一個 dispatch。兩邊只在進入／離開時
+/// 短暫持有 `state` mutex，transition 與 timeout 訊號讀取期間不持有該 mutex。
+pub struct ActorDispatchGate {
+    state: Mutex<ActorDispatchGateState>,
+    changed: Condvar,
+    #[cfg(feature = "test-fakes")]
+    hook: Mutex<Option<ActorDispatchGateHook>>,
+}
+
+impl ActorDispatchGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ActorDispatchGateState::default()),
+            changed: Condvar::new(),
+            #[cfg(feature = "test-fakes")]
+            hook: Mutex::new(None),
+        })
+    }
+
+    fn event(&self, event: ActorDispatchGateEvent) {
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = self.hook.lock().unwrap_or_else(|error| error.into_inner()).clone() {
+            hook(event);
+        }
+        #[cfg(not(feature = "test-fakes"))]
+        let _ = event;
+    }
+
+    pub fn enter_actor_dispatch(self: &Arc<Self>) -> ActorDispatchGuard {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.dispatching || state.decision_waiters > 0 || state.decision_active {
+            #[cfg(feature = "test-fakes")]
+            {
+                state.actor_waits = state.actor_waits.saturating_add(1);
+            }
+            self.event(ActorDispatchGateEvent::ActorWaiting);
+        }
+        while state.dispatching || state.decision_waiters > 0 || state.decision_active {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.dispatching = true;
+        self.event(ActorDispatchGateEvent::ActorEntered);
+        ActorDispatchGuard {
+            gate: Arc::clone(self),
+            decision: false,
+        }
+    }
+
+    fn enter_timeout_decision(self: &Arc<Self>) -> ActorDispatchGuard {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.decision_waiters = state.decision_waiters.saturating_add(1);
+        if state.dispatching || state.decision_active {
+            #[cfg(feature = "test-fakes")]
+            {
+                state.decision_waits = state.decision_waits.saturating_add(1);
+            }
+            self.event(ActorDispatchGateEvent::DecisionWaiting);
+        }
+        while state.dispatching || state.decision_active {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.decision_waiters = state.decision_waiters.saturating_sub(1);
+        state.decision_active = true;
+        self.event(ActorDispatchGateEvent::DecisionEntered);
+        ActorDispatchGuard {
+            gate: Arc::clone(self),
+            decision: true,
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_hook(&self, hook: Option<ActorDispatchGateHook>) {
+        *self.hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn waits_for_test(&self) -> (u64, u64) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (state.decision_waits, state.actor_waits)
+    }
+}
+
+pub struct ActorDispatchGuard {
+    gate: Arc<ActorDispatchGate>,
+    decision: bool,
+}
+
+impl Drop for ActorDispatchGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.decision {
+            state.decision_active = false;
+            self.gate.event(ActorDispatchGateEvent::DecisionExited);
+        } else {
+            state.dispatching = false;
+            self.gate.event(ActorDispatchGateEvent::ActorExited);
+        }
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -182,6 +320,7 @@ impl RxWindow {
 pub struct RxShared {
     inner: Mutex<RxWindow>,
     human_submit_rescue_gate: Mutex<()>,
+    actor_dispatch_gate: Arc<ActorDispatchGate>,
     changed: Condvar,
     /// P7 Task 3：`wait_for_regex_cancellable` 的喚醒通道（append／clear／`RunCancel::trigger` 時 `try_send`）。
     wakers: Mutex<Vec<Sender<()>>>,
@@ -235,6 +374,15 @@ pub struct RxShared {
     /// 測試交錯：actor transition 已產生 HumanTx effect、executor 尚未處理 effect 前暫停。
     #[cfg(feature = "test-fakes")]
     human_tx_before_effect_hook: Mutex<Option<SnapshotWaitEnterHook>>,
+    /// 測試交錯：transition 已回傳 effects、實際 HumanTx guard 尚未登記前暫停。
+    #[cfg(feature = "test-fakes")]
+    dispatch_before_guard_registration_hook: Mutex<Option<SnapshotWaitEnterHook>>,
+    /// 測試觀察：timeout 已開始取得救援判讀線性化點。
+    #[cfg(feature = "test-fakes")]
+    timeout_rescue_attempt_hook: Mutex<Option<SnapshotWaitEnterHook>>,
+    /// 測試觀察：timeout 已讀取完整 human tuple、即將離開 dispatch gate。
+    #[cfg(feature = "test-fakes")]
+    timeout_rescue_read_hook: Mutex<Option<SnapshotWaitEnterHook>>,
     /// 測試交錯：timeout 已辨識 human TX、即將回傳 CompletionUncertain 前暫停。
     #[cfg(feature = "test-fakes")]
     human_timeout_decision_hook: Mutex<Option<SnapshotWaitEnterHook>>,
@@ -260,6 +408,7 @@ impl RxShared {
                 ..RxWindow::default()
             }),
             human_submit_rescue_gate: Mutex::new(()),
+            actor_dispatch_gate: ActorDispatchGate::new(),
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
@@ -294,6 +443,12 @@ impl RxShared {
             #[cfg(feature = "test-fakes")]
             human_tx_before_effect_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            dispatch_before_guard_registration_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            timeout_rescue_attempt_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            timeout_rescue_read_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             human_timeout_decision_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             human_pump_before_take_hook: Mutex::new(None),
@@ -306,37 +461,44 @@ impl RxShared {
         })
     }
 
-    /// human submit 排入唯一 TX writer 前建立起點；計數 guard 持有到 writer report 回傳。
+    #[doc(hidden)]
+    pub fn actor_dispatch_gate(&self) -> Arc<ActorDispatchGate> {
+        Arc::clone(&self.actor_dispatch_gate)
+    }
+
+    /// human line submit 的在途 guard；實際成功排入 TX writer 後才更新 submit 起點計數。
     #[doc(hidden)]
     pub fn begin_human_submit(self: &Arc<Self>) -> HumanInFlightGuard {
         #[cfg(feature = "test-fakes")]
         self.human_submit_attempts.fetch_add(1, Ordering::AcqRel);
-        let rescue_guard = self
-            .human_submit_rescue_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        self.register_human_submit();
-        drop(rescue_guard);
-        self.new_human_in_flight_guard(true)
-    }
-
-    /// 在 actor 套用可能產生 HumanTx 的事件前登記 guard。
-    ///
-    /// 只取 RX inner mutex，不等 timeout rescue gate；pump 之後會在排入 writer 前短暫取得該 gate。
-    /// 因此 actor 不等待 rescue／writer，而 timeout 決策仍以 gate → RX inner 順序線性化。
-    #[doc(hidden)]
-    pub fn begin_human_submit_before_actor_step(self: &Arc<Self>) -> HumanInFlightGuard {
         self.register_human_in_flight();
         self.new_human_in_flight_guard(false)
     }
 
-    fn register_human_submit(&self) {
-        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        window.human_submit_start_count = window.human_submit_start_count.saturating_add(1);
-        window.human_in_flight = window.human_in_flight.saturating_add(1);
-        window.revision = window.revision.saturating_add(1);
-        drop(window);
-        self.wake_all();
+    /// actor 只為 transition 實際產生的每個 HumanTx effect 建立 guard。
+    #[doc(hidden)]
+    pub fn begin_human_tx_effect(self: &Arc<Self>) -> HumanInFlightGuard {
+        self.register_human_in_flight();
+        self.new_human_in_flight_guard(false)
+    }
+
+    /// 對 writer enqueue 與 timeout rescue 決策互斥。計數只在 enqueue 成功後更新；guard 已提供
+    /// 在途訊號，故 writer 可在計數更新前開始處理而不會被誤判為無 human。
+    pub(crate) fn with_human_submit_gate<T, E>(
+        &self,
+        in_flight: &mut HumanInFlightGuard,
+        enqueue: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, ()> {
+        let rescue_guard = self
+            .human_submit_rescue_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = enqueue();
+        if result.is_ok() {
+            in_flight.mark_human_submit_started();
+        }
+        drop(rescue_guard);
+        result.map_err(|_| ())
     }
 
     fn register_human_in_flight(&self) {
@@ -362,30 +524,30 @@ impl RxShared {
         }
     }
 
-    /// Pump 先讓已開始的 no-human rescue 決策完成第一個救援鍵，再排入新的 human writer job。
-    pub(crate) fn wait_for_timeout_rescue_gate(&self) {
-        let gate = self
-            .human_submit_rescue_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        drop(gate);
-    }
-
     /// Timeout 決策與第一個救援鍵排入 writer 之間，阻止新的 human submit 起點插入。
     pub(crate) fn begin_timeout_rescue(
         &self,
         command_start_count: u64,
         command_human_generation: u64,
     ) -> (HumanSubmitRescueGuard<'_>, bool) {
+        #[cfg(feature = "test-fakes")]
+        self.timeout_rescue_attempt_hook_for_test();
         let guard = self
             .human_submit_rescue_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // Lock order: rescue gate → dispatch decision reservation → RX inner. The reservation only
+        // blocks actor dispatch admission; it holds no manager/custody lock or state mutex while reading.
+        let dispatch_guard = self.actor_dispatch_gate.enter_timeout_decision();
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let human_submit_seen = window.human_submit_start_count > command_start_count
             || window.human_in_flight > 0
             || window.tx_submit_pending
             || window.human_tx_generation > command_human_generation;
+        drop(window);
+        drop(dispatch_guard);
+        #[cfg(feature = "test-fakes")]
+        self.timeout_rescue_read_hook_for_test();
         (HumanSubmitRescueGuard { _guard: guard }, human_submit_seen)
     }
 
@@ -482,11 +644,14 @@ impl RxShared {
     }
 
     #[cfg(feature = "test-fakes")]
-    pub fn with_human_submit_start_for_test<T>(self: &Arc<Self>, enqueue: impl FnOnce() -> T) -> T {
-        let guard = self.begin_human_submit();
-        let result = enqueue();
-        drop(guard);
-        result
+    pub fn submit_human_for_test<T, E>(
+        self: &Arc<Self>,
+        enqueue: impl FnOnce() -> Result<T, E>,
+    ) -> Option<(T, HumanInFlightGuard)> {
+        let mut guard = self.begin_human_submit();
+        self.with_human_submit_gate(&mut guard, enqueue)
+            .ok()
+            .map(|value| (value, guard))
     }
 
     #[cfg(feature = "test-fakes")]
@@ -525,6 +690,82 @@ impl RxShared {
             .human_tx_before_effect_hook
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_dispatch_before_guard_registration_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitEnterHook>,
+    ) {
+        *self
+            .dispatch_before_guard_registration_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn dispatch_before_guard_registration_hook_for_test(&self) {
+        if let Some(hook) = self
+            .dispatch_before_guard_registration_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_actor_dispatch_gate_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn(ActorDispatchGateEvent) + Send + Sync>>,
+    ) {
+        self.actor_dispatch_gate.set_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn actor_dispatch_gate_waits_for_test(&self) -> (u64, u64) {
+        self.actor_dispatch_gate.waits_for_test()
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_timeout_rescue_attempt_hook_for_test(&self, hook: Option<SnapshotWaitEnterHook>) {
+        *self
+            .timeout_rescue_attempt_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn timeout_rescue_attempt_hook_for_test(&self) {
+        if let Some(hook) = self
+            .timeout_rescue_attempt_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_timeout_rescue_read_hook_for_test(&self, hook: Option<SnapshotWaitEnterHook>) {
+        *self
+            .timeout_rescue_read_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn timeout_rescue_read_hook_for_test(&self) {
+        if let Some(hook) = self
+            .timeout_rescue_read_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
     }
 
     #[cfg(feature = "test-fakes")]
@@ -880,7 +1121,8 @@ impl RxShared {
 
     #[cfg(feature = "test-fakes")]
     pub fn record_human_tx_for_test(self: &Arc<Self>, payload: &[u8], clock: &dyn Clock) {
-        let submit_guard = self.begin_human_submit();
+        let mut submit_guard = self.begin_human_submit();
+        submit_guard.mark_human_submit_started();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let event_mono = clock.mono_ns();
         let rx_offset = window
@@ -1481,7 +1723,7 @@ impl Drop for HumanInFlightGuard {
 }
 
 impl HumanInFlightGuard {
-    /// 把 transition 前的預判 guard 升級為實際 HumanTx submit；只在 effect 已產生時呼叫。
+    /// 成功排入 writer 後記錄實際 human submit 起點；失敗、取消與未入列都不增加計數。
     pub fn mark_human_submit_started(&mut self) {
         if self.submit_started {
             return;
