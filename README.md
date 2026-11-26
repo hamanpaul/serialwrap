@@ -400,8 +400,10 @@ that session. Names matching `COM[0-9]+` or `<profile>:COM[0-9]+`
 return `INVALID_ARGS`. On upgrade, existing state rows using a reserved name
 are ignored and remain inactive for diagnostics. `serialwrap alias list`
 reports `effective` and `conflict`. When two sessions claim the same custom
-name, the first keeps it and the later session uses its automatic name.
-Explicit YAML `targets` keep their configured aliases.
+name, the first keeps it and the later session uses its automatic name. A
+public `alias set` request returns `INVALID_ARGS` if any other session already
+owns the requested name, including when either owner is an explicit YAML
+target. Explicit YAML `targets` otherwise keep their configured aliases.
 
 ### Command Modes
 
@@ -2248,7 +2250,7 @@ target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖�
 
 ### Dynamic session alias
 
-以 `serialwrap alias set --session-id <session_id> --alias <名稱>` 設定目前 session 名稱；以 `serialwrap alias assign --by-id <by-id> --alias <名稱>` 將名稱綁到裝置。優先序為 by-id 自訂 alias > session 自訂 alias > `<template>+<編號>` 自動 alias。生效名稱會跨 daemon 重啟與 pin template 切換保留；selector 只接受目前生效 alias、session_id 或 COM。符合 `COM[0-9]+` 或 `<profile>:COM[0-9]+`（不分大小寫）的名稱是保留 selector，`alias set`／`alias assign` 一律回 `INVALID_ARGS`；升級時既有 state 中這類列會停用、保留供診斷，且不得遮蔽實際 COM。`serialwrap alias list` 顯示 `effective` 與 `conflict`。同名衝突由先登錄者保留名稱，後續 session 使用自動 alias；YAML `targets` 繼續採用 YAML 設定的 alias。
+以 `serialwrap alias set --session-id <session_id> --alias <名稱>` 設定目前 session 名稱；以 `serialwrap alias assign --by-id <by-id> --alias <名稱>` 將名稱綁到裝置。優先序為 by-id 自訂 alias > session 自訂 alias > `<template>+<編號>` 自動 alias。生效名稱會跨 daemon 重啟與 pin template 切換保留；selector 只接受目前生效 alias、session_id 或 COM。符合 `COM[0-9]+` 或 `<profile>:COM[0-9]+`（不分大小寫）的名稱是保留 selector，`alias set`／`alias assign` 一律回 `INVALID_ARGS`；升級時既有 state 中這類列會停用、保留供診斷，且不得遮蔽實際 COM。`serialwrap alias list` 顯示 `effective` 與 `conflict`。同名衝突由先登錄者保留名稱，後續 session 使用自動 alias；公開 `alias set` 若發現名稱已由另一個 session 持有，無論任一方是 dynamic／pin 還是 explicit YAML target，都回 `INVALID_ARGS` 且不改動兩端生效 alias。除公開設定的衝突以外，YAML `targets` 繼續採用 YAML 設定的 alias。
 
 ### COM 編號確定性綁定 by-id（#100）
 

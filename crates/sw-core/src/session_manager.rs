@@ -1086,6 +1086,17 @@ fn alias_taken(inner: &Inner, alias: &str, except_sid: Option<&str>) -> bool {
             .any(|entry| Some(entry.sid.as_str()) != except_sid && entry.profile.alias == alias)
 }
 
+fn alias_claimed_by_other(
+    inner: &Inner,
+    registry: &AliasRegistry,
+    alias: &str,
+    sid: &str,
+    by_id: &str,
+) -> bool {
+    alias_taken(inner, alias, Some(sid))
+        || registry.conflicts_with_claim(alias, sid, by_id)
+}
+
 fn alias_conflict_response() -> PyDict {
     pydict! {
         "ok" => false,
@@ -7957,14 +7968,8 @@ impl SessionManager {
                 return Ok(not_found());
             };
             let registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
-            let locked_conflict = entry.profile_source != "yaml-target"
-                && (selector_name_taken(&inner, alias, Some(sid))
-                    || (!registry.is_yaml_alias(alias)
-                        && registry.conflicts_with_claim(
-                            alias,
-                            sid,
-                            &entry.profile.device_by_id,
-                        )));
+            let locked_conflict =
+                alias_claimed_by_other(&inner, &registry, alias, sid, &entry.profile.device_by_id);
             if locked_conflict {
                 drop(inner);
                 #[cfg(feature = "test-fakes")]
@@ -8019,14 +8024,13 @@ impl SessionManager {
         }
         let entry = inner.sessions.get(sid).expect("identity checked");
         let latest_registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
-        let conflicts_now = entry.profile_source != "yaml-target"
-            && (selector_name_taken(&inner, alias, Some(sid))
-                || (!latest_registry.is_yaml_alias(alias)
-                    && latest_registry.conflicts_with_claim(
-                        alias,
-                        sid,
-                        &entry.profile.device_by_id,
-                    )));
+        let conflicts_now = alias_claimed_by_other(
+            &inner,
+            &latest_registry,
+            alias,
+            sid,
+            &entry.profile.device_by_id,
+        );
         let (latest_alias, row_updates) = if conflicts_now {
             drop(inner);
             let _ = actor.request(

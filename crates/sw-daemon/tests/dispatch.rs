@@ -4264,16 +4264,148 @@ fn issue281_alias_conflict_keeps_first_materialized_and_marks_conflict() {
     );
     let yaml_session = rig.session("COM0").expect("YAML session");
     let dynamic_session = rig.session("COM1").expect("dynamic session");
-    let alias_row = i281_alias_from_list(&rig.call("alias.list", "{}"), "claimed-name")
-        .expect("衝突的 alias 列應保留");
-    assert_eq!(changed.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        changed.get("error_code").and_then(PyValue::as_str),
+        Some("INVALID_ARGS"),
+        "既有 YAML owner 必須讓公開 alias.set 拒絕衝突：{}",
+        j(&changed)
+    );
     assert_eq!(
         yaml_session.get("alias"),
         Some(&PyValue::from("claimed-name"))
     );
     assert_eq!(dynamic_session.get("alias"), Some(&PyValue::from("t+2")));
+    let rejected_row = i281_alias_from_list(&rig.call("alias.list", "{}"), "claimed-name")
+        .expect("YAML owner 的 alias 列應保留");
+    assert_eq!(rejected_row.get("conflict"), Some(&PyValue::Bool(false)));
+
+    let assigned = rig.call(
+        "alias.assign",
+        &format!(r#"{{"by_id":"{BY_ID_B}","alias":"claimed-name"}}"#),
+    );
+    assert_eq!(assigned.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&assigned));
+    let alias_row = i281_alias_from_list(&rig.call("alias.list", "{}"), "claimed-name")
+        .expect("alias.assign 衝突列應保留");
     assert_eq!(alias_row.get("effective"), Some(&PyValue::Bool(true)));
     assert_eq!(alias_row.get("conflict"), Some(&PyValue::Bool(true)));
+}
+
+/// YAML target 已持有一般 alias 時，dynamic session 的公開 alias.set 必須拒絕另一 owner。
+#[test]
+fn issue281_alias_set_rejects_yaml_owner_from_dynamic_session() {
+    let yaml = format!(
+        "{}targets:\n  - {{com: COM0, profile: t, act_no: 1, alias: claimed-name, device_by_id: {BY_ID_A}}}\n",
+        I281_DYNAMIC_TEMPLATES
+    );
+    let rig = ServiceRig::build(RigSpec {
+        yaml,
+        devices: vec![
+            (BY_ID_A.into(), REAL_A.into()),
+            (BY_ID_B.into(), REAL_B.into()),
+        ],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    wait_until("第二個 dynamic session", || rig.session("COM1").is_some());
+    let yaml_sid = s(&rig.session("COM0").expect("YAML session"), "session_id").to_string();
+    let dynamic = rig.session("COM1").expect("dynamic session");
+    let dynamic_sid = s(&dynamic, "session_id").to_string();
+
+    let rejected = rig.call(
+        "alias.set",
+        &format!(
+            r#"{{"session_id":"{dynamic_sid}","alias":"claimed-name"}}"#
+        ),
+    );
+
+    assert_eq!(
+        rejected.get("error_code").and_then(PyValue::as_str),
+        Some("INVALID_ARGS"),
+        "YAML owner 已持有名稱時 dynamic alias.set 必須拒絕：{}",
+        j(&rejected)
+    );
+    assert_eq!(
+        rig.call("session.get_state", r#"{"selector":"claimed-name"}"#)
+            .get("session")
+            .and_then(PyValue::as_dict_ref)
+            .and_then(|session| session.get("session_id"))
+            .and_then(PyValue::as_str),
+        Some(yaml_sid.as_str())
+    );
+    assert_ne!(
+        rig.session("COM1").and_then(|session| session.get("alias").cloned()),
+        Some(PyValue::from("claimed-name")),
+        "被拒絕的 dynamic session 不得改用 YAML owner 的 alias"
+    );
+}
+
+/// dynamic session 先持有 alias 時，YAML session 的公開 alias.set 也不得略過 owner 衝突。
+#[test]
+fn issue281_alias_set_rejects_dynamic_owner_from_yaml_session() {
+    let yaml = format!(
+        "{}targets:\n  - {{com: COM0, profile: t, act_no: 1, alias: yaml-workbench, device_by_id: {BY_ID_A}}}\n",
+        I281_DYNAMIC_TEMPLATES
+    );
+    let rig = ServiceRig::build(RigSpec {
+        yaml,
+        devices: vec![
+            (BY_ID_A.into(), REAL_A.into()),
+            (BY_ID_B.into(), REAL_B.into()),
+        ],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    wait_until("第二個 dynamic session", || rig.session("COM1").is_some());
+    let yaml_sid = s(&rig.session("COM0").expect("YAML session"), "session_id").to_string();
+    let dynamic_sid = s(
+        &rig.session("COM1").expect("dynamic session"),
+        "session_id",
+    )
+    .to_string();
+    let first = rig.call(
+        "alias.set",
+        &format!(
+            r#"{{"session_id":"{dynamic_sid}","alias":"dynamic-workbench"}}"#
+        ),
+    );
+    assert_eq!(
+        first.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&first)
+    );
+
+    let rejected = rig.call(
+        "alias.set",
+        &format!(
+            r#"{{"session_id":"{yaml_sid}","alias":"dynamic-workbench"}}"#
+        ),
+    );
+
+    assert_eq!(
+        rejected.get("error_code").and_then(PyValue::as_str),
+        Some("INVALID_ARGS"),
+        "dynamic owner 已持有名稱時 YAML alias.set 必須拒絕：{}",
+        j(&rejected)
+    );
+    let yaml_session = rig.session("COM0").expect("YAML session 保持原 alias");
+    assert_eq!(
+        yaml_session.get("alias"),
+        Some(&PyValue::from("yaml-workbench"))
+    );
+    assert_eq!(
+        rig.call(
+            "session.get_state",
+            r#"{"selector":"dynamic-workbench"}"#
+        )
+        .get("session")
+        .and_then(PyValue::as_dict_ref)
+        .and_then(|session| session.get("session_id"))
+        .and_then(PyValue::as_str),
+        Some(dynamic_sid.as_str())
+    );
 }
 
 /// registry 已有別的 session alias claim 時，即使舊 session 不在本次 runtime，也不可讓衝突裝置取得該 alias。

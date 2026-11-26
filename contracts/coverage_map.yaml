@@ -117,6 +117,8 @@ entries:
     - cargo:sw-daemon::dispatch::issue281_unassign_same_as_automatic_does_not_reappear_after_restart
     - cargo:sw-daemon::dispatch::issue281_late_com_assignment_re_resolves_existing_alias
     - cargo:sw-daemon::dispatch::issue281_unassign_race_errors_are_declared_in_rpc_schema
+    - cargo:sw-daemon::dispatch::issue281_alias_set_rejects_yaml_owner_from_dynamic_session
+    - cargo:sw-daemon::dispatch::issue281_alias_set_rejects_dynamic_owner_from_yaml_session
     owner_phase: P7
   bc:DF-01:
     nodeids:
