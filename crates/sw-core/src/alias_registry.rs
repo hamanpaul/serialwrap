@@ -81,9 +81,36 @@ impl AliasRegistry {
         })
     }
 
+    /// alias 列是否由 explicit YAML target 產生。
+    pub fn is_yaml_alias(&self, alias: &str) -> bool {
+        self.rows
+            .get(alias)
+            .is_some_and(|row| is_active(row) && source(row) == Some(SOURCE_YAML))
+    }
+
     /// alias 列是否仍是該名稱的有效設定；舊列沒有 active 欄時視為有效。
     pub fn is_active_alias(&self, alias: &str) -> bool {
         self.rows.get(alias).is_some_and(is_active)
+    }
+
+    /// 停用舊 state.json 中的保留 selector 名稱，保留列供診斷；YAML target 列維持既有行為。
+    pub fn deactivate_reserved_selector_aliases(&mut self) -> Vec<String> {
+        let names: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|(alias, row)| {
+                is_reserved_selector_name(alias)
+                    && source(row) != Some(SOURCE_YAML)
+                    && is_active(row)
+            })
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        for alias in &names {
+            if let Some(row) = self.rows.get_mut(alias) {
+                row.insert(ACTIVE_FIELD, PyValue::Bool(false));
+            }
+        }
+        names
     }
 
     /// 判斷列是否由目前版本明確寫成自動 alias；無來源的舊列不回報為 true。
@@ -292,10 +319,10 @@ impl AliasRegistry {
         automatic_alias: &str,
     ) -> AliasChoice {
         if !by_id.is_empty() {
-            if let Some((alias, _)) = self.newest_matching(|_, row| {
+            if let Some((alias, _)) = self.newest_matching(|alias, row| {
                 let direct = row.get("device_by_id").and_then(PyValue::as_str) == Some(by_id)
                     && !matches!(source(row), Some(SOURCE_YAML | SOURCE_SESSION));
-                direct && is_active(row)
+                direct && is_active(row) && !is_reserved_selector_name(alias)
             }) {
                 return AliasChoice {
                     alias: alias.clone(),
@@ -315,6 +342,7 @@ impl AliasRegistry {
             (session_id_matches || device_matches)
                 && is_custom_session_row(alias, row)
                 && is_active(row)
+                && !is_reserved_selector_name(alias)
         }) {
             return AliasChoice {
                 alias: alias.clone(),
@@ -326,6 +354,7 @@ impl AliasRegistry {
             row.get("session_id").and_then(PyValue::as_str) == Some(sid)
                 && is_automatic_session_row(alias, row)
                 && is_active(row)
+                && !is_reserved_selector_name(alias)
         }) {
             return AliasChoice {
                 alias: alias.clone(),
@@ -369,6 +398,21 @@ pub fn is_automatic_alias_name(alias: &str) -> bool {
         return false;
     };
     !template.is_empty() && !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+/// COM selector 與 `<profile>:COM<數字>` session ID 形狀不可作為自訂 alias。
+pub fn is_reserved_selector_name(name: &str) -> bool {
+    fn is_com(name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+        upper
+            .strip_prefix("COM")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+    }
+
+    is_com(name)
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(profile, com)| !profile.is_empty() && is_com(com))
 }
 
 /// alias row 目前是否由指定 by-id 裝置擁有。

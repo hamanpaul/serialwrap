@@ -43,7 +43,7 @@ use sw_proto::pyre::{compile, PyFlags};
 use crate::actor::{try_spawn_actor_with_reaper, ActorHandle, EffectExecutor};
 use crate::alias_registry::{
     has_conflict, is_automatic_alias_name, is_automatic_session_alias, is_by_id_row, AliasKind,
-    AliasRegistry,
+    is_reserved_selector_name, AliasRegistry,
 };
 use crate::arbiter::CommandRegistry;
 use crate::generations::EpochAllocator;
@@ -759,12 +759,21 @@ struct Shared {
     /// 一次（可暫停）。
     #[cfg(feature = "test-fakes")]
     placeholder_retire_pre_commit_hook: Mutex<Option<SidTestHook>>,
-    /// 只供測試（test-fakes）：alias.set 通過初始 claim 檢查後、序列化 alias 操作前的受控交錯點。
+    /// 只供測試（test-fakes）：alias.set 進入序列化操作鎖前的受控交錯點。
     #[cfg(feature = "test-fakes")]
     alias_pre_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// 只供測試（test-fakes）：`alias.set` 已更新 actor、尚未持久化前的競態暫停點（佔位退休交錯）。
     #[cfg(feature = "test-fakes")]
     alias_pre_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// 只供測試（test-fakes）：`alias.set` 已持久化、操作鎖已釋放但尚未返回的暫停點。
+    #[cfg(feature = "test-fakes")]
+    alias_post_commit_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：`alias.set` 鎖內重驗已判定他人持有名稱時的暫停點。
+    #[cfg(feature = "test-fakes")]
+    alias_locked_conflict_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：`alias.unassign` actor 已更新、manager 尚未重驗前的交錯點。
+    #[cfg(feature = "test-fakes")]
+    alias_unassign_pre_commit_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 只供測試（test-fakes）：`open_bridge` 取 session 預開 handle 之前的一次性暫停點（重現預開 handle 交給
     /// session 後、正式 bridge 接手前的 shutdown 交錯）。
     #[cfg(feature = "test-fakes")]
@@ -1091,6 +1100,17 @@ fn unique_automatic_alias(
     act_no: i128,
     except_sid: Option<&str>,
 ) -> String {
+    unique_automatic_alias_excluding(inner, registry, template, act_no, except_sid, None)
+}
+
+fn unique_automatic_alias_excluding(
+    inner: &Inner,
+    registry: &AliasRegistry,
+    template: &str,
+    act_no: i128,
+    except_sid: Option<&str>,
+    excluded_alias: Option<&str>,
+) -> String {
     let mut n = act_no;
     loop {
         let alias = format!("{template}+{n}");
@@ -1100,7 +1120,8 @@ fn unique_automatic_alias(
                     && is_automatic_session_alias(&alias, row)
             })
         });
-        if !alias_taken(inner, &alias, except_sid)
+        if excluded_alias != Some(alias.as_str())
+            && !alias_taken(inner, &alias, except_sid)
             && (registry.row(&alias).is_none() || registry_owner_is_current_automatic)
         {
             return alias;
@@ -6807,6 +6828,15 @@ impl SessionManager {
             fs,
             warn,
         } = deps;
+        let mut loaded = loaded;
+        let mut aliases = AliasRegistry::load(std::mem::take(&mut loaded.aliases));
+        let ignored_reserved = aliases.deactivate_reserved_selector_aliases();
+        loaded.aliases = aliases.dump();
+        for alias in ignored_reserved {
+            (warn)(format!(
+                "state.json 忽略保留 selector alias {alias}：COM 與 session ID 形狀不得作為自訂 alias"
+            ));
+        }
         let fanout = WalHealthFanout::new();
         wal.set_health_sink(fanout.clone());
         let (note_tx, note_rx) = crossbeam_channel::unbounded();
@@ -6875,6 +6905,12 @@ impl SessionManager {
             alias_pre_lock_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             alias_pre_commit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            alias_post_commit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            alias_locked_conflict_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            alias_unassign_pre_commit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             open_bridge_pre_take_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
@@ -7854,12 +7890,32 @@ impl SessionManager {
                     .values()
                     .filter(|entry| entry.profile.alias == name)
                     .count();
+                let alias_user_sids: HashSet<&str> = inner
+                    .sessions
+                    .values()
+                    .filter(|entry| entry.profile.alias == name)
+                    .map(|entry| entry.sid.as_str())
+                    .collect();
+                let selector_conflict = inner.sessions.values().any(|entry| {
+                    (entry.sid == name || entry.profile.com == name)
+                        && !alias_user_sids.contains(entry.sid.as_str())
+                });
+                let reserved_selector =
+                    !reg.is_yaml_alias(name) && is_reserved_selector_name(name);
                 let targets_live_session = live_alias_users > 0;
-                row.insert("effective", PyValue::Bool(active && targets_live_session));
+                row.insert(
+                    "effective",
+                    PyValue::Bool(
+                        active && targets_live_session && !selector_conflict && !reserved_selector,
+                    ),
+                );
                 row.insert(
                     "conflict",
                     PyValue::Bool(
-                        registry_row.is_some_and(has_conflict) || live_alias_users > 1,
+                        registry_row.is_some_and(has_conflict)
+                            || live_alias_users > 1
+                            || selector_conflict
+                            || reserved_selector,
                     ),
                 );
                 PyValue::Dict(row)
@@ -7876,6 +7932,9 @@ impl SessionManager {
     /// 回 `SESSION_NOT_FOUND`，不寫回已退休 sid（wp510 第三次整包審查 Medium）。鎖序 inner → model，與
     /// `session_from_template_locked` 相同。
     pub fn alias_set(&self, sid: &str, alias: &str) -> Result<PyDict, PyErr> {
+        if is_reserved_selector_name(alias) {
+            return Ok(alias_conflict_response());
+        }
         let not_found = || {
             pydict! {
                 "ok" => false,
@@ -7883,30 +7942,7 @@ impl SessionManager {
                 "session_id" => sid.to_string()
             }
         };
-        let (actor, old_alias, preflight_conflict, preflight_selector_conflict) = {
-            let inner = lock(&self.shared.inner);
-            let Some(e) = inner.sessions.get(sid) else {
-                return Ok(not_found());
-            };
-            let registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
-            let preflight_conflict = e.profile_source != "yaml-target"
-                && registry.conflicts_with_claim(alias, sid, &e.profile.device_by_id);
-            let preflight_selector_conflict = selector_name_taken(&inner, alias, Some(sid));
-            (
-                e.actor.clone(),
-                e.profile.alias.clone(),
-                preflight_conflict,
-                preflight_selector_conflict,
-            )
-        };
-        let still_same_session = |inner: &Inner| {
-            inner
-                .sessions
-                .get(sid)
-                .is_some_and(|e| Arc::ptr_eq(&e.actor, &actor))
-        };
-
-        // 兩個請求都能在此之前觀察到同名空缺；鉤子只供 test-fakes 建立該受控交錯。
+        // 兩個請求都能在此之前到達；衝突 owner 只在操作鎖內判定。
         #[cfg(feature = "test-fakes")]
         {
             let hook = lock(&self.shared.alias_pre_lock_hook).clone();
@@ -7915,21 +7951,29 @@ impl SessionManager {
             }
         }
         let _operation = lock(&self.shared.alias_operation_lock);
-
-        let active_alias = {
+        let (actor, old_alias, active_alias) = {
             let inner = lock(&self.shared.inner);
-            if !still_same_session(&inner) {
+            let Some(entry) = inner.sessions.get(sid) else {
                 return Ok(not_found());
-            }
-            let entry = inner.sessions.get(sid).expect("identity checked");
+            };
             let registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
-            if entry.profile_source != "yaml-target"
-                && !preflight_conflict
-                && registry.conflicts_with_claim(alias, sid, &entry.profile.device_by_id)
-            {
+            let locked_conflict = entry.profile_source != "yaml-target"
+                && (selector_name_taken(&inner, alias, Some(sid))
+                    || (!registry.is_yaml_alias(alias)
+                        && registry.conflicts_with_claim(
+                            alias,
+                            sid,
+                            &entry.profile.device_by_id,
+                        )));
+            if locked_conflict {
+                drop(inner);
+                #[cfg(feature = "test-fakes")]
+                if let Some(hook) = lock(&self.shared.alias_locked_conflict_hook).take() {
+                    hook();
+                }
                 return Ok(alias_conflict_response());
             }
-            alias_set_plan(
+            let active_alias = alias_set_plan(
                 &inner,
                 registry,
                 AliasSetInput {
@@ -7941,7 +7985,14 @@ impl SessionManager {
                     now_iso: &self.shared.now_iso(),
                 },
             )
-            .0
+            .0;
+            (entry.actor.clone(), entry.profile.alias.clone(), active_alias)
+        };
+        let still_same_session = |inner: &Inner| {
+            inner
+                .sessions
+                .get(sid)
+                .is_some_and(|e| Arc::ptr_eq(&e.actor, &actor))
         };
         // actor 持有的 profile 一併更新並等確認（GetState／submit 等回應中的 `session.alias`；sol-backfill p5 #3）。
         let applied = match actor.request(
@@ -7968,15 +8019,14 @@ impl SessionManager {
         }
         let entry = inner.sessions.get(sid).expect("identity checked");
         let latest_registry = AliasRegistry::load(self.shared.model_snapshot().aliases);
-        let conflicts_now = (!preflight_selector_conflict
-            && selector_name_taken(&inner, alias, Some(sid)))
-            || (entry.profile_source != "yaml-target"
-                && !preflight_conflict
-                && latest_registry.conflicts_with_claim(
-                    alias,
-                    sid,
-                    &entry.profile.device_by_id,
-                ));
+        let conflicts_now = entry.profile_source != "yaml-target"
+            && (selector_name_taken(&inner, alias, Some(sid))
+                || (!latest_registry.is_yaml_alias(alias)
+                    && latest_registry.conflicts_with_claim(
+                        alias,
+                        sid,
+                        &entry.profile.device_by_id,
+                    )));
         let (latest_alias, row_updates) = if conflicts_now {
             drop(inner);
             let _ = actor.request(
@@ -8031,6 +8081,11 @@ impl SessionManager {
         };
         drop(inner);
         committed.map_err(|e| commit_error(&e))?;
+        drop(_operation);
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.shared.alias_post_commit_hook).take() {
+            hook();
+        }
         Ok(pydict! { "ok" => true, "session_id" => sid.to_string(), "alias" => alias.to_string() })
     }
 
@@ -8040,6 +8095,9 @@ impl SessionManager {
         alias: &str,
         profile: Option<&str>,
     ) -> Result<PyDict, PyErr> {
+        if is_reserved_selector_name(alias) {
+            return Ok(alias_conflict_response());
+        }
         let _operation = lock(&self.shared.alias_operation_lock);
         let by_id = by_id.to_string();
         let requested_alias = alias.to_string();
@@ -8159,15 +8217,17 @@ impl SessionManager {
                 );
                 let choice = updated.resolve_for_session(sid, &profile.device_by_id, &automatic);
                 let mut replacement = choice.alias;
-                if alias_taken(&inner, &replacement, Some(sid))
+                if replacement == alias
+                    || alias_taken(&inner, &replacement, Some(sid))
                     || updated.conflicts_with_claim(&replacement, sid, &profile.device_by_id)
                 {
-                    replacement = unique_automatic_alias(
+                    replacement = unique_automatic_alias_excluding(
                         &inner,
                         &updated,
                         &profile.template.profile_name,
                         pyint_i128(&profile.act_no),
                         Some(sid),
+                        Some(alias),
                     );
                     updated.set_automatic_for_session(sid, &replacement, &self.shared.now_iso());
                 } else if choice.kind == AliasKind::Automatic
@@ -8196,6 +8256,10 @@ impl SessionManager {
             )?;
             if !is_ok(&applied) {
                 return Ok(applied);
+            }
+            #[cfg(feature = "test-fakes")]
+            if let Some(hook) = lock(&self.shared.alias_unassign_pre_commit_hook).take() {
+                hook();
             }
             let mut inner = lock(&self.shared.inner);
             let Some(entry) = inner
@@ -9053,7 +9117,52 @@ impl SessionManager {
         *lock(&self.shared.alias_pre_commit_hook) = Some(hook);
     }
 
-    /// 只供測試（test-fakes）：設定 alias.set 初始 claim 檢查後的受控交錯點。
+    /// 只供測試（test-fakes）：設定 `alias.set` 持久化後、操作鎖釋放但返回前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_alias_post_commit_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.alias_post_commit_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `alias.set` 鎖內判定 owner 衝突後的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_alias_locked_conflict_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.alias_locked_conflict_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `alias.unassign` actor 更新後、manager 重驗前的一次性交錯點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_alias_unassign_pre_commit_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.alias_unassign_pre_commit_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：受控改動另一 session 的 live alias，建立 alias.unassign 交錯衝突。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_live_alias_for_test(&self, sid: &str, alias: &str) {
+        let actor = lock(&self.shared.inner)
+            .sessions
+            .get(sid)
+            .unwrap_or_else(|| panic!("測試 session 不存在：{sid}"))
+            .actor
+            .clone();
+        let applied = actor
+            .request(
+                SessionRequest::SetAlias {
+                    alias: alias.to_string(),
+                },
+                QUERY_TIMEOUT,
+            )
+            .expect("測試 actor 更新 alias");
+        assert!(is_ok(&applied), "測試 actor 拒絕 alias 更新：{applied:?}");
+        let mut inner = lock(&self.shared.inner);
+        let entry = inner
+            .sessions
+            .get_mut(sid)
+            .expect("測試 session 更新期間不應消失");
+        entry.profile.alias = alias.to_string();
+        *lock(&entry.io.profile) = entry.profile.clone();
+    }
+
+    /// 只供測試（test-fakes）：設定 alias.set 進入操作鎖前的受控交錯點。
     #[cfg(feature = "test-fakes")]
     pub fn set_alias_pre_lock_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.shared.alias_pre_lock_hook) = Some(Arc::from(hook));

@@ -5466,9 +5466,13 @@ fn global_bg_capture_eviction_owner_routing_ignores_alias_collision() {
     }
     let sid0 = m.mgr.resolve("COM0").unwrap();
     let sid1 = m.mgr.resolve("COM1").unwrap();
-    // sol-backfill p5 #7：COM0 的 alias 設為 "COM1"——使用者 selector 規則會讓 "COM1" 先命中 COM0；
+    // sol-backfill p5 #7：以 test-fakes 建立公開 RPC 已拒絕的 COM0 alias "COM1"——selector 可能先命中 COM0；
     // 淘汰通知攜帶的 COM 是內部 owner 身分，必須以 `profile.com` 精確比對，不得走 alias-aware 解析。
-    assert!(is_ok(&rpc(m.mgr.alias_set(&sid0, "COM1"))));
+    m.mgr.set_live_alias_for_test(&sid0, "COM1");
+    assert_eq!(
+        m.session("COM0").get("alias").cloned(),
+        Some(PyValue::from("COM1"))
+    );
     let bg = |sid: &str| -> String {
         let mut req = agent_submit("dmesg");
         req.mode = "bg".into();

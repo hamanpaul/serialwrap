@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 20,
+  "x-catalog-revision": 21,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -1304,15 +1304,24 @@
         ]
       },
       "errors": [
-        "ALIAS_NOT_FOUND"
+        "ALIAS_NOT_FOUND",
+        "SESSION_NOT_FOUND",
+        "INVALID_ARGS"
       ],
       "error_order": [
+        "SESSION_NOT_FOUND",
+        "INVALID_ARGS",
         "ALIAS_NOT_FOUND"
       ],
       "side_effects": [
         {
           "what": "兩種分支皆先 _save_state()（失敗分支仍寫入）",
           "when": "always",
+          "idempotent": false
+        },
+        {
+          "what": "Rust 交錯路徑：目標退休回 SESSION_NOT_FOUND、替代 selector 衝突回 INVALID_ARGS；均在 registry 提交前回覆，衝突時恢復仍存活 actor 的原 alias",
+          "when": "rust_only_interleaving",
           "idempotent": false
         }
       ],

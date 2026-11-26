@@ -113,6 +113,10 @@ entries:
     - cargo:sw-daemon::dispatch::issue281_by_id_assignment_does_not_shadow_com_or_session_id
     - cargo:sw-daemon::dispatch::issue281_unassign_re_resolves_live_selector_before_and_after_restart
     - cargo:sw-daemon::dispatch::issue281_rust_alias_list_actual_response_validates_rpc_schema
+    - cargo:sw-daemon::dispatch::issue281_parallel_alias_set_after_first_commit_has_one_conflict
+    - cargo:sw-daemon::dispatch::issue281_unassign_same_as_automatic_does_not_reappear_after_restart
+    - cargo:sw-daemon::dispatch::issue281_late_com_assignment_re_resolves_existing_alias
+    - cargo:sw-daemon::dispatch::issue281_unassign_race_errors_are_declared_in_rpc_schema
     owner_phase: P7
   bc:DF-01:
     nodeids:

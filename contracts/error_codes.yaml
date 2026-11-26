@@ -6,7 +6,7 @@
 # extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
 # retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
 schema_version: 1
-revision: 7
+revision: 8
 namespace: error_code
 codes:
   - code: ALIAS_NOT_FOUND
@@ -539,7 +539,7 @@ codes:
   - code: INVALID_ARGS
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc, cli_local], methods: ["alias.assign", "alias.set", "command.result_tail", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "session.activity", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_status", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "argparse-boundary", "daemon restart", "daemon start", "fallthrough", "remote"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc, cli_local], methods: ["alias.assign", "alias.set", "alias.unassign", "command.result_tail", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "session.activity", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.console_list", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_status", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "argparse-boundary", "daemon restart", "daemon start", "fallthrough", "remote"], platforms: [posix, windows]}
     meaning: "參數缺漏或型別／值不合法（RPC 分派或 CLI 參數驗證）"
     side_effect: "無（service 版無附帶欄位）"
     retryable: "fix_args"
@@ -1014,7 +1014,7 @@ codes:
   - code: SESSION_NOT_FOUND
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rpc], methods: ["alias.set", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "result.tail", "session.activity", "session.attach", "session.bind", "session.clear", "session.get_state", "session.log_start", "session.log_status", "session.log_stop", "session.recover", "session.self_test"], platforms: [posix, windows]}
+    scope: {interfaces: [rpc], methods: ["alias.set", "alias.unassign", "command.submit", "device.attach", "device.release", "file.pull", "file.push", "log.tail_raw", "log.tail_text", "result.tail", "session.activity", "session.attach", "session.bind", "session.clear", "session.get_state", "session.log_start", "session.log_status", "session.log_stop", "session.recover", "session.self_test"], platforms: [posix, windows]}
     meaning: "selector 未對應任何 session"
     side_effect: "無（部分路徑於失敗前仍附帶 lease 脈絡欄位）"
     retryable: "fix_args"
