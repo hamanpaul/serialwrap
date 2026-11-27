@@ -1090,8 +1090,8 @@ def test_nonbridge_multiple_mapped_nodeids_keep_failure_source(tmp_path: Path):
     fakes.write_run(
         b_dir, case_id, side="b", runner="contract-blackbox", verdict="FAIL",
         l1_results=[
-            {"nodeid": nodeids[0], "outcome": "passed", "skip_kind": None,
-             "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}},
+            {"nodeid": nodeids[0], "outcome": "failed", "skip_kind": None,
+             "phases": {"setup": "passed", "call": "failed", "teardown": "passed"}},
             {"nodeid": nodeids[1], "outcome": "failed", "skip_kind": None,
              "phases": {"setup": "passed", "call": "failed", "teardown": "passed"}},
         ],
@@ -1100,8 +1100,8 @@ def test_nonbridge_multiple_mapped_nodeids_keep_failure_source(tmp_path: Path):
 
     result = _diff(a_dir, b_dir, {case_id})
 
-    failure = next(row for row in result["product_failures"] if row["case"] == case_id)
-    assert failure["source_ref"] == refs[1]
+    failures = [row for row in result["product_failures"] if row["case"] == case_id]
+    assert [row["source_ref"] for row in failures] == refs
 
 
 def test_case_map_source_is_preserved_in_diff_output(tmp_path: Path):
@@ -1317,4 +1317,411 @@ def test_malformed_report_values_do_not_stop_scanning_other_failures(
     assert result["integrity"]["b"] is False
     assert any(row["case"] == trusted_case and row["side"] == "b" for row in result["product_failures"])
     assert f"B:{trusted_case}:zero_tx_on_reject" in result["safety_violations"]
+
+
+def _refresh_nonbridge_source_hash(run_dir: Path, relative: str) -> None:
+    """同步 fixture envelope 中指定原始來源的位元組雜湊。"""
+    envelope_path = run_dir / "runner-observation.json"
+    envelope = fakes.read_json(envelope_path)
+    digest = hashlib.sha256((run_dir / relative).read_bytes()).hexdigest()
+    row = next(item for item in envelope["source_files"] if item["path"] == relative)
+    row["sha256"] = digest
+    fakes.write_json(envelope_path, envelope)
+
+
+@pytest.mark.parametrize("runner", ["contract-blackbox", "windows-native"])
+def test_pytest_runner_l1_fixture_matches_collector_shape(tmp_path: Path, runner: str):
+    case_id = f"pytest-l1-shape-{runner}"
+    a_dir, b_dir = _pair(tmp_path, case_id, runner=runner)
+    report = fakes.read_json(b_dir / case_id / runner / "1" / "source/l1-results.json")
+
+    assert report["schema_version"] == 2
+    assert report["format"] == "l1-results.v1"
+    assert report["runner"] == "pytest"
+    assert report["finished"] is True
+    if runner == "windows-native":
+        assert report["provenance"]["schema"] == "pytest-l1-provenance.v1"
+        assert report["provenance"]["platform"] == "windows"
+        assert set(report["provenance"]) == {"schema", "platform", "git"}
+    else:
+        assert "provenance" not in report
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"] == {"a": True, "b": True}
+
+
+def test_rust_l1_accepts_unmodified_cargo_collector_report_shape(tmp_path: Path):
+    case_id = "cargo-l1-original-shape"
+    a_dir, b_dir = _pair(tmp_path, case_id, runner="rust-l1")
+    report = fakes.read_json(b_dir / case_id / "rust-l1" / "1" / "source/l1-results.json")
+
+    assert report["runner"] == "cargo"
+    assert report["finished"] is True
+    assert report["provenance"]["schema"] == "cargo-l1-provenance.v1"
+    assert "runner" not in report["provenance"]
+    assert "complete" not in report["provenance"]
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"] == {"a": True, "b": True}
+
+
+def test_rust_l1_uses_top_level_finished_for_completion(tmp_path: Path):
+    case_id = "cargo-l1-not-finished"
+    a_dir, b_dir = _pair(tmp_path, case_id, runner="rust-l1")
+    b_run = b_dir / case_id / "rust-l1" / "1"
+    report_path = b_run / "source/l1-results.json"
+    report = fakes.read_json(report_path)
+    report["finished"] = False
+    fakes.write_json(report_path, report)
+    _refresh_nonbridge_source_hash(b_run, "source/l1-results.json")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "runner incomplete: rust-l1")
+
+
+def test_rust_l1_checks_top_level_runner_value(tmp_path: Path):
+    case_id = "cargo-l1-runner-mismatch"
+    a_dir, b_dir = _pair(tmp_path, case_id, runner="rust-l1")
+    b_run = b_dir / case_id / "rust-l1" / "1"
+    report_path = b_run / "source/l1-results.json"
+    report = fakes.read_json(report_path)
+    report["runner"] = "pytest"
+    fakes.write_json(report_path, report)
+    _refresh_nonbridge_source_hash(b_run, "source/l1-results.json")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "runner source identity mismatch: source/l1-results.json")
+
+
+@pytest.mark.parametrize("identity_issue", ["missing", "invalid-json", "unlisted", "hash-mismatch", "artifact-mismatch"])
+def test_unverified_release_identity_keeps_general_and_safety_failures(
+    tmp_path: Path, identity_issue: str,
+):
+    case_id = f"unverified-release-{identity_issue}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    b_run = fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", verdict="FAIL",
+        runner_exit_code=0, invariants=[("zero_tx_on_reject", "FAIL")],
+    )
+    release_path = b_run / "source/release-manifest.json"
+    envelope_path = b_run / "runner-observation.json"
+    if identity_issue == "missing":
+        release_path.unlink()
+    elif identity_issue == "invalid-json":
+        release_path.write_bytes(b"{invalid json\n")
+        _refresh_nonbridge_source_hash(b_run, "source/release-manifest.json")
+    elif identity_issue == "unlisted":
+        envelope = fakes.read_json(envelope_path)
+        envelope["source_files"] = [
+            row for row in envelope["source_files"] if row["path"] != "source/release-manifest.json"
+        ]
+        fakes.write_json(envelope_path, envelope)
+    elif identity_issue == "hash-mismatch":
+        release_path.write_bytes(release_path.read_bytes() + b" ")
+    elif identity_issue == "artifact-mismatch":
+        release = fakes.read_json(release_path)
+        release["components"]["cli"]["sha256"] = "f" * 64
+        fakes.write_json(release_path, release)
+        _refresh_nonbridge_source_hash(b_run, "source/release-manifest.json")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert result["product_failures"] == []
+    assert result["safety_violations"] == []
+    assert next(row for row in result["artifact_identity"] if row["side"] == "b")["verified"] is False
+    assert any(row["side"] == "b" and row["case"] == case_id
+               and row["source_ref"].endswith("source/l1-results.json#results[0]")
+               for row in result["unverified_failures"])
+    assert any(row["side"] == "b" and row["case"] == case_id and "invariant" in row["reason"]
+               for row in result["unverified_failures"])
+    assert result["integrity_problems"]["b"]
+
+
+def test_cli_pairing_mismatch_does_not_downgrade_verified_b_failures(tmp_path: Path):
+    case_id = "cli-mismatch-keeps-failures"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", verdict="FAIL", runner_exit_code=0,
+        invariants=[("zero_tx_on_reject", "FAIL")],
+        artifact_overrides={"cli": {"sha256": "f" * 64}},
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "artifact identity mismatch: artifacts.cli.sha256")
+    assert next(row for row in result["artifact_identity"] if row["side"] == "b")["verified"] is True
+    assert result["cli_pairing"] == [{
+        "case": case_id,
+        "runner": "contract-blackbox",
+        "run_index": "1",
+        "matched": False,
+        "source_refs": {
+            "a": f"{case_id}/contract-blackbox/1/runner-observation.json",
+            "b": f"{case_id}/contract-blackbox/1/runner-observation.json",
+        },
+    }]
+    assert any(row["side"] == "b" and row["case"] == case_id for row in result["product_failures"])
+    assert f"B:{case_id}:zero_tx_on_reject" in result["safety_violations"]
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("l1_state", ["missing", "invalid"])
+def test_nonbridge_envelope_fail_survives_missing_or_invalid_l1(
+    tmp_path: Path, side: str, l1_state: str,
+):
+    case_id = f"envelope-fail-with-{l1_state}-l1-{side}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox")
+    report_dir = a_dir if side == "a" else b_dir
+    run_dir = report_dir / case_id / "contract-blackbox" / "1"
+    envelope_path = run_dir / "runner-observation.json"
+    envelope = fakes.read_json(envelope_path)
+    envelope["verdict"] = "FAIL"
+    envelope["reason"] = "fixture envelope failure"
+    fakes.write_json(envelope_path, envelope)
+    l1_path = run_dir / "source/l1-results.json"
+    if l1_state == "missing":
+        l1_path.unlink()
+    else:
+        l1_path.write_bytes(b"{invalid json\n")
+        _refresh_nonbridge_source_hash(run_dir, "source/l1-results.json")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"][side] is False
+    assert any(row["side"] == side and row["case"] == case_id
+               and row["source_ref"].endswith("runner-observation.json")
+               for row in result["unverified_failures"])
+
+
+def test_raw_l1_failure_survives_missing_envelope_as_unverified(tmp_path: Path):
+    case_id = "raw-l1-failure-without-envelope"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    b_run = fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", verdict="FAIL", runner_exit_code=0,
+    )
+    (b_run / "runner-observation.json").unlink()
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert any(row["side"] == "b" and row["case"] == case_id
+               and row["source_ref"] == f"{case_id}/contract-blackbox/1/source/l1-results.json#results[0]"
+               for row in result["unverified_failures"])
+
+
+def test_bridge_verdict_fail_survives_missing_manifest(tmp_path: Path):
+    case_id = "bridge-fail-without-manifest"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a")
+    b_run = fakes.write_run(b_dir, case_id, side="b", verdict="FAIL")
+    (b_run / "manifest.json").unlink()
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"]["b"] is False
+    assert next(row for row in result["artifact_identity"] if row["side"] == "b")["verified"] is False
+    assert any(row["side"] == "b" and row["case"] == case_id
+               and row["source_ref"] == f"{case_id}/bridge/1/comparison.json"
+               for row in result["unverified_failures"])
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("runner", ["bridge", "contract-blackbox"])
+@pytest.mark.parametrize("id_problem", ["missing", "wrong-type"])
+def test_malformed_invariant_id_preserves_raw_fail_by_index(
+    tmp_path: Path, side: str, runner: str, id_problem: str,
+):
+    case_id = f"malformed-invariant-{runner}-{side}-{id_problem}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner=runner)
+    fakes.write_run(b_dir, case_id, side="b", runner=runner)
+    report_dir = a_dir if side == "a" else b_dir
+    run_dir = report_dir / case_id / runner / "1"
+    if runner == "bridge":
+        path = run_dir / "comparison.json"
+        document = fakes.read_json(path)
+        document["invariants"][0]["verdict"] = "FAIL"
+        if id_problem == "missing":
+            del document["invariants"][0]["id"]
+        else:
+            document["invariants"][0]["id"] = ["bad", "id"]
+        fakes.write_json(path, document)
+        source_ref = f"{case_id}/bridge/1/comparison.json#/invariants/0"
+    else:
+        path = run_dir / "source/invariant-evidence.json"
+        document = fakes.read_json(path)
+        document["invariants"][0]["result"] = "FAIL"
+        if id_problem == "missing":
+            del document["invariants"][0]["id"]
+        else:
+            document["invariants"][0]["id"] = ["bad", "id"]
+        fakes.write_json(path, document)
+        _refresh_nonbridge_source_hash(run_dir, "source/invariant-evidence.json")
+        source_ref = f"{case_id}/contract-blackbox/1/source/invariant-evidence.json#/invariants/0"
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"][side] is False
+    assert not any(token.startswith(side.upper() + ":" + case_id + ":")
+                   for token in result["safety_violations"])
+    assert any(row["side"] == side and row["case"] == case_id and row["source_ref"] == source_ref
+               and "invariant" in row["reason"] for row in result["unverified_failures"])
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("id_problem", ["missing", "wrong-type"])
+def test_malformed_envelope_invariant_id_preserves_fail_by_index(
+    tmp_path: Path, side: str, id_problem: str,
+):
+    case_id = f"malformed-envelope-invariant-{side}-{id_problem}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox")
+    report_dir = a_dir if side == "a" else b_dir
+    run_dir = report_dir / case_id / "contract-blackbox" / "1"
+    envelope_path = run_dir / "runner-observation.json"
+    envelope = fakes.read_json(envelope_path)
+    envelope["invariants"] = [{"id": "zero_tx_on_reject", "result": "FAIL"}]
+    if id_problem == "missing":
+        del envelope["invariants"][0]["id"]
+    else:
+        envelope["invariants"][0]["id"] = ["bad", "id"]
+    fakes.write_json(envelope_path, envelope)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["integrity"][side] is False
+    assert any(row["side"] == side and row["case"] == case_id
+               and row["source_ref"] == f"{case_id}/contract-blackbox/1/runner-observation.json#/invariants/0"
+               and "invariant" in row["reason"] for row in result["unverified_failures"])
+
+
+def test_different_logical_commands_are_reported_even_when_output_matches(tmp_path: Path):
+    case_id = "argv-difference-same-output"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    response = {"ok": True, "items": []}
+    fakes.write_run(a_dir, case_id, side="a", calls=[_call(["session", "list"], response)])
+    fakes.write_run(b_dir, case_id, side="b", calls=[_call(["daemon", "status"], response)])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "argv")
+    assert difference["path"] == "call[0].argv"
+    assert difference["source_refs"]["a"].startswith(f"{case_id}/bridge/1/cli.ndjson#L")
+    assert difference["source_refs"]["b"].startswith(f"{case_id}/bridge/1/cli.ndjson#L")
+
+
+def test_call_count_difference_has_one_entry_per_missing_call(tmp_path: Path):
+    case_id = "argv-call-count-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [_call(["session", "list"], {"ok": True}) for _ in range(3)]
+    calls_b = [_call(["session", "list"], {"ok": True})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", calls=calls_b)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    count_differences = [item for item in result["differences"] if item["kind"] == "call_count"]
+    assert [item["path"] for item in count_differences] == ["call[1]", "call[2]"]
+    assert all(item["source_refs"]["a"] is not None and item["source_refs"]["b"] is None
+               for item in count_differences)
+
+
+@pytest.mark.parametrize("flag", ["--endpoint", "--socket", "--bench"])
+def test_logical_argv_ignores_cli_path_and_instance_endpoint(tmp_path: Path, flag: str):
+    case_id = f"argv-instance-only-{flag[2:]}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv_a = ["/instance/a/bin/serialwrap", flag, "/instance/a/run/serialwrapd.sock", "session", "list"]
+    argv_b = ["C:\\instance\\b\\bin\\serialwrap.exe", flag, "C:\\instance\\b\\run\\serialwrapd.sock", "session", "list"]
+    call_a = {"argv": argv_a, "rc": 0, "response": {"ok": True, "items": []}}
+    call_b = {"argv": argv_b, "rc": 0, "response": {"ok": True, "items": []}}
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox", calls=[call_a])
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox", calls=[call_b])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+
+
+def test_logical_argv_removes_equals_endpoint_and_substitutes_root(tmp_path: Path):
+    case_id = "argv-equals-endpoint"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv_a = ["/instance/a/bin/serialwrap", "--endpoint=/instance/a/run/serialwrapd.sock",
+              "event", "reload", "--config", "/instance/a/config/client.yaml"]
+    argv_b = ["/instance/b/bin/serialwrap", "--endpoint=/instance/b/run/serialwrapd.sock",
+              "event", "reload", "--config", "/instance/b/config/client.yaml"]
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox",
+                    calls=[{"argv": argv_a, "rc": 0,
+                            "response": {"ok": True, "added": ["one", "two"], "removed": [], "changed": []}}])
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox",
+                    calls=[{"argv": argv_b, "rc": 0,
+                            "response": {"ok": True, "added": ["one", "two"], "removed": [], "changed": []}}])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+
+
+def test_logical_argv_substitutes_instance_root_in_other_argument_values(tmp_path: Path):
+    case_id = "argv-instance-root-value"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv_a = ["/instance/a/bin/serialwrap", "--endpoint", "/instance/a/run/serialwrapd.sock",
+              "event", "reload", "--config", "/instance/a/config/client.yaml"]
+    argv_b = ["/instance/b/bin/serialwrap", "--endpoint", "/instance/b/run/serialwrapd.sock",
+              "event", "reload", "--config", "/instance/b/config/client.yaml"]
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox",
+                    calls=[{"argv": argv_a, "rc": 0,
+                            "response": {"ok": True, "added": ["one", "two"], "removed": [], "changed": []}}])
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox",
+                    calls=[{"argv": argv_b, "rc": 0,
+                            "response": {"ok": True, "added": ["one", "two"], "removed": [], "changed": []}}])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+
+
+@pytest.mark.parametrize("preserved_flag", ["--timeout", "--cmd-id"])
+def test_logical_argv_keeps_non_instance_arguments(tmp_path: Path, preserved_flag: str):
+    case_id = f"argv-preserved-{preserved_flag[2:]}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv_a = ["/instance/a/bin/serialwrap", "--endpoint", "/instance/a/run/serialwrapd.sock",
+              "cmd", "status", preserved_flag, "value-a"]
+    argv_b = ["/instance/b/bin/serialwrap", "--endpoint", "/instance/b/run/serialwrapd.sock",
+              "cmd", "status", preserved_flag, "value-b"]
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox",
+                    calls=[{"argv": argv_a, "rc": 0, "response": {"ok": True}}])
+    fakes.write_run(b_dir, case_id, side="b", runner="contract-blackbox",
+                    calls=[{"argv": argv_b, "rc": 0, "response": {"ok": True}}])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert any(item["kind"] == "argv" and item["path"] == "call[0].argv"
+               for item in result["differences"])
 

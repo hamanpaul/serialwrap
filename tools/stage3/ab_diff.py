@@ -61,8 +61,8 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
 _EXCEPTION = "EXCEPTION"
 _ROOT_SEGMENT_CHARS = "A-Za-z0-9._-"
-_ENDPOINT_FLAGS = frozenset({"--socket", "--endpoint"})
-_COMMAND_ID_FLAG = "--cmd-id"
+_INSTANCE_ENDPOINT_FLAGS = frozenset({"--socket", "--endpoint", "--bench"})
+_ENDPOINT_PATH_FLAGS = frozenset({"--socket", "--endpoint"})
 _ALLOWED_RULE_KEYS = frozenset({
     "approved_revision",
     "reviewed_by",
@@ -102,6 +102,7 @@ class _Run:
     problems: list[str] = field(default_factory=list)
     verdict_ref: str = ""
     l1_document: dict[str, Any] | None = None
+    l1_report_valid: bool = False
     instance_roots: tuple[str, ...] = ()
     identity_verified: bool = False
     case_identity_verified: bool = False
@@ -109,6 +110,7 @@ class _Run:
     failure_ref: str = ""
     failure_reason: str = ""
     failure_verified: bool = False
+    failure_records: list[dict[str, Any]] = field(default_factory=list)
     invariant_failures: list[dict[str, Any]] = field(default_factory=list)
     unverified_invariant_failures: list[dict[str, Any]] = field(default_factory=list)
     case_map: dict[str, str] | None = None
@@ -471,6 +473,11 @@ def _load_bridge_run(run: _Run) -> None:
             run.failure_ref = run.verdict_ref
             reasons = comparison.get("reasons")
             run.failure_reason = "; ".join(item for item in reasons if isinstance(item, str)) if isinstance(reasons, list) else ""
+            run.failure_records.append({
+                "source_ref": run.verdict_ref,
+                "reason": run.failure_reason or "bridge comparison verdict FAIL",
+                "verified": False,
+            })
         reasons = comparison.get("reasons")
         if isinstance(reasons, list):
             run.reason = "; ".join(str(reason) for reason in reasons if isinstance(reason, str))
@@ -485,12 +492,18 @@ def _load_bridge_run(run: _Run) -> None:
                 invariant_verdict = invariant.get("verdict")
                 if not _nonempty_string(invariant_id) or not isinstance(invariant_verdict, str) or invariant_verdict not in _VALID_VERDICTS:
                     _add_problem(run.problems, f"invalid comparison invariant: {index}")
+                    if invariant_verdict == "FAIL":
+                        run.unverified_invariant_failures.append({
+                            "id": invariant_id,
+                            "source_ref": run.ref("comparison.json", f"#/invariants/{index}"),
+                            "reason": "invariant FAIL has a missing or invalid id",
+                        })
                     continue
                 run.invariants.append({"id": invariant_id, "result": invariant_verdict})
                 if invariant_verdict == "FAIL":
                     run.invariant_failures.append({
                         "id": invariant_id,
-                        "source_ref": run.ref("comparison.json", f"#invariants[{index}]"),
+                        "source_ref": run.ref("comparison.json", f"#/invariants/{index}"),
                         "reason": f"invariant {invariant_id} FAIL",
                     })
 
@@ -523,6 +536,8 @@ def _load_bridge_run(run: _Run) -> None:
             _add_problem(run.problems, "bridge case/run identity mismatch")
         run.case_identity_verified = bool(identity_ok)
         run.failure_verified = run.identity_verified and run.case_identity_verified
+        for failure in run.failure_records:
+            failure["verified"] = run.failure_verified
     else:
         _add_problem(run.problems, "bridge case/run identity unavailable")
 
@@ -711,10 +726,18 @@ def _instance_roots(run: _Run) -> tuple[str, ...]:
     roots: set[str] = set()
     for call in run.calls:
         argv = call.argv
+        endpoint_values: list[str] = []
         for index, token in enumerate(argv[:-1]):
-            if token not in _ENDPOINT_FLAGS:
-                continue
-            endpoint = argv[index + 1].replace("\\", "/")
+            if token in _ENDPOINT_PATH_FLAGS:
+                endpoint_values.append(argv[index + 1])
+            else:
+                endpoint_values.extend(
+                    token.partition("=")[2]
+                    for flag in _ENDPOINT_PATH_FLAGS
+                    if token.startswith(f"{flag}=")
+                )
+        for raw_endpoint in endpoint_values:
+            endpoint = raw_endpoint.replace("\\", "/")
             parts = PurePosixPath(endpoint).parts
             if len(parts) >= 3 and parts[-2:] == ("run", "serialwrapd.sock"):
                 root = str(PurePosixPath(*parts[:-2]))
@@ -749,6 +772,8 @@ def _load_l1_report(run: _Run) -> None:
     run.l1_document = document
     if document.get("schema_version") != 2 or document.get("format") != "l1-results.v1":
         _add_problem(run.problems, f"invalid runner source: {relative}")
+    else:
+        run.l1_report_valid = True
 
 
 def _load_runner_invariants(run: _Run, envelope: Mapping[str, Any] | None) -> None:
@@ -770,12 +795,18 @@ def _load_runner_invariants(run: _Run, envelope: Mapping[str, Any] | None) -> No
             result = item.get("result")
             if not _nonempty_string(invariant_id) or not isinstance(result, str) or result not in _VALID_VERDICTS:
                 _add_problem(run.problems, f"invalid invariant evidence item: {index}")
+                if result == "FAIL":
+                    run.unverified_invariant_failures.append({
+                        "id": invariant_id,
+                        "source_ref": run.ref("source/invariant-evidence.json", f"#/invariants/{index}"),
+                        "reason": "invariant FAIL has a missing or invalid id",
+                    })
                 continue
             normalized_source.append({"id": invariant_id, "result": result})
             if result == "FAIL":
                 run.invariant_failures.append({
                     "id": invariant_id,
-                    "source_ref": run.ref("source/invariant-evidence.json", f"#invariants[{index}]"),
+                    "source_ref": run.ref("source/invariant-evidence.json", f"#/invariants/{index}"),
                     "reason": f"invariant {invariant_id} FAIL",
                 })
     run.invariants = normalized_source
@@ -795,12 +826,18 @@ def _load_runner_invariants(run: _Run, envelope: Mapping[str, Any] | None) -> No
         result = item.get("result")
         if not _nonempty_string(invariant_id) or not isinstance(result, str) or result not in _VALID_VERDICTS:
             _add_problem(run.problems, f"invalid runner invariant: {index}")
+            if result == "FAIL":
+                run.unverified_invariant_failures.append({
+                    "id": invariant_id,
+                    "source_ref": run.ref("runner-observation.json", f"#/invariants/{index}"),
+                    "reason": "envelope invariant FAIL has a missing or invalid id",
+                })
             continue
         normalized_envelope.append({"id": invariant_id, "result": result})
         if result == "FAIL" and {"id": invariant_id, "result": result} not in normalized_source:
             run.unverified_invariant_failures.append({
                 "id": invariant_id,
-                "source_ref": run.ref("runner-observation.json", f"#invariants[{index}]"),
+                "source_ref": run.ref("runner-observation.json", f"#/invariants/{index}"),
                 "reason": f"invariant {invariant_id} FAIL is not corroborated by raw invariant evidence",
             })
     if normalized_source != normalized_envelope:
@@ -850,7 +887,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
         collected = []
 
     mapped_indices: set[int] = set()
-    failed_refs: list[str] = []
+    verified_mapped_indices: set[int] = set()
     executed_outcomes: list[str] = []
     for map_index, mapping in enumerate(rows):
         if not isinstance(mapping, Mapping):
@@ -893,9 +930,32 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
         if outcome not in _VALID_RUNNER_OUTCOMES:
             _add_problem(run.problems, f"required case result not executed: {outcome}")
             continue
+        verified_mapped_indices.add(result_index)
         executed_outcomes.append(outcome)
-        if outcome == "failed":
-            failed_refs.append(source_ref)
+
+    raw_failed_indices: set[int] = set()
+    for result_index, raw_row in enumerate(raw_results):
+        if not isinstance(raw_row, Mapping) or raw_row.get("outcome") != "failed":
+            continue
+        raw_failed_indices.add(result_index)
+        source_ref = run.ref("source/l1-results.json", f"#results[{result_index}]")
+        verified = (
+            result_index in verified_mapped_indices
+            and case_identity_ok
+            and case_map_ok
+            and run.identity_verified
+            and run.l1_report_valid
+            and "source/l1-results.json" in run.verified_sources
+        )
+        reason = (
+            run.reason if verified and run.reason
+            else "原始 runner FAIL 尚未核實對應此 required case"
+        )
+        run.failure_records.append({"source_ref": source_ref, "reason": reason, "verified": verified})
+    if raw_failed_indices:
+        run.failure_ref = run.failure_records[0]["source_ref"]
+        run.failure_reason = run.failure_records[0]["reason"]
+        run.failure_verified = bool(run.failure_records[0]["verified"])
 
     if not executed_outcomes:
         _add_problem(run.problems, "required case has no executed result: source/l1-results.json")
@@ -908,15 +968,14 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
         elif envelope_verdict != raw_verdict:
             _add_problem(run.problems, "runner result mismatch: verdict")
         run.verdict = raw_verdict
-        if failed_refs:
-            run.failure_ref = failed_refs[0]
-            run.failure_verified = (
-                case_identity_ok
-                and case_map_ok
-                and run.identity_verified
-                and "source/l1-results.json" in run.verified_sources
-            )
     run.case_identity_verified = bool(case_identity_ok and case_map_ok)
+
+    if envelope.get("verdict") == "FAIL" and not raw_failed_indices:
+        run.failure_records.append({
+            "source_ref": run.ref("runner-observation.json"),
+            "reason": run.reason or "runner envelope verdict FAIL is not corroborated by raw L1 results",
+            "verified": False,
+        })
 
 
 def _runner_completion(run: _Run, envelope: Mapping[str, Any]) -> None:
@@ -946,8 +1005,66 @@ def _runner_completion(run: _Run, envelope: Mapping[str, Any]) -> None:
                 _add_problem(run.problems, "runner exit code mismatch: source/l1-results.json")
     if run.runner == "rust-l1":
         provenance = run.l1_document.get("provenance") if run.l1_document is not None else None
-        if not isinstance(provenance, Mapping) or provenance.get("schema") != "cargo-l1-provenance.v1" or provenance.get("complete") is not True:
-            _add_problem(run.problems, f"runner incomplete: {run.runner}")
+        if not _valid_cargo_provenance(provenance, run.l1_document):
+            _add_problem(run.problems, f"runner provenance mismatch: source/l1-results.json")
+
+
+def _valid_cargo_provenance(provenance: Any, report: Mapping[str, Any] | None) -> bool:
+    """驗證 cargo_l1_results._provenance() 真正輸出的欄位，不檢查虛構完成欄位。"""
+    if not isinstance(provenance, Mapping) or report is None:
+        return False
+    if provenance.get("schema") != "cargo-l1-provenance.v1":
+        return False
+    platform = provenance.get("platform")
+    if not isinstance(platform, str) or platform not in {"linux", "windows"} or platform != report.get("platform"):
+        return False
+    if provenance.get("build_target") is not None and not _nonempty_string(provenance.get("build_target")):
+        return False
+    git = provenance.get("git")
+    if not isinstance(git, Mapping) or not isinstance(git.get("clean"), bool):
+        return False
+    if git.get("head") is not None and not isinstance(git.get("head"), str):
+        return False
+    end = git.get("end")
+    if not isinstance(end, Mapping) or not isinstance(end.get("clean"), bool):
+        return False
+    if end.get("head") is not None and not isinstance(end.get("head"), str):
+        return False
+    toolchain = provenance.get("toolchain")
+    if not isinstance(toolchain, Mapping) or not {"rustc_vv", "rustc_vv_sha256", "error"} <= set(toolchain):
+        return False
+    if toolchain.get("rustc_vv") is not None and not isinstance(toolchain.get("rustc_vv"), str):
+        return False
+    if toolchain.get("rustc_vv_sha256") is not None and not _valid_sha256(toolchain.get("rustc_vv_sha256")):
+        return False
+    if toolchain.get("error") is not None and not isinstance(toolchain.get("error"), str):
+        return False
+    rustflags = provenance.get("rustflags")
+    env_names = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")
+    if not isinstance(rustflags, Mapping):
+        return False
+    for name in env_names:
+        value = rustflags.get(name)
+        if not isinstance(value, Mapping) or not isinstance(value.get("set"), bool):
+            return False
+        digest = value.get("sha256")
+        if digest is not None and not _valid_sha256(digest):
+            return False
+    executables = provenance.get("executables")
+    if not isinstance(executables, list):
+        return False
+    for executable in executables:
+        if not isinstance(executable, Mapping):
+            return False
+        if not all(_nonempty_string(executable.get(key)) for key in ("crate", "target", "path")):
+            return False
+        digest = executable.get("sha256")
+        if digest is not None and not _valid_sha256(digest):
+            return False
+        nodeids = executable.get("nodeids")
+        if not isinstance(nodeids, list) or not all(isinstance(nodeid, str) for nodeid in nodeids):
+            return False
+    return True
 
 
 def _load_runner_run(run: _Run) -> None:
@@ -957,6 +1074,16 @@ def _load_runner_run(run: _Run) -> None:
     if envelope is None:
         _load_runner_invariants(run, None)
         _runner_completion(run, {})
+        if run.l1_document is not None:
+            raw_results = run.l1_document.get("results")
+            if isinstance(raw_results, list):
+                for index, item in enumerate(raw_results):
+                    if isinstance(item, Mapping) and item.get("outcome") == "failed":
+                        run.failure_records.append({
+                            "source_ref": run.ref("source/l1-results.json", f"#results[{index}]"),
+                            "reason": "原始 runner FAIL 尚未核實對應此 required case",
+                            "verified": False,
+                        })
         return
     if envelope.get("schema_version") != "stage3-runner-observation.v1":
         _add_problem(run.problems, "invalid runner observation schema_version")
@@ -970,11 +1097,13 @@ def _load_runner_run(run: _Run) -> None:
     run.artifacts = dict(artifacts) if isinstance(artifacts, Mapping) else {}
     if not isinstance(artifacts, Mapping):
         _add_problem(run.problems, "missing runner observation field: artifacts")
-    run.identity_verified = _check_identity_fields(run)
+    # 身分預設未核實；envelope 的 SHA 格式本身不是原始來源證據。
+    run.identity_verified = False
 
     source_hashes = _source_file_map(run, envelope)
     release_path = run.path / "source/release-manifest.json"
     release = _json_object(release_path, run, "source/release-manifest.json")
+    release_digest = ""
     if release is not None:
         try:
             release_digest = sha256_file(release_path)
@@ -985,7 +1114,18 @@ def _load_runner_run(run: _Run) -> None:
             _add_problem(run.problems, "invalid release manifest schema_version")
         if source_hashes.get("source/release-manifest.json") != release_digest:
             _add_problem(run.problems, "source hash mismatch: source/release-manifest.json")
-        run.identity_verified = _release_identity(run, release, release_digest) and run.identity_verified
+    release_source_verified = (
+        release is not None
+        and release.get("schema_version") == 1
+        and source_hashes.get("source/release-manifest.json") == release_digest
+        and "source/release-manifest.json" in run.verified_sources
+    )
+    if release_source_verified:
+        fields_valid = _check_identity_fields(run)
+        identity_matches = _release_identity(run, release, release_digest)
+        run.identity_verified = fields_valid and identity_matches
+    else:
+        _add_problem(run.problems, "artifact identity source unverified: source/release-manifest.json")
 
     _load_runner_invariants(run, envelope)
     _parse_runner_calls(run, envelope)
@@ -999,10 +1139,6 @@ def _load_runner_run(run: _Run) -> None:
             _add_problem(run.problems, "runner source identity mismatch: source/l1-results.json")
         if run.runner == "windows-native" and run.l1_document.get("platform") != "windows":
             _add_problem(run.problems, "runner platform mismatch: source/l1-results.json")
-        if run.runner == "rust-l1":
-            provenance = run.l1_document.get("provenance")
-            if not isinstance(provenance, Mapping) or provenance.get("runner") != "cargo":
-                _add_problem(run.problems, "runner provenance mismatch: source/l1-results.json")
     if run.runner == "windows-native":
         context = _json_object(
             run.path / "source/windows-transport-context.json",
@@ -1187,31 +1323,42 @@ def normalize_response(obj: Any, *, rules: Mapping[str, Any], instance_root: str
     return normalized
 
 
-def _logical_argv(argv: Sequence[str]) -> tuple[str, ...]:
+def _logical_argv(
+    argv: Sequence[str], *, roots: Sequence[str] = (), placeholder: str = "<ROOT>",
+) -> tuple[str, ...]:
+    """移除 CLI 執行檔及實例 endpoint 選項，保留其他參數並替換實例根目錄。"""
     tokens = list(argv)
-    for index, token in enumerate(tokens):
-        if token in _ENDPOINT_FLAGS:
-            tokens = tokens[index + 2:]
-            break
-    else:
-        if tokens:
-            basename = Path(tokens[0].replace("\\", "/")).name.lower()
-            if basename in {"serialwrap", "serialwrap.exe", "serialwrap.py"}:
-                tokens = tokens[1:]
+    if tokens:
+        first = tokens[0]
+        basename = Path(first.replace("\\", "/")).name.lower()
+        if (basename in {"serialwrap", "serialwrap.exe", "serialwrap.py"}
+                or "/" in first or "\\" in first):
+            tokens = tokens[1:]
     output: list[str] = []
     index = 0
     while index < len(tokens):
-        if tokens[index] == _COMMAND_ID_FLAG:
+        token = tokens[index]
+        if token in _INSTANCE_ENDPOINT_FLAGS:
             index += 2
             continue
-        output.append(tokens[index])
+        if any(token.startswith(f"{flag}=") for flag in _INSTANCE_ENDPOINT_FLAGS):
+            index += 1
+            continue
+        normalized = token
+        for root in roots:
+            normalized = _root_substitute(normalized, root, placeholder)
+        output.append(normalized)
         index += 1
     return tuple(output)
 
 
-def _rules_for_calls(rules: Mapping[str, Any], left: _Call, right: _Call) -> dict[str, Any]:
-    left_command = _logical_argv(left.argv)
-    right_command = _logical_argv(right.argv)
+def _rules_for_calls(
+    rules: Mapping[str, Any], left: _Call, right: _Call,
+    roots_a: Sequence[str] = (), roots_b: Sequence[str] = (),
+) -> dict[str, Any]:
+    placeholder = rules.get("instance_root_placeholder", "<ROOT>")
+    left_command = _logical_argv(left.argv, roots=roots_a, placeholder=placeholder)
+    right_command = _logical_argv(right.argv, roots=roots_b, placeholder=placeholder)
     if left_command != right_command:
         return {**rules, "g2_set_paths": []}
     selected = [
@@ -1329,16 +1476,24 @@ def _collect_failures_and_safety(
     for side, label in (("a", "A"), ("b", "B")):
         for case_id, runs in sorted(runs_by_side[side].items()):
             for run in runs:
-                failure_ref = run.failure_ref
-                failure_reason = run.failure_reason or _failure_reason(run)
-                if failure_ref:
+                failure_records = list(run.failure_records)
+                if not failure_records and run.failure_ref:
+                    failure_records.append({
+                        "source_ref": run.failure_ref,
+                        "reason": run.failure_reason or _failure_reason(run),
+                        "verified": run.failure_verified,
+                    })
+                for failure in failure_records:
+                    failure_ref = failure.get("source_ref")
+                    if not isinstance(failure_ref, str) or not failure_ref:
+                        continue
                     row = {
                         "side": side,
                         "case": case_id,
                         "source_ref": failure_ref,
-                        "reason": failure_reason,
+                        "reason": str(failure.get("reason") or _failure_reason(run)),
                     }
-                    if run.failure_verified:
+                    if failure.get("verified") is True:
                         if side == "a":
                             baseline_failures.append(row)
                         elif case_id in required_case_ids:
@@ -1351,38 +1506,6 @@ def _collect_failures_and_safety(
                     else:
                         problems = list(dict.fromkeys(run.problems))
                         unverified_failures.append({**row, "problems": problems or ["failure source identity unverified"]})
-
-                if run.runner != "bridge" and run.l1_document is not None:
-                    raw_results = run.l1_document.get("results")
-                    if isinstance(raw_results, list):
-                        for index, item in enumerate(raw_results):
-                            if not isinstance(item, Mapping) or item.get("outcome") != "failed":
-                                continue
-                            source_ref = run.ref("source/l1-results.json", f"#results[{index}]")
-                            if source_ref == run.failure_ref:
-                                continue
-                            unverified_failures.append({
-                                "side": side,
-                                "case": case_id,
-                                "source_ref": source_ref,
-                                "reason": "原始 runner FAIL 尚未核實對應此 required case",
-                                "problems": list(dict.fromkeys(run.problems)) or ["case mapping unverified"],
-                            })
-                    envelope_path = run.path / "runner-observation.json"
-                    envelope = _json_document(envelope_path, run, "runner-observation.json", required=False)
-                    if (
-                        not (run.failure_ref and run.failure_verified)
-                        and isinstance(envelope, Mapping)
-                        and envelope.get("verdict") == "FAIL"
-                        and run.verdict != "FAIL"
-                    ):
-                        unverified_failures.append({
-                            "side": side,
-                            "case": case_id,
-                            "source_ref": run.ref("runner-observation.json"),
-                            "reason": "runner envelope FAIL 未對應到原始 required-case FAIL",
-                            "problems": list(dict.fromkeys(run.problems)) or ["raw case result unavailable"],
-                        })
 
                 for invariant_failure in run.invariant_failures:
                     verified = run.identity_verified and run.case_identity_verified
@@ -1433,15 +1556,6 @@ def _pair_problems(
     return pairs
 
 
-def _call_fallback_ref(run: _Run, calls: Sequence[_Call], index: int) -> str:
-    if index < len(calls):
-        return calls[index].source_ref
-    if calls:
-        return calls[-1].source_ref
-    file_name = "cli.ndjson" if run.runner == "bridge" else "source/cli-observations.ndjson"
-    return run.ref(file_name)
-
-
 def _difference(
     run_a: _Run,
     run_b: _Run,
@@ -1449,8 +1563,8 @@ def _difference(
     path: str,
     kind: str,
     case_changes: Mapping[str, str],
-    source_a: str,
-    source_b: str,
+    source_a: str | None,
+    source_b: str | None,
 ) -> dict[str, Any]:
     return {
         "case": case_id,
@@ -1476,13 +1590,32 @@ def _compare_run_pair(
             run_a.verdict_ref or run_a.ref("comparison.json"),
             run_b.verdict_ref or run_b.ref("comparison.json"),
         ))
-    if len(run_a.calls) != len(run_b.calls):
+    placeholder = rules.get("instance_root_placeholder", "<ROOT>")
+    left_logical: list[tuple[str, ...]] = []
+    right_logical: list[tuple[str, ...]] = []
+    for call in run_a.calls:
+        left_logical.append(_logical_argv(call.argv, roots=run_a.instance_roots, placeholder=placeholder))
+    for call in run_b.calls:
+        right_logical.append(_logical_argv(call.argv, roots=run_b.instance_roots, placeholder=placeholder))
+
+    paired_count = min(len(run_a.calls), len(run_b.calls))
+    for index in range(paired_count, max(len(run_a.calls), len(run_b.calls))):
+        call_a = run_a.calls[index] if index < len(run_a.calls) else None
+        call_b = run_b.calls[index] if index < len(run_b.calls) else None
         differences.append(_difference(
-            run_a, run_b, case_id, "calls.length", "value", case_changes,
-            _call_fallback_ref(run_a, run_a.calls, min(len(run_a.calls), len(run_b.calls))),
-            _call_fallback_ref(run_b, run_b.calls, min(len(run_a.calls), len(run_b.calls))),
+            run_a, run_b, case_id, f"call[{index}]", "call_count", case_changes,
+            call_a.source_ref if call_a is not None else None,
+            call_b.source_ref if call_b is not None else None,
         ))
-    for index, (call_a, call_b) in enumerate(zip(run_a.calls, run_b.calls)):
+
+    for index in range(paired_count):
+        call_a = run_a.calls[index]
+        call_b = run_b.calls[index]
+        if left_logical[index] != right_logical[index]:
+            differences.append(_difference(
+                run_a, run_b, case_id, f"call[{index}].argv", "argv", case_changes,
+                call_a.source_ref, call_b.source_ref,
+            ))
         if call_a.rc != call_b.rc:
             differences.append(_difference(
                 run_a, run_b, case_id, f"call[{index}].rc", "rc", case_changes,
@@ -1490,7 +1623,9 @@ def _compare_run_pair(
             ))
         if not call_a.response_valid or not call_b.response_valid:
             continue
-        call_rules = _rules_for_calls(rules, call_a, call_b)
+        call_rules = _rules_for_calls(
+            rules, call_a, call_b, run_a.instance_roots, run_b.instance_roots,
+        )
         left = normalize_response(
             _call_response(call_a), rules=call_rules,
             instance_root=run_a.instance_roots[0] if run_a.instance_roots else "",
@@ -1556,6 +1691,7 @@ def diff_l15(
                 _add_problem(problems[side], f"missing required case: {case_id}")
 
     differences: list[dict[str, Any]] = []
+    cli_pairing: list[dict[str, Any]] = []
     for case_id in sorted(set(runs_a) | set(runs_b)):
         a_runs = runs_a.get(case_id, [])
         b_runs = runs_b.get(case_id, [])
@@ -1563,11 +1699,20 @@ def diff_l15(
         for run_a, run_b in pairs:
             cli_a = _nested(run_a.artifacts, "cli", "sha256")
             cli_b = _nested(run_b.artifacts, "cli", "sha256")
-            if _valid_sha256(cli_a) and _valid_sha256(cli_b) and cli_a != cli_b:
+            cli_match = cli_a == cli_b if _valid_sha256(cli_a) and _valid_sha256(cli_b) else None
+            cli_pairing.append({
+                "case": case_id,
+                "runner": run_a.runner,
+                "run_index": run_a.run_index,
+                "matched": cli_match,
+                "source_refs": {
+                    "a": run_a.ref("manifest.json" if run_a.runner == "bridge" else "runner-observation.json"),
+                    "b": run_b.ref("manifest.json" if run_b.runner == "bridge" else "runner-observation.json"),
+                },
+            })
+            if cli_match is False:
                 _add_problem(problems["b"], "artifact identity mismatch: artifacts.cli.sha256")
                 _add_problem(run_b.problems, "artifact identity mismatch: artifacts.cli.sha256")
-                run_b.identity_verified = False
-                run_b.failure_verified = False
             differences.extend(_compare_run_pair(run_a, run_b, rules=rules, case_changes=case_changes))
 
     baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
@@ -1608,6 +1753,20 @@ def diff_l15(
         "baseline_failures": baseline_failures,
         "unverified_failures": unverified_failures,
         "product_failures": product_failures,
+        "artifact_identity": [
+            {
+                "side": side,
+                "case": case_id,
+                "runner": run.runner,
+                "run_index": run.run_index,
+                "verified": run.identity_verified,
+                "source_ref": run.ref("manifest.json" if run.runner == "bridge" else "source/release-manifest.json"),
+            }
+            for side, runs_by_case in (("a", runs_a), ("b", runs_b))
+            for case_id, case_runs in sorted(runs_by_case.items())
+            for run in case_runs
+        ],
+        "cli_pairing": cli_pairing,
         "case_maps": [
             {
                 "side": side,

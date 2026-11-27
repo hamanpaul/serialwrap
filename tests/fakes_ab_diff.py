@@ -90,15 +90,24 @@
      ``source/cli-observations.ndjson``、
      ``source/invariant-evidence.json``。原生 COM／OD-08 實體替代的實際開埠
      證據不得由預定 manifest 值回填；依 R12-01 的去識別與非公開來源規則處理。
+     兩種 pytest runner 的 L1 都由
+     ``tests/resource_report_plugin.py::pytest_sessionfinish`` 產生；Windows 原始
+     報告附 ``pytest-l1-provenance.v1``，Linux 原始報告不含 pytest provenance。
    - rust-l1：原始 ``source/l1-results.json`` 使用現行
-     ``l1-results.v1``（schema_version=2、runner=cargo；原始報告的
-     ``provenance.schema`` 為 ``cargo-l1-provenance.v1``），另列
+     ``l1-results.v1``（schema_version=2）；頂層 ``runner`` 與 ``finished``
+     是 Cargo 收集器輸出的 runner／完成狀態。``provenance`` 僅驗
+     ``scripts/rust/cargo_l1_results.py`` 的 ``_provenance()`` 實際輸出欄位，
+     不要求原始報告沒有的 ``provenance.runner`` 或 ``provenance.complete``。
+     另列
      ``source/libtest.stdout.txt`` 及
      ``source/cli-observations.ndjson``、
      ``source/invariant-evidence.json``。cargo／pytest 本身的通過只證明測試
      runner 完成；只有可對應 required case 的受測產品觀測才能成為 verdict、
      safety 或 CLI 差分來源。
 
+   身分只有在原始 ``source/release-manifest.json`` 存在且可解析、該檔列於
+   ``source_files`` 且位元組 SHA 已核實、適用 artifact 欄位與 envelope 一致時
+   才算已核實；envelope 中格式正確的 SHA 不足以單獨證明身分。
    ``source/cli-observations.ndjson`` 使用 T5B 約定的
    ``stage3-cli-observations.v1`` 記錄，逐行保存呼叫序號、argv、整數 rc 與
    原始 stdout。``source_files`` 必列出該 runner 產生的全部必要來源檔與 SHA；
@@ -136,6 +145,13 @@
    ``bridge failure: bridge-manifest.json.failure``。不能以空 observation 或合成空檔
    當成兩側相同。
 
+   回傳另含 ``artifact_identity: [{side, case, runner, run_index, verified,
+   source_ref}]``，逐 run 記錄當側 artifact／原始身分來源核實狀態；以及
+   ``cli_pairing: [{case, runner, run_index, matched, source_refs}]``，逐 A/B
+   run 記錄 CLI SHA 是否相同（SHA 缺漏或格式錯誤時 ``matched`` 為 null）。
+   pairing 不改寫任一側的 ``artifact_identity.verified``；CLI SHA 不同仍會令
+   B 側 integrity 失敗，但不降級當側已核實的產品或安全 FAIL。
+
 4. ``scope: "rust_only"`` 且 ``ab_participation: "absolute_only"`` 的 BC
    仍由 T7B 保留差異與 ``registered_change``；T7 依 ``absolute_only`` 處理，
    B 側 FAIL 仍須保留。現行依據是
@@ -143,15 +159,30 @@
    ``scope``、``ab_participation``、``case_ids``；例如 BC-06 為 rust_only /
    absolute_only，且列出 ``bc06-shutdown-self-test-flush``。
 
-5. 產品／安全 FAIL 先收集，再彙整 integrity；不得因缺案或 runner 未完成提前返回。
+5. CLI 呼叫以序號逐筆配對並比較 logical argv：移除 argv[0] 的 CLI 執行檔
+   （``sw_core/cli.py:2148-2150`` 的 parser 程式名稱），再移除
+   ``--endpoint``、``--socket``、``--bench`` 及其值（全域選項依
+   ``sw_core/cli.py:2162-2168`` 定義，endpoint 優先序依
+   ``sw_core/cli.py:876-900``）；支援 ``--flag=value`` 寫法。其他參數一律保留，
+   包括 ``--timeout``（``sw_core/cli.py:2170-2175``）與 ``--cmd-id``
+   （``sw_core/cli.py:2395-2401``）。剩餘每個參數值套用該側 instance root
+   替換為 ``<ROOT>``。命令不同時新增一筆 ``{kind: "argv", path:
+   "call[<i>].argv", source_refs: {a, b}}`` 差異；呼叫數不同時，每一筆多出或
+   缺少的呼叫各新增 ``{kind: "call_count", path: "call[<i>]",
+   source_refs: {a, b}}``，缺少側的 source_ref 為 null。這兩個 kind 是 plan
+   介面新增值，T7 依未登錄差異判 FAIL。
+
+6. 產品／安全 FAIL 先收集，再彙整 integrity；不得因缺案或 runner 未完成提前返回。
    ``baseline_failures`` 與 ``product_failures`` 每筆為
    ``{side, case, source_ref, reason}``；``unverified_failures`` 每筆另含
-   ``problems``。來源引用相對該側 report-dir 且必須指向原始可解析 FAIL 來源。
+   ``problems``。原始 invariant 項目以 JSON Pointer index（例如
+   ``comparison.json#/invariants/3``）定位；識別欄位無效時仍留存 FAIL 與原因。
+   來源引用相對該側 report-dir 且必須指向原始可解析 FAIL 來源。
    安全 invariant FAIL 另外保留為 ``<A|B>:<case>:<invariant_id>``；安全 FAIL 不受 B11 欄位正規化
    影響。每筆差異必含 ``source_refs: {a, b}``，分別為兩側觀測的相對來源引用，
    且可定位原始觀測檔／line；不以 report 根絕對路徑作 provenance。
 
-6. B11 暫定觀測範圍：候選規則只允許忽略邏輯命令為 ``daemon status`` 或
+7. B11 暫定觀測範圍：候選規則只允許忽略邏輯命令為 ``daemon status`` 或
    ``health.status``、CLI ``rc == 0`` 且 stdout JSON ``ok is true`` 的回應中最上層
    ``foreign_holders`` 掃描快照。通用 volatile key 刪除與 instance-root 替換不進入
    ``foreign_holders`` 子樹。命令不符、非成功回應、巢狀同名欄位、危險 holder、
@@ -344,11 +375,45 @@ def _source_specs(
         "finished": bool(complete),
         "deployed_content": None,
     }
+    if runner == "windows-native":
+        # 對應 tests.resource_report_plugin.py::pytest_sessionfinish 的原生 Windows provenance。
+        l1_report["provenance"] = {
+            "schema": "pytest-l1-provenance.v1",
+            "platform": "windows",
+            "git": {
+                "head": "0" * 40,
+                "clean": True,
+                "end": {"head": "0" * 40, "clean": True},
+            },
+        }
     if runner == "rust-l1":
+        # 對應 scripts/rust/cargo_l1_results.py::_provenance()；完成狀態與 runner
+        # 位於 l1_report 頂層，不是 provenance 欄位。
         l1_report["provenance"] = {
             "schema": "cargo-l1-provenance.v1",
-            "runner": "cargo",
-            "complete": bool(complete),
+            "platform": "linux",
+            "build_target": None,
+            "git": {
+                "head": "0" * 40,
+                "clean": True,
+                "end": {"head": "0" * 40, "clean": True},
+            },
+            "toolchain": {
+                "rustc_vv": "rustc fixture\n",
+                "rustc_vv_sha256": _sha256(b"rustc fixture\n"),
+                "error": None,
+            },
+            "rustflags": {
+                "RUSTFLAGS": {"set": False, "sha256": None},
+                "CARGO_ENCODED_RUSTFLAGS": {"set": False, "sha256": None},
+            },
+            "executables": [{
+                "crate": "serialwrap",
+                "target": "lib",
+                "path": "fixture-cargo-test",
+                "sha256": "d" * 64,
+                "nodeids": ["fixture-nodeid"],
+            }],
         }
     specs: dict[str, bytes] = {
         "source/release-manifest.json": release_manifest,
@@ -576,6 +641,8 @@ def write_run(
         l1["collected"] = [nodeid]
         l1["results"][0]["nodeid"] = nodeid
         case_nodeids = [nodeid]
+        if runner == "rust-l1":
+            l1["provenance"]["executables"][0]["nodeids"] = [nodeid]
         source_specs["source/l1-results.json"] = _json_bytes(l1)
     if l1_results is not None:
         l1 = json.loads(source_specs["source/l1-results.json"].decode("utf-8"))
