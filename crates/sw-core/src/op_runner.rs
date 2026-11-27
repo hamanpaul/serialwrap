@@ -1054,6 +1054,10 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let mut completion_silence_expired = false;
     let mut timeout_rescue_guard = None;
     if let Some(evaluator) = echo_evaluator.as_ref() {
+        // 一般命令改用 snapshot evaluator 後，仍讓既有 prompt-wait 屏障看見等待起點。
+        #[cfg(feature = "test-fakes")]
+        ctx.rx.prompt_completion_wait_started_for_test();
+
         // 靜默 chunk 與絕對 operation deadline 使用相同的 human TX 救援分流。
         let silence_limit = timeout_s.min(30.0);
         'completion_wait: loop {

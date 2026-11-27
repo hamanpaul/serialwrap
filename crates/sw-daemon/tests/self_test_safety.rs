@@ -723,11 +723,13 @@ fn rpc_self_test_busy_has_zero_probe_tx() {
         let rig = Arc::new(ServiceRig::ready_shell());
         let dev = rig.device(REAL_A);
         let tx_start = dev.tx_len();
+        let wal_tx_start = tx_records(&rig);
         let rpc_rig = Arc::clone(&rig);
         let handle = thread::spawn(move || {
             rpc_rig.call("session.recover", r#"{"selector":"COM0","timeout_s":30}"#)
         });
         wait_for("Recover 救援鍵 TX", || dev.tx_len() > tx_start);
+        wait_for("Recover 救援鍵 WAL", || tx_records(&rig) > wal_tx_start);
         let before = tx_snapshot(&rig, dev);
         let reply = rig.call("session.self_test", r#"{"selector":"COM0"}"#);
         assert_busy(&reply);

@@ -1756,6 +1756,11 @@ impl ActorRig {
             .expect("尚未開出 bridge")
     }
 
+    /// 回傳此測試 session 實際解析出的逾時救援鍵清單。
+    pub fn timeout_recovery_keys(&self) -> &[sw_proto::config_types::TimeoutRecoveryKey] {
+        &self.profile.template.timeout_recovery_keys
+    }
+
     /// 建立直接呼叫 OpRunner `send` 測試入口所需的正式 OpCtx。
     pub fn op_ctx_for_test(&self) -> sw_core::op_runner::OpCtx {
         sw_core::op_runner::OpCtx {

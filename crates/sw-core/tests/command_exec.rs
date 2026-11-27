@@ -132,6 +132,14 @@ fn wal_tx_bytes_since(h: &ActorRig, count: usize) -> Vec<u8> {
         .collect()
 }
 
+fn expected_timeout_tx(h: &ActorRig, command_tx: &[u8]) -> Vec<u8> {
+    let mut expected = command_tx.to_vec();
+    for key in h.timeout_recovery_keys() {
+        expected.extend_from_slice(key.payload());
+    }
+    expected
+}
+
 /// 等 WAL 出現指定 TX（OpRunner 已送出）。
 fn wait_tx(h: &ActorRig, payload: &[u8]) {
     h.wait_for("TX 寫出", |h| wal_tx_has(h, payload));
@@ -2048,16 +2056,19 @@ fn i294_r7_absolute_deadline_is_not_restarted_before_snapshot_wait() {
 
     // 以救援 TX 的 WAL 作同步點，讓救援等待本身也透過 FakeClock 到期；late prompt 不得被當成
     // 命令完成或救援回 prompt 的證據。
-    wait_tx(&h, b"\x03");
-    h.advance(Duration::from_secs(2));
-    wait_tx(&h, b"\x04");
-    h.advance(Duration::from_secs(2));
+    for key in h.timeout_recovery_keys() {
+        wait_tx(&h, key.payload());
+        h.advance(Duration::from_secs(2));
+    }
     let result = h.wait_done(&id);
     assert_ne!(result["status"], PyValue::from("done"), "外層期限後的 echo 不得完成：{result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
     assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
     assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
-    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo OUTER_DEADLINE\n\x03\x04".to_vec());
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        expected_timeout_tx(&h, b"echo OUTER_DEADLINE\n")
+    );
 }
 
 #[test]
@@ -5291,7 +5302,8 @@ fn ctrl_d_after_ctrl_c_fails() {
 
 #[test]
 fn both_keys_fail_prompt_timeout_to_attached() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("cat", |r| r.timeout_s = 1.0);
     let queued = h.submit_ok("echo later");

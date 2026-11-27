@@ -1173,6 +1173,12 @@ impl RxShared {
         self.regex_wait_starts.load(Ordering::Acquire)
     }
 
+    /// 將 snapshot-based 一般命令完成等待納入既有 prompt waiter 起點屏障。
+    #[cfg(feature = "test-fakes")]
+    pub fn prompt_completion_wait_started_for_test(&self) {
+        self.regex_wait_starts.fetch_add(1, Ordering::AcqRel);
+    }
+
     #[cfg(feature = "test-fakes")]
     pub fn regex_wait_checks_for_test(&self) -> u64 {
         self.regex_wait_checks.load(Ordering::Acquire)

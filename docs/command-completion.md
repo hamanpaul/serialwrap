@@ -68,7 +68,9 @@ echo 前的 human 殘餘不進入一般 stdout。
 - 有 human TX／pending 人類行而找不到可辨識 echo 時，才依既有 human 交錯
   規則在原等待上限回 partial；一般無 echo 且無 human 訊號不沿用這項判準。
 - silence chunk 與絕對 deadline 兩入口採同一矩陣：無 human 且無候選時維持
-  9af187ca 的 timeout／recover_after_failure 與救援 TX；有候選但證據不足時
+  9af187ca 的 timeout／recover_after_failure 結算與救援 TX 在相同
+  `timeout_recovery_keys` 設定下逐位元組相同；預設鍵集合依 BC-09 為 `[CTRL_C]`。
+  有候選但證據不足時
   回 `CompletionUncertain`、`PROMPT_TIMEOUT`、`partial=true`、
   `recovery_action=NONE`、保留輸出且不送救援鍵。human 路徑仍沿用第 1 項
   已定的線性化與 pending 規則。

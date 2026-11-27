@@ -16,6 +16,13 @@ fn wait_for_tx(h: &ActorRig, payload: &[u8]) {
     });
 }
 
+fn profile_with_two_recovery_keys() -> String {
+    SHELL_PROFILE.replace(
+        "    timeout_s: 2.0\n",
+        "    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C, CTRL_D]\n",
+    )
+}
+
 fn decode_base64(value: &str) -> Vec<u8> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
@@ -87,7 +94,8 @@ fn tail_text(h: &ActorRig, id: &str) -> (PyValue, Vec<u8>) {
 }
 
 fn run_timeout_case(echo_found: bool, recovery_succeeds: bool, quiet_timeout: bool) {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
 
     let command = "printf R9_BASELINE";
     let command_tx = b"printf R9_BASELINE\n";
@@ -189,6 +197,60 @@ fn run_timeout_case(echo_found: bool, recovery_succeeds: bool, quiet_timeout: bo
     assert_eq!(tail_error, expected_tail_error, "{record:?}");
     assert_eq!(stdout, expected_stdout, "stdout 必須逐位元組符合 9af187ca 基線");
     assert_eq!(tx, expected_tx, "TX 序列必須逐位元組符合 9af187ca 基線");
+}
+
+#[test]
+fn i294_r9_default_timeout_recovery_matches_bc09_without_extra_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    assert_eq!(
+        h.timeout_recovery_keys(),
+        &[sw_proto::config_types::TimeoutRecoveryKey::CtrlC]
+    );
+    let command = "printf R9_BC09_DEFAULT";
+    let command_tx = b"printf R9_BC09_DEFAULT\n";
+    let tx_count = h.wal_tx_payloads().len();
+    let rx_before = h.rx.snapshot_len();
+    let id = h.submit_with(command, |request| request.timeout_s = 3.0);
+    wait_for_tx(&h, command_tx);
+
+    h.dev.push_rx(b"before\r\n");
+    h.wait_for("期限前輸出由 RX reader 追加", |rig| {
+        rig.rx.snapshot_len() >= rx_before + b"before\r\n".len() as u64
+    });
+    wait_until_tx(&h, b"\x03");
+    inject_and_wait_for_rx(&h, b"late-c\r\n");
+    wait_until_done(&h, &id);
+
+    let record = h.command_get(&id);
+    let (tail_error, stdout) = tail_text(&h, &id);
+    let tx_rows: Vec<_> = h
+        .wal_rows()
+        .into_iter()
+        .filter(|row| row.get("dir").and_then(PyValue::as_str) == Some("TX"))
+        .collect();
+    let tx: Vec<u8> = tx_rows
+        .into_iter()
+        .skip(tx_count)
+        .filter(|row| {
+            row.get("source").and_then(PyValue::as_str) == Some("agent")
+                || row.get("source").and_then(PyValue::as_str) == Some("system:recover")
+        })
+        .flat_map(|row| {
+            decode_base64(row.get("payload_b64").and_then(PyValue::as_str).unwrap_or(""))
+        })
+        .collect();
+
+    assert_eq!(record["status"], PyValue::from("error"), "{record:?}");
+    assert_eq!(record["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{record:?}");
+    assert_eq!(record["partial"], PyValue::Bool(true), "{record:?}");
+    assert_eq!(record["recovery_action"], PyValue::from("NONE"), "{record:?}");
+    assert_eq!(tail_error, PyValue::from("PROMPT_TIMEOUT"), "{record:?}");
+    assert_eq!(stdout, b"before\nlate-c\n", "BC-09 default settlement");
+    assert_eq!(tx, b"printf R9_BC09_DEFAULT\n\x03", "BC-09 default TX only");
+    assert!(!tx.contains(&0x04), "BC-09 default must not send CTRL_D: {tx:?}");
+    let state = h.get_state();
+    assert_eq!(state["state"], PyValue::from("ATTACHED"), "{state:?}");
+    assert_eq!(state["last_error"], PyValue::from("PROMPT_TIMEOUT"), "{state:?}");
 }
 
 #[test]
