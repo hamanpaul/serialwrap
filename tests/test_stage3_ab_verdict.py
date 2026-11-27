@@ -325,7 +325,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             _empty_diff(verdict="INCOMPLETE", integrity={"a": True, "b": False}),
             {},
-            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR"),
             id="l2-incomplete",
         ),
         pytest.param(
@@ -362,7 +362,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             _empty_diff(kind="cases", verdict="INCOMPLETE", integrity={"a": True, "b": False}),
             {},
-            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR"),
             id="l3-cases-incomplete",
         ),
         pytest.param(
@@ -1083,7 +1083,7 @@ def test_l3_nonlongrun_missing_remote_or_native_is_incomplete(missing_case: str)
     assert diff["verdict"] == "INCOMPLETE" and diff["missing"]["b"] == [missing_case]
     assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[:2] == (
         "INFRA_ERROR",
-        "HARNESS_SUITE_INFRA_ERROR",
+        "HARNESS_COMPARATOR_ERROR",
     )
 
 
@@ -2199,3 +2199,183 @@ def test_r4_longrun_gate_verdict_follows_first_matching_decision_row(
     assert (verdict, reason_code) == expected
     if b_status == "FAIL" and diff["b_engine_verdict"] == "PASS":
         assert "suite/engine inconsistent" in notes
+
+
+@pytest.mark.parametrize(
+    "gate_result, b_status, expected",
+    [
+        pytest.param("PASS", "PASS", ("PASS", None), id="gate-pass"),
+        pytest.param("BLOCKED", "PASS", ("INFRA_ERROR", "HARNESS_OD09_NOT_FROZEN"), id="gate-blocked"),
+        pytest.param("PASS", "FAIL", ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"), id="suite-fail-engine-pass"),
+    ],
+)
+def test_r5_01_longrun_baseline_ignores_a_suite_fail_when_engine_and_baseline_pass(
+    tmp_path: Path,
+    gate_result: str,
+    b_status: str,
+    expected: tuple[str, str | None],
+):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+    if gate_result == "BLOCKED":
+        b_gate = json.loads(b_path.read_bytes().decode("utf-8"))
+        b_gate["checks"].append({
+            "id": "resources",
+            "group": "resources",
+            "status": "evaluated",
+            "result": "BLOCKED",
+            "detail": {},
+        })
+        b_gate["release_gate_result"] = "BLOCKED"
+        b_path.write_bytes((json.dumps(b_gate, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    assert diff["integrity"] == {"a": True, "b": True}
+    assert diff["a_engine_verdict"] == "PASS"
+    assert diff["a_baseline_result"] == "PASS"
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="FAIL", b_status=b_status, diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == expected
+    assert "A suite status: FAIL" in notes
+    if b_status == "FAIL":
+        assert "suite/engine inconsistent" in notes
+    elif gate_result == "BLOCKED":
+        assert "release gate BLOCKED" in notes
+
+
+@pytest.mark.parametrize("layer", ["l2", "l3-cases"], ids=["l2", "l3-cases"])
+@pytest.mark.parametrize(
+    "scenario, expected, a_status, b_status",
+    [
+        pytest.param(
+            "missing",
+            ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR"),
+            "PASS",
+            "PASS",
+            id="missing-case",
+        ),
+        pytest.param(
+            "fail-and-missing",
+            ("FAIL", None),
+            "PASS",
+            "PASS",
+            id="confirmed-fail-and-missing-case",
+        ),
+        pytest.param(
+            "suite-infra-and-missing",
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            "PASS",
+            "INFRA_ERROR",
+            id="suite-infra-and-missing-case",
+        ),
+    ],
+)
+def test_r5_02_real_case_comparison_checks_integrity_before_incomplete_mapping(
+    layer: str,
+    scenario: str,
+    expected: tuple[str, str | None],
+    a_status: str,
+    b_status: str,
+):
+    required = {"required-case", "other-required"}
+    a_report = _l2_report(
+        _l2_result("required-case"),
+        _l2_result("other-required"),
+    )
+    if scenario == "fail-and-missing":
+        b_report = _l2_report(_l2_result(
+            "required-case",
+            verdict="FAIL",
+            reason="target assertion failed",
+            evidence=[{"source_ref": "testpilot/report.json#/results/0"}],
+        ))
+    else:
+        b_report = _l2_report(_l2_result("other-required"))
+
+    diff = _compare_l2(a_report, b_report, required)
+    assert diff["verdict"] == ("FAIL" if scenario == "fail-and-missing" else "INCOMPLETE")
+    assert diff["integrity"] == {"a": True, "b": False}
+    expected_missing = "other-required" if scenario == "fail-and-missing" else "required-case"
+    assert diff["missing"]["b"] == [expected_missing]
+    if scenario == "fail-and-missing":
+        assert diff["b_failures"] == ["required-case"]
+        assert diff["product_failures"][0]["source_ref"] == "testpilot/report.json#/results/0"
+
+    if layer == "l3-cases":
+        diff = _cases_diff(diff)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l2" if layer == "l2" else "l3",
+        a_status=a_status,
+        b_status=b_status,
+        diff=diff,
+        registered={},
+    )
+
+    assert (verdict, reason_code) == expected
+    assert any("required-case" in note or "other-required" in note for note in notes)
+    if scenario == "suite-infra-and-missing":
+        assert "B suite status: INFRA_ERROR" in notes
+
+
+@pytest.mark.parametrize(
+    "layer, integrity, expected",
+    [
+        pytest.param(
+            "l3",
+            {"a": False, "b": True},
+            ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR"),
+            id="longrun-integrity-error-first",
+        ),
+        pytest.param(
+            "l3",
+            {"a": True, "b": True},
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            id="longrun-unknown-status-with-intact-integrity",
+        ),
+        pytest.param(
+            "l1.5",
+            {"a": False, "b": True},
+            ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR"),
+            id="l15-integrity-error-first",
+        ),
+        pytest.param(
+            "l1.5",
+            {"a": True, "b": True},
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            id="l15-unknown-status-with-intact-integrity",
+        ),
+    ],
+)
+def test_r5_audit_unknown_suite_status_check_follows_integrity(
+    layer: str,
+    integrity: dict[str, bool],
+    expected: tuple[str, str | None],
+):
+    if layer == "l1.5":
+        diff = _empty_diff(integrity=integrity)
+    else:
+        diff = _longrun_diff(integrity=integrity)
+
+    verdict, reason_code, _notes = ab_verdict.combine(
+        layer, a_status="UNKNOWN", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == expected
+
+
+@pytest.mark.parametrize("layer", ["l2", "l3"], ids=["l2", "l3-cases"])
+def test_r5_02_intact_incomplete_verdict_keeps_suite_infra_mapping(layer: str):
+    diff = _empty_diff(
+        kind="cases" if layer == "l3" else None,
+        verdict="INCOMPLETE",
+        integrity={"a": True, "b": True},
+    )
+
+    verdict, reason_code, _notes = ab_verdict.combine(
+        layer, a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR")

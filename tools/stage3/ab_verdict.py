@@ -215,8 +215,6 @@ def combine(
 
     if shape_errors:
         return INFRA_ERROR, _COMPARATOR, notes
-    if a_status not in _SUITE_STATUSES or b_status not in _SUITE_STATUSES:
-        return INFRA_ERROR, _SUITE, _unique([*notes, f"unknown suite status: A={a_status!r} B={b_status!r}"])
     if layer == "l1.5" and isinstance(diff, Mapping):
         differences = diff.get("differences")
         if isinstance(differences, list) and any(
@@ -228,6 +226,8 @@ def combine(
     integrity = diff.get("integrity") if isinstance(diff, Mapping) else None
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：比較器完整性未通過"])
+    if a_status not in _SUITE_STATUSES or b_status not in _SUITE_STATUSES:
+        return INFRA_ERROR, _SUITE, _unique([*notes, f"unknown suite status: A={a_status!r} B={b_status!r}"])
 
     if layer == "l3":
         return _combine_l3(a_status, b_status, diff, notes)
@@ -536,12 +536,12 @@ def _combine_cases(
 ) -> tuple[str, str | None, list[str]]:
     if diff is None:
         return INFRA_ERROR, _COMPARATOR, _unique(["缺少逐案比較結果", *notes])
-    verdict = diff.get("verdict")
-    if verdict == INCOMPLETE:
-        return INFRA_ERROR, _SUITE, _unique([*notes, "逐案報告不完整（缺案、重複、未知 verdict 或必要案例 SKIP／ERROR）"])
     integrity = diff.get("integrity")
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：逐案比較完整性未通過"])
+    verdict = diff.get("verdict")
+    if verdict == INCOMPLETE:
+        return INFRA_ERROR, _SUITE, _unique([*notes, "逐案報告不完整（缺案、重複、未知 verdict 或必要案例 SKIP／ERROR）"])
     if verdict == PASS:
         return PASS, None, notes
     if verdict == FAIL:
@@ -575,7 +575,7 @@ def _combine_l3(
 ) -> tuple[str, str | None, list[str]]:
     if diff is None:
         return INFRA_ERROR, _COMPARATOR, _unique(["缺少 L3 比較結果", *diagnostics])
-    if a_status != PASS or diff.get("a_engine_verdict") != PASS or diff.get("a_baseline_result") != PASS:
+    if diff.get("a_engine_verdict") != PASS or diff.get("a_baseline_result") != PASS:
         return BASELINE_INVALID, _BASELINE, diagnostics
     b_engine = diff.get("b_engine_verdict")
     if b_engine == FAIL:
