@@ -329,10 +329,19 @@ fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect::<String>();
-    let rx = match response {
-        "probe-echo" => format!("echo __READY__{nonce}\r\nAsyncPath# "),
-        "old-prompt" => format!("\r\necho __READY__{nonce}\r\nroot@t:/# "),
-        "async-output" => format!("\r\n__READY__{nonce}\r\nAsyncPath# "),
+    let (rx, rejected_literal) = match response {
+        "probe-echo" => (
+            format!("echo __READY__{nonce}\r\nAsyncPath# "),
+            "AsyncPath# ",
+        ),
+        "old-prompt" => (
+            format!("\r\necho __READY__{nonce}\r\nroot@t:/# "),
+            "root@t:/# ",
+        ),
+        "async-output" => (
+            format!("\r\n__READY__{nonce}\r\nAsyncPath# "),
+            "AsyncPath# ",
+        ),
         other => panic!("未知 READY evidence case: {other}"),
     };
     let bytes = rx.as_bytes();
@@ -347,11 +356,23 @@ fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
     h.wait_for(&ready_wait, |rig| {
         rig.get_state()["state"].as_str() == Some("READY")
     });
+    assert_ne!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some(rejected_literal),
+        "READY 反例不得登錄被拒字面: response={response}, fragmented={fragmented}"
+    );
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "READY 反例不得留下任何 evidence: response={response}, fragmented={fragmented}"
+    );
+    h.inject_rx_reader_processed(b"\r\n");
 
     let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("printf EVIDENCE", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf EVIDENCE\n");
-    h.inject_rx_processed(b"printf EVIDENCE\r\nAsyncOther# ");
+    h.inject_rx_processed(
+        format!("printf EVIDENCE\r\n{rejected_literal}").as_bytes(),
+    );
     assert_eq!(
         h.command_get(&id)["status"],
         PyValue::from("running"),
@@ -372,6 +393,11 @@ fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
         wal_tx_bytes_since(&h, tx_count),
         b"printf EVIDENCE\n",
         "錯誤 READY evidence 不得觸發救援 TX"
+    );
+    assert_ne!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some(rejected_literal),
+        "後續不具互證前綴的命令不得反向學入被拒字面"
     );
 }
 
@@ -954,6 +980,132 @@ fn i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms() {
         assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
         assert!(h.rx.prompt_evidence_literal_for_test().is_none());
     }
+}
+
+#[test]
+fn i294_r4_cross_tx_prefix_waits_for_real_human_effect_guard() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r4-real-human-effect");
+    h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+
+    let human_starts = h.rx.human_submit_start_count_for_test();
+    let human_generation = h.rx.human_tx_state().generation;
+    let (pump_paused_tx, pump_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+            pump_paused_tx
+                .send(())
+                .expect("R4 human job 到達 writer 前屏障");
+            release_pump_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("R4 測試釋放 human pump");
+        })));
+    console.push_input(b"echo R4_HUMAN\n");
+    pump_paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("真實 HumanTx effect 已建立 guard");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(
+        h.rx.human_submit_start_count_for_test(),
+        human_starts,
+        "HumanTx 尚未成功入 writer，不得增加 submit 計數"
+    );
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        human_generation,
+        "HumanTx 尚未登錄，不得推進 TX generation"
+    );
+    assert!(
+        !h.rx.snapshot_from(0).tx_submit_pending,
+        "writer 前屏障只覆蓋 HumanTx guard 與 pump channel"
+    );
+
+    let command = "printf R4_GUARDED";
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx
+                .send(())
+                .expect("R4 command completion waiter 已開始");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("R4 command 已進入 completion wait");
+
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    h.inject_rx_reader_processed(
+        format!("{command}\r\nGUARDED\r\nroot@t:/# ").as_bytes(),
+    );
+    let evaluated = h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    );
+    let snapshot = h.rx.snapshot_from(0);
+    assert!(
+        evaluated,
+        "跨 TX bare echo 必須在 human guard 仍在途時重新評估: in_flight={}, submit_pending={}, revision={}",
+        snapshot.human_in_flight,
+        snapshot.tx_submit_pending,
+        snapshot.revision,
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "human guard 在途時不得以跨 TX 前綴完成 agent 命令"
+    );
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "human guard 在途的跨 TX 前綴不得寫回 evidence"
+    );
+
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "R4 human 交錯後原命令 timeout",
+        |h| is_done(h, &id),
+    );
+    let first = h.wait_done(&id);
+    assert_eq!(first["status"], PyValue::from("error"), "{first:?}");
+    assert_eq!(first["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{first:?}");
+    assert_eq!(first["partial"], PyValue::Bool(true), "{first:?}");
+    assert_eq!(first["recovery_action"], PyValue::from("NONE"), "{first:?}");
+    assert!(h.rx.prompt_evidence_literal_for_test().is_none());
+
+    release_pump_tx.send(()).expect("釋放真實 HumanTx job");
+    h.wait_for("R4 HumanTx writer report 與 guard 結算", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+            && rig.rx.human_tx_state().generation > human_generation
+    });
+    wait_tx(&h, b"echo R4_HUMAN\n");
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+    h.wait_for("R4 human pending 已由 TX 後 prompt 結案", |rig| {
+        !rig.rx.human_tx_state().pending_human
+    });
+
+    let next = h.submit_ok("printf R4_AFTER");
+    wait_tx(&h, b"printf R4_AFTER\n");
+    h.inject_rx_processed(
+        b"printf R4_AFTER\r\nAFTER\r\nroot@t:/# ",
+    );
+    let next_result = h.wait_done(&next);
+    assert_eq!(next_result["status"], PyValue::from("done"), "{next_result:?}");
+    assert_eq!(next_result["stdout"], PyValue::from("AFTER"));
+    assert_eq!(next_result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some("root@t:/# ")
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf R4_GUARDED\necho R4_HUMAN\nprintf R4_AFTER\n",
+        "guard 釋放後 liveness 恢復不得增加或重送 TX"
+    );
 }
 
 #[test]

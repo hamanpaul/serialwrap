@@ -207,6 +207,7 @@ entries:
     - cargo:sw-core::command_exec::i294_r3_barriers_never_revive_stale_evidence_with_human_or_without_human
     - cargo:sw-core::command_exec::i294_r3_long_prefix_with_different_tail_never_completes_or_learns
     - cargo:sw-core::command_exec::i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms
+    - cargo:sw-core::command_exec::i294_r4_cross_tx_prefix_waits_for_real_human_effect_guard
     - cargo:sw-daemon::rpc_console::i262_rpc_arrow_output_is_complete
     - cargo:sw-daemon::rpc_console::i271_rpc_no_newline_and_nul_stdout
     owner_phase: P5

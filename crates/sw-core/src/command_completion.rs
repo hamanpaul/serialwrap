@@ -22,6 +22,27 @@ pub(crate) enum Evaluation {
     Uncertain { stdout: String },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CompletionHumanContext {
+    tx_seen: bool,
+    cross_tx_prefix_blocked: bool,
+}
+
+impl CompletionHumanContext {
+    pub(crate) fn new(
+        tx_seen: bool,
+        human_in_flight: usize,
+        tx_submit_pending: bool,
+    ) -> Self {
+        Self {
+            tx_seen,
+            cross_tx_prefix_blocked: tx_seen
+                || human_in_flight > 0
+                || tx_submit_pending,
+        }
+    }
+}
+
 /// 以 snapshot 本身計算 echo、prompt 與 stdout 邊界，命中後不再讀取或搜尋較新的 RX。
 pub(crate) struct CompletionEvaluator<'a> {
     command: &'a str,
@@ -36,7 +57,7 @@ impl<'a> CompletionEvaluator<'a> {
     pub(crate) fn evaluate_snapshot(
         &self,
         raw: &str,
-        human_tx_seen: bool,
+        human: CompletionHumanContext,
         raw_half_line: bool,
         prompt_evidence: Option<&str>,
         trimmed_before_from: bool,
@@ -74,8 +95,7 @@ impl<'a> CompletionEvaluator<'a> {
                 if let Some(combined_echo) = combined_echo {
                     echo = Some(combined_echo);
                     echo_cleaned = combined_cleaned;
-                    may_observe_prefix =
-                        !human_tx_seen || prefix.is_empty();
+                    may_observe_prefix = !human.cross_tx_prefix_blocked;
                 }
             }
         }
@@ -144,7 +164,7 @@ impl<'a> CompletionEvaluator<'a> {
             }
         }
 
-        if human_tx_seen {
+        if human.tx_seen {
             let stdout = prompt_evidence_tail_range(&cleaned, prompt_evidence)
                 .map(|prompt| char_slice(&cleaned, 0..prompt.start).trim_matches('\n').to_string())
                 .unwrap_or_else(|| cleaned.clone());
@@ -186,14 +206,14 @@ impl<'a> CompletionEvaluator<'a> {
     pub(crate) fn partial_stdout(
         &self,
         raw: &str,
-        human_tx_seen: bool,
+        human: CompletionHumanContext,
         raw_half_line: bool,
         prompt_evidence: Option<&str>,
         line_prefix_before_from: Option<&str>,
     ) -> String {
         let (evaluation, _) = self.evaluate_snapshot(
             raw,
-            human_tx_seen,
+            human,
             raw_half_line,
             prompt_evidence,
             false,
@@ -214,7 +234,7 @@ impl<'a> CompletionEvaluator<'a> {
             .map(|prompt| char_slice(&cleaned, prompt));
         self.evaluate_snapshot(
             raw,
-            human_tx_seen,
+            CompletionHumanContext::new(human_tx_seen, 0, false),
             raw_half_line,
             evidence.as_deref(),
             false,
@@ -692,7 +712,7 @@ mod tests {
         );
         let (evaluation, learned) = arrow.evaluate_snapshot(
             "Path => cat /tmp/job\r\nB => ",
-            false,
+            CompletionHumanContext::new(false, 0, false),
             false,
             None,
             false,

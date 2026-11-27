@@ -38,7 +38,9 @@ echo 前的 human 殘餘不進入一般 stdout。
   前綴須完整匹配目前 profile regex、至少含一個字母或數字，且 echo 後真實
   最後一行行首到 snapshot 尾端重現完全相同字面，才可完成並建立 evidence。
   互證失敗時，已有 evidence 若完整等於 snapshot 尾端仍可完成；否則維持
-  Uncertain。跨 TX 前綴遇 human 訊號時不做互證，沿既有 human 路徑。
+  Uncertain。跨 TX 前綴遇 human 訊號時不做互證，沿既有 human 路徑；同一
+  snapshot 的 `human_in_flight > 0` 或 `tx_submit_pending` 亦屬可信在途訊號。
+  在途訊號消失後，revision 改變會再次評估，不新增 TX 閘門。
   `A => `、只作命令輸出的 `Path => ` 不得只因寬鬆 regex 命中而完成或成為
   evidence；可信來源證實的 `router => `、`router=> ` 均可辨識。
 - stdout 不以換行結尾時，只有已找到本命令 echo 的情況，才可用已知且至少含

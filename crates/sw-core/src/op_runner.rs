@@ -22,7 +22,9 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{compile, valid_completion_regex, PyFlags, PyRegex};
 
 use crate::arbiter::QueuedCommand;
-use crate::command_completion::{CompletionEvaluator, Evaluation as CompletionEvaluation};
+use crate::command_completion::{
+    CompletionEvaluator, CompletionHumanContext, Evaluation as CompletionEvaluation,
+};
 use crate::file_transfer::{
     pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles,
     TransferAbort, TransferIds, TxRejection,
@@ -1075,11 +1077,17 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         return None;
                     }
                     let human_tx_state = snapshot.human_tx_state;
+                    let human_tx_seen = pending_human_before
+                        || snapshot.human_submit_start_count > human_submit_start_before
+                        || human_tx_state.generation > human_tx_before.generation;
+                    let human = CompletionHumanContext::new(
+                        human_tx_seen,
+                        snapshot.human_in_flight,
+                        snapshot.tx_submit_pending,
+                    );
                     let (evaluation, observed_prompt) = evaluator.evaluate_snapshot(
                         &snapshot.text,
-                        pending_human_before
-                            || snapshot.human_submit_start_count > human_submit_start_before
-                            || human_tx_state.generation > human_tx_before.generation,
+                        human,
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open,
                         snapshot
                             .prompt_evidence
@@ -1136,6 +1144,11 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         ctx.clock.mono_ns(),
                     );
                     let human_tx_seen = pending_human_before || submit_window_has_human_tx;
+                    let human = CompletionHumanContext::new(
+                        human_tx_seen,
+                        snapshot.human_in_flight,
+                        snapshot.tx_submit_pending,
+                    );
                     let human_tx_state = snapshot.human_tx_state;
                     let raw_half_line =
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open;
@@ -1145,7 +1158,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         .map(|evidence| evidence.literal.as_str());
                     let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
                         &snapshot.text,
-                        human_tx_seen,
+                        human,
                         raw_half_line,
                         prompt_evidence,
                         snapshot.trimmed_before_from,
@@ -1162,7 +1175,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         return OpOutcome::CompletionUncertain {
                             stdout: evaluator.partial_stdout(
                                 &snapshot.text,
-                                human_tx_seen,
+                                human,
                                 raw_half_line,
                                 prompt_evidence,
                                 snapshot.line_prefix_before_from.as_deref(),
@@ -1224,6 +1237,11 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 ctx.clock.mono_ns(),
             );
             let human_tx_seen = pending_human_before || submit_window_has_human_tx;
+            let human = CompletionHumanContext::new(
+                human_tx_seen,
+                snapshot.human_in_flight,
+                snapshot.tx_submit_pending,
+            );
             let human_tx_state = snapshot.human_tx_state;
             let raw_half_line =
                 human_tx_before.raw_line_open || human_tx_state.raw_line_open;
@@ -1233,7 +1251,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 .map(|evidence| evidence.literal.as_str());
             let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
                 &snapshot.text,
-                human_tx_seen,
+                human,
                 raw_half_line,
                 prompt_evidence,
                 snapshot.trimmed_before_from,
@@ -1242,7 +1260,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
             let stdout = evaluator.partial_stdout(
                 &snapshot.text,
-                human_tx_seen,
+                human,
                 raw_half_line,
                 prompt_evidence,
                 snapshot.line_prefix_before_from.as_deref(),

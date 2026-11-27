@@ -246,7 +246,9 @@ sequenceDiagram
    同 epoch、未修剪、行首可證明時可跨 TX 前延伸。不得剝舊 evidence 或取後段
    suffix；該完整字面須匹配目前 profile、且 echo 後真實行首到 snapshot 尾端
    重現相同字面才能原子更新。互證不成立時，舊 evidence 完整等於 tail 才完成，
-   否則 partial；`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而學習
+   否則 partial；跨 TX 判讀另包含同一 snapshot 的 human_in_flight 與
+   tx_submit_pending，在途訊號未消失前不得互證，revision 更新後才重評，不新增
+   TX 閘門。`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而學習
 6. 已知完整 prompt 若含字母或數字，可作無換行 stdout 的尾端 suffix；只移除
    suffix。短／未知 prompt 不猜測，NUL 原樣保留
 7. 無 echo 且無 human 訊號時不要求 prompt evidence；目前 profile regex 由

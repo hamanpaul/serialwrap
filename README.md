@@ -418,7 +418,10 @@ digit, and reappear exactly from the real start of the final line through the
 snapshot tail before it atomically replaces the evidence. If mutual proof
 fails, existing evidence still completes only when it exactly equals the tail;
 otherwise the result is partial. A human TX signal follows the existing human
-path and does not learn a cross-TX prefix. `Path => ` appearing only as command
+path and does not learn a cross-TX prefix; the same is true when that snapshot
+still has a human job in flight or a TX submit pending observer registration.
+When those in-flight signals disappear, the revision change permits another
+evaluation without adding a TX gate. `Path => ` appearing only as command
 output cannot learn its prompt identity. Exact prompts `router => ` and
 `router=> ` remain valid from those
 trusted sources. Without a trailing newline, only known complete prompt evidence
@@ -2530,7 +2533,8 @@ RX window 且行首可證明時可往 TX 前延伸。前綴須完整符合目前
 含至少一個字母或數字，且 echo 後最後一行行首到 snapshot 尾端重現完全相同
 字面，才能完成並原子更新 evidence；互證不成立時，只有既有 evidence 與 tail
 完整相等才可完成，否則回 partial。跨 TX 前綴遇 human TX 訊號時走既有 human
-路徑，不以此學習；只把
+路徑；同一 snapshot 仍有 human job 在途或 submit 尚待 observer 登錄時也不以此
+學習。這些訊號消失後以 revision 變動重新評估，不新增 TX 閘門；只把
 `Path => ` 當命令輸出時不得學成 evidence。精確 `router => ` 與 `router=> `
 均可由上述可信來源證實。無換行 stdout 只有在已找到本命令 echo 時，才以
 已知、至少含字母或數字的完整 prompt suffix 裁切，因此 `printf abc` 回傳
