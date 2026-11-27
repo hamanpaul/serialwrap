@@ -13,8 +13,8 @@
 # - P2 bridge 比較器的 APPROVED_RULES（tools/uart_stdio_bridge/.../compare/rules.py）不受本檔影響。
 # - 本檔屬測試資產（§10.4）：任何變更須非實作者獨立審閱，變更即提升 approved_revision；
 #   P9-T7B（10-stage3-canary.md Task 7B）只追加鍵，不改既有映射。
-approved_revision: 2
-reviewed_by: []            # 待獨立審閱者填入（審閱完成前本檔視為提案）
+approved_revision: 3
+reviewed_by: [codex-gpt-6.1-terra-xhigh]  # approved_revision 3 的非實作者獨立審閱（T7B 第 1～5 輪）；B11 候選不在本檔
 mappings:
   - field: wall_ts
     kind: key
@@ -68,3 +68,31 @@ mappings:
     apply_to: non_null_int
     placeholder: "<PID>"
     reason: daemon start 遇既有 daemon 時回報的行程 ID（cli.py `existing_pid`）
+
+g1_exception_message: true
+g2_set_paths:
+  - command: [event, reload]
+    json_path: added
+    source: RPC-H-13
+  - command: [event, reload]
+    json_path: removed
+    source: RPC-H-13
+  - command: [event, reload]
+    json_path: changed
+    source: RPC-H-13
+volatile_keys:
+  - pid
+  - cmd_id
+  - wall_ts
+  - elapsed_ms
+  - socket
+  - created_at
+  - started_at
+  - finished_at
+  - last_rx_at
+  - last_tx_at
+  - last_probe_at
+  - last_state_change_at
+  - last_ready_at
+  - detached_at
+instance_root_placeholder: "<ROOT>"
