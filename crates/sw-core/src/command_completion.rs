@@ -49,36 +49,53 @@ impl<'a> CompletionEvaluator<'a> {
             if let Some(echo) =
                 find_command_echo(&cleaned, self.command, self.prompt, &wraps, &mut metrics)
             {
-                let observed_prompt = echo.prompt_evidence;
+                let observed_prompt = echo.prompt_evidence.and_then(|literal| {
+                    normalize_echo_prompt_prefix(literal, prompt_evidence, self.prompt)
+                });
                 let observed_range =
-                    prompt_evidence_tail_range(&cleaned, observed_prompt.as_deref())
+                    prompt_evidence_line_start_tail_range(&cleaned, observed_prompt.as_deref())
                         .filter(|prompt| prompt.start >= echo.after_line);
-                let existing_range = prompt_evidence_tail_range(&cleaned, prompt_evidence)
+                let prompt_changed = observed_prompt
+                    .as_deref()
+                    .zip(prompt_evidence)
+                    .is_some_and(|(observed, existing)| observed != existing);
+                let existing_range = (!prompt_changed)
+                    .then(|| prompt_evidence_tail_range(&cleaned, prompt_evidence))
+                    .flatten()
                     .filter(|prompt| prompt.start >= echo.after_line);
-                let Some(prompt) = observed_range.clone().or(existing_range) else {
-                    let learned_prompt =
-                        prompt_evidence.is_none().then(|| observed_prompt.clone()).flatten();
-                    if regex_tail_prompt_range(&cleaned, self.prompt).is_some()
+                let short_line_prompt = (observed_prompt.is_none()).then(|| {
+                    regex_tail_prompt_range(&cleaned, self.prompt).filter(|prompt| {
+                        prompt_is_symbol_only(&char_slice(&cleaned, prompt.clone()))
+                    })
+                });
+                let Some(prompt) = existing_range
+                    .clone()
+                    .or(observed_range.clone())
+                    .or(short_line_prompt.flatten())
+                else {
+                    let has_candidate = regex_tail_prompt_range(&cleaned, self.prompt).is_some()
+                        || short_prompt_suffix_range(&cleaned, self.prompt).is_some()
                         || prompt_evidence_suffix_range(&cleaned, observed_prompt.as_deref())
                             .is_some()
-                        || prompt_evidence_suffix_range(&cleaned, prompt_evidence).is_some()
-                    {
-                        let stdout = char_slice(
-                            &cleaned,
-                            echo.after_line..cleaned.chars().count(),
-                        )
-                        .trim_matches('\n')
-                        .to_string();
-                        return (Evaluation::Uncertain { stdout }, learned_prompt);
+                        || prompt_evidence_suffix_range(&cleaned, prompt_evidence).is_some();
+                    if !has_candidate {
+                        return (Evaluation::Pending, None);
                     }
-                    return (Evaluation::Pending, learned_prompt);
+                    let stdout =
+                        char_slice(&cleaned, echo.after_line..cleaned.chars().count())
+                            .trim_matches('\n')
+                            .to_string();
+                    return (Evaluation::Uncertain { stdout }, None);
                 };
                 let body = char_slice(&cleaned, echo.after_line..prompt.start);
+                let learned_prompt = observed_range.and_then(|_| {
+                    observed_prompt.filter(|literal| prompt_evidence != Some(literal.as_str()))
+                });
                 return (
                     Evaluation::Complete {
                         stdout: strip_repeated_echo_compat(&body, self.command),
                     },
-                    observed_range.and(observed_prompt),
+                    learned_prompt,
                 );
             }
         }
@@ -90,7 +107,7 @@ impl<'a> CompletionEvaluator<'a> {
             return (Evaluation::Uncertain { stdout }, None);
         }
 
-        match prompt_evidence_line_start_tail_range(&cleaned, prompt_evidence) {
+        match regex_tail_prompt_range(&cleaned, self.prompt) {
             Some(prompt) if trimmed_before_from => (
                 Evaluation::Partial {
                     stdout: char_slice(&cleaned, 0..prompt.start)
@@ -108,6 +125,7 @@ impl<'a> CompletionEvaluator<'a> {
                 None,
             ),
             None if regex_tail_prompt_range(&cleaned, self.prompt).is_some()
+                || short_prompt_suffix_range(&cleaned, self.prompt).is_some()
                 || prompt_evidence_suffix_range(&cleaned, prompt_evidence).is_some() =>
             (
                 Evaluation::Uncertain {
@@ -364,6 +382,35 @@ fn echo_prompt_prefix(chars: &[char], line_start: usize, command_start: usize) -
     prompt_evidence_literal_is_identifiable(&literal).then_some(literal)
 }
 
+fn normalize_echo_prompt_prefix(
+    literal: String,
+    existing: Option<&str>,
+    prompt: &PyRegex,
+) -> Option<String> {
+    if let Some(existing) = existing {
+        let mut suffix = literal.as_str();
+        let mut normalized = None;
+        while let Some(stripped) = suffix.strip_prefix(existing) {
+            if stripped.is_empty() {
+                break;
+            }
+            let matched = prompt.search(stripped);
+            if prompt_evidence_literal_is_identifiable(stripped)
+                && matched.is_some_and(|matched| {
+                    matched.start == 0 && matched.end == stripped.chars().count()
+                })
+            {
+                normalized = Some(stripped.to_string());
+            }
+            suffix = stripped;
+        }
+        if normalized.is_some() {
+            return normalized;
+        }
+    }
+    prompt_evidence_literal_is_identifiable(&literal).then_some(literal)
+}
+
 fn prompt_evidence_tail_range(cleaned: &str, evidence: Option<&str>) -> Option<Range<usize>> {
     let range = prompt_evidence_suffix_range(cleaned, evidence)?;
     let chars = cleaned.chars().collect::<Vec<_>>();
@@ -405,6 +452,32 @@ fn prompt_evidence_suffix_range(cleaned: &str, evidence: Option<&str>) -> Option
         return None;
     }
     Some(start..chars.len())
+}
+
+fn prompt_is_symbol_only(literal: &str) -> bool {
+    !literal.is_empty()
+        && !literal.contains(['\0', '\r', '\n'])
+        && !literal.chars().any(char::is_alphanumeric)
+        && literal.chars().any(|ch| !ch.is_whitespace())
+}
+
+fn short_prompt_suffix_range(cleaned: &str, prompt: &PyRegex) -> Option<Range<usize>> {
+    let chars = cleaned.chars().collect::<Vec<_>>();
+    let line_start = chars
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |index| index + 1);
+    let suffix_start = chars[line_start..]
+        .iter()
+        .rposition(|ch| ch.is_alphanumeric())
+        .map_or(line_start, |index| line_start + index + 1);
+    let suffix: String = chars.get(suffix_start..)?.iter().collect();
+    if !prompt_is_symbol_only(&suffix) {
+        return None;
+    }
+    let matched = prompt.search(&suffix)?;
+    (matched.start == 0 && matched.end == suffix.chars().count())
+        .then_some(suffix_start..chars.len())
 }
 
 fn regex_tail_prompt_range(cleaned: &str, prompt: &PyRegex) -> Option<Range<usize>> {

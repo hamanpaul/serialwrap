@@ -2492,16 +2492,9 @@ fn ready_prompt_literal_after_marker(
 }
 
 pub(crate) fn prompt_evidence_literal_is_identifiable(literal: &str) -> bool {
-    if literal.is_empty()
-        || literal.chars().all(char::is_whitespace)
-        || literal.contains('\0')
-        || literal.contains('\r')
-        || literal.contains('\n')
-    {
-        return false;
-    }
-    let trimmed = literal.trim_end_matches([' ', '\t']);
-    !trimmed.ends_with("=>") || !trimmed.chars().any(char::is_whitespace)
+    !literal.is_empty()
+        && !literal.contains(['\0', '\r', '\n'])
+        && literal.chars().any(char::is_alphanumeric)
 }
 
 fn prompt_full_literal_matches(literal: &str, prompt: &PyRegex) -> bool {

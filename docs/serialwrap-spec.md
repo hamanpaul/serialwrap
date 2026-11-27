@@ -241,13 +241,15 @@ sequenceDiagram
 3. 記錄 RX 起點 offset
 4. 未指定 `completion_regex` 時，搜尋完整命令 echo；完成判定與 stdout 擷取
    共用同一份 RX snapshot，echo 前的文字不進入一般 stdout
-5. 只接受 epoch 內有字面證據的真正 prompt：證據來源限可辨識 READY 結果或
-   完整 echo 前綴；一般 prompt 在 echo 後、最後一行行首並終止於 snapshot
-   尾端。`=> ` 類輸出不能只因寬鬆 regex 命中而完成
+5. epoch 內既有 prompt evidence 只取自可辨識 READY 結果；evidence 遺失或
+   與 echo 前綴不同時，前綴須從真實行首完整匹配目前 profile regex、至少含
+   字母或數字，且 echo 後行首到 snapshot 尾端重現相同字面，才能完成並原子
+   更新。`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而完成或學習
 6. 已知完整 prompt 若含字母或數字，可作無換行 stdout 的尾端 suffix；只移除
    suffix。短／未知 prompt 不猜測，NUL 原樣保留
-7. 無 echo 且無 human 訊號時，可信尾端 prompt 仍可完成；必要 RX 已被窗口
-   修剪則回 `ok:true`、`partial:true`、無 error_code
+7. 無 echo 且無 human 訊號時不要求 prompt evidence；目前 profile regex 由
+   真實最後一行行首完整匹配至 snapshot 尾端即可完成；必要 RX 已被窗口修剪
+   則回 `ok:true`、`partial:true`、無 error_code
 8. `stdout` 寫回 `command.get`
 
 #### 命令限制
@@ -958,9 +960,11 @@ targets:
 - background capture 建立前的 `result-tail` 回傳 `from_seq=0, last_seq=0` sentinel
 - prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
 - 未指定 `completion_regex` 時，tail completion candidate 是最後一行完整符合 profile
-  prompt regex，或 snapshot 尾端完整等於 epoch 內已知 prompt 字面；只有有候選但
-  身分不足才走 `PROMPT_TIMEOUT`／partial／NONE，無 human 且無候選則維持基線 recovery。
-  無 echo prompt 必須在最後一行行首；同行 suffix 裁切只套用已確認本命令 echo。
+  prompt regex、snapshot 尾端完整等於 epoch 內已知 prompt 字面，或可由 profile
+  辨識的純符號短 suffix；只有有候選但身分不足才走 `PROMPT_TIMEOUT`／partial／NONE，
+  無 human 且無候選則維持基線 recovery。無 echo 且無 human 時不要求既有 evidence，
+  但 prompt 只接受真實最後一行行首到 snapshot 尾端；同行 suffix 裁切只套用已
+  確認本命令 echo。
 - `_recover_after_failure` 成功恢復 prompt 時回 `ok: true`（含 `PROMPT_TIMEOUT_RECOVERED`）
 - `expected_duration_s` 可延長前景命令總期限（靜默上限 `min(timeout_s, 30s)` 不變）
 - interactive lease 可建立、送 key、關閉

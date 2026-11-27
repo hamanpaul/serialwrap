@@ -375,6 +375,211 @@ fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
     );
 }
 
+fn i294_r2_run_liveness_sequence(h: &ActorRig, label: &str) {
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "{label}: 測試必須從沒有 prompt evidence 的狀態開始"
+    );
+    let tx_count = h.wal_tx_payloads().len();
+    let cases = [
+        (
+            "printf R2_NO_ECHO",
+            "NO ECHO\r\nroot@t:/# ",
+            "NO ECHO",
+        ),
+        (
+            "printf R2_ECHO_ONE",
+            "root@t:/# printf R2_ECHO_ONE\r\nECHO ONE\r\nroot@t:/# ",
+            "ECHO ONE",
+        ),
+        (
+            "printf R2_ECHO_TWO",
+            "root@t:/# printf R2_ECHO_TWO\r\nECHO TWO\r\nroot@t:/# ",
+            "ECHO TWO",
+        ),
+    ];
+    for (index, (command, raw, stdout)) in cases.into_iter().enumerate() {
+        let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+        wait_tx(h, format!("{command}\n").as_bytes());
+        h.inject_rx_processed(raw.as_bytes());
+        advance_until(
+            h,
+            Duration::from_millis(200),
+            &format!("{label}: liveness command {index}"),
+            |h| is_done(h, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("done"), "{label}: {result:?}");
+        assert_eq!(result["stdout"], PyValue::from(stdout), "{label}: {result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(false), "{label}: {result:?}");
+        if index == 0 {
+            assert!(
+                h.rx.snapshot_from(0).prompt_evidence.is_none(),
+                "{label}: 無 echo 的相容完成不得自行學習 prompt evidence"
+            );
+        } else {
+            assert!(
+                h.rx.snapshot_from(0).prompt_evidence.is_some(),
+                "{label}: 完整 echo 前綴與尾端同行 prompt 應重建 evidence"
+            );
+        }
+    }
+    assert_eq!(
+        wal_tx_bytes_since(h, tx_count),
+        b"printf R2_NO_ECHO\nprintf R2_ECHO_ONE\nprintf R2_ECHO_TWO\n",
+        "{label}: liveness 恢復不得增加救援或重送 TX"
+    );
+}
+
+#[test]
+fn i294_r2_clear_without_evidence_completes_then_reestablishes_from_echo() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.rx.clear();
+    i294_r2_run_liveness_sequence(&h, "clear");
+}
+
+#[test]
+fn i294_r2_rejected_ready_evidence_recovers_no_echo_then_echo_sequence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile);
+    h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+    let h = h.attach();
+    h.wait_for("混合來源 READY probe TX", |rig| {
+        rig.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload.starts_with(b"echo __READY__"))
+    });
+    let probe = h
+        .wal_tx_payloads()
+        .into_iter()
+        .find(|payload| payload.starts_with(b"echo __READY__"))
+        .expect("mixed READY probe");
+    let probe = String::from_utf8(probe).expect("READY probe UTF-8");
+    let nonce = probe
+        .split("__READY__")
+        .nth(1)
+        .expect("READY nonce")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    h.inject_rx_reader_processed(
+        format!("\r\n__READY__{nonce}\r\nAsyncPath# ").as_bytes(),
+    );
+    h.wait_for("混合來源仍可完成登入", |rig| {
+        rig.get_state()["state"].as_str() == Some("READY")
+    });
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "probe 後不同 prompt 必須拒絕 READY evidence"
+    );
+    i294_r2_run_liveness_sequence(&h, "READY rejected");
+}
+
+fn i294_r2_run_router_arrow_matrix(prompt_regex: &str, prompt: &str) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new(&profile).ready_with_prompt(prompt.as_bytes());
+    let tx_count = h.wal_tx_payloads().len();
+
+    let ready = h.submit_with("printf R2_READY", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_READY\n");
+    h.inject_rx_processed(
+        format!("printf R2_READY\r\nREADY{prompt}").as_bytes(),
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "READY arrow evidence completion",
+        |h| is_done(h, &ready),
+    );
+    let result = h.wait_done(&ready);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("READY"), "{result:?}");
+
+    h.rx.clear();
+    let echo = h.submit_with("printf R2_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_ECHO\n");
+    h.inject_rx_processed(
+        format!("{prompt}printf R2_ECHO\r\nECHO\r\n{prompt}").as_bytes(),
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "echo arrow evidence completion",
+        |h| is_done(h, &echo),
+    );
+    let result = h.wait_done(&echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ECHO"), "{result:?}");
+
+    let no_echo = h.submit_with("printf R2_NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_NO_ECHO\n");
+    h.inject_rx_processed(format!("NO ECHO\r\n{prompt}").as_bytes());
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "no-echo arrow completion",
+        |h| is_done(h, &no_echo),
+    );
+    let result = h.wait_done(&no_echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("NO ECHO"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf R2_READY\nprintf R2_ECHO\nprintf R2_NO_ECHO\n"
+    );
+}
+
+#[test]
+fn i294_r2_exact_spaced_and_compact_router_arrow_matrix() {
+    i294_r2_run_router_arrow_matrix(r"(?m)^router =>[ \t]*$", "router => ");
+    i294_r2_run_router_arrow_matrix(r"(?m)^router=>[ \t]*$", "router=> ");
+}
+
+#[test]
+fn i294_r2_path_arrow_output_never_completes_or_becomes_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^.*=>[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready_with_prompt(b"router => ");
+    h.rx.clear();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf R2_PATH", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_PATH\n");
+    h.inject_rx_processed(b"printf R2_PATH\r\nPath => ");
+    let (checks, end) = h.rx.snapshot_wait_progress_for_test();
+    h.clock.advance(Duration::from_millis(51));
+    assert!(
+        h.rx
+            .wait_for_snapshot_wait_progress_for_test(checks, end, Duration::from_secs(5)),
+        "Path => 片段後 evaluator 應已跨過 poll 間隔"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "Path => 命令輸出不得提前完成"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "Path => ambiguity timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "Path => 命令輸出不得成為 prompt evidence"
+    );
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R2_PATH\n");
+}
+
 #[test]
 fn i294_r1_ready_evidence_rejects_probe_echo_old_prompt_and_async_output() {
     for response in ["probe-echo", "old-prompt", "async-output"] {
@@ -517,7 +722,7 @@ fn i294_r1_timeout_candidate_matrix_preserves_no_candidate_recovery() {
 fn i294_r1_prompt_evidence_barrier(kind: &str) {
     let profile = SHELL_PROFILE.replace(
         "(?m)^root@t:.*# ",
-        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+        r"(?m)^root@(?:t|new):/#[ \t]*$",
     );
     let h = ActorRig::new(&profile).ready();
     h.dev
@@ -567,7 +772,9 @@ fn i294_r1_prompt_evidence_barrier(kind: &str) {
         request.timeout_s = 0.2
     });
     wait_tx(&h, b"printf AFTER_BARRIER\n");
-    h.inject_rx_processed(b"AFTER\r\nroot@new:/# ");
+    h.inject_rx_processed(
+        b"root@t:/# printf AFTER_BARRIER\r\nAFTERroot@t:/# ",
+    );
     assert_eq!(
         h.command_get(&second)["status"],
         PyValue::from("running"),
@@ -614,7 +821,7 @@ fn i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo() {
     h.rx.clear();
     let echo = h.submit_with("printf ECHO", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf ECHO\n");
-    h.inject_rx_processed(b"router=> printf ECHO\r\nECHOrouter=> ");
+    h.inject_rx_processed(b"router=> printf ECHO\r\nECHO\r\nrouter=> ");
     advance_until(
         &h,
         Duration::from_millis(50),
@@ -650,7 +857,7 @@ fn i294_r1_path_arrow_output_cannot_become_echo_prefix_evidence() {
     h.rx.clear();
     let id = h.submit_with("printf PATH", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf PATH\n");
-    h.inject_rx_processed(b"Path => printf PATH\r\nPath => ");
+    h.inject_rx_processed(b"printf PATH\r\nPath => ");
     assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
     advance_until(
         &h,
@@ -882,7 +1089,7 @@ fn i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix() {
     let relearn = h.submit_ok("printf after");
     wait_tx(&h, b"printf after\n");
     h.inject_rx_processed(
-        b"root@t:/# printf after\r\nafterroot@t:/# ",
+        b"root@t:/# printf after\r\nafter\r\nroot@t:/# ",
     );
     let result = h.wait_done(&relearn);
     assert_eq!(result["status"], PyValue::from("done"));
@@ -1080,7 +1287,9 @@ fn i294_human_reply_arriving_inside_submit_does_not_poison_next_no_echo_command(
         .recv_timeout(Duration::from_secs(5))
         .expect("推進假時鐘前 operation deadline 已建立");
     h.inject_rx_processed(b"NO_ECHO\r\nroot@t:/# ");
-    h.advance(Duration::from_millis(200));
+    h.wait_for("無 echo prompt 完成線性化", |rig| {
+        rig.command_get(&id).get("status") != Some(&PyValue::from("running"))
+    });
     let result = h.wait_done(&id);
     assert_eq!(result["status"], PyValue::from("done"));
     assert_eq!(result["stdout"], PyValue::from("NO_ECHO"));
@@ -3606,10 +3815,8 @@ fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
         h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
     }
 
-    let raw = format!(
-        "root@t:/{}# echo x\r\nx\r\nroot@t:/# ",
-        "e".repeat(2_000)
-    );
+    let changed_prompt = format!("root@t:/{}# ", "e".repeat(2_000));
+    let raw = format!("{changed_prompt}echo x\r\nx\r\n{changed_prompt}");
     h.inject_rx_processed(raw.as_bytes());
     h.advance(Duration::from_millis(200));
 
@@ -10606,33 +10813,11 @@ fn i294_r19_submit_human_writer_job(
 fn i294_r19_advance_prompt_timeout_if_still_running(
     h: &ActorRig,
     id: &str,
-    timeout_entry: I294R17TimeoutEntry,
+    _timeout_entry: I294R17TimeoutEntry,
 ) {
-    if h.command_get(id).get("status") != Some(&PyValue::from("running")) {
-        return;
-    }
-    if timeout_entry == I294R17TimeoutEntry::OperationDeadline {
-        timeout_entry.advance_actor(h);
-        return;
-    }
-
-    let (restart_tx, restart_rx) = crossbeam_channel::bounded(1);
-    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
-        let _ = restart_tx.send(());
-    })));
-    timeout_entry.advance_actor(h);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if h.command_get(id).get("status") != Some(&PyValue::from("running")) {
-            return;
-        }
-        if restart_rx.try_recv().is_ok() {
-            timeout_entry.advance_actor(h);
-            return;
-        }
-        assert!(Instant::now() < deadline, "{id}: 靜默 timeout 重新等待或命令結案");
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    h.wait_for("prompt completion 已通過 stale recheck", |rig| {
+        rig.command_get(id).get("status") != Some(&PyValue::from("running"))
+    });
 }
 
 fn i294_r19_run_three_no_echo_commands(
@@ -10816,7 +11001,9 @@ fn i294_r19_pending_timeout_keeps_new_human_submit_until_next_timeout() {
         }
         let third_id = i294_r17_submit_no_echo_actor(&h, "true # R19_THIRD", timeout_entry);
         i294_r17_push_actor_rx_and_wait(&h, b"root@t:/# ");
-        i294_r19_advance_prompt_timeout_if_still_running(&h, &third_id, timeout_entry);
+        h.wait_for("第三筆 prompt 完成線性化", |rig| {
+            rig.command_get(&third_id).get("status") != Some(&PyValue::from("running"))
+        });
         let third = h.wait_done(&third_id);
         if !i294_r19_assert_no_echo_done(&third) {
             failures.push(format!("{timeout_entry:?}: 第三筆應正常完成，record={third:?}"));

@@ -5965,7 +5965,6 @@ fn wp58_assert_device_attach_recovering(r: &ServiceRig, response: &PyDict) {
 fn gpx_rpc_device_attach_during_reboot_recovery_already_attached() {
     let r = ServiceRig::ready_shell();
     let dev = r.device(REAL_A);
-    dev.clear_replies();
 
     let submitted = r.call(
         "command.submit",

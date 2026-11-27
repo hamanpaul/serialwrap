@@ -66,8 +66,8 @@
 2. **停機時進行中的 `session self-test`、`session recover`、interactive 操作會回 `EXCEPTION`**（#297）。呼叫端請視為已中止，daemon 重新啟動後再重試。
 3. **human／agent 完成判定（#294，0.5.1 已修，含 #262、#271）**
    - 0.5.0 可能讓 human 的舊 prompt 或 `Path => ` 命令輸出提前完成 agent 命令，也可能從 regex match 起點裁掉 `printf abc` 與 NUL 尾端檔案的同行 stdout。
-   - 0.5.1 的 Rust daemon 已用本命令 echo 與 epoch 內 prompt 字面證據共同判定；READY 證據只收 probe 獨立輸出 nonce、其後同一已知 prompt，舊 prompt／probe echo 不算。同行 `printf abc` 只在已有本命令 echo 時，以已證實完整 prompt suffix 裁切，保留 U+0000。無 echo 且無 human TX 時 prompt 必須位於最後一行行首；必要 RX 已被有界窗口修剪時回 `ok:true`、`partial:true`。
-   - tail candidate 的判準是最後一行完整符合 prompt regex，或 snapshot 尾端完整等於已知 prompt。已知短 suffix、未知／變更候選，或 human 交錯且無 echo 時，等待原上限後回 partial，不重送、不另送救援鍵；無 human 且完全沒有候選時維持 9af187ca 既有 timeout 與救援 TX。producer `--completion-regex` 契約不變；prpl／Speedport prefix prompt 已納入 Rust Cargo／RPC 驗收。
+   - 0.5.1 的 Rust daemon 已用本命令 echo 與精確尾端邊界判定；READY 只收 probe 獨立輸出 nonce、其後同一已知 prompt。evidence 清除、被拒或 PS1 改變時，echo 前綴須從真實行首完整匹配目前 profile、至少含字母或數字，且 echo 後行首到 tail 重現相同字面才能重建。同行 `printf abc` 只在已有本命令 echo 時，以已證實完整 prompt suffix 裁切，保留 U+0000。無 echo 且無 human TX 時不要求 evidence；目前 regex 從真實最後一行行首完整匹配到 snapshot 尾端即可完成，必要 RX 修剪時回 `ok:true`、`partial:true`。
+   - tail candidate 的判準是最後一行完整符合 prompt regex、snapshot 尾端完整等於已知 prompt，或 profile 可辨識的純符號短 suffix。短／未知／變更候選，或 human 交錯且無 echo 時，等待原上限後回 partial，不重送、不另送救援鍵；無 human 且完全沒有候選時維持 9af187ca 既有 timeout 與救援 TX。producer `--completion-regex` 契約不變；prpl／Speedport prefix prompt 已納入 Rust Cargo／RPC 驗收。
 4. **USB 序列埠短暫斷線又回來後，不會自動接回**（#300）
    - 裝置在 1 秒內斷線又回來（例如 USB 重新列舉）時，session 停在 `DETACHED`，`last_error` 為 `ATTACH_FAILED:FileNotFoundError`，之後不會自動接回。0.4.x 也有同樣的限制。
    - 恢復方式：`serialwrap session attach --selector <COM>`。
