@@ -1458,7 +1458,7 @@ def _b11_candidate_applies(call: _Call) -> bool:
 
 
 def _b11_foreign_holders_is_safe(response: Mapping[str, Any]) -> bool:
-    """只允許空快照或所有 holder 都是該 daemon 自身 PID。"""
+    """只允許空快照或 /dev/ 絕對裝置路徑對應該 daemon 自身 PID。"""
     holders = response.get(_B11_FOREIGN_HOLDERS_KEY)
     if not isinstance(holders, Mapping):
         return False
@@ -1469,6 +1469,7 @@ def _b11_foreign_holders_is_safe(response: Mapping[str, Any]) -> bool:
         return False
     return all(
         isinstance(name, str)
+        and name.startswith("/dev/")
         and isinstance(holder_pid, int)
         and not isinstance(holder_pid, bool)
         and holder_pid == pid

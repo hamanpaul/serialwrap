@@ -213,13 +213,29 @@
 
 7. B11 暫定觀測範圍：候選規則只允許忽略邏輯命令為 ``daemon status`` 或
    ``health.status``、CLI ``rc == 0`` 且 stdout JSON ``ok is true`` 的回應中最上層
-   ``foreign_holders`` 掃描快照。通用 volatile key 刪除與 instance-root 替換不進入
-   ``foreign_holders`` 子樹。命令不符、非成功回應、巢狀同名欄位、危險 holder、
-   ``holder_unknown`` 及任何安全 invariant 都必須保留。本 fixture 的允許正例限於
-   ``foreign_holders`` map 只含與回應 ``pid`` 相同的 daemon 自身 PID；含外來 PID
-   或 unknown 欄位時，即使位於成功 status 回應最上層也須保留差異。將整個欄位
-   無條件刪除而一併掩蓋 unknown／外來 PID，會違反本 Task 測試。此項未經獨立審查
-   或擁有者追認，不得凍結為 approved normalization。
+   ``foreign_holders`` 掃描快照。空 map 可忽略；非空 map 必須每一項的鍵都是以
+   ``/dev/`` 開頭的絕對裝置路徑字串、值是非 bool 整數，且等於回應頂層 ``pid``，
+   才可忽略。依據是 ``sw_core/multi_open.py`` 的 ``detect_multi_open(tty_paths=...)``
+   以呼叫端傳入的 tty 路徑作為 ``holders`` 鍵，``sw_core/service.py`` 從 session 的
+   ``attached_real_path`` 建立 ``tty_paths`` 並將 ``mo["holders"]`` 輸出為頂層
+   ``foreign_holders``；本地程序／PTY DUT 的路徑形如 ``/dev/pts/N``。因此其他鍵，
+   包含 ``holder_unknown``、``device``、相對路徑、Windows 裝置形式及任何非
+   ``/dev/`` 開頭字串，都必須保留整個欄位並嚴格比較。
+
+   Windows 路徑的靜態查證結果：不能說 Windows daemon 的 ``multi_open`` 完全不嘗試
+   掃 ``/proc``。``service.py`` 仍會呼叫 ``detect_multi_open``，而該函式預設
+   ``proc_root="/proc"`` 並嘗試列舉它；若 procfs 不可用，``OSError`` 分支回傳空
+   ``holders`` 與 ``holders_status="unknown"``。之後 service 仍可把
+   ``unknown_holder_devices()`` 的項目合併進 map；Windows 裝置來源使用
+   ``\\\\.\\COMx`` 路徑，這些鍵不符合 ``/dev/`` 條件。因此在目前 Windows 原生
+   daemon 輸出路徑中，這條候選規則不會忽略任何非空 map。此結論來自上述程式路徑，
+   未以 Windows 原生執行驗證。
+
+   通用 volatile key 刪除與 instance-root 替換不進入 ``foreign_holders`` 子樹。
+   命令不符、非成功回應、巢狀同名欄位、危險 holder、``holder_unknown`` 及任何安全
+   invariant 都必須保留；外來 PID 或 unknown 欄位即使位於成功 status 回應最上層
+   也須保留差異。將整個欄位無條件刪除會掩蓋這些差異。此項未經獨立審查或擁有者
+   追認，不得凍結為 approved normalization。
 
 這份契約只規範 T7B loader／fixture 與後續 T5B adapter 的讀取介面。它不代表目前
 repo 已有非 bridge adapter，也不宣稱純資料 fixture 是產品執行證據。

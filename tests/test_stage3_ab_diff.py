@@ -505,16 +505,59 @@ def test_foreign_holders_success_top_level_snapshot_is_ignored(tmp_path: Path, c
     b_dir = tmp_path / "b"
     fakes.write_run(a_dir, case_id, side="a", calls=[_call(argv, {
         "ok": True, "pid": 4101, "multi_open": False,
-        "foreign_holders": {"fixture-device": 4101},
+        "foreign_holders": {"/dev/pts/7": 4101},
     })])
     fakes.write_run(b_dir, case_id, side="b", calls=[_call(argv, {
         "ok": True, "pid": 4202, "multi_open": False,
-        "foreign_holders": {"fixture-device": 4202},
+        "foreign_holders": {"/dev/pts/8": 4202},
     })])
 
     result = _diff(a_dir, b_dir, {case_id})
 
     assert result["differences"] == []
+
+
+def test_foreign_holders_empty_success_snapshot_is_ignored(tmp_path: Path):
+    case_id = "foreign-holders-empty"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv = ["daemon", "status"]
+    fakes.write_run(a_dir, case_id, side="a", calls=[_call(argv, {
+        "ok": True, "pid": 4101, "foreign_holders": {},
+    })])
+    fakes.write_run(b_dir, case_id, side="b", calls=[_call(argv, {
+        "ok": True, "pid": 4202, "foreign_holders": {},
+    })])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+    assert result["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "holder_key",
+    ["holder_unknown", "device", "relative/tty0", r"\\.\COM3"],
+    ids=["holder-unknown", "device", "relative-path", "windows-device-path"],
+)
+def test_foreign_holders_non_dev_key_matching_own_pid_is_compared(
+    tmp_path: Path, holder_key: str,
+):
+    case_id = "foreign-holders-non-dev-key"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    argv = ["daemon", "status"]
+    fakes.write_run(a_dir, case_id, side="a", calls=[_call(argv, {
+        "ok": True, "pid": 4101, "foreign_holders": {},
+    })])
+    fakes.write_run(b_dir, case_id, side="b", calls=[_call(argv, {
+        "ok": True, "pid": 4202, "foreign_holders": {holder_key: 4202},
+    })])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert any("foreign_holders" in item["path"] for item in result["differences"])
+    assert result["ok"] is False
 
 
 def test_foreign_holders_dangerous_holder_is_not_masked(tmp_path: Path):
@@ -523,7 +566,7 @@ def test_foreign_holders_dangerous_holder_is_not_masked(tmp_path: Path):
     b_dir = tmp_path / "b"
     a_response = {"ok": True, "pid": 4101, "multi_open": False, "foreign_holders": {}}
     b_response = {"ok": True, "pid": 4202, "multi_open": True,
-                  "foreign_holders": {"fixture-device": {"device": "fixture-device", "pids": [9999]}}}
+                  "foreign_holders": {"/dev/pts/8": {"device": "/dev/pts/8", "pids": [9999]}}}
     fakes.write_run(a_dir, case_id, side="a", calls=[_call(["daemon", "status"], a_response)])
     fakes.write_run(b_dir, case_id, side="b", calls=[_call(["daemon", "status"], b_response)])
 
@@ -560,11 +603,11 @@ def test_foreign_holders_success_snapshot_with_unknown_is_not_ignored(tmp_path: 
     b_dir = tmp_path / "b"
     fakes.write_run(a_dir, case_id, side="a", calls=[_call(["daemon", "status"], {
         "ok": True, "pid": 4101, "multi_open": False,
-        "foreign_holders": {"fixture-device": {"device": "fixture-device", "holder_unknown": False, "pids": [4101]}},
+        "foreign_holders": {"/dev/pts/7": {"device": "/dev/pts/7", "holder_unknown": False, "pids": [4101]}},
     })])
     fakes.write_run(b_dir, case_id, side="b", calls=[_call(["daemon", "status"], {
         "ok": True, "pid": 4202, "multi_open": False,
-        "foreign_holders": {"fixture-device": {"device": "fixture-device", "holder_unknown": True, "pids": [4202]}},
+        "foreign_holders": {"/dev/pts/7": {"device": "/dev/pts/7", "holder_unknown": True, "pids": [4202]}},
     })])
 
     result = _diff(a_dir, b_dir, {case_id})
@@ -628,11 +671,11 @@ def test_foreign_holders_nested_same_name_is_not_masked(tmp_path: Path):
     a_dir = tmp_path / "a"
     b_dir = tmp_path / "b"
     fakes.write_run(a_dir, case_id, side="a", calls=[_call(["daemon", "status"], {
-        "ok": True, "pid": 4101, "foreign_holders": {"fixture-device": 4101},
+        "ok": True, "pid": 4101, "foreign_holders": {"/dev/pts/7": 4101},
         "metadata": {"foreign_holders": {"origin": "A"}},
     })])
     fakes.write_run(b_dir, case_id, side="b", calls=[_call(["daemon", "status"], {
-        "ok": True, "pid": 4202, "foreign_holders": {"fixture-device": 4202},
+        "ok": True, "pid": 4202, "foreign_holders": {"/dev/pts/8": 4202},
         "metadata": {"foreign_holders": {"origin": "B"}},
     })])
 
@@ -646,10 +689,10 @@ def test_foreign_holders_does_not_hide_independent_safety_invariant(tmp_path: Pa
     a_dir = tmp_path / "a"
     b_dir = tmp_path / "b"
     fakes.write_run(a_dir, case_id, side="a", calls=[_call(["daemon", "status"], {
-        "ok": True, "pid": 4101, "foreign_holders": {"fixture-device": 4101},
+        "ok": True, "pid": 4101, "foreign_holders": {"/dev/pts/7": 4101},
     })])
     fakes.write_run(b_dir, case_id, side="b", calls=[_call(["daemon", "status"], {
-        "ok": True, "pid": 4202, "foreign_holders": {"fixture-device": 4202},
+        "ok": True, "pid": 4202, "foreign_holders": {"/dev/pts/8": 4202},
     })], invariants=[("zero_tx_on_reject", "FAIL")])
 
     result = _diff(a_dir, b_dir, {case_id})
@@ -1907,4 +1950,3 @@ def test_nonbridge_mixed_mapped_results_only_reports_failed_source(tmp_path: Pat
 
     failures = [row for row in result["product_failures"] if row["case"] == case_id]
     assert [row["source_ref"] for row in failures] == [refs[1]]
-
