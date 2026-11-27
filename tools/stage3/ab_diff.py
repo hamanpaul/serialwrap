@@ -109,6 +109,8 @@ class _Run:
     identity_verified: bool = False
     case_identity_verified: bool = False
     verified_sources: set[str] = field(default_factory=set)
+    declared_sources: set[str] = field(default_factory=set)
+    verified_l1_result_indices: set[int] = field(default_factory=set)
     failure_ref: str = ""
     failure_reason: str = ""
     failure_verified: bool = False
@@ -382,6 +384,7 @@ def _manifest_evidence(manifest: Mapping[str, Any], run: _Run) -> None:
         if relative is None:
             _add_problem(run.problems, f"invalid manifest path: evidence.{key}.path")
             continue
+        run.declared_sources.add(relative)
         candidate = run.path / Path(*PurePosixPath(relative).parts)
         if not candidate.is_file():
             _add_problem(run.problems, f"missing source file: {relative}")
@@ -895,6 +898,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
 
     mapped_indices: set[int] = set()
     verified_mapped_indices: set[int] = set()
+    mapped_outcomes: dict[int, str] = {}
     executed_outcomes: list[str] = []
     for map_index, mapping in enumerate(rows):
         if not isinstance(mapping, Mapping):
@@ -938,6 +942,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
             _add_problem(run.problems, f"required case result not executed: {outcome}")
             continue
         verified_mapped_indices.add(result_index)
+        mapped_outcomes[result_index] = outcome
         executed_outcomes.append(outcome)
 
     mapped_failed_indices: set[int] = set()
@@ -977,6 +982,21 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
             _add_problem(run.problems, "runner result mismatch: verdict")
         run.verdict = raw_verdict
     run.case_identity_verified = bool(case_identity_ok and case_map_ok)
+    if (
+        run.identity_verified
+        and run.case_identity_verified
+        and run.l1_report_valid
+        and "source/l1-results.json" in run.verified_sources
+    ):
+        run.verified_l1_result_indices = set(verified_mapped_indices)
+        if run.verdict in {"PASS", "FAIL"}:
+            wanted_outcome = "failed" if run.verdict == "FAIL" else "passed"
+            result_index = next(
+                (index for index, outcome in mapped_outcomes.items() if outcome == wanted_outcome),
+                None,
+            )
+            if result_index is not None:
+                run.verdict_ref = run.ref("source/l1-results.json", f"#results[{result_index}]")
 
     if envelope.get("verdict") == "FAIL" and not (
         case_identity_ok and case_map_ok and mapped_failed_indices
@@ -1651,8 +1671,13 @@ def _difference(
     case_changes: Mapping[str, str],
     source_a: str | None,
     source_b: str | None,
-    unverified_case_ids: set[str],
 ) -> dict[str, Any]:
+    if kind == "verdict":
+        source_a_verified = _verdict_source_verified(run_a, source_a)
+        source_b_verified = _verdict_source_verified(run_b, source_b)
+    else:
+        source_a_verified = _call_source_verified(run_a, source_a)
+        source_b_verified = _call_source_verified(run_b, source_b)
     return {
         "case": case_id,
         "path": path,
@@ -1664,9 +1689,8 @@ def _difference(
             and run_a.case_identity_verified
             and run_b.identity_verified
             and run_b.case_identity_verified
-            and _call_source_verified(run_a, source_a)
-            and _call_source_verified(run_b, source_b)
-            and case_id not in unverified_case_ids
+            and source_a_verified
+            and source_b_verified
         ),
     }
 
@@ -1685,13 +1709,36 @@ def _call_source_verified(run: _Run, source_ref: str | None) -> bool:
     return source_path in run.verified_sources
 
 
+def _verdict_source_verified(run: _Run, source_ref: str | None) -> bool:
+    """核對 verdict 差異實際引用的 comparison 或原始 L1 結果列。"""
+    if not isinstance(source_ref, str) or not source_ref:
+        return False
+    expected_prefix = run.path.relative_to(run.report_root).as_posix() + "/"
+    if not source_ref.startswith(expected_prefix):
+        return False
+    relative = source_ref[len(expected_prefix):]
+    if run.runner == "bridge":
+        return (
+            relative == "comparison.json"
+            and (
+                "comparison.json" not in run.declared_sources
+                or "comparison.json" in run.verified_sources
+            )
+        )
+    match = re.fullmatch(r"source/l1-results\.json#results\[([0-9]+)\]", relative)
+    return bool(
+        match
+        and int(match.group(1)) in run.verified_l1_result_indices
+        and "source/l1-results.json" in run.verified_sources
+    )
+
+
 def _compare_run_pair(
     run_a: _Run,
     run_b: _Run,
     *,
     rules: Mapping[str, Any],
     case_changes: Mapping[str, str],
-    unverified_case_ids: set[str],
 ) -> list[dict[str, Any]]:
     differences: list[dict[str, Any]] = []
     case_id = run_a.case_id
@@ -1700,7 +1747,6 @@ def _compare_run_pair(
             run_a, run_b, case_id, "comparison.verdict", "verdict", case_changes,
             run_a.verdict_ref or run_a.ref("comparison.json"),
             run_b.verdict_ref or run_b.ref("comparison.json"),
-            unverified_case_ids,
         ))
     placeholder = rules.get("instance_root_placeholder", "<ROOT>")
     left_logical: list[tuple[str, ...]] = []
@@ -1718,7 +1764,6 @@ def _compare_run_pair(
             run_a, run_b, case_id, f"call[{index}]", "call_count", case_changes,
             call_a.source_ref if call_a is not None else None,
             call_b.source_ref if call_b is not None else None,
-            unverified_case_ids,
         ))
 
     for index in range(paired_count):
@@ -1728,13 +1773,11 @@ def _compare_run_pair(
             differences.append(_difference(
                 run_a, run_b, case_id, f"call[{index}].argv", "argv", case_changes,
                 call_a.source_ref, call_b.source_ref,
-                unverified_case_ids,
             ))
         if call_a.rc != call_b.rc:
             differences.append(_difference(
                 run_a, run_b, case_id, f"call[{index}].rc", "rc", case_changes,
                 call_a.source_ref, call_b.source_ref,
-                unverified_case_ids,
             ))
         if not call_a.response_valid or not call_b.response_valid:
             continue
@@ -1754,7 +1797,6 @@ def _compare_run_pair(
             differences.append(_difference(
                 run_a, run_b, case_id, value_path, "value", case_changes,
                 call_a.source_ref, call_b.source_ref,
-                unverified_case_ids,
             ))
     return differences
 
@@ -1814,12 +1856,6 @@ def diff_l15(
     baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
         {"a": runs_a, "b": runs_b}, required_case_ids,
     )
-    unverified_case_ids = {
-        row["case"]
-        for row in unverified_failures
-        if isinstance(row.get("case"), str)
-    }
-
     differences: list[dict[str, Any]] = []
     cli_pairing: list[dict[str, Any]] = []
     for case_id in sorted(set(runs_a) | set(runs_b)):
@@ -1848,7 +1884,6 @@ def diff_l15(
                 run_b,
                 rules=rules,
                 case_changes=case_changes,
-                unverified_case_ids=unverified_case_ids,
             ))
 
     for side, runs_by_case in (("a", runs_a), ("b", runs_b)):

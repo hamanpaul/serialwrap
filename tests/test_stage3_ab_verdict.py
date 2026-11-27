@@ -125,8 +125,8 @@ def _write_gate(
     revision: str = "2026-11-21.1",
     engine_verdict: str = "PASS",
     baseline_result: str | None = None,
-    release_gate_result: str = "PASS",
-    baseline_compatible: str = "PASS",
+    release_gate_result: str | None = None,
+    baseline_compatible: str | None = None,
     evidence_results: tuple[str, ...] = ("PASS",),
     safety_results: tuple[tuple[str, str], ...] = (),
 ) -> Path:
@@ -134,10 +134,26 @@ def _write_gate(
         {"id": f"evidence-{index}", "group": "evidence", "status": "evaluated", "result": result, "detail": {}}
         for index, result in enumerate(evidence_results)
     ]
-    checks.append({"id": "baseline_compatible", "group": "evidence", "status": "evaluated", "result": baseline_compatible, "detail": {}})
+    checks.append({
+        "id": "engine_verdict", "group": "engine", "status": "evaluated",
+        "result": engine_verdict, "detail": {"verdict": engine_verdict},
+    })
+    checks.append({
+        "id": "baseline_compatible", "group": "evidence", "status": "evaluated",
+        "result": baseline_compatible or ("NOT_APPLICABLE_BASELINE" if mode == "baseline" else "PASS"),
+        "detail": {},
+    })
     checks.extend(
         {"id": check_id, "group": "safety", "status": "evaluated", "result": result, "detail": {}}
         for check_id, result in safety_results
+    )
+    check_results = {check["result"] for check in checks}
+    summarized_result = (
+        "FAIL" if "FAIL" in check_results
+        else "INSUFFICIENT_EVIDENCE" if "INSUFFICIENT_EVIDENCE" in check_results
+        else "BLOCKED" if "BLOCKED" in check_results
+        else "PASS" if mode == "candidate"
+        else "NOT_APPLICABLE_BASELINE"
     )
     gate = {
         "schema_version": "release-gate.v1",
@@ -145,8 +161,8 @@ def _write_gate(
         "platform": platform,
         "mode": mode,
         "engine_result": {"verdict": engine_verdict, "metrics": {"samples": 1}},
-        "release_gate_result": release_gate_result,
-        "baseline_result": "PASS" if baseline_result is None and mode == "baseline" else baseline_result,
+        "release_gate_result": release_gate_result or summarized_result,
+        "baseline_result": baseline_result or ("FAIL" if engine_verdict == "FAIL" else "PASS") if mode == "baseline" else baseline_result,
         "acceptance": {
             "path": "acceptance.yaml",
             "revision": revision,
@@ -766,6 +782,8 @@ def test_confirmed_fail_wins_over_incomplete_and_infra(tmp_path: Path, layer: st
 
     without_confirmed_fail = copy.deepcopy(diff)
     without_confirmed_fail["product_failures"] = []
+    if layer == "l1.5":
+        without_confirmed_fail["differences"] = []
     if "b_failures" in without_confirmed_fail:
         without_confirmed_fail["b_failures"] = []
         without_confirmed_fail["expired_sentinels"] = []
@@ -1020,7 +1038,7 @@ def test_l3_baseline_compatible_check_is_read_without_recalculation(tmp_path: Pa
     b_path = _write_gate(
         tmp_path / "b" / "release-gate.json",
         mode="candidate",
-        baseline_compatible="FAIL",
+        baseline_compatible="INSUFFICIENT_EVIDENCE",
     )
     diff = ab_verdict.compare_l3(a_path, b_path)
     assert diff["b_baseline_compatible"] is False
@@ -1151,8 +1169,11 @@ def test_t7b_baseline_failure_stays_out_of_product_failures(tmp_path: Path):
     case_id = "baseline-only-fail"
     a_dir = tmp_path / "a"
     b_dir = tmp_path / "b"
-    fakes_ab_diff.write_run(a_dir, case_id, side="a", verdict="FAIL", reason="baseline observation failed")
-    fakes_ab_diff.write_run(b_dir, case_id, side="b")
+    calls = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "same"}}]
+    fakes_ab_diff.write_run(
+        a_dir, case_id, side="a", verdict="FAIL", reason="baseline observation failed", calls=calls,
+    )
+    fakes_ab_diff.write_run(b_dir, case_id, side="b", calls=calls)
     diff = diff_l15(
         a_dir,
         b_dir,
@@ -1170,9 +1191,12 @@ def test_t7b_baseline_failure_stays_out_of_product_failures(tmp_path: Path):
         }
     ]
     assert diff["product_failures"] == []
+    assert [(row["kind"], row["path"]) for row in diff["differences"]] == [
+        ("verdict", "comparison.verdict"),
+    ]
     assert ab_verdict.combine("l1.5", a_status="FAIL", b_status="PASS", diff=diff, registered={})[:2] == (
-        "INFRA_ERROR",
-        "HARNESS_COMPARATOR_ERROR",
+        "BASELINE_INVALID",
+        "HARNESS_BASELINE_INVALID",
     )
 
 
@@ -1482,7 +1506,7 @@ def test_r1_03_l3_safety_failure_keeps_side_and_source(tmp_path: Path):
         {
             "side": "a",
             "case": "safety_unauthorized_tx",
-            "source_ref": "release-gate.json#/checks/2",
+            "source_ref": "release-gate.json#/checks/3",
             "reason": "safety check FAIL",
         }
     ]
@@ -1718,3 +1742,160 @@ def test_r1_07_result_source_ref_reads_failed_row_from_report_dir(
     assert source_report["results"][result_index]["id"] == "failed-case"
     assert source_report["results"][result_index]["verdict"] == "FAIL"
     assert failure["evidence_refs"] == ["evidence/trace.json#/events/0"]
+
+
+def test_r2_verified_cli_difference_survives_unverified_invariant_and_is_fail(tmp_path: Path):
+    case_id = "r2-cli-diff-with-unverified-invariant"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "a"}}]
+    calls_b = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "b"}}]
+    fakes_ab_diff.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes_ab_diff.write_run(
+        b_dir, case_id, side="b", calls=calls_b,
+        invariants=[{"id": None, "result": "FAIL"}],
+    )
+    diff = diff_l15(
+        a_dir, b_dir, registered={}, case_changes={}, required_case_ids={case_id}, rules_path=RULES_PATH,
+    )
+
+    difference = next(row for row in diff["differences"] if row["kind"] == "value")
+    assert difference["verified"] is True
+    assert diff["unverified_failures"]
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert difference["source_refs"]["b"] in " ".join(notes)
+    assert "unverified failure" in " ".join(notes)
+
+
+def test_r2_verified_unregistered_difference_has_priority_over_baseline_failure(tmp_path: Path):
+    case_id = "r2-product-diff-and-baseline-failure"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "a"}}]
+    calls_b = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "b"}}]
+    fakes_ab_diff.write_run(a_dir, case_id, side="a", verdict="FAIL", calls=calls_a)
+    fakes_ab_diff.write_run(b_dir, case_id, side="b", calls=calls_b)
+    diff = diff_l15(
+        a_dir, b_dir, registered={}, case_changes={}, required_case_ids={case_id}, rules_path=RULES_PATH,
+    )
+
+    difference = next(row for row in diff["differences"] if row["kind"] == "value")
+    assert difference["verified"] is True
+    assert diff["baseline_failures"]
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert difference["source_refs"]["b"] in " ".join(notes)
+
+
+@pytest.mark.parametrize("kind", ["value", "argv", "call_count"])
+def test_r2_collect_product_failures_references_actual_side_report(
+    tmp_path: Path, kind: str,
+):
+    case_id = f"r2-source-{kind}"
+    a_dir = tmp_path / kind / "a"
+    b_dir = tmp_path / kind / "b"
+    base_call = {"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "same"}}
+    if kind == "value":
+        calls_a = [base_call]
+        calls_b = [{**base_call, "response": {"ok": True, "state": "changed"}}]
+    elif kind == "argv":
+        calls_a = [base_call]
+        calls_b = [{**base_call, "argv": ["session", "list"]}]
+    else:
+        calls_a = [base_call, {"argv": ["session", "list"], "rc": 0, "response": {"ok": True}}]
+        calls_b = [base_call]
+    fakes_ab_diff.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes_ab_diff.write_run(b_dir, case_id, side="b", calls=calls_b)
+    diff = diff_l15(
+        a_dir, b_dir, registered={}, case_changes={}, required_case_ids={case_id}, rules_path=RULES_PATH,
+    )
+
+    failures = ab_verdict.collect_product_failures("l1.5", diff=diff, registered={})
+    assert len(failures) == 1
+    failure = failures[0]
+    expected_side = "a" if kind == "call_count" else "b"
+    assert set(failure) == {"side", "case", "source_ref", "reason", "source_refs", "kind", "path"}
+    assert failure["side"] == expected_side
+    assert failure["kind"] == kind
+    assert failure["source_refs"] == next(row for row in diff["differences"] if row["kind"] == kind)["source_refs"]
+    assert failure["path"] == next(row for row in diff["differences"] if row["kind"] == kind)["path"]
+    for side, report_dir in (("a", a_dir), ("b", b_dir)):
+        source_ref = failure["source_refs"][side]
+        if source_ref is None:
+            continue
+        assert _source_ref_exists(report_dir, source_ref)
+        relative, locator = source_ref.split("#", 1)
+        line_number = int(locator.removeprefix("L"))
+        source_file = report_dir / relative
+        source_row = json.loads(source_file.read_bytes().splitlines()[line_number - 1].decode("utf-8"))
+        assert isinstance(source_row.get("argv"), list)
+    assert _source_ref_exists(a_dir if expected_side == "a" else b_dir, failure["source_ref"])
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert failure["source_ref"] in " ".join(notes)
+    expected_label = "difference source A" if expected_side == "a" else "difference source B"
+    assert expected_label in " ".join(notes)
+
+
+@pytest.mark.parametrize("evidence_result", ["BLOCKED", "FAIL"])
+def test_r2_nonpass_evidence_check_with_pass_summary_breaks_gate_integrity(
+    tmp_path: Path, evidence_result: str,
+):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        evidence_results=(evidence_result,),
+        release_gate_result="PASS",
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"]["b"] is False
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+
+
+def test_r2_consistent_gate_results_and_complete_evidence_are_intact(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+
+    assert json.loads(a_path.read_bytes().decode("utf-8"))["release_gate_result"] == "NOT_APPLICABLE_BASELINE"
+    assert diff["b_release_gate_result"] == "PASS"
+    assert diff["integrity"] == {"a": True, "b": True}
+
+
+def test_r2_gate_integrity_error_preserves_product_and_safety_failures(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL",
+        evidence_results=("BLOCKED",),
+        safety_results=(("safety_unauthorized_tx", "FAIL"),),
+        release_gate_result="PASS",
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"]["b"] is False
+    assert any(row["side"] == "b" for row in diff["product_failures"])
+    assert diff["safety_violations"] == ["B:safety_unauthorized_tx"]
+    assert (verdict, reason_code) == ("FAIL", None)

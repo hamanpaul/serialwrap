@@ -238,10 +238,15 @@
    也須保留差異。將整個欄位無條件刪除會掩蓋這些差異。此項未經獨立審查或擁有者
    追認，不得凍結為 approved normalization。
 
-8. ``differences[]`` 每列含 ``verified: bool``。只有 A/B run identity 與 case identity
-   均核實、該列引用到的 CLI 原始觀測檔 hash 已核實，且該 case 在任一側都沒有
-   ``unverified_failures`` 時才為 true。``call_count`` 列只有一側觀測引用，另一側
-   ``source_refs`` 為 null；可信度只需核對存在的觀測來源，但仍要求兩側 run 身分已核實。
+8. ``differences[]`` 每列含 ``verified: bool``，只依該差異實際引用的來源與身分判定。
+   ``value``、``rc``、``argv``、``call_count`` 引用 CLI 原始觀測，須核實兩側 run／case
+   身分，以及存在側的 CLI 原始檔 hash；同 case 其他未核實線索不會單獨降級差異。
+   ``call_count`` 缺少側的 ``source_refs`` 為 null，只核對存在側來源，但仍須核對兩側
+   run／case 身分。``verdict`` 的 bridge 來源為 ``comparison.json``，依 manifest 與
+   comparison 的 case／run 身分及 artifact 身分核實；不要求 comparison 出現在 manifest
+   evidence hash 清單中，但若有該檔的 hash 宣告則必須核對。非 bridge verdict 引用
+   ``source/l1-results.json`` 的對應結果列，且只在該列已映射、原始檔 hash、run 與 case
+   身分均核實時為 true。
 
 這份契約只規範 T7B loader／fixture 與後續 T5B adapter 的讀取介面。它不代表目前
 repo 已有非 bridge adapter，也不宣稱純資料 fixture 是產品執行證據。

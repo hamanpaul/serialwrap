@@ -158,7 +158,12 @@ def combine(
         raise HarnessError(_COMPARATOR, "registered 必須是映射")
 
     safety, malformed_safety = _checked_text_rows(diff, "safety_violations")
-    products, malformed_products = _checked_record_rows(diff, "product_failures", expected_side="b")
+    raw_products, malformed_products = _checked_record_rows(diff, "product_failures", expected_side="b")
+    products = collect_product_failures(
+        layer,
+        diff=dict(diff) if isinstance(diff, Mapping) else {},
+        registered=registered,
+    )
     _baselines, malformed_baselines = _checked_record_rows(diff, "baseline_failures", expected_side="a")
     shape_errors = []
     if malformed_safety:
@@ -171,16 +176,14 @@ def combine(
     notes = _unique([*_diagnostic_notes(diff, a_status, b_status), *shape_errors])
     if a_status == INFRA_ERROR or b_status == INFRA_ERROR:
         notes = _unique([*notes, "suite reported INFRA_ERROR"])
-    difference_failures: list[dict[str, str]] = []
     difference_notes: list[str] = []
     difference_errors: list[str] = []
     if layer == "l1.5" and isinstance(diff, Mapping):
-        difference_failures, difference_notes, difference_errors = _l15_difference_findings(diff, registered, products)
+        _difference_failures, difference_notes, difference_errors = _l15_difference_findings(
+            diff, registered, raw_products,
+        )
         shape_errors.extend(difference_errors)
         notes = _unique([*difference_notes, *notes, *difference_errors])
-        for row in difference_failures:
-            if not any(_failure_side(existing) == "b" and existing.get("case") == row["case"] for existing in products):
-                products.append(row)
         notes = _unique(notes)
     if safety:
         return FAIL, None, _unique([*(f"safety violation: {item}" for item in safety), *notes])
@@ -219,6 +222,17 @@ def combine(
             for row in differences
         ):
             return INFRA_ERROR, _COMPARATOR, _unique([*notes, "L1.5 含未核實差異"])
+    if layer == "l3" and isinstance(diff, Mapping) and diff.get("kind") == "longrun" and not shape_errors:
+        integrity_problems = diff.get("integrity_problems")
+        has_gate_problem = isinstance(integrity_problems, Mapping) and any(
+            bool(integrity_problems.get(side)) for side in ("a", "b")
+        )
+        if not has_gate_problem:
+            release = diff.get("b_release_gate_result")
+            if release == "BLOCKED":
+                return INFRA_ERROR, _OD09_NOT_FROZEN, _unique([*notes, "release gate BLOCKED"])
+            if release == _INSUFFICIENT or diff.get("b_baseline_compatible") is False:
+                return INFRA_ERROR, _SUITE, _unique([*notes, "release gate 證據不足或 baseline 不相容"])
     integrity = diff.get("integrity") if isinstance(diff, Mapping) else None
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：比較器完整性未通過"])
@@ -248,13 +262,14 @@ def _l15_difference_findings(
     diff: Mapping[str, Any],
     registered: Mapping[str, str],
     existing_products: list[Mapping[str, Any]],
-) -> tuple[list[dict[str, str]], list[str], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     """從可信的 T7B 差異建產品 FAIL 記錄；未核實差異僅保留診斷。"""
     differences = diff.get("differences")
     if not isinstance(differences, list):
         return [], [], ["L1.5 differences 結構不符"]
     b_cases = diff.get("b_cases") if isinstance(diff.get("b_cases"), Mapping) else {}
-    failures: list[dict[str, str]] = []
+    a_cases = diff.get("a_cases") if isinstance(diff.get("a_cases"), Mapping) else {}
+    failures: list[dict[str, Any]] = []
     notes: list[str] = []
     errors: list[str] = []
     for index, item in enumerate(differences):
@@ -263,8 +278,13 @@ def _l15_difference_findings(
             continue
         case = item.get("case")
         path = item.get("path")
-        if not isinstance(case, str) or not case or not isinstance(path, str) or not path:
-            errors.append(f"L1.5 difference[{index}] 缺少 case 或 path")
+        kind = item.get("kind")
+        if (
+            not isinstance(case, str) or not case
+            or not isinstance(path, str) or not path
+            or not isinstance(kind, str) or not kind
+        ):
+            errors.append(f"L1.5 difference[{index}] 缺少 case、kind 或 path")
             continue
         verified = item.get("verified")
         if not isinstance(verified, bool):
@@ -282,12 +302,16 @@ def _l15_difference_findings(
         if source_b is not None and (not isinstance(source_b, str) or not source_b):
             errors.append(f"L1.5 difference[{index}] source_refs.b 結構不符")
             continue
-        source_ref = source_b or source_a
+        side, source_ref = ("b", source_b) if source_b is not None else ("a", source_a)
         if not source_ref:
             errors.append(f"L1.5 difference[{index}] 缺少可核對來源")
             continue
         if not verified:
             notes.append(f"unverified difference: {case} {path} (a={source_a or 'null'} b={source_b or 'null'})")
+            continue
+        if kind == "verdict" and a_cases.get(case) == FAIL and b_cases.get(case) == PASS:
+            # 逐案 PASS/FAIL 已分別歸入 product_failures／baseline_failures；
+            # A FAIL、B PASS 是基線無效，不是未登錄的 CLI 產品差異。
             continue
 
         change = item.get("registered_change")
@@ -301,8 +325,16 @@ def _l15_difference_findings(
         else:
             reason = f"unregistered difference: {case} {path}"
 
-        row = {"side": "b", "case": case, "source_ref": source_ref, "reason": reason}
-        if not any(existing.get("side") == "b" and existing.get("case") == case for existing in existing_products):
+        row = {
+            "side": side,
+            "case": case,
+            "source_ref": source_ref,
+            "reason": reason,
+            "source_refs": {"a": source_a, "b": source_b},
+            "kind": kind,
+            "path": path,
+        }
+        if not any(existing.get("side") == side and existing.get("case") == case for existing in existing_products):
             failures.append(row)
         notes.append(reason)
         notes.append(_record_note("difference source", row))
@@ -345,6 +377,27 @@ def _checked_record_rows(
         else:
             malformed = True
     return rows, malformed
+
+
+def collect_product_failures(
+    layer: str,
+    *,
+    diff: dict[str, Any],
+    registered: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """回傳報告既有與 T7 判定成立的產品 FAIL 記錄。"""
+    if layer not in _LAYERS:
+        raise HarnessError(_COMPARATOR, f"未知的 A/B 層級：{layer!r}")
+    if not isinstance(diff, dict):
+        raise HarnessError(_COMPARATOR, "diff 必須是字典")
+    if not isinstance(registered, Mapping):
+        raise HarnessError(_COMPARATOR, "registered 必須是映射")
+    existing, _malformed = _checked_record_rows(diff, "product_failures", expected_side="b")
+    products: list[dict[str, Any]] = [dict(row) for row in existing]
+    if layer == "l1.5":
+        difference_failures, _notes, _errors = _l15_difference_findings(diff, registered, existing)
+        products.extend(difference_failures)
+    return products
 
 
 def _other_shape_errors(diff: Mapping[str, Any] | None) -> list[str]:
@@ -926,10 +979,25 @@ def _checks_of(gate: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], list[s
     return rows, problems
 
 
-def _evidence_intact(checks: list[Mapping[str, Any]]) -> bool:
-    """證據完整：至少一筆 evidence 檢查，且無任何 evidence 檢查為 INSUFFICIENT_EVIDENCE。"""
+def _evidence_intact(checks: list[Mapping[str, Any]], mode: str) -> bool:
+    """證據完整：candidate 僅接受 PASS；baseline 另接受 P2 明定的不適用值。"""
     results = [check.get("result") for check in checks if check.get("group") == "evidence"]
-    return bool(results) and all(result != _INSUFFICIENT for result in results)
+    return bool(results) and all(
+        result == PASS or (mode == "baseline" and result == "NOT_APPLICABLE_BASELINE")
+        for result in results
+    )
+
+
+def _summarized_gate_result(checks: list[Mapping[str, Any]], mode: str) -> str:
+    """複製 P2 ``_summarize`` 的優先序，不自行推導其他發版門檻。"""
+    results = {check.get("result") for check in checks}
+    if FAIL in results:
+        return FAIL
+    if _INSUFFICIENT in results:
+        return _INSUFFICIENT
+    if "BLOCKED" in results:
+        return "BLOCKED"
+    return PASS if mode == "candidate" else "NOT_APPLICABLE_BASELINE"
 
 
 def _gate_side_verified(gate: Mapping[str, Any] | None, expected_mode: str) -> bool:
@@ -1140,6 +1208,18 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
     b_checks, b_check_problems = _checks_of(b_gate or {})
     problems["a"].extend(f"A {item}" for item in a_check_problems)
     problems["b"].extend(f"B {item}" for item in b_check_problems)
+    for side, gate, checks, check_problems, mode in (
+        ("a", a_gate, a_checks, a_check_problems, "baseline"),
+        ("b", b_gate, b_checks, b_check_problems, "candidate"),
+    ):
+        if gate is not None and not check_problems:
+            summarized = _summarized_gate_result(checks, mode)
+            reported = gate.get("release_gate_result")
+            if reported != summarized:
+                problems[side].append(
+                    f"{side.upper()} release_gate_result 與 checks 彙總不一致："
+                    f"reported={reported!r} summarized={summarized!r}"
+                )
     trusted_a = a_gate if a_valid else None
     trusted_b = b_gate if b_valid else None
     safety_sources = _l3_safety_sources(trusted_a, trusted_b)
@@ -1183,13 +1263,13 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
     a_integrity = (
         a_gate is not None
         and not problems["a"]
-        and _evidence_intact(a_checks)
+        and _evidence_intact(a_checks, "baseline")
         and isinstance(a_engine, str)
     )
     b_integrity = (
         b_gate is not None
         and not problems["b"]
-        and _evidence_intact(b_checks)
+        and _evidence_intact(b_checks, "candidate")
         and isinstance(b_engine, str)
         and len(compatible_checks) == 1
     )
@@ -1216,6 +1296,7 @@ __all__ = [
     "L2_VERDICTS",
     "case_changes",
     "combine",
+    "collect_product_failures",
     "compare_l2_reports",
     "compare_l3",
     "load_registered_changes",

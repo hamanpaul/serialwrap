@@ -1739,6 +1739,79 @@ def test_call_count_difference_verifies_only_present_observation_source(tmp_path
     assert difference["source_refs"]["b"] is None
 
 
+def test_independent_cli_difference_stays_verified_with_unverified_invariant(tmp_path: Path):
+    case_id = "independent-difference-unverified-invariant"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [_call(["daemon", "status"], {"ok": True, "state": "baseline"})]
+    calls_b = [_call(["daemon", "status"], {"ok": True, "state": "candidate"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(
+        b_dir,
+        case_id,
+        side="b",
+        calls=calls_b,
+        invariants=[{"id": None, "result": "FAIL"}],
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "value")
+    assert difference["verified"] is True
+    assert result["unverified_failures"]
+    assert result["integrity"]["b"] is False
+
+
+def test_bridge_comparison_verdict_difference_uses_comparison_identity(tmp_path: Path):
+    case_id = "comparison-verdict-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls, verdict="FAIL")
+    fakes.write_run(b_dir, case_id, side="b", calls=calls, verdict="PASS")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"].endswith("comparison.json")
+    assert difference["source_refs"]["b"].endswith("comparison.json")
+
+
+def test_comparison_identity_mismatch_unverifies_verdict_difference(tmp_path: Path):
+    case_id = "comparison-verdict-identity-mismatch"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls, verdict="PASS")
+    b_run = fakes.write_run(b_dir, case_id, side="b", calls=calls, verdict="FAIL")
+    comparison = fakes.read_json(b_run / "comparison.json")
+    comparison["case_id"] = "different-case"
+    fakes.write_json(b_run / "comparison.json", comparison)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is False
+
+
+def test_nonbridge_verdict_difference_uses_verified_l1_result_row(tmp_path: Path):
+    case_id = "nonbridge-verdict-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox", calls=calls)
+    fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", calls=calls, verdict="FAIL"
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["b"].endswith("source/l1-results.json#results[0]")
+
+
 @pytest.mark.parametrize("flag", ["--endpoint", "--socket", "--bench"])
 def test_logical_argv_ignores_cli_path_and_instance_endpoint(tmp_path: Path, flag: str):
     case_id = f"argv-instance-only-{flag[2:]}"
