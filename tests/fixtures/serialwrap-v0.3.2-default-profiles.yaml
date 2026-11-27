@@ -1,0 +1,110 @@
+# 來源：Git tag v0.3.2 的 sw_core/assets/profiles/default.yaml
+# Git blob SHA-1：b34c354d5efe0d3a9aaede3e2b5844f81976d2df
+# 原始內容 SHA-256：0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0
+# 以下為原始資產位元組；雜湊驗證從本行之後開始。
+
+defaults:
+  log_dir: "~/b-log"
+  max_sessions: 16
+
+profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "(?m)^root@prplOS:.*# "
+    login_regex: "(?mi)^login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    ready_probe: "echo __READY__${nonce}"
+    # #130：U-Boot bootloader prompt（常見為 "=> "；部分板實測為大寫 "U-Boot> "）。
+    # 卡在 bootloader 時，interactive-open --allow-attached 的 recovery lease 需比對此清單。
+    bootloader_prompts:
+      - "^=> $"
+      - "^U-Boot> $"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  op3-template:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: "SW_OPI_U"
+    pass_env: "SW_OPI_P"
+    env_file: "OPI.env"
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  brcm-template:
+    platform: bcm
+    # #174：錨定行首＋排除連續 '#'/'>' 裝飾線（如 BDK login banner 的 "#####" 分隔
+    # 行）。舊版 "(?m)[>#]\\s*$" 會匹配 buffer 任意位置以 '>'/'#' 結尾的行，在洪流
+    # 板（CEVENT ... DRIVER -- E_RADIO/40 這類持續輸出）與 banner 裝飾線下皆會誤配
+    # 成 prompt，讓 login FSM 整段跳過、把 post_login_cmd 當帳密送進 login prompt。
+    # serialwrap profile test 可離線用樣本驗證本 regex。
+    prompt_regex: "(?m)^(?:.*[^>#\\s])?[>#][ \\t]*$"
+    # 勿錨定行首：getty 標準格式是 "<hostname> login: "（如 "(none) login: "），
+    # 行首前面帶 hostname，錨定 ^login: 會打壞這個最常見的格式（#174 S4）。
+    login_regex: "(?mi)login:\\s*$"
+    password_regex: "(?mi)password:\\s*$"
+    post_login_cmd: "sh"
+    ready_probe: "echo __READY__${nonce}"
+    user_env: "BRCM_USER"
+    pass_env: "BRCM_PASS"
+    env_file: "brcm.env"
+    timeout_s: 15
+    bootloader_prompts:
+      - "^CFE> $"
+      - "^=> $"
+      - "^BCM\\d+>> $"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  uboot-template:
+    platform: passthrough
+    prompt_regex: "(?mi)^(=>|u-boot>|cfe>) $"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: "echo __READY__${nonce}"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+  others-template:
+    platform: passthrough
+    prompt_regex: ".*"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: ""
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+
+# targets 區段為可選：
+# - 有 explicit 綁定的裝置寫在這裡，其餘走動態偵測
+# - 省略或留空 targets → 全部走動態偵測
+#
+# targets:
+#   - act_no: 1
+#     com: COM0
+#     alias: my-prpl
+#     profile: prpl-template
+#     device_by_id: /dev/serial/by-id/usb-FTDI_...

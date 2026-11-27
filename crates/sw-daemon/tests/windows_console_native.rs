@@ -413,6 +413,16 @@ fn telnet_second_client_line_mode() {
             .and_then(PyValue::as_array)
             .is_some_and(|rows| rows.len() == 2)
     });
+    let session = r.session("COM0").expect("COM0 session");
+    let interactive_id = session
+        .get("interactive_session_id")
+        .and_then(PyValue::as_str)
+        .expect("TCP mirror lease ID");
+    let closed = r.call(
+        "session.interactive_close",
+        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    );
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
     let device = r.device(REAL_A);
     let _ = device.take_tx();
     second.write_all(b"ls\r\n").expect("送出 line-mode 輸入");

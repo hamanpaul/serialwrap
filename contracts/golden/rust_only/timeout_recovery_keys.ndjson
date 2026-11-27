@@ -1,0 +1,7 @@
+{"case":"language_default_omitted","effective":["CTRL_C"],"target":"OMITTED","template":"OMITTED","tx_hex":"03"}
+{"case":"template_null_uses_default","effective":["CTRL_C"],"target":"OMITTED","template":null,"tx_hex":"03"}
+{"case":"target_omitted_inherits","effective":["CTRL_D","CTRL_C"],"target":"OMITTED","template":["CTRL_D","CTRL_C"],"tx_hex":"0403"}
+{"case":"target_null_inherits","effective":["CTRL_D","CTRL_C"],"target":null,"template":["CTRL_D","CTRL_C"],"tx_hex":"0403"}
+{"case":"target_list_replaces","effective":["CTRL_C"],"target":["CTRL_C"],"template":["CTRL_D"],"tx_hex":"03"}
+{"case":"empty_list_sends_nothing","effective":[],"target":[],"template":["CTRL_C","CTRL_D"],"tx_hex":""}
+{"case":"explicit_two_key_order","effective":["CTRL_C","CTRL_D"],"target":"OMITTED","template":["CTRL_C","CTRL_D"],"tx_hex":"0304"}

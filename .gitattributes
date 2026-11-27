@@ -15,6 +15,8 @@ crates/*/tests/golden/** text eol=lf
 # Rust 以原始位元組內嵌名稱表與安裝資產；CRLF 會破壞十六進位解析及 stdout 換行契約
 crates/sw-proto/src/pyre/unicode_names.tsv text eol=lf
 sw_core/assets/** text eol=lf
+# 位元組雜湊驗證用的舊版 profiles fixture，跨平台檢出必須維持 LF。
+tests/fixtures/serialwrap-v0.3.2-default-profiles.yaml text eol=lf
 crates/sw-pal/tests/golden/serialwrap.task.xml -text
 # golden 以位元組比對（Python 新鮮度測試與 Rust include_str!），Windows 檢出不得轉 CRLF（parity-amendments-2026-10-26 #181）；
 # 37_bom_crlf 為刻意保存 CRLF 的 profiles fixture，須維持原位元組。
@@ -32,3 +34,10 @@ scripts/rust/goldens/pyre_corpus.txt text eol=lf
 # 架構文件以位元組雜湊與逐位元組重建驗證（docs/architecture/toolchain.json）；加工工具與 skill 副本以 sha256 比對。跨平台檢出不得轉換行尾
 docs/architecture/** -text
 tools/architecture_overlay.py -text
+
+# Stage 3 L1.5 將 func-test 全樹列為凍結工具；Windows checkout 保留 Git blob 原始位元組。
+func-test/** -text
+# Stage 3 凍結工具、公開證據與退役 metadata 以原始位元組計算雜湊；Windows checkout 不做任何 EOL 轉換。
+tools/stage3/** -text
+docs/rust-refactor/evidence/** -text
+packaging/python_daemon_retirement.json -text

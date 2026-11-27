@@ -54,6 +54,19 @@ fn owner(h: &CoreHarness) -> Option<String> {
     h.core.human_console().ownership.interactive_owner.clone()
 }
 
+fn close_mirror_publicly(h: &mut CoreHarness, client_id: &str) {
+    let lease = h.core.active_lease().expect("TCP raw owner mirror lease");
+    assert_eq!(lease.owner, format!("human:{client_id}"));
+    let interactive_id = lease.interactive_id.clone();
+    let response = h
+        .rpc(SessionRequest::InteractiveClose {
+            interactive_id,
+        })
+        .expect("interactive-close RPC");
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert!(h.core.human_console().consoles.contains_key(client_id), "close lease 保留 console");
+}
+
 #[test]
 fn raw_input_becomes_human_tx() {
     let mut h = ready_with_tcp(&["c1"]);
@@ -122,6 +135,7 @@ fn unknown_or_old_lifetime_dropped() {
 #[test]
 fn line_input_echo_then_submit_order() {
     let mut h = ready_with_tcp(&["c1", "c2"]);
+    close_mirror_publicly(&mut h, "c1");
     let fx = h.input("c2", b"ls\r");
     let echo = fx
         .iter()
@@ -420,6 +434,7 @@ fn self_test_probe_suspends_human_without_admission() {
 #[test]
 fn last_line_before_disconnect_is_submitted() {
     let mut h = ready_with_tcp(&["c1", "c2"]);
+    close_mirror_publicly(&mut h, "c1");
     h.input("c2", b"reboot\r");
     h.disconnect("c2");
     let row = h.last_human_command().expect("reboot 已提交");

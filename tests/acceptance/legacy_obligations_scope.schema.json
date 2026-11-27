@@ -1,0 +1,206 @@
+{
+  "$defs": {
+    "FrozenFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "Obligation": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_evidence": {
+          "additionalProperties": false,
+          "properties": {
+            "case_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "kinds": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "kinds",
+            "case_ids"
+          ],
+          "type": "object"
+        },
+        "item_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "required_scope": {
+          "additionalProperties": false,
+          "properties": {
+            "case_ids": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "case_ids"
+          ],
+          "type": "object"
+        },
+        "required_scope_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "safety_invariant": {
+          "type": "boolean"
+        },
+        "source_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "stage": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "stage",
+        "platform",
+        "item_id",
+        "source_refs",
+        "required_scope",
+        "required_scope_sha256",
+        "safety_invariant",
+        "allowed_evidence"
+      ],
+      "type": "object"
+    },
+    "Review": {
+      "additionalProperties": false,
+      "properties": {
+        "approved_at": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "decision_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "record": {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        "reviewer_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "reviewer_id",
+        "approved_at",
+        "decision_ref",
+        "record"
+      ],
+      "type": "object"
+    },
+    "Sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        "source_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "version",
+        "snapshot"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://serialwrap.local/schemas/legacy_obligations_scope",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "exit_catalog_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "obligations": {
+      "items": {
+        "$ref": "#/$defs/Obligation"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "review": {
+      "$ref": "#/$defs/Review"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/Source"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "exit_catalog_sha256",
+    "sources",
+    "obligations",
+    "review"
+  ],
+  "title": "Stage 3 遺留必要義務範圍",
+  "type": "object"
+}

@@ -1,0 +1,133 @@
+{
+  "$defs": {
+    "FrozenFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "Resolution": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "enum": [
+                  "retest",
+                  "reuse"
+                ]
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "required": [
+              "entry_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "new_od"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "required": [
+              "decision_ref",
+              "evidence"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "decision_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "entry_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          "type": "array"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          "type": "array"
+        },
+        "key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "pending",
+            "retest",
+            "reuse",
+            "new_od"
+          ]
+        },
+        "target_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "method"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://serialwrap.local/schemas/legacy_obligations_resolutions",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "resolutions": {
+      "items": {
+        "$ref": "#/$defs/Resolution"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "scope_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "scope_sha256",
+    "resolutions"
+  ],
+  "title": "Stage 3 遺留必要義務解決紀錄",
+  "type": "object"
+}

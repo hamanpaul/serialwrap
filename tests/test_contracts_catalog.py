@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 import sys
 import textwrap
 from pathlib import Path
@@ -1356,8 +1358,8 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-10", "BC-13", "BC-22"})
-_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-10": "2026-11-24", "BC-13": "2026-11-22", "BC-22": "2026-11-24"}
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09", "BC-10", "BC-13", "BC-22", "BC-23"})
+_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25", "BC-10": "2026-11-24", "BC-13": "2026-11-22", "BC-22": "2026-11-24", "BC-23": "2026-11-24"}
 
 
 def test_bc_real_five_bcs_registered() -> None:
@@ -1379,6 +1381,168 @@ def test_bc_real_five_bcs_registered() -> None:
             assert c.scope == "rust_only"
             assert "OD-111" in c.related_decisions
 
+
+def test_bc08_doctor_profile_template_fields_registered() -> None:
+    """BC-08、P4 案例與 doctor 機器介面依裁決一致。"""
+    behavior = yaml.safe_load((ROOT / "contracts" / "behavior_changes.yaml").read_text(encoding="utf-8"))
+    change = next(item for item in behavior["changes"] if item["id"] == "BC-08")
+    expected_case_ids = {
+        "bc08-doctor-profile-template-fields",
+        "bc08-doctor-profile-unavailable",
+    }
+    assert change["kind"] == "BC"
+    assert change["status"] == "IMPLEMENTED"
+    assert change["approval"]["decision_ref"] == "OD-111"
+    assert change["scope"] == "rust_only"
+    assert change["ab_participation"] == "absolute_only"
+    assert change["applies_to"]["python"] is None
+    assert change["applies_to"]["rust"]["stage"] == "stage-1b"
+    assert change["phases"] == ["P4"]
+    def assert_bc08_revision(catalog: dict[str, Any], bc08: dict[str, Any]) -> None:
+        assert type(catalog["revision"]) is int and catalog["revision"] > 0
+        approved_at = bc08["approved_at_revision"]
+        assert type(approved_at) is int and 0 < approved_at <= catalog["revision"]
+        # BC-08 的內容與最後變更核准 revision 綁定；變更 BC-08 時須同時更新此指紋與 revision。
+        assert approved_at == 24
+        content = {key: value for key, value in bc08.items() if key != "approved_at_revision"}
+        canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assert hashlib.sha256(canonical).hexdigest() == "deed7e4e4a4cbf8d1133f23423782b438d73c6e0873715c693822f483dbe457c"
+
+    assert_bc08_revision(behavior, change)
+    advanced_behavior = json.loads(json.dumps(behavior))
+    advanced_behavior["revision"] += 1
+    advanced_change = next(item for item in advanced_behavior["changes"] if item["id"] == "BC-08")
+    assert advanced_change == change
+    assert_bc08_revision(advanced_behavior, advanced_change)
+    earlier_approval = json.loads(json.dumps(behavior))
+    earlier_change = next(item for item in earlier_approval["changes"] if item["id"] == "BC-08")
+    earlier_change["approved_at_revision"] = 1
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(earlier_approval, earlier_change)
+    changed_content = json.loads(json.dumps(behavior))
+    changed_change = next(item for item in changed_content["changes"] if item["id"] == "BC-08")
+    changed_change["title"] += "（未同步核准 revision）"
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(changed_content, changed_change)
+    future_approval = json.loads(json.dumps(behavior))
+    future_approval["revision"] = change["approved_at_revision"] - 1
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(future_approval, change)
+    assert set(change["case_ids"]) == expected_case_ids
+    assert "OD-111" in change["related_decisions"]
+
+    cli_schema = json.loads((ROOT / "contracts" / "cli_schema.json").read_text(encoding="utf-8"))
+    doctor_check = cli_schema["x-doctor-checks"]["profile_template_fields"]
+    assert doctor_check["advisory"] is True
+    assert doctor_check["comparison_status"] == [
+        "matched",
+        "missing_fields",
+        "not_materialized",
+        "unavailable",
+        "no_common_templates",
+    ]
+    assert set(doctor_check["extra_fields"]) == {
+        "comparison_status",
+        "missing_fields",
+        "compared_templates",
+        "reason",
+    }
+
+
+    assert doctor_check["invariants"] == [
+        "matched: ok=true, missing_fields={}",
+        "missing_fields: ok=false, missing_fields is non-empty",
+        "not_materialized|unavailable|no_common_templates: ok=false, missing_fields=null",
+        "compared_templates and each missing_fields key list are sorted",
+    ]
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        """拒絕一般 PyYAML 會靜默採後值的重複 mapping key。"""
+
+        def construct_mapping(self, node, deep=False):
+            self.flatten_mapping(node)
+            mapping = {}
+            for key_node, value_node in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in mapping
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        "found an unhashable key", key_node.start_mark,
+                    ) from exc
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        f"found duplicate key {key!r}", key_node.start_mark,
+                    )
+                mapping[key] = self.construct_object(value_node, deep=deep)
+            return mapping
+
+    coverage = yaml.load(
+        (ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"),
+        Loader=UniqueKeyLoader,
+    )
+    coverage_entry = coverage["entries"]["bc:BC-08"]
+    assert coverage_entry["owner_phase"] == "P4"
+    assert coverage_entry["nodeids"]
+    assert all(nodeid.startswith("cargo:") for nodeid in coverage_entry["nodeids"])
+    l1_lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    locked_cargo_nodeids = {
+        nodeid
+        for set_id in ("p7_gate:cargo-test-workspace", "s21_core", "s22_gate:cargo_workspace")
+        for nodeid in l1_lock["sets"][set_id]["linux"]["nodeids"]
+    }
+    assert set(coverage_entry["nodeids"]) <= locked_cargo_nodeids
+    approval = coverage["l1_only_approvals"]["bc:BC-08"]
+    assert approval == {
+        "l1_only": True,
+        "reason": "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。",
+    }
+
+    p4_cases = yaml.safe_load((ROOT / "tests" / "acceptance" / "p4_case_map.yaml").read_text(encoding="utf-8"))
+    mapped_case_ids = {item["case_id"] for item in p4_cases["cases"]}
+    assert expected_case_ids <= mapped_case_ids
+
+
+def test_bc09_timeout_recovery_keys_registered() -> None:
+    """BC-09 記錄 p290 的 Rust-only profile、recovery 與 setup 遷移契約。"""
+    behavior = yaml.safe_load((ROOT / "contracts" / "behavior_changes.yaml").read_text(encoding="utf-8"))
+    change = next(item for item in behavior["changes"] if item["id"] == "BC-09")
+    # 全檔 revision 會隨後續 BC 登錄前進；只要求不小於 BC-09 的核准 revision。
+    assert behavior["revision"] >= change["approved_at_revision"]
+    assert change["kind"] == "BC"
+    assert change["status"] == "IMPLEMENTED"
+    assert change["approval"] == {
+        "owner": "hamanpaul",
+        "date": "2026-11-25",
+        "decision_ref": "OD-111",
+        "basis": "owner_decision",
+    }
+    assert change["approved_at_revision"] == 24
+    assert change["scope"] == "rust_only"
+    assert change["ab_participation"] == "absolute_only"
+    assert change["applies_to"]["python"] is None
+    assert change["phases"] == ["P7"]
+    assert change["case_ids"] == ["bc09-timeout-recovery-keys"]
+    assert change["related_decisions"] == ["OD-111"]
+    coverage = yaml.safe_load((ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"))
+    entry = coverage["entries"]["bc:BC-09"]
+    assert entry["owner_phase"] == "P7"
+    assert "cargo:sw-daemon::dispatch::p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal" in entry["nodeids"]
+    assert "cargo:sw-proto::timeout_recovery_keys::rust_only_contract_matrix_matches_generated_golden" in entry["nodeids"]
+    l1_lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    locked_cargo_nodeids = {
+        nodeid
+        for set_id in ("p7_gate:cargo-test-workspace", "s21_core", "s22_gate:cargo_workspace")
+        for nodeid in l1_lock["sets"][set_id]["linux"]["nodeids"]
+    }
+    assert set(entry["nodeids"]) <= locked_cargo_nodeids
+    approval = coverage["l1_only_approvals"]["bc:BC-09"]
+    assert approval == {
+        "l1_only": True,
+        "reason": "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。",
+    }
 
 def test_bc_real_approval_owner_by_basis() -> None:
     """每筆變更之 approval.owner 符合 basis 映射，SC-19 為 OD-11，DF 均為 reconciliation。"""

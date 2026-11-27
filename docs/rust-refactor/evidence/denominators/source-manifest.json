@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "attachment": "denominators/cases.yaml",
+      "path": "tests/acceptance/cases.yaml",
+      "revision": "59d8c7f1eb7de1ae2a90cefd6df21ce945d695d2",
+      "sha256": "b5e70e8c77687a1526e98a77a909bd729817fd67c66f28c4a09fb5d11ed235c6"
+    },
+    {
+      "attachment": "denominators/cases.lock.json",
+      "path": "tests/acceptance/cases.lock.json",
+      "revision": "59d8c7f1eb7de1ae2a90cefd6df21ce945d695d2",
+      "sha256": "4799a83c655b45c693603704e0fd3b3776f84f04c12b4a4cdd293183e51b861d"
+    }
+  ]
+}

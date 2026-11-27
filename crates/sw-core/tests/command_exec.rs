@@ -29,6 +29,13 @@ use sw_proto::pyre::{PyFlags, compile};
 
 const BANNER: &[u8] = b"\r\nU-Boot 2024.04 (Oct 01 2024)\r\n";
 
+fn shell_profile_with_two_recovery_keys() -> String {
+    SHELL_PROFILE.replace(
+        "    timeout_s: 2.0\n",
+        "    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C, CTRL_D]\n",
+    )
+}
+
 fn pget(d: &PyDict, k: &str) -> PyValue {
     d.get(k).cloned().unwrap_or(PyValue::Null)
 }
@@ -2879,6 +2886,121 @@ fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
     assert_eq!(wal_tx_bytes_since(&h, tx_count), expected_tx);
 }
 
+#[test]
+fn i294_r20_empty_recovery_releases_timeout_rescue_guard_and_allows_later_human_submit() {
+    let profile = shell_profile_with_two_recovery_keys().replace("[CTRL_C, CTRL_D]", "[]");
+    let h = ActorRig::new_with_hub(&profile).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("cat", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"cat\n");
+
+    i294_r10_advance_clock(&h, Duration::from_secs(2));
+    let result = h.wait_done(&id);
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(state_of(&h), "ATTACHED");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\n",
+        "空 timeout_recovery_keys 必須走 recovery 且不得送救援鍵"
+    );
+    h.wait_for("空救援鍵清單釋放 timeout rescue guard", |rig| {
+        rig.rx.timeout_rescue_gate_available_for_test()
+    });
+
+    let console = h.attach_pty_console("i294-r20-empty-recovery-human");
+    console.push_input(b"echo AFTER_EMPTY\n");
+    wait_tx(&h, b"echo AFTER_EMPTY\n");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\necho AFTER_EMPTY\n",
+        "空清單 recovery 收尾後 human submit 必須能送達"
+    );
+}
+
+#[test]
+fn i294_r20_non_ctrl_c_first_key_releases_timeout_rescue_guard_at_enqueue() {
+    let profile = shell_profile_with_two_recovery_keys().replace("[CTRL_C, CTRL_D]", "[CTRL_D, CTRL_C]");
+    let h = ActorRig::new(&profile).ready();
+    h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
+    let tx_start = h.dev.tx_len();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("cat", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"cat\n");
+
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    let (enqueue_tx, enqueue_rx) = crossbeam_channel::unbounded();
+    h.tx_handle().set_enqueue_hook_for_test(Some(Arc::new(move |class, op_id| {
+        enqueue_tx.send((class, op_id)).expect("記錄 rescue 與 human enqueue 次序");
+    })));
+    i294_r10_advance_clock(&h, Duration::from_secs(2));
+    h.dev.wait_blocked();
+
+    assert_eq!(
+        h.dev.tx_since(tx_start),
+        b"cat\n\x04",
+        "設定順序的第一鍵必須是 CTRL_D，且 writer 尚在此鍵的 report 等待中"
+    );
+    assert!(!is_done(&h, &id), "第一鍵 writer 尚未回報，OpRunner 不得已收尾");
+    assert!(
+        h.rx.timeout_rescue_gate_available_for_test(),
+        "CTRL_D 入列後、writer report 尚未返回時就必須釋放 rescue guard"
+    );
+    assert_eq!(
+        enqueue_rx.recv_timeout(Duration::from_secs(5)).expect("第一救援鍵入列").0,
+        sw_core::tx_writer::TxClass::SystemRecoverKey
+    );
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_201);
+    let submit_rx = Arc::clone(&h.rx);
+    let (human_enqueued_tx, human_enqueued_rx) = crossbeam_channel::bounded(1);
+    let (human_done_tx, human_done_rx) = crossbeam_channel::bounded(1);
+    let human_submit = std::thread::spawn(move || {
+        let (reply, report_rx) = crossbeam_channel::bounded(1);
+        let job = sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"echo AFTER_FIRST_KEY\n".to_vec(),
+            reply,
+            aggregate: None,
+        };
+        let (_, guard) = submit_rx
+            .submit_human_job_for_test(&tx, job)
+            .expect("rescue guard 釋放後 human submit 應能入列");
+        human_enqueued_tx.send(()).expect("human line 已入列");
+        let report = report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("HumanLine writer report");
+        drop(guard);
+        human_done_tx.send(report).expect("human line writer 結果已回報");
+    });
+    human_enqueued_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CTRL_D 已入列且 writer report 暫停時 human submit 仍可入列");
+    assert_eq!(
+        enqueue_rx.recv_timeout(Duration::from_secs(5)).expect("human line 入列").0,
+        sw_core::tx_writer::TxClass::HumanLine
+    );
+
+    h.dev.release_block();
+    let human_report = human_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human line 已由 writer 收尾");
+    assert!(matches!(
+        human_report.result.outcome,
+        sw_pal::TxOutcome::Completed(n) if n == b"echo AFTER_FIRST_KEY\n".len()
+    ));
+    human_submit.join().expect("human submit worker 正常結束");
+    let result = h.wait_done(&id);
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_D"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\n\x04echo AFTER_FIRST_KEY\n",
+        "非 CTRL_C 首鍵後 human bytes 緊接入列，不得多送 CTRL_C"
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 enum I294R11HumanState {
     QueuedAtDecision,
@@ -4841,7 +4963,15 @@ struct Wp61Case {
 /// `recovery_action` 與 lease owner。
 fn wp61_runner_timeout_case(c: &Wp61Case) {
     let label = c.label;
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let two_key_profile;
+    let profile = match c.reply {
+        Wp61KeyReply::CtrlC => SHELL_PROFILE,
+        Wp61KeyReply::CtrlDOnly => {
+            two_key_profile = shell_profile_with_two_recovery_keys();
+            two_key_profile.as_str()
+        }
+    };
+    let h = ActorRig::new(profile).ready();
     match c.reply {
         Wp61KeyReply::CtrlC => h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# "),
         Wp61KeyReply::CtrlDOnly => h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# "),
@@ -5142,7 +5272,8 @@ fn rx_keeps_waiting_until_timeout() {
 
 #[test]
 fn ctrl_d_after_ctrl_c_fails() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
     let id = h.submit_with("cat", |r| r.timeout_s = 1.0);
     wait_tx(&h, b"cat\n");
@@ -7621,7 +7752,8 @@ fn recover_ready_path_returns_prompt_timeout_recovered() {
 
 #[test]
 fn recover_keys_wal_source_system_recover() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
     let r = request_advancing(
         &h,
@@ -7840,7 +7972,8 @@ fn recover_attached_reprobe_bootloader_classification() {
 #[test]
 fn recover_ready_path_force_fallbacks() {
     // (a) 救援鍵皆失敗 → ATTACHED → force clear＋reattach → READY → PROMPT_TIMEOUT_FORCE_RECOVERED。
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     let _ = h.dev.take_tx();
     let rx = h.request_async(SessionRequest::Recover {
         timeout_s: 1.0,
@@ -8233,7 +8366,19 @@ fn command_cancel_running_revokes_tx_op() {
 const PRPL_BOOT_DONE_PROFILE: &str = "profiles:\n  r:\n    platform: prpl\n    prompt_regex: '(?m)^root@prplOS:.*# '\n    boot_done_regex: 'Please press Enter to activate this console'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: r, act_no: 1, alias: r+1, device_by_id: /s/by-id/usb-A}\n";
 
 fn ready_prpl_with_boot_done() -> ActorRig {
-    let h = ActorRig::new(PRPL_BOOT_DONE_PROFILE);
+    ready_prpl_with_boot_done_profile(PRPL_BOOT_DONE_PROFILE)
+}
+
+/// issue 308（BC-09）把逾時救援的語言層預設改為 `[CTRL_C]`；需要沿用舊的 Ctrl-C→Ctrl-D 情境時明列兩鍵。
+fn ready_prpl_with_boot_done_two_recovery_keys() -> ActorRig {
+    ready_prpl_with_boot_done_profile(&PRPL_BOOT_DONE_PROFILE.replace(
+        "    timeout_s: 2.0\n",
+        "    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C, CTRL_D]\n",
+    ))
+}
+
+fn ready_prpl_with_boot_done_profile(profile: &str) -> ActorRig {
+    let h = ActorRig::new(profile);
     h.dev.on_tx_reply(b"\n", b"root@prplOS:~# ");
     h.dev.on_tx_match(
         r"__READY__[0-9a-f]+",
@@ -8317,7 +8462,7 @@ fn self_test_while_foreground_command_sends_probe() {
 
 #[test]
 fn self_test_during_recover_after_boot_done_is_passive() {
-    let h = ready_prpl_with_boot_done();
+    let h = ready_prpl_with_boot_done_two_recovery_keys();
     h.dev.on_tx_reply(b"\x03", BANNER);
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@prplOS:~# ");
 
@@ -8404,7 +8549,7 @@ fn self_test_during_recover_after_boot_done_is_passive() {
 #[test]
 fn self_test_during_recover_stays_busy_when_wal_health_recovers() {
     // WAL 暫時故障不撤銷仍有效的 Recover side-op；恢復寫入後不得讓既有 probe 競爭救援鍵。
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let h = ActorRig::new(&shell_profile_with_two_recovery_keys()).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\n");
     h.dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
 
@@ -8501,7 +8646,7 @@ fn self_test_during_recover_stays_busy_when_wal_health_recovers() {
 #[test]
 fn self_test_and_get_state_do_not_wait_for_recover_tx_fence() {
     // PauseInsideSubmit 持有 TX fence；self-test 與 actor 查詢都必須在 OS submit 返回前回覆。
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let h = ActorRig::new(&shell_profile_with_two_recovery_keys()).ready();
     h.dev.script_write(vec![FakeWriteStep::PauseInsideSubmit]);
     h.dev.on_tx_reply(b"\x03", b"^C\r\n");
     h.dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");

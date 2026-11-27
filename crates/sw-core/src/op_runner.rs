@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use sw_pal::traits::{Clock, TxOutcome};
 use sw_proto::config_types::{ProfileTemplate, SessionProfile};
 use sw_proto::pycompat::{
@@ -1404,6 +1404,8 @@ fn run_reboot(
 
 /// `_recover_after_failure`（agent／system:recover 分支；人類來源不適用，DF-02）。
 /// passthrough 不送救援鍵（SC-35）；quiet 由 fence 在每次寫入前重驗（`Quiet` 拒絕即停止）。
+/// 救援鍵依 profile 的 `timeout_recovery_keys` 依序送出（Rust 0.5.1 預設 CTRL_C）；空清單＝不送，直接落到
+/// `PromptTimeout` 收尾，與全部按鍵都救不回時相同（命令轉 ATTACHED；READY recover 接 auto-fallback Force）。
 /// `aborted`：命令路徑的 `(cmd_id, 命令本身已確認的 TX bytes)`，救援鍵遇其他拒絕時依 Python `_map_aborted_result`
 /// 結算（審查 F26）；READY recover 為 `None`（維持例外）。
 #[allow(clippy::too_many_arguments)]
@@ -1420,18 +1422,26 @@ fn recover_after_failure(
     mut timeout_rescue_guard: Option<crate::uart_bridge::HumanSubmitRescueGuard>,
 ) -> OpOutcome {
     if passthrough {
+        drop(timeout_rescue_guard.take());
         return OpOutcome::PromptTimeout {
             stdout: clean_text(&ctx.rx.text_from(pre_offset)),
         };
     }
+    if !begin_general_recovery(ctx, grant) {
+        drop(timeout_rescue_guard.take());
+        return OpOutcome::CommandResult(
+            pydict! { "ok" => false, "error_code" => "FLUSHED_BY_RECOVERY" },
+        );
+    }
     let prompt_re = compile_or_never(prompt_regex);
-    for (name, key) in [("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")] {
+    for (index, recovery_key) in ctx.profile.template.timeout_recovery_keys.iter().enumerate() {
+        let name = recovery_key.name();
         let offset = ctx.rx.snapshot_len();
-        let report = if name == "CTRL_C" {
+        let report = if index == 0 {
             send_with_enqueue_hook(
                 ctx,
                 grant,
-                key,
+                recovery_key.payload(),
                 SendMeta {
                     class: TxClass::SystemRecoverKey,
                     source: "system:recover",
@@ -1444,7 +1454,7 @@ fn recover_after_failure(
             send(
                 ctx,
                 grant,
-                key,
+                recovery_key.payload(),
                 TxClass::SystemRecoverKey,
                 "system:recover",
                 None,
@@ -1455,6 +1465,7 @@ fn recover_after_failure(
             match report.reject {
                 Some(FenceReject::Quiet | FenceReject::ReconfirmPending) => break,
                 Some(FenceReject::Frozen | FenceReject::Cancelled | FenceReject::StaleEpoch) => {
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::CommandResult(
                         pydict! { "ok" => false, "error_code" => "FLUSHED_BY_RECOVERY" },
                     );
@@ -1484,10 +1495,12 @@ fn recover_after_failure(
                                 meta: Some(meta),
                             });
                         }
+                        drop(timeout_rescue_guard.take());
                         return OpOutcome::CommandResult(
                             pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
                         );
                     }
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(&report, 1)));
                 }
             }
@@ -1502,6 +1515,7 @@ fn recover_after_failure(
                 WaitOutcome::Matched => true,
                 WaitOutcome::TimedOut => false,
                 WaitOutcome::Cancelled => {
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::CommandResult(
                         pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN" },
                     );
@@ -1511,13 +1525,61 @@ fn recover_after_failure(
             wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0))
         };
         if matched {
+            drop(timeout_rescue_guard.take());
             let raw = ctx.rx.text_from(pre_offset);
             let stdout = extract_command_stdout(&raw, command, &prompt_re, None);
             return OpOutcome::Recovered { key: name, stdout };
         }
     }
+    // 空鍵清單或第一鍵未能入列時也必須在收尾前解除 timeout rescue gate。
+    drop(timeout_rescue_guard.take());
     OpOutcome::PromptTimeout {
         stdout: clean_text(&ctx.rx.text_from(pre_offset)),
+    }
+}
+
+/// 讓 actor 先公布 recovery input epoch、清掉 deferred 與已排隊的舊 human input。
+///
+/// actor 以 `op_id`／bridge epoch 驗證仍在途；取消、drain、shutdown 或 actor 結束時不等待無限期 ACK。
+fn begin_general_recovery(ctx: &OpCtx, grant: &OpGrant) -> bool {
+    let (reply, ack) = bounded(1);
+    if ctx
+        .control
+        .send(ControlEvent::RecoveryStart {
+            op_id: grant.op_id,
+            epoch: grant.epoch,
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let permit = TxPermit {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        owner_gen: grant.owner_gen,
+        fsm_gen: grant.fsm_gen,
+        class: TxClass::SystemRecoverKey,
+        source: "system:recover".to_string(),
+        cmd_id: None,
+        log: true,
+        input_epoch: None,
+        replay_hold: None,
+        probe_id: None,
+    };
+    loop {
+        match ack.recv_timeout(Duration::from_millis(20)) {
+            Ok(valid) => return valid,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if matches!(
+                    ctx.tx.fence_verdict(&permit),
+                    Err(FenceReject::Frozen | FenceReject::Cancelled | FenceReject::StaleEpoch)
+                ) {
+                    return false;
+                }
+            }
+        }
     }
 }
 

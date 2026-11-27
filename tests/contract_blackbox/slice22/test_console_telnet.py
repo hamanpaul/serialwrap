@@ -6,7 +6,18 @@ import time
 
 import pytest
 
-from .console_helpers import console_kind, open_console, sock_read_for, sock_read_until, wait_for, wait_rx_contains, write_console
+from bb_harness import is_rust
+
+from .console_helpers import (
+    console_kind,
+    open_console,
+    sock_read_for,
+    sock_read_until,
+    tx_payload,
+    wait_for,
+    wait_rx_contains,
+    write_console,
+)
 
 if os.name == "nt":
     pytestmark = [pytest.mark.windows_native, pytest.mark.windows_com]
@@ -59,12 +70,17 @@ def test_first_raw_second_line(telnet_daemon) -> None:
     try:
         rows = _consoles(d)
         assert sum(1 for r in rows if r["interactive_owner"]) == 1, rows
+        t2_client_id = next(r["client_id"] for r in rows if not r["interactive_owner"])
         write_console(t1, b"ab")
         assert wait_rx_contains(target, b"ab", 3.0)
         write_console(t2, b"ls\r\n")
         echo = sock_read_until(t2, b"ls\r", 3.0)
         assert b"ls\r" in echo, echo
-        assert wait_rx_contains(target, b"ls\n", 3.0)
+        if is_rust():
+            assert not wait_rx_contains(target, b"ls\n", 3.0)
+            assert tx_payload(d.wal_records(), f"human:{t2_client_id}") == b""
+        else:
+            assert wait_rx_contains(target, b"ls\n", 3.0)
     finally:
         t1.close()
         t2.close()

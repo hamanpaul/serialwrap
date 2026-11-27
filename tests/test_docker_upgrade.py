@@ -13,6 +13,7 @@ host runner `scripts/docker/run-upgrade.sh` 以 `--dry-run` 檢查不碰 docker 
 from __future__ import annotations
 
 import importlib.util
+import base64
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 import types
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +40,10 @@ UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
 NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "regression"))
 
 from scripts.docker import upgrade_checks as uc  # noqa: E402
+from serialwrap_regression.cases import f09_prpl_timeout_recovery as p290_case  # noqa: E402
 
 
 def _proc(root: Path, pid: int, argv: list[str], ppid: int = 1) -> None:
@@ -199,6 +203,55 @@ def _load_driver():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_p290_profile_fixtures(driver: Any, target_asset: Path, live_profile: Path) -> None:
+    import yaml
+
+    target_document = yaml.safe_load((REPO / "sw_core" / "assets" / "profiles" / "default.yaml").read_text(
+        encoding="utf-8"))
+    target_document["profiles"]["prpl-template"]["timeout_recovery_keys"] = ["CTRL_C"]
+    target_asset.parent.mkdir(parents=True, exist_ok=True)
+    target_asset.write_text(yaml.safe_dump(target_document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    live_profile.parent.mkdir(parents=True, exist_ok=True)
+    if driver.mode == "systemd-system":
+        live_document = target_document
+    else:
+        legacy_fixture = (REPO / "tests" / "fixtures" / "serialwrap-v0.3.2-default-profiles.yaml").read_bytes()
+        legacy_document = yaml.safe_load(legacy_fixture.split(b"\n\n", maxsplit=1)[1])
+        legacy_document["profiles"]["prpl-template"]["timeout_recovery_keys"] = ["CTRL_C"]
+        live_document = legacy_document
+    live_profile.write_text(yaml.safe_dump(live_document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def _profile_doctor_payload(target_asset: Path, live_profile: Path) -> dict[str, Any]:
+    import yaml
+
+    target_profiles = yaml.safe_load(target_asset.read_text(encoding="utf-8"))["profiles"]
+    live_profiles = yaml.safe_load(live_profile.read_text(encoding="utf-8"))["profiles"]
+    compared = sorted(set(target_profiles) & set(live_profiles))
+    missing = {}
+    for template in compared:
+        fields = sorted(set(target_profiles[template]) - set(live_profiles[template]))
+        if fields:
+            missing[template] = fields
+    has_missing = bool(missing)
+    return {"ok": True, "checks": [
+        {"check": "dialout", "ok": True, "advisory": False},
+        {"check": "version_pairing", "ok": True, "advisory": False},
+        {"check": "devices", "ok": False, "advisory": True},
+        {"check": "profile_template_fields", "ok": not has_missing, "advisory": True,
+         "comparison_status": "missing_fields" if has_missing else "matched",
+         "missing_fields": missing, "compared_templates": compared, "reason": None},
+    ]}
+
+
+def _remove_p290_timeout_recovery_key(profile_path: Path) -> None:
+    import yaml
+
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    del document["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    profile_path.write_text(yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 @pytest.mark.core_portable
@@ -444,7 +497,7 @@ class _FakeContainer:
             if argv[1:2] == ["install"]:
                 self.cli = "0.3.2"
             return self._done(argv, 0)
-        if argv and argv[0].endswith("/bin/serialwrap") and argv[1:2] == ["setup"]:
+        if argv and Path(argv[0]).stem == "serialwrap" and Path(argv[0]).parent.name == "bin" and argv[1:2] == ["setup"]:
             self.cli = NEW_VERSION if not self.old_alive() else self.cli
             return self._guarded(f"{NEW_VERSION} setup", argv, {"ok": True, "install": {
                 "op": "install", "from_version": "0.3.2", "to_version": NEW_VERSION, "steps": []}})
@@ -465,23 +518,96 @@ def fake_driver(tmp_path, monkeypatch):
     drv = _load_driver()
     made: list[_FakeContainer] = []
 
-    def make(*, cli_version: str, exit_delay: float | None = 0.4, stop_wait_s: float = 10.0):
+    def make(*, cli_version: str, exit_delay: float | None = 0.4, stop_wait_s: float = 10.0,
+             mode: str = "on-demand", scenario: str = "upgrade",
+             profile_policies: dict[str, dict[str, Any]] | None = None):
         fake = _FakeContainer(tmp_path, drv, cli_version=cli_version, exit_delay=exit_delay)
         made.append(fake)
         monkeypatch.setattr(drv, "CONFIG", fake.config)
         monkeypatch.setattr(drv, "BIN", tmp_path / "bin")
+        monkeypatch.setattr(drv, "SYSTEM_PROFILE_DIR", tmp_path / "etc" / "serialwrap" / "profiles")
         # phase_seed 以 subprocess.run 執行 chown：只替換 driver 模組看到的 subprocess，不動全域
         monkeypatch.setattr(drv, "subprocess", types.SimpleNamespace(
             run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""), CompletedProcess=subprocess.CompletedProcess,
-            TimeoutExpired=subprocess.TimeoutExpired))
+            TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError))
         out = tmp_path / "out"
         out.mkdir(exist_ok=True)
-        driver = drv.Driver("on-demand", tmp_path / "w.whl", tmp_path / "bundle", out,
-                            installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz")
+        default_policies, policy_evidence = drv.select_upgrade_profile_policies(mode=mode)
+        selected_policies = profile_policies or default_policies
+        driver = drv.Driver(mode, tmp_path / "w.whl", tmp_path / "bundle", out, scenario=scenario,
+                            installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz",
+                            profile_policies=selected_policies,
+                            profile_policy_evidence=policy_evidence)
+        driver._upgrade_checks = drv.uc
+        driver._driver_module = drv
         driver.proc_root = fake.proc
         driver.stop_wait_s = stop_wait_s
-        driver.sw = fake.sw
-        driver.run = fake.run
+        test_home = tmp_path / "test-home"
+        legacy_python = test_home / ".local" / "share" / "pipx" / "venvs" / "serialwrap" / "bin" / "python"
+        legacy_python.parent.mkdir(parents=True)
+        legacy_python.write_text("legacy runtime is supplied by the test subprocess stub\n", encoding="utf-8")
+        driver.env["HOME"] = str(test_home)
+
+        target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                        / "default.yaml")
+        _write_p290_profile_fixtures(driver, target_asset, driver.doctor_profile_dir / "default.yaml")
+        cli_name = "serialwrap.exe" if os.name == "nt" else "serialwrap"
+        candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
+        candidate_cli.parent.mkdir(parents=True, exist_ok=True)
+        candidate_cli.write_bytes(b"candidate CLI embedded profile asset\n" + target_asset.read_bytes())
+        candidate_cli.chmod(0o755)
+        driver.new_cli = candidate_cli
+        installed_version = tmp_path / f"installed-{len(made)}" / "versions" / NEW_VERSION
+        shutil.copytree(candidate_cli.parent.parent, installed_version)
+        installed_cli = installed_version / "bin" / cli_name
+        driver.env["PATH"] = str(installed_cli.parent)
+
+        candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+        real_probe_run = subprocess.run
+
+        def run_profile_probe(argv, **kwargs):
+            if argv and str(argv[0]) in (str(candidate_python), str(legacy_python)):
+                interpreter = Path(argv[0])
+                if not interpreter.is_file():
+                    raise FileNotFoundError(2, "No such file or directory", str(interpreter))
+                argv = [sys.executable, *argv[1:]]
+            return real_probe_run(argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", run_profile_probe)
+
+        def run(argv, *, timeout=300.0, label=""):
+            if argv and Path(argv[0]).stem == "serialwrap" and argv[1:] == ["doctor"]:
+                probed_cli = Path(argv[0]).resolve()
+                reports_p290 = b"timeout_recovery_keys" in probed_cli.read_bytes()
+                profile_check = {
+                    "check": "profile_template_fields",
+                    "ok": False,
+                    "advisory": True,
+                    "comparison_status": "missing_fields",
+                    "missing_fields": {"prpl-template": ["timeout_recovery_keys"] if reports_p290 else ["platform"]},
+                    "compared_templates": ["prpl-template"],
+                    "reason": None,
+                }
+                payload = {"ok": True, "checks": [profile_check]}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload) + "\n", "")
+            return fake.run(argv, timeout=timeout, label=label)
+
+        def sw(*args, **kwargs):
+            if args == ("doctor",):
+                if fake.cli == NEW_VERSION or drv.uc.cli_version_identifies(fake.cli, NEW_VERSION):
+                    doctor = _doctor_with_profile_policy(driver.profile_policies["new"])
+                else:
+                    doctor = {"ok": True, "checks": [
+                        {"check": "dialout", "ok": True, "advisory": False},
+                        {"check": "devices", "ok": False, "advisory": True},
+                    ]}
+                return subprocess.CompletedProcess(
+                    ["serialwrap", "doctor"], 0, json.dumps(doctor, ensure_ascii=False) + "\n", "",
+                )
+            return fake.sw(*args, **kwargs)
+
+        driver.sw = sw
+        driver.run = run
         orig_wait = driver.wait_daemon
         driver.wait_daemon = lambda *, version, timeout=60.0: orig_wait(version=version, timeout=min(timeout, 2.0))
         orig_gone = driver.wait_no_daemon
@@ -494,6 +620,175 @@ def fake_driver(tmp_path, monkeypatch):
     yield make
     for fake in made:
         fake.close()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_fake_driver_setup_without_symlink_permission(request, monkeypatch):
+    """測試替身建置不得依賴測試執行帳號建立符號連結的權限。"""
+    def deny_symlink(src, dst, *args, **kwargs):
+        raise PermissionError("symbolic link creation is unavailable")
+
+    monkeypatch.setattr(os, "symlink", deny_symlink)
+    make_driver = request.getfixturevalue("fake_driver")
+    driver, fake = make_driver(cli_version=NEW_VERSION)
+
+    assert driver.new_cli.is_file()
+    assert (Path(driver.env["PATH"]) / driver.new_cli.name).is_file()
+    assert fake.proc.is_dir()
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+@pytest.mark.parametrize(("phase", "mode", "scenario", "cli_version", "policy_key", "expected_phase"), [
+    ("upgrade", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-missing-timeout", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-asset-live-missing", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-live-missing", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-missing-check", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-wrong-policy", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-damaged-payload", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("install-sh", "on-demand", "install-sh", NEW_VERSION, "new", "migrated"),
+    ("system", "systemd-system", "upgrade", NEW_VERSION, "new", "materialized"),
+    ("reupgrade", "on-demand", "upgrade", "0.3.2", "new", "migrated"),
+    ("old", "on-demand", "upgrade", "0.3.2", "old", "legacy_0_3_2"),
+    ("downgrade", "on-demand", "upgrade", NEW_VERSION, "downgrade", "downgrade"),
+], ids=[
+    "upgrade-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-missing-timeout-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-asset-live-missing-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-live-missing-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-missing-check-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-wrong-policy-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-damaged-payload-on-demand-upgrade-0.5.0-new-migrated",
+    "install-sh-on-demand-install-sh-0.5.0-new-migrated",
+    "system-systemd-system-upgrade-0.5.0-new-migrated",
+    "reupgrade-on-demand-upgrade-0.3.2-new-migrated",
+    "old-on-demand-upgrade-0.3.2-old-legacy_0_3_2",
+    "downgrade-on-demand-upgrade-0.5.0-downgrade-downgrade",
+])
+def test_upgrade_driver_passes_profile_expectation_policy(
+    fake_driver, monkeypatch, phase, mode, scenario, cli_version, policy_key, expected_phase,
+):
+    policies, policy_evidence = _load_driver().select_upgrade_profile_policies(mode=mode)
+    if phase == "upgrade-wrong-policy":
+        policies[policy_key] = _load_driver().uc.select_profile_policy("asset_added_not_migrated")
+    driver, _fake = fake_driver(
+        cli_version=cli_version, mode=mode, scenario=scenario, profile_policies=policies,
+    )
+    assert driver.profile_policy_evidence == policy_evidence
+    policy_source = driver._driver_module.uc.PROFILE_EXPECTATIONS_PATH.read_bytes()
+    assert policy_evidence == {
+        "policy_id": "od33-profile-template-fields-v1",
+        "policy_sha256": hashlib.sha256(policy_source).hexdigest(),
+        "migration_policy_id": "p290-template-migration-v1",
+        "selected_phases": {
+            "old": "legacy_0_3_2", "new": expected_phase if mode == "systemd-system" else "migrated",
+            "downgrade": "downgrade",
+        },
+    }
+    selected = policies[policy_key]
+    if selected["supported"]:
+        target_asset = (driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                        / "default.yaml")
+        live_profile = driver.doctor_profile_dir / "default.yaml"
+        if phase == "upgrade-asset-live-missing":
+            _remove_p290_timeout_recovery_key(target_asset)
+            _remove_p290_timeout_recovery_key(live_profile)
+        elif phase == "upgrade-live-missing":
+            _remove_p290_timeout_recovery_key(live_profile)
+        doctor_payload = _profile_doctor_payload(target_asset, live_profile)
+        profile_check = doctor_payload["checks"][-1]
+        if phase in {"upgrade-missing-timeout", "upgrade-wrong-policy"}:
+            profile_check["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
+            profile_check["missing_fields"]["prpl-template"].sort()
+            profile_check["comparison_status"] = "missing_fields"
+            profile_check["ok"] = False
+        if phase == "upgrade-missing-check":
+            doctor_payload["checks"] = [check for check in doctor_payload["checks"]
+                                         if check["check"] != "profile_template_fields"]
+        elif phase == "upgrade-damaged-payload":
+            doctor_payload["checks"][-1]["compared_templates"] = ["unexpected-template"]
+    else:
+        doctor_payload = {"ok": True, "checks": [
+            {"check": "dialout", "ok": True, "advisory": False},
+            {"check": "devices", "ok": False, "advisory": True},
+        ]}
+    real_sw = driver.sw
+
+    def sw(*args, **kwargs):
+        if args == ("doctor",):
+            return subprocess.CompletedProcess(
+                ["serialwrap", "doctor"], 0, json.dumps(doctor_payload, ensure_ascii=False) + "\n", "",
+            )
+        return real_sw(*args, **kwargs)
+
+    driver.sw = sw
+    calls: list[tuple[str, dict[str, Any] | None]] = []
+    real_judge = driver._upgrade_checks.judge_doctor
+
+    def judge(check_id, doctor, *, require_pairing, profile_policy=None):
+        calls.append((check_id, profile_policy))
+        return real_judge(check_id, doctor, require_pairing=require_pairing, profile_policy=profile_policy)
+
+    monkeypatch.setattr(driver._upgrade_checks, "judge_doctor", judge)
+    if phase in {"upgrade", "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing",
+                 "upgrade-missing-check", "upgrade-wrong-policy",
+                 "upgrade-damaged-payload", "install-sh", "system"}:
+        monkeypatch.setattr(driver._upgrade_checks, "scan_daemon_instances", lambda _root: [4242])
+        monkeypatch.setattr(driver._driver_module, "bundle_source_evidence", lambda *_a, **_k: {
+            "from_bundle": True, "exe_path": "/tmp/serialwrap", "exe_read_method": "test",
+            "exe_read_error": None, "argv_mentions_bundle": True,
+        })
+
+    if phase in {"upgrade", "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing",
+                 "upgrade-missing-check", "upgrade-wrong-policy",
+                 "upgrade-damaged-payload", "install-sh"}:
+        driver.phase_new_running()
+        expected_check = "doctor_green_new"
+    elif phase == "system":
+        driver.phase_new_running_system()
+        expected_check = "doctor_green_new"
+    elif phase == "reupgrade":
+        driver.phase_reupgrade()
+        expected_check = "reupgrade_doctor"
+    elif phase == "old":
+        driver.phase_seed()
+        expected_check = "doctor_green_old"
+    else:
+        driver.phase_downgrade()
+        expected_check = "doctor_green_downgrade"
+
+    assert calls == [(expected_check, selected)]
+    selected_phase = "asset_added_not_migrated" if phase == "upgrade-wrong-policy" else expected_phase
+    assert selected["phase"] == selected_phase
+    expected_profile_dir = str(driver._driver_module.SYSTEM_PROFILE_DIR) if mode == "systemd-system" \
+        else str(driver._driver_module.CONFIG / "profiles")
+    assert driver.env["SERIALWRAP_PROFILE_DIR"] == expected_profile_dir
+    assert driver.doctor_evidence[-1]["profile_path"] == expected_profile_dir
+    if phase == "reupgrade":
+        result = _row(driver, "reupgrade")["detail"]["doctor"]
+    else:
+        result = _row(driver, expected_check)
+    expected_verdict = "FAIL" if phase in {
+        "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing", "upgrade-missing-check",
+        "upgrade-wrong-policy", "upgrade-damaged-payload",
+    } else "PASS"
+    assert result["verdict"] == expected_verdict, result
+    if phase == "upgrade-asset-live-missing":
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is False, migration
+        assert migration["detail"]["live_profile_has_field"] is False, migration
+    elif phase == "upgrade-live-missing":
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is True, migration
+        assert migration["detail"]["live_profile_has_field"] is False, migration
+    elif selected["supported"] and phase not in {"upgrade-missing-timeout", "upgrade-missing-check",
+                                                   "upgrade-wrong-policy", "upgrade-damaged-payload"}:
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "PASS", migration
 
 
 def _row(driver: Any, check_id: str) -> dict[str, Any]:
@@ -552,7 +847,7 @@ _VERSION_WITH_FP = f"serialwrap {NEW_VERSION} (code {_BASELINE_FP})"
 
 def _with_baseline_fingerprint(fake, driver):
     """新版的 `--version` 改成 Python 基線整行；0.3.2 維持純版本。"""
-    orig = fake.sw
+    orig = driver.sw
 
     def sw(*args, **kwargs):
         proc = orig(*args, **kwargs)
@@ -769,22 +1064,889 @@ def test_alias_binding_lost_fails():
 
 # ---------- doctor ----------
 
+def _doctor_with_profile_policy(policy: dict[str, Any], *, status: str | None = None,
+                                missing_fields: dict[str, list[str]] | None = None,
+                                profile_ok: bool | None = None) -> dict[str, Any]:
+    fields = json.loads(json.dumps(policy["expected_missing_fields"])) if missing_fields is None else missing_fields
+    has_missing = any(fields.values())
+    profile_status = status or ("missing_fields" if has_missing else "matched")
+    profile_result = (not has_missing) if profile_ok is None else profile_ok
+    return {"ok": True, "checks": [
+        {"check": "dialout", "ok": True, "advisory": False},
+        {"check": "version_pairing", "ok": True, "advisory": False},
+        {"check": "devices", "ok": False, "advisory": True},
+        {"check": "profile_template_fields", "ok": profile_result, "advisory": True,
+         "detail": "共同 template 的頂層欄位無缺漏",
+         "fix": "參照出貨 profile 處理缺漏欄位",
+         "comparison_status": profile_status,
+         "missing_fields": fields,
+         "compared_templates": list(policy["expected_common_templates"]),
+         "reason": None},
+    ]}
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_doctor_green_requires_non_advisory_and_pairing():
-    ok = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
-                                 {"check": "version_pairing", "ok": True, "advisory": False},
-                                 {"check": "devices", "ok": False, "advisory": True}]}
-    assert uc.judge_doctor("doctor_green_new", ok, require_pairing=True)["verdict"] == "PASS"
+    policy = uc.select_profile_policy("materialized")
+    ok = _doctor_with_profile_policy(policy)
+    assert uc.judge_doctor("doctor_green_new", ok, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "PASS"
     bad = json.loads(json.dumps(ok))
     bad["checks"][0]["ok"] = False
-    assert uc.judge_doctor("doctor_green_new", bad, require_pairing=True)["verdict"] == "FAIL"
+    assert uc.judge_doctor("doctor_green_new", bad, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
     nopair = {"ok": True, "checks": [c for c in ok["checks"] if c["check"] != "version_pairing"]}
-    assert uc.judge_doctor("doctor_green_new", nopair, require_pairing=True)["verdict"] == "FAIL"
-    assert uc.judge_doctor("doctor_green_old", nopair, require_pairing=False)["verdict"] == "PASS"
+    assert uc.judge_doctor("doctor_green_new", nopair, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
+    old_policy = uc.select_profile_policy("legacy_0_3_2")
+    old = {"ok": True, "checks": [c for c in ok["checks"] if c["check"] not in
+                                    {"version_pairing", "profile_template_fields"}]}
+    assert uc.judge_doctor("doctor_green_old", old, require_pairing=False,
+                           profile_policy=old_policy)["verdict"] == "PASS"
     other_adv = json.loads(json.dumps(ok))
     other_adv["checks"].append({"check": "jq_on_path", "ok": False, "advisory": True})
-    assert uc.judge_doctor("doctor_green_new", other_adv, require_pairing=True)["verdict"] == "FAIL"
+    assert uc.judge_doctor("doctor_green_new", other_adv, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
+    stale_policy = uc.select_profile_policy("before_asset_addition")
+    stale = _doctor_with_profile_policy(stale_policy)
+    assert uc.judge_doctor("doctor_green_new", stale, require_pairing=True,
+                           profile_policy=stale_policy)["verdict"] == "PASS"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_expected_missing_fields_exact():
+    policy = uc.select_profile_policy("asset_added_not_migrated")
+    doctor = _doctor_with_profile_policy(policy)
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+    assert row["verdict"] == "PASS", row
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_missing_fields_mismatch_fails():
+    policy = uc.select_profile_policy("migrated")
+    valid = _doctor_with_profile_policy(policy)
+    invalid_results = []
+    too_many = json.loads(json.dumps(valid))
+    too_many["checks"][-1]["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
+    invalid_results.append(too_many)
+    too_few = json.loads(json.dumps(valid))
+    too_few["checks"][-1]["missing_fields"]["prpl-template"] = []
+    invalid_results.append(too_few)
+    wrong_template = json.loads(json.dumps(valid))
+    wrong_template["checks"][-1]["missing_fields"] = {"other-template": ["boot_done_regex"]}
+    invalid_results.append(wrong_template)
+    wrong_common = json.loads(json.dumps(valid))
+    wrong_common["checks"][-1]["compared_templates"] = ["other-template"]
+    invalid_results.append(wrong_common)
+    for doctor in invalid_results:
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", row
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_unavailable_fails():
+    policy = uc.select_profile_policy("before_asset_addition")
+    for status in ("unavailable", "not_materialized", "no_common_templates"):
+        doctor = _doctor_with_profile_policy(policy, status=status, missing_fields=None, profile_ok=False)
+        profile = doctor["checks"][-1]
+        profile["missing_fields"] = None
+        profile["compared_templates"] = list(policy["expected_common_templates"])
+        profile["reason"] = "live_structure"
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", (status, row)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_invalid_payload_fails():
+    policy = uc.select_profile_policy("before_asset_addition")
+    no_payload = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
+                                          {"check": "version_pairing", "ok": True, "advisory": False},
+                                          {"check": "devices", "ok": False, "advisory": True},
+                                          {"check": "profile_template_fields", "ok": False, "advisory": True,
+                                           "detail": "共同 template 的頂層欄位無缺漏",
+                                           "fix": "參照出貨 profile 處理缺漏欄位"}]}
+    invalid_rows = [no_payload]
+    duplicate = _doctor_with_profile_policy(policy)
+    duplicate["checks"].append(json.loads(json.dumps(duplicate["checks"][-1])))
+    invalid_rows.append(duplicate)
+    wrong_ok_type = _doctor_with_profile_policy(policy)
+    wrong_ok_type["checks"][-1]["ok"] = 1
+    invalid_rows.append(wrong_ok_type)
+    missing_key = _doctor_with_profile_policy(policy)
+    del missing_key["checks"][-1]["compared_templates"]
+    invalid_rows.append(missing_key)
+    missing_check = _doctor_with_profile_policy(policy)
+    missing_check["checks"] = missing_check["checks"][:-1]
+    invalid_rows.append(missing_check)
+    duplicate_field = _doctor_with_profile_policy(policy)
+    duplicate_field["checks"][-1]["missing_fields"]["prpl-template"].append("boot_done_regex")
+    invalid_rows.append(duplicate_field)
+    wrong_advisory_type = _doctor_with_profile_policy(policy)
+    wrong_advisory_type["checks"][-1]["advisory"] = 1
+    invalid_rows.append(wrong_advisory_type)
+    wrong_status_type = _doctor_with_profile_policy(policy)
+    wrong_status_type["checks"][-1]["comparison_status"] = True
+    invalid_rows.append(wrong_status_type)
+    wrong_missing_type = _doctor_with_profile_policy(policy)
+    wrong_missing_type["checks"][-1]["missing_fields"] = None
+    invalid_rows.append(wrong_missing_type)
+    wrong_compared_type = _doctor_with_profile_policy(policy)
+    wrong_compared_type["checks"][-1]["compared_templates"] = "prpl-template"
+    invalid_rows.append(wrong_compared_type)
+    wrong_reason_type = _doctor_with_profile_policy(policy)
+    wrong_reason_type["checks"][-1]["reason"] = True
+    invalid_rows.append(wrong_reason_type)
+    inconsistent = _doctor_with_profile_policy(policy, status="matched", profile_ok=True)
+    invalid_rows.append(inconsistent)
+    for doctor in invalid_rows:
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", row
+    missing_policy = uc.judge_doctor("doctor_green_new", _doctor_with_profile_policy(policy),
+                                     require_pairing=True)
+    assert missing_policy["verdict"] == "FAIL", missing_policy
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_expectation_policy_p290_phases():
+    document = uc.load_profile_expectations()
+    assert document["schema_version"] == 1
+    assert document["policy_id"] == "od33-profile-template-fields-v1"
+    source_expected = {
+        "fixture_id": "serialwrap-v0.3.2-default-profiles",
+        "fixture_kind": "tagged_release_asset",
+        "source_version": "0.3.2",
+        "source_ref": "v0.3.2",
+        "source_path": "sw_core/assets/profiles/default.yaml",
+        "source_sha256": "0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0",
+    }
+    assert document["target_asset"] == {
+        "asset_id": "serialwrap-default-profiles",
+        "asset_path": "sw_core/assets/profiles/default.yaml",
+        "migration_policy_id": "p290-template-migration-v1",
+    }
+    source = document["source"]
+    fixture_header = (
+        "# 來源：Git tag v0.3.2 的 sw_core/assets/profiles/default.yaml\n"
+        "# Git blob SHA-1：b34c354d5efe0d3a9aaede3e2b5844f81976d2df\n"
+        "# 原始內容 SHA-256：0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0\n"
+        "# 以下為原始資產位元組；雜湊驗證從本行之後開始。\n\n"
+    ).encode("utf-8")
+    fixture_path = REPO / "tests" / "fixtures" / "serialwrap-v0.3.2-default-profiles.yaml"
+    fixture_bytes = fixture_path.read_bytes()
+    assert fixture_bytes.startswith(fixture_header), fixture_path
+    source_bytes = fixture_bytes[len(fixture_header):]
+    assert hashlib.sha256(source_bytes).hexdigest() == source["source_sha256"]
+    import yaml
+
+    source_profiles = yaml.safe_load(source_bytes)["profiles"]
+    target_profiles = yaml.safe_load(
+        (REPO / document["target_asset"]["asset_path"]).read_text(encoding="utf-8")
+    )["profiles"]
+    legacy_common = sorted(set(source_profiles) & set(target_profiles))
+    fully_materialized = sorted(target_profiles)
+    assert legacy_common == ["brcm-template", "op3-template", "others-template", "prpl-template", "uboot-template"]
+    assert fully_materialized == [
+        "brcm-template", "op3-template", "others-template", "prpl-template", "smart4R-profile", "uboot-template",
+    ]
+    expected = {
+        "before_asset_addition": {"prpl-template": ["boot_done_regex"]},
+        "asset_added_not_migrated": {"prpl-template": ["boot_done_regex", "timeout_recovery_keys"]},
+        "migrated": {"prpl-template": ["boot_done_regex"]},
+        "materialized": {},
+    }
+    policy_shape_errors = []
+    if source != source_expected:
+        policy_shape_errors.append({"source": source})
+    for phase, expected_missing in expected.items():
+        policy_entry = document["phases"][phase]
+        expected_common = fully_materialized if phase == "materialized" else legacy_common
+        if policy_entry["expected_missing_fields"] != expected_missing:
+            policy_shape_errors.append({phase: {"expected_missing_fields": policy_entry["expected_missing_fields"]}})
+        if policy_entry["expected_common_templates"] != expected_common:
+            policy_shape_errors.append({phase: {"expected_common_templates": policy_entry["expected_common_templates"]}})
+    assert not policy_shape_errors, policy_shape_errors
+
+    for phase, expected_missing in expected.items():
+        policy = uc.select_profile_policy(phase)
+        assert policy["expected_missing_fields"] == expected_missing
+        expected_common = fully_materialized if phase == "materialized" else legacy_common
+        assert policy["expected_common_templates"] == expected_common
+        doctor = _doctor_with_profile_policy(policy)
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "PASS", (phase, row)
+
+    assert document["phases"]["migrated"]["allowed_migration_fields"] == ["timeout_recovery_keys"]
+    assert document["phases"]["before_asset_addition"]["allowed_migration_fields"] == []
+    assert document["phases"]["asset_added_not_migrated"]["allowed_migration_fields"] == []
+    assert document["phases"]["materialized"]["allowed_migration_fields"] == []
+    migrated = uc.select_profile_policy("migrated")
+    doctor = _doctor_with_profile_policy(
+        migrated,
+        missing_fields={"prpl-template": ["timeout_recovery_keys"]},
+        profile_ok=False,
+    )
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=migrated)
+    assert row["verdict"] == "FAIL", row
+    forged = json.loads(json.dumps(migrated))
+    forged["expected_missing_fields"] = {"prpl-template": ["timeout_recovery_keys"]}
+    row = uc.judge_doctor("doctor_green_new", _doctor_with_profile_policy(forged),
+                           require_pairing=True, profile_policy=forged)
+    assert row["verdict"] == "FAIL", row
+
+    for mode in ("legacy_0_3_2", "downgrade"):
+        unsupported = uc.select_profile_policy(mode)
+        old_doctor = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
+                                               {"check": "devices", "ok": False, "advisory": True}]}
+        row = uc.judge_doctor("doctor_green_old", old_doctor, require_pairing=False,
+                               profile_policy=unsupported)
+        assert row["verdict"] == "PASS", (mode, row)
+        unexpected_check = _doctor_with_profile_policy(uc.select_profile_policy("materialized"))["checks"][-1]
+        old_doctor["checks"].append(unexpected_check)
+        row = uc.judge_doctor("doctor_green_old", old_doctor, require_pairing=False,
+                               profile_policy=unsupported)
+        assert row["verdict"] == "FAIL", (mode, row)
+
+    with pytest.raises(ValueError, match="沒有登錄 profile policy phase"):
+        uc.select_profile_policy("unlisted_phase")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_field_scanner_ignores_multiline_quoted_value(fake_driver):
+    """YAML 多行 scalar 內的欄位文字不可被當成 prpl-template 的實際 key。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    text = (
+        'profiles:\n'
+        '  prpl-template:\n'
+        '    platform: prpl\n'
+        '    login_regex: "prompt begins\n'
+        '    timeout_recovery_keys: [CTRL_C]\n'
+        '    prompt ends"\n'
+    )
+    parsed = yaml.safe_load(text)
+    assert "timeout_recovery_keys" not in parsed["profiles"]["prpl-template"]
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "多行 quoted scalar 反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is False, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "field_missing", evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_field_scanner_accepts_quoted_mapping_key(fake_driver):
+    """YAML quoted key 仍是 template 的實際頂層欄位。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        '    "timeout_recovery_keys": [CTRL_C]\n'
+    )
+    parsed = yaml.safe_load(text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "quoted key 反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "PASS", result
+    assert migration["detail"]["target_asset_has_field"] is True, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "ok", evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_accepts_merged_mapping_key(fake_driver):
+    """YAML merge key 合併出的 template 欄位須由解析器正確辨識。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    text = (
+        "common_profile: &common_profile\n"
+        "  timeout_recovery_keys: [CTRL_C]\n"
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    <<: *common_profile\n"
+    )
+    parsed = yaml.safe_load(text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "YAML merge key 欄位反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "PASS", result
+    assert migration["detail"]["target_asset_has_field"] is True, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "ok", evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, tmp_path):
+    """bundle 副本和 live profile 有 p290 欄位，不可掩蓋候選 CLI 內嵌舊資產。"""
+    import shutil
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target_asset = (driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                    / "default.yaml")
+    live_profile = driver.doctor_profile_dir / "default.yaml"
+    target_document = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    live_document = yaml.safe_load(live_profile.read_text(encoding="utf-8"))
+    assert "timeout_recovery_keys" in target_document["profiles"]["prpl-template"]
+    assert "timeout_recovery_keys" in live_document["profiles"]["prpl-template"]
+
+    stale_document = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    del stale_document["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    stale_asset = yaml.safe_dump(stale_document, sort_keys=False, allow_unicode=True).encode("utf-8")
+    assert "boot_done_regex" in stale_document["profiles"]["prpl-template"]
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / driver.new_cli.name
+    candidate_cli.write_bytes(b"candidate CLI with stale embedded asset\n" + stale_asset)
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(candidate_cli.parent.parent, installed_version)
+    installed_cli = installed_version / "bin" / driver.new_cli.name
+    driver.env["PATH"] = str(installed_cli.parent)
+    doctor_before_probe = driver.parse(driver.sw("doctor"))
+    profile_before_probe = next(check for check in doctor_before_probe["checks"]
+                                if check["check"] == "profile_template_fields")
+    assert profile_before_probe["missing_fields"] == {"prpl-template": ["boot_done_regex"]}
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 CLI 內嵌資產檢查", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "FAIL", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "FAIL" and embedded["detail"]["reported_missing_field"] is False, embedded
+
+    driver.env["PATH"] = str(tmp_path / "active-bin")
+    unconfirmed = driver.judge_doctor(
+        "doctor_green_new", "候選 CLI 路徑無法確認", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert unconfirmed["verdict"] == "FAIL", unconfirmed
+    assert unconfirmed["detail"]["candidate_cli_p290_asset"]["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_nested_flow_sequence_as_candidate_profile_field(fake_driver):
+    """候選 YAML 的巢狀 flow key 不得掩蓋候選 CLI 與 live profile 的版本差異。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    other:\n"
+        "      - [one,\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+        "      ]\n",
+        encoding="utf-8",
+    )
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "巢狀 flow 欄位反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["detail"]["candidate_cli_p290_asset"]["verdict"] == "PASS", result
+    assert result["verdict"] == "FAIL", result
+    assert migration["verdict"] == "FAIL", migration
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    assert yaml_evidence["interpreter_path"] == str(
+        Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs" / "serialwrap" / "bin" / "python"
+    ), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_alternate_nested_flow_layout_as_candidate_profile_field(fake_driver):
+    """另一種合法的 flow sequence 換行也不能把巢狀文字當成 template 欄位。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    other:\n"
+        "      - [\n"
+        "          one,\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+        "        ]\n",
+        encoding="utf-8",
+    )
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "另一種巢狀 flow 排版", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+
+
+def _simulate_windows_candidate_cli(driver, tmp_path):
+    """建立只有 `.exe` 候選檔的 bundle，於 POSIX 測試 Windows 檔名語意。"""
+    import shutil
+
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    windows_bundle = tmp_path / "windows-bundle"
+    windows_version = windows_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, windows_version)
+    source_cli = windows_version / "bin" / driver.new_cli.name
+    windows_candidate = windows_version / "bin" / "serialwrap.exe"
+    candidate_bytes = source_cli.read_bytes()
+    if source_cli != windows_candidate:
+        source_cli.unlink()
+    windows_candidate.write_bytes(candidate_bytes)
+    driver.bundle = windows_bundle
+    driver.new_cli = windows_candidate
+    target = windows_version / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    return target, windows_candidate
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_path):
+    """目前 CLI 與 bundle 候選路徑不一致時應回傳 FAIL 列，不得拋例外。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target, windows_candidate = _simulate_windows_candidate_cli(driver, tmp_path)
+    cli_name = driver.new_cli.name
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
+    configured_cli = tmp_path / "configured-copy" / "bin" / cli_name
+    configured_cli.parent.mkdir(parents=True)
+    configured_cli.write_text("not the bundle candidate", encoding="utf-8")
+    driver.new_cli = configured_cli
+
+    assert candidate_cli == windows_candidate
+    assert candidate_cli.is_file()
+    assert windows_candidate.is_file()
+    assert configured_cli.is_file()
+    result = driver.verify_candidate_p290_asset(target)
+
+    assert result["verdict"] == "FAIL", result
+    assert result["id"] == "candidate_cli_p290_asset", result
+    assert result["reason"] == "目前 CLI 並非本次候選版本", result
+    assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+    assert result["detail"]["candidate_cli_path"] == str(candidate_cli.resolve()), result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_candidate_cli_missing_path_returns_configured_path_evidence(fake_driver, tmp_path):
+    """bundle 候選 CLI 缺失時，FAIL 列仍須帶回設定 CLI 路徑與解析錯誤。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target, windows_candidate = _simulate_windows_candidate_cli(driver, tmp_path)
+    cli_name = driver.new_cli.name
+    configured_cli = tmp_path / "configured-copy" / "bin" / cli_name
+    configured_cli.parent.mkdir(parents=True)
+    configured_cli.write_text("configured CLI", encoding="utf-8")
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
+    assert candidate_cli == windows_candidate
+    assert candidate_cli.is_file()
+    candidate_cli.unlink()
+    assert not candidate_cli.exists()
+    driver.new_cli = configured_cli
+
+    result = driver.verify_candidate_p290_asset(target)
+
+    assert result["verdict"] == "FAIL", result
+    assert result["id"] == "candidate_cli_p290_asset", result
+    assert result["reason"] == "無法確認候選 CLI 路徑", result
+    assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+    assert result["detail"]["path_resolution_errors"]["candidate_cli"] == {
+        "path": str(candidate_cli), "error": "FileNotFoundError",
+    }, result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_prefers_candidate_runtime_for_profile_yaml_probe(fake_driver):
+    """候選 bundle runtime 有 PyYAML 時，profile gate 應使用並記錄該直譯器。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+    candidate_python.parent.mkdir(parents=True)
+    candidate_python.write_text("candidate runtime is supplied by the test subprocess stub\n", encoding="utf-8")
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 runtime YAML 解析", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    assert result["verdict"] == "PASS", result
+    assert yaml_evidence["interpreter_path"] == str(candidate_python), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_falls_back_when_candidate_runtime_lacks_pyyaml(fake_driver, monkeypatch):
+    """候選 runtime 缺 PyYAML 時改用舊版 venv，並記錄兩次解析器選擇。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+    candidate_python.parent.mkdir(parents=True)
+    candidate_python.write_text("candidate runtime is stubbed by this test\n", encoding="utf-8")
+    fallback_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
+                       / "serialwrap" / "bin" / "python")
+    real_run = uc.subprocess.run
+    attempted_interpreters = []
+
+    def run_candidate_probe(argv, **kwargs):
+        attempted_interpreters.append(str(argv[0]))
+        if str(argv[0]) == str(candidate_python):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "missing_pyyaml"}), "")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(uc.subprocess, "run", run_candidate_probe)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 runtime 缺 PyYAML 時回退", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    assert result["verdict"] == "PASS", result
+    assert yaml_evidence["interpreter_path"] == str(fallback_python), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
+    assert yaml_evidence["parser_attempts"][0]["status"] == "missing_pyyaml", yaml_evidence
+    assert yaml_evidence["parser_attempts"][1]["status"] == "ok", yaml_evidence
+    assert attempted_interpreters == [str(candidate_python), str(fallback_python)] * 2, attempted_interpreters
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_yaml_probe_fails_closed_on_invalid_input_or_missing_parser(fake_driver):
+    """YAML 解析錯誤、非 mapping、template 不存在及缺解析器都必須回結構化 FAIL。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+    invalid_profiles = (
+        "profiles: [unterminated\n",
+        "- not-a-mapping\n",
+        "profiles: {}\n",
+        "profiles:\n  prpl-template: []\n",
+    )
+    for text in invalid_profiles:
+        target.write_text(text, encoding="utf-8")
+        result = driver.judge_doctor(
+            "doctor_green_new", "YAML 解析失敗關閉", require_pairing=True,
+            profile_policy=driver.profile_policies["new"],
+        )
+        migration = result["detail"]["p290_profile_migration"]
+        assert result["verdict"] == "FAIL", result
+        assert result["detail"]["candidate_cli_p290_asset"]["verdict"] == "PASS", result
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is False, migration
+        assert migration["detail"]["target_asset_yaml"]["pyyaml_version"], migration
+
+    legacy_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
+                     / "serialwrap" / "bin" / "python")
+    legacy_python.unlink()
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+    result = driver.judge_doctor(
+        "doctor_green_new", "缺少 YAML 解析器", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["verdict"] == "FAIL", migration
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["target_asset_yaml"]["interpreter_path"] is None, migration
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_accepts_bracket_in_plain_scalar(fake_driver, monkeypatch):
+    """正式 driver 的遷移判定不可讓 plain scalar 內的 bracket 遮蔽真實欄位。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    live_text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    prompt_regex: ^\\[\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+    )
+    parsed = yaml.safe_load(live_text)
+    assert parsed["profiles"]["prpl-template"]["prompt_regex"] == r"^\["
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(live_text, encoding="utf-8")
+    live.write_text(live_text, encoding="utf-8")
+    monkeypatch.setattr(driver, "verify_candidate_p290_asset", lambda _asset: {
+        "id": "candidate_cli_p290_asset", "verdict": "PASS", "reason": None, "detail": {},
+    })
+    result = driver.judge_doctor(
+        "doctor_green_new", "plain scalar bracket migration", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_decodes_escaped_quoted_key(fake_driver, monkeypatch):
+    """正式 driver 依 YAML 解碼後的 quoted key 判定目標欄位。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    live_text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        '    "timeout_recovery_\\x6beys": [CTRL_C]\n'
+    )
+    parsed = yaml.safe_load(live_text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(live_text, encoding="utf-8")
+    live.write_text(live_text, encoding="utf-8")
+    monkeypatch.setattr(driver, "verify_candidate_p290_asset", lambda _asset: {
+        "id": "candidate_cli_p290_asset", "verdict": "PASS", "reason": None, "detail": {},
+    })
+    result = driver.judge_doctor(
+        "doctor_green_new", "escaped quoted key migration", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, monkeypatch):
+    """安裝後 CLI 位於版本目錄副本時，須驗證副本後再執行內嵌資產 probe。"""
+    import shutil
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    source_cli_name = driver.new_cli.name
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(source_version, installed_version)
+    installed_cli = installed_version / "bin" / driver.new_cli.name
+    driver.env["PATH"] = str(installed_cli.parent)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "不同路徑的安裝候選 CLI", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "PASS", embedded
+    assert embedded["detail"]["active_cli_path"] == str(installed_cli.resolve())
+    assert embedded["detail"]["candidate_cli_sha256"] == embedded["detail"]["active_cli_sha256"]
+
+    # 在 Linux 注入 Windows 的可執行檔名稱與 PATH 查找結果，重現 Windows CI 的 PATHEXT 路徑。
+    windows_bundle = tmp_path / "windows-bundle"
+    windows_version = windows_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, windows_version)
+    windows_candidate = windows_version / "bin" / "serialwrap.exe"
+    windows_candidate.write_bytes(driver.new_cli.read_bytes())
+    windows_installed_version = tmp_path / "windows-installed" / "versions" / NEW_VERSION
+    shutil.copytree(windows_version, windows_installed_version)
+    windows_installed_cli = windows_installed_version / "bin" / "serialwrap.exe"
+    driver.bundle = windows_bundle
+    driver.new_cli = windows_candidate
+    driver.env["PATH"] = os.pathsep.join((
+        str(tmp_path / "missing-active-bin"),
+        str(windows_installed_cli.parent),
+    ))
+    driver_module = driver._driver_module
+
+    monkeypatch.setattr(driver_module.shutil, "which", lambda *_args, **_kwargs: None)
+    lookup_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 精確檔名 PATH 查找", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    real_mkdtemp = driver_module.tempfile.mkdtemp
+    temp_dirs: list[str | None] = []
+
+    def tracked_mkdtemp(*args, **kwargs):
+        temp_dirs.append(kwargs.get("dir"))
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "tempfile", types.SimpleNamespace(mkdtemp=tracked_mkdtemp))
+    monkeypatch.setattr(
+        driver_module.shutil,
+        "which",
+        lambda *_args, **_kwargs: None,
+    )
+    temp_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 平台預設暫存根", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert (
+        lookup_result["verdict"],
+        temp_result["verdict"],
+        temp_dirs,
+    ) == ("PASS", "PASS", [None]), {
+        "lookup_result": lookup_result,
+        "temp_result": temp_result,
+        "temp_dirs": temp_dirs,
+    }
+    for probe_result in (lookup_result, temp_result):
+        embedded = probe_result["detail"]["candidate_cli_p290_asset"]
+        assert embedded["verdict"] == "PASS", embedded
+        assert embedded["detail"]["active_cli_path"] == str(windows_installed_cli.resolve())
+
+    # Windows 模擬也保留無副檔名 CLI；即使 shutil.which 找不到，精確 PATH 查找仍須定位安裝副本。
+    extensionless_bundle = tmp_path / "windows-extensionless-bundle"
+    extensionless_version = extensionless_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, extensionless_version)
+    extensionless_source_cli = extensionless_version / "bin" / source_cli_name
+    extensionless_candidate = extensionless_version / "bin" / "serialwrap"
+    extensionless_candidate_bytes = extensionless_source_cli.read_bytes()
+    if extensionless_source_cli != extensionless_candidate:
+        extensionless_source_cli.unlink()
+    extensionless_candidate.write_bytes(extensionless_candidate_bytes)
+    extensionless_installed_version = tmp_path / "windows-extensionless-installed" / "versions" / NEW_VERSION
+    shutil.copytree(extensionless_version, extensionless_installed_version)
+    extensionless_installed_cli = extensionless_installed_version / "bin" / "serialwrap"
+    driver.bundle = extensionless_bundle
+    driver.new_cli = extensionless_candidate
+    driver.env["PATH"] = os.pathsep.join((
+        str(tmp_path / "missing-extensionless-active-bin"),
+        str(extensionless_installed_cli.parent),
+    ))
+    extensionless_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 無副檔名 CLI 精確 PATH 查找", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert extensionless_result["verdict"] == "PASS", extensionless_result
+    extensionless_embedded = extensionless_result["detail"]["candidate_cli_p290_asset"]
+    assert extensionless_embedded["verdict"] == "PASS", extensionless_embedded
+    assert extensionless_embedded["detail"]["active_cli_path"] == str(extensionless_installed_cli.resolve())
+    assert extensionless_embedded["detail"]["candidate_cli_sha256"] == extensionless_embedded["detail"][
+        "active_cli_sha256"
+    ]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_stale_embedded_asset_in_installed_copy(fake_driver, tmp_path):
+    """bundle 副本雖新，安裝中的候選 CLI 若是舊內嵌資產仍須 FAIL。"""
+    import shutil
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(source_version, installed_version)
+    installed_cli = installed_version / "bin" / driver.new_cli.name
+    target_asset = source_version / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    parsed = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    del parsed["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    stale_asset = yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True).encode("utf-8")
+    stale_cli = b"candidate CLI with stale embedded asset\n" + stale_asset
+    installed_cli.write_bytes(stale_cli)
+    driver.env["PATH"] = str(installed_cli.parent)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "舊內嵌資產安裝副本", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "FAIL", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "FAIL", embedded
+    assert embedded["reason"] == "已安裝候選版本與 bundle 候選內容不一致"
+    assert embedded["detail"]["candidate_cli_sha256"] != embedded["detail"]["active_cli_sha256"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_other_advisory_still_fails():
+    policy = uc.select_profile_policy("materialized")
+    doctor = _doctor_with_profile_policy(policy)
+    doctor["checks"].append({"check": "jq_on_path", "ok": False, "advisory": True})
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+    assert row["verdict"] == "FAIL", row
 
 
 # ---------- 整體 verdict ----------
@@ -1015,6 +2177,309 @@ def test_system_driver_keeps_managed_profiles_in_snapshot():
     text = UPGRADE_CONTAINER.read_text(encoding="utf-8")
     assert "if k not in managed" not in text
     assert "expected_overwrites" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_migration_preservation_is_exact():
+    """p290 只核准 prpl template 缺欄位到 `[CTRL_C]` 的插入；其他 bytes 與已有值嚴格保留。"""
+    import hashlib
+
+    path = "profiles/custom.yaml"
+    before = (
+        b"# user comment\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\ntargets: []\n"
+    )
+    migrated = (
+        b"# user comment\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\n    timeout_recovery_keys: [CTRL_C]\ntargets: []\n"
+    )
+    before_hashes = {path: hashlib.sha256(before).hexdigest()}
+    after_hashes = {path: hashlib.sha256(migrated).hexdigest()}
+    exact = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade", before_hashes, after_hashes,
+        before_bytes={path: before}, after_bytes={path: migrated},
+    )
+    assert exact["verdict"] == "PASS", exact
+    assert exact["detail"]["p290_migrated"] == [path]
+
+    sequence_before = (
+        b"profiles:\n  - name: renamed-prpl\n    platform: prpl\n    prompt_regex: x\n"
+        b"targets: []\n"
+    )
+    sequence_after = (
+        b"profiles:\n  - name: renamed-prpl\n    platform: prpl\n    prompt_regex: x\n"
+        b"    timeout_recovery_keys: [CTRL_C]\ntargets: []\n"
+    )
+    sequence = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(sequence_before).hexdigest()},
+        {path: hashlib.sha256(sequence_after).hexdigest()},
+        before_bytes={path: sequence_before}, after_bytes={path: sequence_after},
+    )
+    assert sequence["verdict"] == "PASS", sequence
+    package_mismatch = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade", before_hashes, after_hashes,
+        before_bytes={path: before}, after_bytes={path: migrated},
+        expected_overwrites={path: hashlib.sha256(b"authoritative package asset").hexdigest()},
+    )
+    assert package_mismatch["verdict"] == "FAIL", package_mismatch
+
+    for invalid in (
+        migrated.replace(b"root@board", b"root@changed"),
+        migrated.replace(b"[CTRL_C]", b"[CTRL_D]"),
+        migrated.replace(b"    timeout_recovery_keys", b"      timeout_recovery_keys"),
+    ):
+        rejected = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade", before_hashes,
+            {path: hashlib.sha256(invalid).hexdigest()},
+            before_bytes={path: before}, after_bytes={path: invalid},
+        )
+        assert rejected["verdict"] == "FAIL", rejected
+
+    already_set = b"profiles:\n  prpl:\n    platform: prpl\n    timeout_recovery_keys: []\n"
+    overwritten = already_set.replace(b"[]", b"[CTRL_C]")
+    rejected = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(already_set).hexdigest()},
+        {path: hashlib.sha256(overwritten).hexdigest()},
+        before_bytes={path: already_set}, after_bytes={path: overwritten},
+    )
+    assert rejected["verdict"] == "FAIL", rejected
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_system_profile_accepts_exact_migration_with_expected_asset():
+    """expected_overwrites 不得遮蔽合法的缺欄精確遷移。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    before = (
+        b"# owner profile\nprofiles:\n  renamed-prpl:\n    platform: prpl\n"
+        b"    prompt_regex: 'root@board'\n"
+    )
+    after = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    result = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(before).hexdigest()},
+        {path: hashlib.sha256(after).hexdigest()},
+        before_bytes={path: before},
+        after_bytes={path: after},
+        expected_overwrites={path: hashlib.sha256(package_asset).hexdigest()},
+    )
+    assert result["verdict"] == "PASS", result
+    assert result["detail"]["p290_migrated"] == [path]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_system_profile_rejects_full_asset_overwrite_of_explicit_values():
+    """套件資產 hash 命中也不能授權整檔覆寫既有 [] 或 null。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    expected = {path: hashlib.sha256(package_asset).hexdigest()}
+    for explicit in (b"[]", b"null"):
+        before = (
+            b"# owner template and unrelated settings\nprofiles:\n  custom:\n    platform: prpl\n"
+            b"    timeout_recovery_keys: " + explicit + b"\nother_setting: retained\n"
+        )
+        result = uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade",
+            {path: hashlib.sha256(before).hexdigest()},
+            {path: hashlib.sha256(package_asset).hexdigest()},
+            before_bytes={path: before},
+            after_bytes={path: package_asset},
+            expected_overwrites=expected,
+        )
+        assert result["verdict"] == "FAIL", result
+        assert result["detail"]["changed"] == [path], result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_system_profile_overwrite_without_bytes_is_insufficient():
+    """缺少前後 bytes 時，expected_overwrites 不能替 system profile 的整檔覆寫背書。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    before = b"profiles:\n  custom:\n    platform: prpl\n    timeout_recovery_keys: null\n"
+    package_asset = b"profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n"
+    result = uc.judge_files_preserved_with_p290_migration(
+        "config_preserved_upgrade",
+        {path: hashlib.sha256(before).hexdigest()},
+        {path: hashlib.sha256(package_asset).hexdigest()},
+        before_bytes={},
+        after_bytes={},
+        expected_overwrites={path: hashlib.sha256(package_asset).hexdigest()},
+    )
+    assert result["verdict"] == "FAIL", result
+    assert result["detail"]["changed"] == [path], result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_long_comment_profile_comparison_is_iterative(monkeypatch):
+    """超過 Python 遞迴上限的合法插入與非法改寫都要得到結構化判定。"""
+    import hashlib
+
+    path = "/etc/serialwrap/profiles/default.yaml"
+    comments = b"".join(f"# 保留註解 {i}\n".encode("utf-8") for i in range(1_200))
+    before = comments + b"profiles:\n  renamed-prpl:\n    platform: prpl\n"
+    after = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+
+    def judge(candidate: bytes) -> dict[str, Any]:
+        return uc.judge_files_preserved_with_p290_migration(
+            "config_preserved_upgrade",
+            {path: hashlib.sha256(before).hexdigest()},
+            {path: hashlib.sha256(candidate).hexdigest()},
+            before_bytes={path: before},
+            after_bytes={path: candidate},
+        )
+
+    # Windows pipe stdin may use a legacy code page. Wrap the child probe's decoder
+    # portably so UTF-8 bytes for Chinese comments fail under CP-1252 on either host.
+    monkeypatch.setattr(
+        uc,
+        "_P290_YAML_PROBE",
+        "import io, sys\nsys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='cp1252')\n"
+        + uc._P290_YAML_PROBE,
+    )
+
+    assert judge(after)["verdict"] == "PASS"
+    illegal = after.replace("# 保留註解 1\n".encode("utf-8"), b"# changed\n", 1)
+    rejected = judge(illegal)
+    assert rejected["verdict"] == "FAIL", rejected
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_post_setup_expectation_rejects_missing_recovery_keys(tmp_path):
+    """遷移後 p289 gate 必須見到欄位；該補未補仍判 FAIL。"""
+    asset = tmp_path / "asset.yaml"
+    live = tmp_path / "live.yaml"
+    asset.write_text("profiles:\n  prpl-template:\n    platform: prpl\n    timeout_recovery_keys: [CTRL_C]\n", encoding="utf-8")
+    live.write_text("profiles:\n  prpl-template:\n    platform: prpl\n", encoding="utf-8")
+    row = uc.judge_p290_profile_migration(
+        "p290_profile_migration", asset, live,
+        migration_policy_id="p290-template-migration-v1",
+    )
+    assert row["verdict"] == "FAIL", row
+    assert row["detail"]["live_profile_has_field"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_downgrade_preserves_post_migration_profiles():
+    """rollback 與降級以成功遷移後 snapshot 作保存基準，且不可刪掉新增欄位。"""
+    import hashlib
+
+    before = b"profiles:\n  prpl:\n    platform: prpl\n"
+    migrated = before + b"    timeout_recovery_keys: [CTRL_C]\n"
+    post_migration = {"profiles/default.yaml": hashlib.sha256(migrated).hexdigest()}
+    kept = uc.judge_rollback_success(
+        "rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.3.2",
+        cfg_before=post_migration, cfg_after=dict(post_migration),
+    )
+    assert kept["verdict"] == "PASS", kept
+    removed = uc.judge_rollback_success(
+        "rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.3.2",
+        cfg_before=post_migration,
+        cfg_after={"profiles/default.yaml": hashlib.sha256(before).hexdigest()},
+    )
+    assert removed["verdict"] == "FAIL", removed
+    assert uc.judge_files_preserved("config_preserved_downgrade", post_migration,
+                                    dict(post_migration))["verdict"] == "PASS"
+    assert uc.judge_files_preserved(
+        "config_preserved_downgrade", post_migration,
+        {"profiles/default.yaml": hashlib.sha256(before).hexdigest()},
+    )["verdict"] == "FAIL"
+
+
+def _p290_wal_record(seq: int, payload: bytes) -> dict[str, Any]:
+    return {"seq": seq, "dir": "TX", "payload_b64": base64.b64encode(payload).decode("ascii")}
+
+
+class _P290RecoveryFakeSw:
+    def __init__(self, recovery: dict[str, Any]) -> None:
+        self.recovery = recovery
+        self.commands: list[str] = []
+        self.shell_pids = iter((4_201, 4_201))
+
+    def session(self, _com: str) -> dict[str, Any]:
+        return {"state": "READY"}
+
+    def run(self, *args: str) -> dict[str, Any]:
+        if args[:2] == ("wal", "current-seq"):
+            return {"ok": True, "seq": 100}
+        if args[:2] == ("log", "tail-raw"):
+            return {"ok": True, "wal_file_exists": True, "truncated": False,
+                    "records": [_p290_wal_record(101, b"\x03")]}
+        raise AssertionError(args)
+
+    def submit_and_wait(self, _com: str, command: str, **_kwargs: Any) -> dict[str, Any]:
+        self.commands.append(command)
+        if command == "sleep 30":
+            return self.recovery
+        if command.startswith("echo P290_SHELL_ID_") and command.endswith("_$$"):
+            marker = command.removeprefix("echo ").removesuffix("_$$")
+            return {"status": "done", "stdout": f"{marker}_{next(self.shell_pids)}"}
+        marker = command.removeprefix("echo ")
+        return {"status": "done", "stdout": marker}
+
+
+def _p290_case_context(recovery: dict[str, Any]) -> SimpleNamespace:
+    sw = _P290RecoveryFakeSw(recovery)
+    notes: dict[str, str] = {}
+    return SimpleNamespace(
+        sw=sw,
+        cfg={"boards": [{"com": "COM0", "platform": "prpl"}]},
+        note=lambda name, body: notes.setdefault(name, body) or name,
+        notes=notes,
+    )
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_accepts_done_ctrl_c_recovery():
+    """回歸 driver 依 command status 契約接受 done／null error_code／CTRL_C。"""
+    ctx = _p290_case_context({"status": "done", "error_code": None, "recovery_action": "CTRL_C"})
+    result = p290_case._run(ctx)
+    assert result.verdict == "PASS", result
+    assert ctx.sw.commands[0].startswith("echo P290_SHELL_ID_")
+    assert ctx.sw.commands[0].endswith("_$$")
+    assert ctx.sw.commands[1] == "sleep 30"
+    assert ctx.sw.commands[2] == ctx.sw.commands[0]
+    assert ctx.sw.commands[3].startswith("echo P290_ALIVE_")
+    assert "keys=[3]" in ctx.notes["recovery-key-sequence.txt"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_rejects_failed_recovery():
+    """fake driver 的失敗 command status 不得被誤判成 Ctrl-C 已恢復。"""
+    ctx = _p290_case_context({"status": "failed", "error_code": "PROMPT_TIMEOUT", "recovery_action": "NONE"})
+    result = p290_case._run(ctx)
+    assert result.verdict == "FAIL", result
+    assert result.reason_code == "timeout_not_recovered_by_ctrl_c"
+    assert len(ctx.sw.commands) == 2
+    assert ctx.sw.commands[0].startswith("echo P290_SHELL_ID_")
+    assert ctx.sw.commands[0].endswith("_$$")
+    assert ctx.sw.commands[1] == "sleep 30"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_p290_regression_fake_driver_rejects_shell_identity_change():
+    """recovery 後若 ash PID 改變，fake driver 必須拒絕即使 echo 命令成功。"""
+    ctx = _p290_case_context({"status": "done", "error_code": None, "recovery_action": "CTRL_C"})
+    ctx.sw.shell_pids = iter((4_201, 9_802))
+    result = p290_case._run(ctx)
+    assert result.verdict == "FAIL", result
+    assert result.reason_code == "shell_identity_changed"
 
 
 @pytest.mark.core_portable

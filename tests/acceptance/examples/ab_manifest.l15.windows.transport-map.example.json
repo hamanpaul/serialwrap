@@ -1,0 +1,34 @@
+{
+  "approved_pairs": {
+    "EXAMPLE-PAIR": {
+      "daemon_side_port_id": "EXAMPLE-PAIR-DAEMON-ENDPOINT",
+      "decision_ref": "EXAMPLE-PAIR-APPROVED",
+      "dut_side_port_id": "EXAMPLE-PAIR-DUT-ENDPOINT"
+    }
+  },
+  "cases": {
+    "example-local-case": {
+      "allowed_transports": [
+        "local-process"
+      ],
+      "pair_id": null,
+      "platform": "windows",
+      "requires_native_com": false,
+      "runner": "func-test"
+    },
+    "example-native-com-case": {
+      "allowed_transports": [
+        "windows-native-com",
+        "od08-physical"
+      ],
+      "pair_id": "EXAMPLE-PAIR",
+      "platform": "windows",
+      "requires_native_com": true,
+      "runner": "windows-native"
+    }
+  },
+  "exit_item_id": "S3-L15-RELEASE-AB-WINDOWS",
+  "physical_substitutes": {},
+  "platform": "windows",
+  "schema_version": 1
+}
