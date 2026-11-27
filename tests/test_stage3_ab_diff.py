@@ -1950,3 +1950,43 @@ def test_nonbridge_mixed_mapped_results_only_reports_failed_source(tmp_path: Pat
 
     failures = [row for row in result["product_failures"] if row["case"] == case_id]
     assert [row["source_ref"] for row in failures] == [refs[1]]
+
+
+def test_paired_runs_follow_numeric_run_index_order(tmp_path: Path):
+    # PR 330 review：配對順序須依數值 run_index（2 在 10 之前），不得用字串字典序。
+    case_id = "numeric-run-order"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    for run_index in (2, 10):
+        fakes.write_run(a_dir, case_id, side="a", run_index=run_index,
+                        calls=[_call(["session", "list"], {"state": "READY"})])
+        fakes.write_run(b_dir, case_id, side="b", run_index=run_index,
+                        calls=[_call(["session", "list"], {"state": f"ATTACHED-{run_index}"})])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    order = [item["source_refs"]["b"].split("/")[2] for item in result["differences"]
+             if item["case"] == case_id and "state" in item["path"]]
+    assert order == ["2", "10"]
+
+
+def test_case_change_missing_from_registered_breaks_integrity(tmp_path: Path):
+    # PR 330 review：case_changes 引用的變更 ID 必須存在於 registered，否則兩側完整性失敗。
+    case_id = "unregistered-case-change"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", calls=[_call(["session", "list"], {"state": "READY"})])
+    fakes.write_run(b_dir, case_id, side="b", calls=[_call(["session", "list"], {"state": "READY"})])
+
+    result = _diff(a_dir, b_dir, {case_id}, registered={"SC-15": "diff"},
+                   case_changes={case_id: "BC-99"})
+
+    assert result["integrity"] == {"a": False, "b": False}
+    for side in ("a", "b"):
+        assert _has_problem(result, side, f"unregistered case change: {case_id} -> BC-99")
+    assert result["ok"] is False
+
+    registered_ok = _diff(a_dir, b_dir, {case_id}, registered={"BC-99": "absolute_only"},
+                          case_changes={case_id: "BC-99"})
+    assert registered_ok["integrity"] == {"a": True, "b": True}
+    assert registered_ok["ok"] is True

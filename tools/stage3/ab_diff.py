@@ -1631,7 +1631,7 @@ def _pair_problems(
     a_by_key = {_run_pair_key(run): run for run in a_runs}
     b_by_key = {_run_pair_key(run): run for run in b_runs}
     pairs: list[tuple[_Run, _Run]] = []
-    for runner, index in sorted(set(a_by_key) | set(b_by_key), key=lambda item: (item[1], item[0])):
+    for runner, index in sorted(set(a_by_key) | set(b_by_key), key=lambda item: (_run_key(item[1]), item[0])):
         key = (runner, index)
         if key not in a_by_key:
             _add_problem(problems["a"], f"missing corresponding run: {case_id}/{runner}/{index}")
@@ -1769,6 +1769,11 @@ def diff_l15(
         raise _harness(f"無法讀取 A/B 報告目錄：{exc}") from exc
 
     problems: dict[str, list[str]] = {"a": [], "b": []}
+    # case_changes 引用的變更 ID 必須存在於 registered；對照表不一致時兩側完整性失敗，不靜默忽略。
+    for case_id, change_id in sorted(case_changes.items()):
+        if change_id not in registered:
+            for side in ("a", "b"):
+                _add_problem(problems[side], f"unregistered case change: {case_id} -> {change_id}")
     for side, runs_by_case in (("a", runs_a), ("b", runs_b)):
         if not required_case_ids:
             _add_problem(problems[side], "required_case_ids 為空，無法判定完整性")

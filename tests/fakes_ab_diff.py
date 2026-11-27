@@ -116,7 +116,8 @@
    成 P2 bridge 檔。
 
 3. 缺漏採 fail-closed，缺漏類型不互相代替：缺 required case 為
-   ``missing required case: <case_id>``；缺 source_files 所列原檔或 SHA 不符為
+   ``missing required case: <case_id>``；``case_changes`` 引用的變更 ID 不在 ``registered`` 時，兩側都記
+   ``unregistered case change: <case_id> -> <change_id>``；缺 source_files 所列原檔或 SHA 不符為
    ``missing source file: <relative_path>``／``source hash mismatch:
    <relative_path>``；缺 CLI 記錄、rc 或 stdout 為
    ``missing required observation: cli_observations[<i>].<field>``（例如 argv、rc、stdout）；缺 CLI／daemon
