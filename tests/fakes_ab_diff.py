@@ -131,7 +131,8 @@
    都保留在 ``safety_violations``；來源未核實者另記於 ``unverified_failures`` 並
    令該側 integrity=false。只有對應 ``required_case_ids`` 的 B 側一般 FAIL 才列入
    ``product_failures``；A 側一般 FAIL 列入 ``baseline_failures``。任何可解析但尚未
-   核實的 FAIL 線索都保留在 ``unverified_failures``。資料欄位型別錯誤轉成該 run
+   核實的 FAIL 線索都保留在 ``unverified_failures``，且該側必須有對應的
+   ``integrity_problems``、``integrity=false`` 與 ``ok=false``。資料欄位型別錯誤轉成該 run
    的完整性診斷並繼續掃描；只有呼叫端參數無效才回報 HarnessError。bridge 缺
    ``manifest.json``、``comparison.json``、``bridge-manifest.json``、
    ``wire.ndjson``、``cli.ndjson``、``daemon.log`` 或 ``wal/``，逐項使用
@@ -159,14 +160,39 @@
    ``scope``、``ab_participation``、``case_ids``；例如 BC-06 為 rust_only /
    absolute_only，且列出 ``bc06-shutdown-self-test-flush``。
 
-5. CLI 呼叫以序號逐筆配對並比較 logical argv：移除 argv[0] 的 CLI 執行檔
-   （``sw_core/cli.py:2148-2150`` 的 parser 程式名稱），再移除
-   ``--endpoint``、``--socket``、``--bench`` 及其值（全域選項依
-   ``sw_core/cli.py:2162-2168`` 定義，endpoint 優先序依
-   ``sw_core/cli.py:876-900``）；支援 ``--flag=value`` 寫法。其他參數一律保留，
-   包括 ``--timeout``（``sw_core/cli.py:2170-2175``）與 ``--cmd-id``
-   （``sw_core/cli.py:2395-2401``）。剩餘每個參數值套用該側 instance root
-   替換為 ``<ROOT>``。命令不同時新增一筆 ``{kind: "argv", path:
+5. CLI 呼叫以序號逐筆配對並比較 logical argv。移除 argv[0] 的 CLI 執行檔
+   （Python parser 的 ``prog="serialwrap"`` 定義於 ``sw_core/cli.py:2148-2150``；
+   Rust root spec 定義於 ``crates/sw-cli/src/cli_spec.rs:1893``），再只在 root
+   parser 的子命令之前移除真正的實例路由選項：``--socket``（
+   ``sw_core/cli.py:2162``、``crates/sw-cli/src/cli_spec.rs:1904``）、
+   ``--endpoint``（``sw_core/cli.py:2163``、
+   ``crates/sw-cli/src/cli_spec.rs:1905``；解析優先序見
+   ``sw_core/cli.py:876-900`` 與 ``crates/sw-cli/src/endpoint_resolve.rs:230-300``）、
+   ``--bench``（``sw_core/cli.py:2164-2168``、
+   ``crates/sw-cli/src/cli_spec.rs:1906``；bench endpoint 解析見
+   ``sw_core/cli.py:876-900`` 與 ``crates/sw-cli/src/endpoint_resolve.rs:230-300``）及
+   各自緊接的一個值。三者是實例路由選項：socket／endpoint 選定 daemon endpoint，
+   bench 依已記住的 bench 解析 endpoint。支援 ``--flag=value``；分離值只移除
+   選項後一個 token。遇到 ``--`` 後保留所有 token；一旦進入子命令，該層位置參數
+   與選項一律保留，即使 token 名稱與 root 選項相同。其他 root 選項也保留，包含
+   ``--timeout``（``sw_core/cli.py:2170-2175``、
+   ``crates/sw-cli/src/cli_spec.rs:1907``）、``--retries``
+   （``sw_core/cli.py:2177-2183``、``crates/sw-cli/src/cli_spec.rs:1908``）、
+   ``-v``／``--verbose``（``sw_core/cli.py:2161``、
+   ``crates/sw-cli/src/cli_spec.rs:1903``）、``--version``
+   （``sw_core/cli.py:2160``、``crates/sw-cli/src/cli_spec.rs:1902``）、
+   ``-h``／``--help``（Python ``ArgumentParser`` 的 ``add_help=True`` 見
+   ``sw_core/cli.py:2149``；Rust root spec 見
+   ``crates/sw-cli/src/cli_spec.rs:1899-1901``）；它們不是實例路由參數。
+   子命令的 ``--cmd-id``
+   （``sw_core/cli.py:2395-2401``）同樣保留。Rust root spec 對應位置在
+   ``crates/sw-cli/src/cli_spec.rs:1899-1908``；此處沒有 Rust CLI 實際 argv 執行。
+   bridge ``cli.ndjson`` 與非 bridge ``cli_observations`` 的 argv 都必須是非空字串
+   清單，移除 CLI 路徑與實例路由選項後仍須有 root 子命令位置參數；否則分別記
+   ``missing required observation: cli_observations[<i>].argv (cli.ndjson#L<n>)``
+   與 ``missing required observation: cli_observations[<i>].argv``。
+   剩餘每個參數值套用該側 instance root 替換為 ``<ROOT>``。命令不同時新增一筆
+   ``{kind: "argv", path:
    "call[<i>].argv", source_refs: {a, b}}`` 差異；呼叫數不同時，每一筆多出或
    缺少的呼叫各新增 ``{kind: "call_count", path: "call[<i>]",
    source_refs: {a, b}}``，缺少側的 source_ref 為 null。這兩個 kind 是 plan
@@ -181,6 +207,9 @@
    安全 invariant FAIL 另外保留為 ``<A|B>:<case>:<invariant_id>``；安全 FAIL 不受 B11 欄位正規化
    影響。每筆差異必含 ``source_refs: {a, b}``，分別為兩側觀測的相對來源引用，
    且可定位原始觀測檔／line；不以 report 根絕對路徑作 provenance。
+   ``unverified_failures`` 非空的一側，必須在該側
+   ``integrity_problems`` 有對應診斷、``integrity`` 必為 false，並因此令
+   ``ok`` 為 false。
 
 7. B11 暫定觀測範圍：候選規則只允許忽略邏輯命令為 ``daemon status`` 或
    ``health.status``、CLI ``rc == 0`` 且 stdout JSON ``ok is true`` 的回應中最上層

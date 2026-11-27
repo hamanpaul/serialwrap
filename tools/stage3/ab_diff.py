@@ -63,6 +63,8 @@ _EXCEPTION = "EXCEPTION"
 _ROOT_SEGMENT_CHARS = "A-Za-z0-9._-"
 _INSTANCE_ENDPOINT_FLAGS = frozenset({"--socket", "--endpoint", "--bench"})
 _ENDPOINT_PATH_FLAGS = frozenset({"--socket", "--endpoint"})
+_ROOT_VALUE_OPTIONS = frozenset({"--timeout", "--retries"})
+_ROOT_SWITCH_OPTIONS = frozenset({"-h", "--help", "--version", "-v", "--verbose"})
 _ALLOWED_RULE_KEYS = frozenset({
     "approved_revision",
     "reviewed_by",
@@ -317,8 +319,12 @@ def _parse_bridge_calls(run: _Run) -> None:
         argv = row.get("argv")
         rc = row.get("rc")
         stdout = row.get("stdout")
-        if not isinstance(argv, list) or not all(isinstance(token, str) for token in argv):
-            _add_problem(run.problems, f"missing required observation: cli_observations[{len(run.calls)}].argv")
+        argv_valid = isinstance(argv, list) and all(isinstance(token, str) for token in argv)
+        if not argv_valid or not argv or not _has_logical_command(argv):
+            _add_problem(
+                run.problems,
+                f"missing required observation: cli_observations[{len(run.calls)}].argv ({ref})",
+            )
         if not isinstance(rc, int) or isinstance(rc, bool):
             _add_problem(run.problems, f"missing required observation: cli_observations[{len(run.calls)}].rc")
             rc = None
@@ -326,7 +332,7 @@ def _parse_bridge_calls(run: _Run) -> None:
             _add_problem(run.problems, f"missing required observation: cli_observations[{len(run.calls)}].stdout")
         response, response_valid = _parse_stdout(run, stdout, ref)
         run.calls.append(_Call(
-            argv=list(argv) if isinstance(argv, list) and all(isinstance(token, str) for token in argv) else [],
+            argv=list(argv) if argv_valid else [],
             rc=rc,
             stdout=stdout if isinstance(stdout, str) else None,
             response=response,
@@ -699,7 +705,8 @@ def _parse_runner_calls(run: _Run, envelope: Mapping[str, Any]) -> None:
         argv = observation.get("argv")
         rc = observation.get("rc")
         stdout = observation.get("stdout")
-        if not isinstance(argv, list) or not all(isinstance(token, str) for token in argv):
+        argv_valid = isinstance(argv, list) and all(isinstance(token, str) for token in argv)
+        if not argv_valid or not argv or not _has_logical_command(argv):
             _add_problem(run.problems, f"missing required observation: cli_observations[{index}].argv")
         if not isinstance(rc, int) or isinstance(rc, bool):
             _add_problem(run.problems, f"missing required observation: cli_observations[{index}].rc")
@@ -711,7 +718,7 @@ def _parse_runner_calls(run: _Run, envelope: Mapping[str, Any]) -> None:
         )
         response, response_valid = _parse_stdout(run, stdout, source_ref or f"{raw_relative}#L{index + 1}")
         run.calls.append(_Call(
-            argv=list(argv) if isinstance(argv, list) and all(isinstance(token, str) for token in argv) else [],
+            argv=list(argv) if argv_valid else [],
             rc=rc,
             stdout=stdout if isinstance(stdout, str) else None,
             response=response,
@@ -933,11 +940,12 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
         verified_mapped_indices.add(result_index)
         executed_outcomes.append(outcome)
 
-    raw_failed_indices: set[int] = set()
+    mapped_failed_indices: set[int] = set()
     for result_index, raw_row in enumerate(raw_results):
         if not isinstance(raw_row, Mapping) or raw_row.get("outcome") != "failed":
             continue
-        raw_failed_indices.add(result_index)
+        if result_index in verified_mapped_indices:
+            mapped_failed_indices.add(result_index)
         source_ref = run.ref("source/l1-results.json", f"#results[{result_index}]")
         verified = (
             result_index in verified_mapped_indices
@@ -952,7 +960,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
             else "原始 runner FAIL 尚未核實對應此 required case"
         )
         run.failure_records.append({"source_ref": source_ref, "reason": reason, "verified": verified})
-    if raw_failed_indices:
+    if run.failure_records:
         run.failure_ref = run.failure_records[0]["source_ref"]
         run.failure_reason = run.failure_records[0]["reason"]
         run.failure_verified = bool(run.failure_records[0]["verified"])
@@ -970,7 +978,9 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
         run.verdict = raw_verdict
     run.case_identity_verified = bool(case_identity_ok and case_map_ok)
 
-    if envelope.get("verdict") == "FAIL" and not raw_failed_indices:
+    if envelope.get("verdict") == "FAIL" and not (
+        case_identity_ok and case_map_ok and mapped_failed_indices
+    ):
         run.failure_records.append({
             "source_ref": run.ref("runner-observation.json"),
             "reason": run.reason or "runner envelope verdict FAIL is not corroborated by raw L1 results",
@@ -1326,7 +1336,56 @@ def normalize_response(obj: Any, *, rules: Mapping[str, Any], instance_root: str
 def _logical_argv(
     argv: Sequence[str], *, roots: Sequence[str] = (), placeholder: str = "<ROOT>",
 ) -> tuple[str, ...]:
-    """移除 CLI 執行檔及實例 endpoint 選項，保留其他參數並替換實例根目錄。"""
+    """依 root parser 邊界移除 CLI 路徑及實例路由選項，保留其餘 token。"""
+    tokens = _argv_without_cli_path(argv)
+    output: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            output.extend(tokens[index:])
+            break
+        if token in _INSTANCE_ENDPOINT_FLAGS:
+            index += 2 if index + 1 < len(tokens) else 1
+            continue
+        option, separator, _ = token.partition("=")
+        if separator and option in _INSTANCE_ENDPOINT_FLAGS:
+            index += 1
+            continue
+        if token in _ROOT_VALUE_OPTIONS:
+            output.append(token)
+            if index + 1 < len(tokens):
+                output.append(tokens[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if separator and option in _ROOT_VALUE_OPTIONS:
+            output.append(token)
+            index += 1
+            continue
+        if token in _ROOT_SWITCH_OPTIONS or (token.startswith("-") and len(token) > 2 and set(token[1:]) == {"v"}):
+            output.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            # 未知選項可能是子命令語法或 root parser 縮寫；保守保留後續全部輸入。
+            output.extend(tokens[index:])
+            break
+        # root parser 在第一個位置參數處進入子命令；後續 token 都由子命令解析。
+        output.extend(tokens[index:])
+        break
+    normalized: list[str] = []
+    for token in output:
+        value = token
+        for root in roots:
+            value = _root_substitute(value, root, placeholder)
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _argv_without_cli_path(argv: Sequence[str]) -> list[str]:
+    """移除 argv[0] 的 serialwrap 執行檔或帶路徑的執行檔。"""
     tokens = list(argv)
     if tokens:
         first = tokens[0]
@@ -1334,22 +1393,37 @@ def _logical_argv(
         if (basename in {"serialwrap", "serialwrap.exe", "serialwrap.py"}
                 or "/" in first or "\\" in first):
             tokens = tokens[1:]
-    output: list[str] = []
+    return tokens
+
+
+def _has_logical_command(argv: Sequence[str]) -> bool:
+    """判斷移除 CLI 路徑與全域選項值後是否仍有 root 子命令位置參數。"""
+    tokens = _argv_without_cli_path(argv)
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            return any(value.strip() for value in tokens[index + 1:])
         if token in _INSTANCE_ENDPOINT_FLAGS:
-            index += 2
+            index += 2 if index + 1 < len(tokens) else 1
             continue
-        if any(token.startswith(f"{flag}=") for flag in _INSTANCE_ENDPOINT_FLAGS):
+        option, separator, _ = token.partition("=")
+        if separator and option in _INSTANCE_ENDPOINT_FLAGS:
             index += 1
             continue
-        normalized = token
-        for root in roots:
-            normalized = _root_substitute(normalized, root, placeholder)
-        output.append(normalized)
-        index += 1
-    return tuple(output)
+        if token in _ROOT_VALUE_OPTIONS:
+            index += 2 if index + 1 < len(tokens) else 1
+            continue
+        if separator and option in _ROOT_VALUE_OPTIONS:
+            index += 1
+            continue
+        if token in _ROOT_SWITCH_OPTIONS or (token.startswith("-") and len(token) > 2 and set(token[1:]) == {"v"}):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return False
+        return bool(token.strip())
+    return False
 
 
 def _rules_for_calls(
@@ -1499,13 +1573,19 @@ def _collect_failures_and_safety(
                         elif case_id in required_case_ids:
                             product_failures.append(row)
                         else:
+                            problem = f"unverified failure source: {failure_ref}"
+                            _add_problem(run.problems, problem)
                             unverified_failures.append({
                                 **row,
-                                "problems": ["FAIL case is not in required_case_ids"],
+                                "problems": list(dict.fromkeys([*run.problems, "FAIL case is not in required_case_ids"])),
                             })
                     else:
-                        problems = list(dict.fromkeys(run.problems))
-                        unverified_failures.append({**row, "problems": problems or ["failure source identity unverified"]})
+                        problem = f"unverified failure source: {failure_ref}"
+                        _add_problem(run.problems, problem)
+                        unverified_failures.append({
+                            **row,
+                            "problems": list(dict.fromkeys(run.problems)),
+                        })
 
                 for invariant_failure in run.invariant_failures:
                     verified = run.identity_verified and run.case_identity_verified
@@ -1517,6 +1597,7 @@ def _collect_failures_and_safety(
                             safety.append(token)
                     else:
                         _add_problem(run.problems, "invariant FAIL source identity unverified")
+                        _add_problem(run.problems, f"unverified invariant failure source: {invariant_failure['source_ref']}")
                         unverified_failures.append({
                             "side": side,
                             "case": case_id,
@@ -1525,6 +1606,10 @@ def _collect_failures_and_safety(
                             "problems": list(dict.fromkeys(run.problems)),
                         })
                 for invariant_failure in run.unverified_invariant_failures:
+                    _add_problem(
+                        run.problems,
+                        f"unverified invariant failure source: {invariant_failure['source_ref']}",
+                    )
                     unverified_failures.append({
                         "side": side,
                         "case": case_id,

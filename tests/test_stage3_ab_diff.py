@@ -1725,3 +1725,186 @@ def test_logical_argv_keeps_non_instance_arguments(tmp_path: Path, preserved_fla
     assert any(item["kind"] == "argv" and item["path"] == "call[0].argv"
                for item in result["differences"])
 
+
+def _rewrite_bridge_argv(run_dir: Path, argv: list[str]) -> None:
+    """改寫 bridge CLI 觀測並同步 manifest 的原始位元組雜湊。"""
+    cli_path = run_dir / "cli.ndjson"
+    row = json.loads(cli_path.read_bytes().splitlines()[0].decode("utf-8"))
+    row["argv"] = argv
+    cli_path.write_bytes(
+        (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    )
+    manifest_path = run_dir / "manifest.json"
+    manifest = fakes.read_json(manifest_path)
+    manifest["evidence"]["cli_log"]["sha256"] = hashlib.sha256(cli_path.read_bytes()).hexdigest()
+    fakes.write_json(manifest_path, manifest)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+@pytest.mark.parametrize("runner", fakes.RUNNERS, ids=fakes.RUNNERS)
+@pytest.mark.parametrize("argv_shape", ["empty", "executable-only", "instance-options-only"])
+def test_empty_logical_argv_breaks_integrity(
+    tmp_path: Path, side: str, runner: str, argv_shape: str,
+):
+    case_id = f"empty-logical-argv-{runner}-{side}-{argv_shape}"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    bad_argv = {
+        "empty": [],
+        "executable-only": ["serialwrap"],
+        "instance-options-only": ["serialwrap", "--endpoint", "INSTANCE_ROOT/run/serialwrapd.sock"],
+    }[argv_shape]
+    for report_dir, report_side in ((a_dir, "a"), (b_dir, "b")):
+        calls = None
+        if report_side == side:
+            calls = [_call(bad_argv, {"ok": True})]
+        run_dir = fakes.write_run(
+            report_dir,
+            case_id,
+            side=report_side,
+            runner=runner,
+            calls=calls,
+        )
+        if report_side == side and runner == "bridge":
+            _rewrite_bridge_argv(run_dir, bad_argv)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    expected = "cli_observations[0].argv"
+    assert result["integrity"][side] is False
+    assert _has_problem(result, side, expected)
+    if runner == "bridge":
+        assert _has_problem(result, side, "cli.ndjson#L1")
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_unmapped_raw_failure_breaks_integrity_even_with_passed_mapped_result(
+    tmp_path: Path, side: str,
+):
+    case_id = f"unmapped-failure-with-pass-{side}"
+    nodeids = ["tests/test_behavior.py::test_mapped_pass", "tests/test_behavior.py::test_unmapped_failure"]
+    raw_results = [
+        {"nodeid": nodeids[0], "outcome": "passed", "skip_kind": None,
+         "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}},
+        {"nodeid": nodeids[1], "outcome": "failed", "skip_kind": None,
+         "phases": {"setup": "passed", "call": "failed", "teardown": "passed"}},
+    ]
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    for report_dir, report_side in ((a_dir, "a"), (b_dir, "b")):
+        options = {}
+        if report_side == side:
+            options = {
+                "l1_results": raw_results,
+                "case_results": [{
+                    "nodeid": nodeids[0],
+                    "source_ref": f"{case_id}/contract-blackbox/1/source/l1-results.json#results[0]",
+                }],
+                "runner_exit_code": 0,
+            }
+        fakes.write_run(
+            report_dir, case_id, side=report_side, runner="contract-blackbox", **options,
+        )
+
+    result = _diff(a_dir, b_dir, {case_id})
+    failure_ref = f"{case_id}/contract-blackbox/1/source/l1-results.json#results[1]"
+
+    assert result["integrity"][side] is False
+    assert result["ok"] is False
+    assert any(row["side"] == side and row["case"] == case_id and row["source_ref"] == failure_ref
+               for row in result["unverified_failures"])
+    assert any(failure_ref in problem for problem in result["integrity_problems"][side])
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_envelope_fail_needs_mapped_raw_failure_evidence(tmp_path: Path, side: str):
+    case_id = f"envelope-fail-unmapped-raw-failure-{side}"
+    nodeid = "tests/test_behavior.py::test_unmapped_failure"
+    raw_results = [{
+        "nodeid": nodeid,
+        "outcome": "failed",
+        "skip_kind": None,
+        "phases": {"setup": "passed", "call": "failed", "teardown": "passed"},
+    }]
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    for report_dir, report_side in ((a_dir, "a"), (b_dir, "b")):
+        options = {}
+        if report_side == side:
+            options = {
+                "verdict": "FAIL",
+                "runner_exit_code": 0,
+                "l1_results": raw_results,
+                "case_results": [],
+            }
+        fakes.write_run(
+            report_dir, case_id, side=report_side, runner="contract-blackbox", **options,
+        )
+
+    result = _diff(a_dir, b_dir, {case_id})
+    unverified = [row for row in result["unverified_failures"] if row["side"] == side]
+
+    assert result["integrity"][side] is False
+    assert result["ok"] is False
+    assert any(row["source_ref"] == f"{case_id}/contract-blackbox/1/runner-observation.json"
+               for row in unverified)
+    assert any(row["source_ref"] == f"{case_id}/contract-blackbox/1/source/l1-results.json#results[0]"
+               for row in unverified)
+    assert result["integrity_problems"][side]
+
+
+@pytest.mark.parametrize(
+    "left_token,right_token",
+    [
+        ("--endpoint=alpha", "--endpoint=beta"),
+        ("--socket=alpha", "--socket=beta"),
+        ("--bench=alpha", "--bench=beta"),
+    ],
+    ids=["endpoint", "socket", "bench"],
+)
+def test_logical_argv_preserves_route_looking_tokens_after_double_dash(
+    tmp_path: Path, left_token: str, right_token: str,
+):
+    case_id = "argv-after-double-dash-" + left_token.split("=", 1)[0][2:]
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    response = {"ok": True, "items": []}
+    fakes.write_run(
+        a_dir, case_id, side="a", runner="contract-blackbox",
+        calls=[_call(["remote", "--", left_token], response)],
+    )
+    fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox",
+        calls=[_call(["remote", "--", right_token], response)],
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert any(item["kind"] == "argv" and item["path"] == "call[0].argv"
+               for item in result["differences"])
+
+
+def test_nonbridge_mixed_mapped_results_only_reports_failed_source(tmp_path: Path):
+    case_id = "mixed-mapped-pass-and-fail"
+    nodeids = ["tests/test_behavior.py::test_mapped_pass", "tests/test_behavior.py::test_mapped_failure"]
+    refs = [f"{case_id}/contract-blackbox/1/source/l1-results.json#results[{index}]" for index in range(2)]
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox")
+    fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", verdict="FAIL", runner_exit_code=0,
+        l1_results=[
+            {"nodeid": nodeids[0], "outcome": "passed", "skip_kind": None,
+             "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}},
+            {"nodeid": nodeids[1], "outcome": "failed", "skip_kind": None,
+             "phases": {"setup": "passed", "call": "failed", "teardown": "passed"}},
+        ],
+        case_results=[{"nodeid": nodeid, "source_ref": source_ref}
+                      for nodeid, source_ref in zip(nodeids, refs)],
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    failures = [row for row in result["product_failures"] if row["case"] == case_id]
+    assert [row["source_ref"] for row in failures] == [refs[1]]
+
