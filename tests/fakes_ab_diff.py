@@ -75,6 +75,10 @@
    ``source_files`` 項目是 ``{path, sha256}``，path 以 run 目錄為根的相對
    POSIX 路徑，sha256 是原始檔位元組雜湊。``source_ref`` 以側 report-dir
    為根的相對 POSIX 路徑，可定位 envelope 內該觀測或 FAIL 的原始來源。
+   非 bridge 的 CLI 比較資料一律來自 hash 已核實的
+   ``source/cli-observations.ndjson`` 原始列；envelope 的
+   ``cli_observations`` 僅作一致性核對，欄位、source_ref 或列索引不一致時記完整性
+   問題，但不取代原始列，也不單獨降級其來源核實狀態。
 
    - contract-blackbox：原始 ``source/l1-results.json`` 使用現行 P2
      ``schema_version: 2``、``format: "l1-results.v1"``（pytest runner）；
@@ -239,10 +243,13 @@
    追認，不得凍結為 approved normalization。
 
 8. ``differences[]`` 每列含 ``verified: bool``，只依該差異實際引用的來源與身分判定。
-   ``value``、``rc``、``argv``、``call_count`` 引用 CLI 原始觀測，須核實兩側 run／case
-   身分，以及存在側的 CLI 原始檔 hash；同 case 其他未核實線索不會單獨降級差異。
-   ``call_count`` 缺少側的 ``source_refs`` 為 null，只核對存在側來源，但仍須核對兩側
-   run／case 身分。``verdict`` 的 bridge 來源為 ``comparison.json``，依 manifest 與
+   ``value``、``rc``、``argv`` 引用 CLI 原始觀測，須核實兩側 run／case 身分，以及兩側
+   對應列與 CLI 原始檔 hash；A/B CLI SHA 不同時這些差異不得核實。同 case 其他未核實
+   線索不會單獨降級差異。非 bridge 比較資料與引用一律取自原始
+   ``source/cli-observations.ndjson`` 第 i 列；envelope 摘要只核對一致性。
+   ``call_count`` 只有兩側整份 CLI 觀測集合都已核實（檔案 hash 正確、列可解析且無截斷）
+   才能核實；缺少側的 ``source_refs`` 為 null，但仍需核對兩側 run／case 身分與 CLI SHA。
+   ``verdict`` 的 bridge 來源為 ``comparison.json``，依 manifest 與
    comparison 的 case／run 身分及 artifact 身分核實；不要求 comparison 出現在 manifest
    evidence hash 清單中，但若有該檔的 hash 宣告則必須核對。非 bridge verdict 引用
    ``source/l1-results.json`` 的對應結果列，且只在該列已映射、原始檔 hash、run 與 case

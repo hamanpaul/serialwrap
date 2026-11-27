@@ -602,6 +602,7 @@ def test_rust_only_difference_skipped_but_absolute_must_pass():
         "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={"SC-15": "absolute_only"}
     )[0] == "PASS"
     diff["b_cases"]["sc15-x"] = "FAIL"
+    diff["product_failures"] = [_failure("b", "sc15-x")]
     assert ab_verdict.combine(
         "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={"SC-15": "absolute_only"}
     )[0] == "FAIL"
@@ -944,6 +945,15 @@ def test_l3_release_gate_fail_is_preserved_as_product_failure(tmp_path: Path):
         mode="candidate",
         release_gate_result="FAIL",
     )
+    b_gate = json.loads(b_path.read_bytes().decode("utf-8"))
+    b_gate["checks"].append({
+        "id": "resources_over_threshold",
+        "group": "resources",
+        "status": "evaluated",
+        "result": "FAIL",
+        "detail": {},
+    })
+    b_path.write_bytes((json.dumps(b_gate, sort_keys=True) + "\n").encode("utf-8"))
     diff = ab_verdict.compare_l3(a_path, b_path)
     assert any(row["side"] == "b" and "release-gate.json" in row["source_ref"] for row in diff["product_failures"])
     assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[0] == "FAIL"
@@ -1044,7 +1054,7 @@ def test_l3_baseline_compatible_check_is_read_without_recalculation(tmp_path: Pa
     assert diff["b_baseline_compatible"] is False
     assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[:2] == (
         "INFRA_ERROR",
-        "HARNESS_SUITE_INFRA_ERROR",
+        "HARNESS_COMPARATOR_ERROR",
     )
 
 
@@ -1899,3 +1909,160 @@ def test_r2_gate_integrity_error_preserves_product_and_safety_failures(tmp_path:
     assert any(row["side"] == "b" for row in diff["product_failures"])
     assert diff["safety_violations"] == ["B:safety_unauthorized_tx"]
     assert (verdict, reason_code) == ("FAIL", None)
+
+
+@pytest.mark.parametrize(
+    "b_status,include_case",
+    [
+        pytest.param("INSUFFICIENT_EVIDENCE", True, id="insufficient"),
+        pytest.param("UNRECOGNIZED", True, id="unknown"),
+        pytest.param(None, False, id="missing"),
+    ],
+)
+def test_r3_rust_only_needs_verified_candidate_failure_record(
+    b_status: str | None, include_case: bool,
+):
+    case_id = "rust-only-absolute"
+    diff = _empty_diff(
+        differences=[{
+            "case": case_id,
+            "path": "call[0].state",
+            "kind": "value",
+            "registered_change": "SC-15",
+            "source_refs": {"a": f"{case_id}/a.json", "b": f"{case_id}/b.json"},
+            "verified": True,
+        }],
+        a_cases={case_id: "PASS"},
+        b_cases={case_id: b_status} if include_case else {},
+    )
+
+    products = ab_verdict.collect_product_failures(
+        "l1.5", diff=diff, registered={"SC-15": "absolute_only"},
+    )
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff,
+        registered={"SC-15": "absolute_only"},
+    )
+
+    assert products == []
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+    assert f"rust_only case lacks verified absolute result: {case_id}" in " ".join(notes)
+
+
+def test_r3_rust_only_collects_existing_verified_candidate_fail_only():
+    case_id = "rust-only-verified-failure"
+    failure = {
+        "side": "b",
+        "case": case_id,
+        "source_ref": f"{case_id}/source/l1-results.json#results[0]",
+        "reason": "verified candidate case failed",
+    }
+    diff = _empty_diff(
+        differences=[{
+            "case": case_id,
+            "path": "call[0].state",
+            "kind": "value",
+            "registered_change": "SC-15",
+            "source_refs": {"a": f"{case_id}/a.json", "b": f"{case_id}/b.json"},
+            "verified": True,
+        }],
+        b_cases={case_id: "FAIL"},
+        product_failures=[failure],
+    )
+
+    products = ab_verdict.collect_product_failures(
+        "l1.5", diff=diff, registered={"SC-15": "absolute_only"},
+    )
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff,
+        registered={"SC-15": "absolute_only"},
+    )
+
+    assert products == [failure]
+    assert (verdict, reason_code) == ("FAIL", None)
+
+
+@pytest.mark.parametrize("evidence_result", ["FAIL", "BLOCKED", "INSUFFICIENT_EVIDENCE"])
+def test_r3_nonpass_evidence_always_records_integrity_problem(
+    tmp_path: Path, evidence_result: str,
+):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        evidence_results=(evidence_result,),
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"]["b"] is False
+    assert any(
+        f"evidence check not PASS: evidence-0={evidence_result}" in item
+        for item in diff["integrity_problems"]["b"]
+    )
+    assert diff["product_failures"] == []
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+    assert "evidence-0" in " ".join(notes)
+
+
+def test_r3_gate_engine_failure_precedes_evidence_integrity_failure(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL",
+        evidence_results=("BLOCKED",),
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert any(row["case"] == "engine_result" for row in diff["product_failures"])
+    assert (verdict, reason_code) == ("FAIL", None)
+
+
+def test_r3_gate_safety_failure_precedes_evidence_integrity_failure(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        evidence_results=("INSUFFICIENT_EVIDENCE",),
+        safety_results=(("safety_unauthorized_tx", "FAIL"),),
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["safety_violations"] == ["B:safety_unauthorized_tx"]
+    assert (verdict, reason_code) == ("FAIL", None)
+
+
+def test_r3_intact_blocked_longrun_gate_keeps_od09_reason(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+    b_gate = json.loads(b_path.read_bytes().decode("utf-8"))
+    b_gate["checks"].append({
+        "id": "resources",
+        "group": "resources",
+        "status": "evaluated",
+        "result": "BLOCKED",
+        "detail": {},
+    })
+    b_gate["release_gate_result"] = "BLOCKED"
+    b_path.write_bytes((json.dumps(b_gate, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, _notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"] == {"a": True, "b": True}
+    assert diff["integrity_problems"] == {"a": [], "b": []}
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_OD09_NOT_FROZEN")

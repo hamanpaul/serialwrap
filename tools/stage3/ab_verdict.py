@@ -50,6 +50,9 @@ _GATE_SCHEMA = "release-gate.v1"
 _GATE_RESULTS: frozenset[str] = frozenset({
     PASS, FAIL, _INSUFFICIENT, "BLOCKED", "NOT_APPLICABLE_BASELINE",
 })
+_GATE_GROUPS: frozenset[str] = frozenset({
+    "evidence", "engine", "integrity", "liveness", "load", "relative", "resources", "safety",
+})
 _GATE_REQUIRED_FIELDS: tuple[str, ...] = (
     "schema_version",
     "created_at",
@@ -222,20 +225,16 @@ def combine(
             for row in differences
         ):
             return INFRA_ERROR, _COMPARATOR, _unique([*notes, "L1.5 含未核實差異"])
-    if layer == "l3" and isinstance(diff, Mapping) and diff.get("kind") == "longrun" and not shape_errors:
-        integrity_problems = diff.get("integrity_problems")
-        has_gate_problem = isinstance(integrity_problems, Mapping) and any(
-            bool(integrity_problems.get(side)) for side in ("a", "b")
-        )
-        if not has_gate_problem:
-            release = diff.get("b_release_gate_result")
-            if release == "BLOCKED":
-                return INFRA_ERROR, _OD09_NOT_FROZEN, _unique([*notes, "release gate BLOCKED"])
-            if release == _INSUFFICIENT or diff.get("b_baseline_compatible") is False:
-                return INFRA_ERROR, _SUITE, _unique([*notes, "release gate 證據不足或 baseline 不相容"])
     integrity = diff.get("integrity") if isinstance(diff, Mapping) else None
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：比較器完整性未通過"])
+
+    if layer == "l3" and isinstance(diff, Mapping) and diff.get("kind") == "longrun":
+        release = diff.get("b_release_gate_result")
+        if release == "BLOCKED":
+            return INFRA_ERROR, _OD09_NOT_FROZEN, _unique([*notes, "release gate BLOCKED"])
+        if release == _INSUFFICIENT or diff.get("b_baseline_compatible") is False:
+            return INFRA_ERROR, _SUITE, _unique([*notes, "release gate 證據不足或 baseline 不相容"])
 
     if layer == "l1.5":
         baseline_failures = _rows(diff, "baseline_failures")
@@ -319,7 +318,13 @@ def _l15_difference_findings(
         if participation == "absolute_only":
             if b_cases.get(case) == PASS:
                 continue
-            reason = f"rust_only case failed absolute: {case}"
+            has_verified_absolute_failure = (
+                b_cases.get(case) == FAIL
+                and any(existing.get("side") == "b" and existing.get("case") == case for existing in existing_products)
+            )
+            if not has_verified_absolute_failure:
+                errors.append(f"rust_only case lacks verified absolute result: {case}")
+            continue
         elif participation == "diff":
             reason = f"both-scope change differs: {change} {case}"
         else:
@@ -954,6 +959,23 @@ def _gate_problems(gate: Mapping[str, Any], label: str) -> list[str]:
     return problems
 
 
+def _evidence_check_problems(gate: Mapping[str, Any]) -> list[str]:
+    """將不完整的 evidence check 明確記錄為側別 integrity 問題。"""
+    checks = gate.get("checks")
+    if not isinstance(checks, list):
+        return []
+    mode = gate.get("mode")
+    problems: list[str] = []
+    for check in checks:
+        if not isinstance(check, Mapping) or check.get("group") != "evidence":
+            continue
+        result = check.get("result")
+        if result == PASS or (mode == "baseline" and result == "NOT_APPLICABLE_BASELINE"):
+            continue
+        problems.append(f"evidence check not PASS: {check.get('id')}={result}")
+    return problems
+
+
 def _checks_of(gate: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], list[str]]:
     checks = gate.get("checks")
     if not isinstance(checks, list):
@@ -970,6 +992,10 @@ def _checks_of(gate: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], list[s
             if not isinstance(value, str) or not value:
                 problems.append(f"checks[{index}].{key} 缺漏或非字串")
                 valid = False
+        group = check.get("group")
+        if isinstance(group, str) and group not in _GATE_GROUPS:
+            problems.append(f"checks[{index}].group 未知：{group!r}")
+            valid = False
         result = check.get("result")
         if isinstance(result, str) and result not in _GATE_RESULTS:
             problems.append(f"checks[{index}].result 未知：{result!r}")
@@ -1064,7 +1090,6 @@ def _l3_product_failures(gate: Mapping[str, Any] | None) -> list[dict[str, str]]
     failures: list[dict[str, str]] = []
     engine = gate.get("engine_result")
     engine_verdict = engine.get("verdict") if isinstance(engine, Mapping) else None
-    release_result = gate.get("release_gate_result")
     if engine_verdict == FAIL:
         failures.append({
             "side": "b",
@@ -1072,13 +1097,23 @@ def _l3_product_failures(gate: Mapping[str, Any] | None) -> list[dict[str, str]]
             "source_ref": "release-gate.json#/engine_result/verdict",
             "reason": "candidate engine verdict is FAIL",
         })
-    if release_result == FAIL:
-        failures.append({
-            "side": "b",
-            "case": "release_gate_result",
-            "source_ref": "release-gate.json#/release_gate_result",
-            "reason": "candidate release gate result is FAIL",
-        })
+    checks = gate.get("checks")
+    if isinstance(checks, list):
+        for index, check in enumerate(checks):
+            if (
+                isinstance(check, Mapping)
+                and check.get("group") in _GATE_GROUPS - {"evidence", "safety"}
+                and check.get("result") == FAIL
+                and check.get("id") != "engine_verdict"
+                and isinstance(check.get("id"), str)
+                and check.get("id")
+            ):
+                failures.append({
+                    "side": "b",
+                    "case": check["id"],
+                    "source_ref": f"release-gate.json#/checks/{index}",
+                    "reason": f"candidate {check['group']} check FAIL",
+                })
     return failures
 
 
@@ -1208,6 +1243,10 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
     b_checks, b_check_problems = _checks_of(b_gate or {})
     problems["a"].extend(f"A {item}" for item in a_check_problems)
     problems["b"].extend(f"B {item}" for item in b_check_problems)
+    if a_gate is not None:
+        problems["a"].extend(_evidence_check_problems(a_gate))
+    if b_gate is not None:
+        problems["b"].extend(_evidence_check_problems(b_gate))
     for side, gate, checks, check_problems, mode in (
         ("a", a_gate, a_checks, a_check_problems, "baseline"),
         ("b", b_gate, b_checks, b_check_problems, "candidate"),
