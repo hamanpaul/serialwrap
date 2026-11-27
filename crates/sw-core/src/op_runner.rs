@@ -89,7 +89,8 @@ pub enum OpOutcome {
     PromptTimeout {
         stdout: String,
     },
-    /// echo 無法確認且同窗口出現可信 human TX；保留輸出並回 PROMPT_TIMEOUT，不降級 session 或送救援鍵。
+    /// 有完成候選但 echo／prompt 身分不足，或 human 路徑不允許相容完成；
+    /// 保留輸出並回 PROMPT_TIMEOUT，不降級 session 或送救援鍵。
     CompletionUncertain {
         stdout: String,
     },
@@ -1024,6 +1025,9 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let watermark_before = command_boundary
         .as_ref()
         .map_or_else(|| ctx.rx.watermark(), |boundary| boundary.watermark);
+    let completion_identity = command_boundary
+        .as_ref()
+        .map(|boundary| (boundary.watermark.0, boundary.prompt_revision));
     let pending_human_before = echo_evaluator
         .as_ref()
         .is_some_and(|_| human_tx_before.pending_human);
@@ -1064,6 +1068,12 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 watermark_before,
                 &*ctx.clock,
                 |snapshot| {
+                    if completion_identity.is_some_and(|(epoch, prompt_revision)| {
+                        snapshot.watermark.0 != epoch
+                            || snapshot.prompt_revision != prompt_revision
+                    }) {
+                        return None;
+                    }
                     let human_tx_state = snapshot.human_tx_state;
                     let (evaluation, observed_prompt) = evaluator.evaluate_snapshot(
                         &snapshot.text,
@@ -1078,8 +1088,12 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         snapshot.trimmed_before_from,
                     );
                     if let Some(observed_prompt) = observed_prompt {
+                        #[cfg(feature = "test-fakes")]
+                        ctx.rx
+                            .prompt_evidence_before_write_hook_for_test(snapshot);
                         ctx.rx.remember_prompt_evidence(
                             observed_prompt,
+                            snapshot.revision,
                             snapshot.watermark,
                             snapshot.prompt_revision,
                         );

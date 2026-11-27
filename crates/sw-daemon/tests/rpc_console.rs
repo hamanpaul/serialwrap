@@ -5,6 +5,7 @@
 #![cfg(feature = "test-fakes")]
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::*;
@@ -428,6 +429,15 @@ fn rpc_rx_bytes(r: &ServiceRig) -> u64 {
 fn i262_rpc_arrow_output_is_complete() {
     let r = broad_prompt_rig();
     let dev = r.device(REAL_A);
+    let sid = r.mgr.resolve("COM0").expect("COM0 session id");
+    let (rx, _, _, _) = r
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("COM0 actor snapshot");
+    let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
+    rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        let _ = waiter_tx.send(());
+    })));
     let command = "obuspa -c get Device.DNS.Diagnostics.";
     let cmd_id = rpc_command(&r, command);
 
@@ -436,6 +446,9 @@ fn i262_rpc_arrow_output_is_complete() {
             .windows(format!("{command}\n").len())
             .any(|window| window == format!("{command}\n").as_bytes())
     });
+    waiter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RPC completion deadline 與 waiter 已建立");
     let first = format!("{command}\r\nA => \r\n");
     let rx_before = rpc_rx_bytes(&r);
     dev.push_rx(first.as_bytes());
@@ -452,6 +465,18 @@ fn i262_rpc_arrow_output_is_complete() {
         matches!(running.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "running"),
         "RPC 不得在 B =>  尾端提前完成：{}",
         j(&running)
+    );
+    let (checks, end) = rx.snapshot_wait_progress_for_test();
+    r.clock.advance(Duration::from_millis(51));
+    wait_for("RPC evaluator 跨過 50 ms poll 間隔", || {
+        let (now_checks, now_end) = rx.snapshot_wait_progress_for_test();
+        now_checks > checks && now_end >= end
+    });
+    let running_after_poll = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert!(
+        matches!(running_after_poll.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "running"),
+        "RPC 跨過 poll 間隔後仍不得在 B =>  完成：{}",
+        j(&running_after_poll)
     );
     dev.push_rx(b"\r\nC => 1\r\nroot@t:/# ");
 

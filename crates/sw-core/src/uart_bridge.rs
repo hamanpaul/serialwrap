@@ -461,6 +461,9 @@ pub struct RxShared {
     /// 測試交錯：predicate 已依 snapshot 完成評估、等待器尚未重取 RX 鎖時暫停。
     #[cfg(feature = "test-fakes")]
     snapshot_wait_evaluated_hook: Mutex<Option<SnapshotWaitHook>>,
+    /// 測試交錯：evaluator 已辨識新 prompt、證據寫回與完成 stale recheck 前暫停。
+    #[cfg(feature = "test-fakes")]
+    prompt_evidence_before_write_hook: Mutex<Option<SnapshotWaitHook>>,
     /// 測試交錯：snapshot wait 確認逾時後、呼叫端收回結果前暫停。
     #[cfg(feature = "test-fakes")]
     snapshot_wait_deadline_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -543,6 +546,8 @@ impl RxShared {
             #[cfg(feature = "test-fakes")]
             snapshot_wait_evaluated_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            prompt_evidence_before_write_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             snapshot_wait_deadline_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             snapshot_wait_before_deadline_snapshot_hook: Mutex::new(None),
@@ -603,6 +608,7 @@ impl RxShared {
         state.prompt_revision = state.prompt_revision.saturating_add(1);
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.prompt_evidence = None;
+        window.revision = window.revision.saturating_add(1);
         drop(window);
         drop(state);
         self.actor_dispatch_gate.changed.notify_all();
@@ -1267,6 +1273,29 @@ impl RxShared {
     }
 
     #[cfg(feature = "test-fakes")]
+    pub fn set_prompt_evidence_before_write_hook_for_test(
+        &self,
+        hook: Option<SnapshotWaitHook>,
+    ) {
+        *self
+            .prompt_evidence_before_write_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub(crate) fn prompt_evidence_before_write_hook_for_test(&self, snapshot: &RxSnapshot) {
+        if let Some(hook) = self
+            .prompt_evidence_before_write_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook(snapshot);
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
     pub fn set_snapshot_wait_deadline_hook_for_test(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1423,8 +1452,15 @@ impl RxShared {
         self.wake_all();
     }
 
-    /// READY nonce 後、以完整清理尾行確認的 prompt 字面；只記錄，不改登入判準。
-    pub(crate) fn observe_ready_prompt_evidence(&self, prompt: &PyRegex, marker: &str) {
+    /// READY probe 的獨立 nonce 輸出後、以完整清理尾行確認 prompt；只記錄，不改登入判準。
+    pub(crate) fn observe_ready_prompt_evidence(
+        &self,
+        prompt: &PyRegex,
+        probe: &str,
+        marker: &str,
+        before_probe: &str,
+        before_probe_offset: u64,
+    ) {
         let state = self
             .actor_dispatch_gate
             .state
@@ -1433,7 +1469,18 @@ impl RxShared {
         let prompt_revision = state.prompt_revision;
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.prompt_evidence = None;
-        if let Some(literal) = ready_prompt_literal_after_marker(&window.text, marker, prompt) {
+        let probe_output = (before_probe_offset >= window.trimmed)
+            .then(|| window.text_from(before_probe_offset).to_string());
+        let Some(probe_output) = probe_output else {
+            return;
+        };
+        if let Some(literal) = ready_prompt_literal_after_marker(
+            &probe_output,
+            probe,
+            marker,
+            before_probe,
+            prompt,
+        ) {
             window.prompt_evidence = Some(PromptEvidence {
                 literal,
                 watermark: window.watermark,
@@ -1446,6 +1493,7 @@ impl RxShared {
     pub(crate) fn remember_prompt_evidence(
         self: &Arc<Self>,
         literal: String,
+        window_revision: u64,
         watermark: (u64, u64),
         prompt_revision: u64,
     ) {
@@ -1467,7 +1515,10 @@ impl RxShared {
             return;
         }
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if window.watermark != watermark || literal.is_empty() {
+        if window.revision != window_revision
+            || window.watermark != watermark
+            || literal.is_empty()
+        {
             return;
         }
         window.prompt_evidence = Some(PromptEvidence {
@@ -1995,6 +2046,13 @@ impl RxShared {
                 break;
             }
             let stale_snapshot = window.revision != revision
+                || window.revision != snapshot.revision
+                || human.prompt_revision != snapshot.prompt_revision
+                || human
+                    .active_rx
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|active| !std::ptr::eq(active.as_ref(), self))
                 || human_tx_state(&human, window.watermark.0) != snapshot.human_tx_state
                 || window.tx_submit_pending != snapshot.tx_submit_pending
                 || human.human_submit_start_count != snapshot.human_submit_start_count
@@ -2163,6 +2221,7 @@ pub struct RxSnapshot {
     /// `base > requested_from` 時，所需的早期 RX 已被窗口修剪。
     pub trimmed_before_from: bool,
     /// snapshot 當下可用的完整 prompt 字面與 profile revision。
+    pub revision: u64,
     pub prompt_revision: u64,
     pub prompt_evidence: Option<PromptEvidence>,
 }
@@ -2201,6 +2260,8 @@ pub struct CommandTxBoundary {
     pub human_submit_start_count: u64,
     /// command TX 前 RX watermark，供 deadline settlement 作為無後續事件時的基線。
     pub watermark: (u64, u64),
+    /// command TX 前的 profile revision；profile 切換後舊 evaluator 不可完成。
+    pub prompt_revision: u64,
 }
 
 struct TxSubmitPendingGuard<'a> {
@@ -2303,6 +2364,7 @@ fn snapshot_from_window(
         human_in_flight: human.human_in_flight,
         tx_submit_pending: window.tx_submit_pending,
         trimmed_before_from: base > from,
+        revision: window.revision,
         prompt_revision,
         prompt_evidence: snapshot_prompt_evidence(window, watermark, prompt_revision),
     }
@@ -2350,6 +2412,7 @@ fn snapshot_from_window_at(
         human_in_flight: human.human_in_flight,
         tx_submit_pending: window.tx_submit_pending || window.completion_tx_submit_crossed_deadline,
         trimmed_before_from: base > from,
+        revision: window.revision,
         prompt_revision,
         prompt_evidence: snapshot_prompt_evidence(window, watermark, prompt_revision),
     }
@@ -2366,28 +2429,64 @@ fn snapshot_prompt_evidence(
     })
 }
 
+fn full_last_line_literal(raw: &str, prompt: &PyRegex) -> Option<String> {
+    let cleaned = clean_text(raw);
+    let literal = cleaned
+        .rsplit_once('\n')
+        .map_or(cleaned.as_str(), |(_, tail)| tail);
+    if literal.is_empty()
+        || !prompt_evidence_literal_is_identifiable(literal)
+        || !prompt_full_literal_matches(literal, prompt)
+    {
+        return None;
+    }
+
+    Some(literal.to_string())
+}
+
 fn ready_prompt_literal_after_marker(
     raw: &str,
+    probe: &str,
     marker: &str,
+    before_probe: &str,
     prompt: &PyRegex,
 ) -> Option<String> {
     if marker.is_empty() {
         return None;
     }
-    let cleaned = clean_text(raw);
-    let marker_start = cleaned.rfind(marker)?;
-    let marker_end = marker_start.saturating_add(marker.len());
-    let following = cleaned.get(marker_end..)?;
-    let tail = following
-        .rsplit_once('\n')
-        .map_or(following, |(_, tail)| tail);
-    if tail.is_empty() || tail.chars().all(char::is_whitespace) {
+    let probe = clean_text(probe);
+    let default_marker = format!("__READY__{marker}");
+    if probe.trim_end_matches(['\r', '\n']) == marker
+        || probe.trim_end_matches(['\r', '\n']) == default_marker
+    {
         return None;
     }
-    if prompt_evidence_literal_is_identifiable(tail)
-        && prompt_full_literal_matches(tail, prompt)
-    {
-        return Some(tail.to_string());
+    let expected = full_last_line_literal(before_probe, prompt)?;
+    let cleaned = clean_text(raw);
+    let mut line_start = 0;
+    while line_start < cleaned.len() {
+        let line_end = cleaned[line_start..]
+            .find('\n')
+            .map_or(cleaned.len(), |offset| line_start + offset);
+        let line = &cleaned[line_start..line_end];
+        let output_without_line_echo =
+            line.strip_prefix(&expected).is_some_and(|suffix| {
+                suffix == marker || suffix == default_marker
+            });
+        if line == marker || line == default_marker || output_without_line_echo {
+            let prompt_start = if line_end < cleaned.len() {
+                line_end.saturating_add(1)
+            } else {
+                line_end
+            };
+            if prompt_start < cleaned.len() && cleaned[prompt_start..] == expected {
+                return Some(expected);
+            }
+        }
+        if line_end == cleaned.len() {
+            break;
+        }
+        line_start = line_end.saturating_add(1);
     }
     None
 }
@@ -2402,7 +2501,7 @@ pub(crate) fn prompt_evidence_literal_is_identifiable(literal: &str) -> bool {
         return false;
     }
     let trimmed = literal.trim_end_matches([' ', '\t']);
-    !trimmed.ends_with("=>")
+    !trimmed.ends_with("=>") || !trimmed.chars().any(char::is_whitespace)
 }
 
 fn prompt_full_literal_matches(literal: &str, prompt: &PyRegex) -> bool {
@@ -2446,6 +2545,7 @@ fn command_boundary(human: &ActorDispatchGateState, window: &RxWindow) -> Comman
         human_tx_state,
         human_submit_start_count: human.human_submit_start_count,
         watermark: window.watermark,
+        prompt_revision: human.prompt_revision,
     }
 }
 

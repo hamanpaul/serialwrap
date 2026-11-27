@@ -9606,6 +9606,7 @@ fn df27_rpc_post_login_timeout_rejects_zero_tx_then_reprobes_ready() {
     );
 
     let dev = r.device(REAL_A);
+    dev.clear_replies();
     let sh_ok = Arc::new(AtomicBool::new(false));
     dev.on_tx_match("^$", Box::new(|_line: &[u8]| b"\r\nlogin: ".to_vec()));
     dev.on_tx_match(

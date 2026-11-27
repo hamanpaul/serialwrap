@@ -957,6 +957,10 @@ targets:
 - background mode 可用 `result-tail` 取得後續 chunk
 - background capture 建立前的 `result-tail` 回傳 `from_seq=0, last_seq=0` sentinel
 - prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
+- 未指定 `completion_regex` 時，tail completion candidate 是最後一行完整符合 profile
+  prompt regex，或 snapshot 尾端完整等於 epoch 內已知 prompt 字面；只有有候選但
+  身分不足才走 `PROMPT_TIMEOUT`／partial／NONE，無 human 且無候選則維持基線 recovery。
+  無 echo prompt 必須在最後一行行首；同行 suffix 裁切只套用已確認本命令 echo。
 - `_recover_after_failure` 成功恢復 prompt 時回 `ok: true`（含 `PROMPT_TIMEOUT_RECOVERED`）
 - `expected_duration_s` 可延長前景命令總期限（靜默上限 `min(timeout_s, 30s)` 不變）
 - interactive lease 可建立、送 key、關閉

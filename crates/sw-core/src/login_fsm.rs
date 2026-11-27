@@ -236,7 +236,7 @@ fn probe_ready_inner(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
         let code = classify_non_ready_state(io, p).to_string();
         return Ok(maybe_reclassify_flood(io, Some(code)));
     }
-    let err = finalize_ready(io, p)?;
+    let err = finalize_ready(io, p, None)?;
     Ok(maybe_reclassify_flood(io, err))
 }
 
@@ -260,8 +260,10 @@ fn ensure_ready_inner(
     if declared(&p.template.console_unlock_env) {
         return ensure_console_unlocked(io, p, auth);
     }
+    let mut login_prompt = None;
     if !probe_prompt(io, p)? {
-        let (ok, err) = maybe_login(io, p, auth, env)?;
+        let (ok, err, observed_prompt) = maybe_login(io, p, auth, env)?;
+        login_prompt = observed_prompt;
         if err.is_some() {
             return Ok(maybe_reclassify_flood(io, err));
         }
@@ -270,7 +272,7 @@ fn ensure_ready_inner(
             return Ok(maybe_reclassify_flood(io, Some(code)));
         }
     }
-    let err = finalize_ready(io, p)?;
+    let err = finalize_ready(io, p, login_prompt.as_deref())?;
     Ok(maybe_reclassify_flood(io, err))
 }
 
@@ -536,7 +538,11 @@ fn tail_requires_login(io: &LoginIo, p: &SessionProfile) -> bool {
 }
 
 /// `_finalize_ready`：post_login_cmd（含 #174 login guard）→ nonce probe → prompt；`Ok(None)` 為成功。
-fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
+fn finalize_ready(
+    io: &LoginIo,
+    p: &SessionProfile,
+    login_prompt: Option<&str>,
+) -> Step<Option<String>> {
     let t = &p.template;
     let timeout = secs(t.timeout_s);
     if !t.post_login_cmd.is_empty() {
@@ -558,6 +564,15 @@ fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
         // 隱藏 lock 的舊 prompt 與 terminal echo 都不能作為解鎖證據。
         io.rx.clear();
     }
+    let before_probe = {
+        let current = io.rx.tail(RX_TAIL_CHARS);
+        if current.is_empty() {
+            login_prompt.unwrap_or_default().to_string()
+        } else {
+            current
+        }
+    };
+    let before_probe_offset = io.rx.snapshot_len();
     send_command(io, &probe)?;
     let nonce_pattern = if unlock && t.ready_probe == DEFAULT_READY_PROBE {
         format!("(?m)^__READY__{}\\r?$", escape(&nonce))
@@ -574,7 +589,13 @@ fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
         return Ok(Some("READY_PROMPT_TIMEOUT".into()));
     }
     let prompt = compile_or_raise(&t.prompt_regex)?;
-    io.rx.observe_ready_prompt_evidence(&prompt, &nonce);
+    io.rx.observe_ready_prompt_evidence(
+        &prompt,
+        &probe,
+        &nonce,
+        &before_probe,
+        before_probe_offset,
+    );
     Ok(None)
 }
 
@@ -616,39 +637,41 @@ fn resolve_login_password(
         .ok_or("PASS_ENV_MISSING")
 }
 
-/// `_maybe_login`：回傳 `(ok, err)`；`USER_ENV_MISSING` 照 Python 被後續等待覆寫而不外傳（X3）。
+/// `_maybe_login`：回傳 `(ok, err, observed_prompt)`；`USER_ENV_MISSING` 照 Python 被後續等待覆寫而不外傳（X3）。
 fn maybe_login(
     io: &LoginIo,
     p: &SessionProfile,
     auth: &SessionAuth,
     env: &dyn SysEnv,
-) -> Step<(bool, Option<String>)> {
+) -> Step<(bool, Option<String>, Option<String>)> {
     let t = &p.template;
     let timeout = secs(t.timeout_s);
     let (user, _unreachable_err) = resolve_login_user(p, auth, env);
     if user.is_none() && !declared(&t.pass_env) {
-        return Ok((false, None));
+        return Ok((false, None, None));
     }
     if !wait_regex(io, &t.login_regex, timeout)? {
-        return Ok((false, Some("LOGIN_PROMPT_TIMEOUT".into())));
+        return Ok((false, Some("LOGIN_PROMPT_TIMEOUT".into()), None));
     }
     let Some(user) = user else {
-        return Ok((false, Some("LOGIN_USER_REQUIRED".into())));
+        return Ok((false, Some("LOGIN_USER_REQUIRED".into()), None));
     };
     send_command(io, &user)?;
     let timeout_code = prompt_timeout_error(&t.platform);
     if wait_regex(io, &t.password_regex, timeout)? {
         let password = match resolve_login_password(p, auth, env) {
             Ok(password) => password,
-            Err(code) => return Ok((false, Some(code.into()))),
+            Err(code) => return Ok((false, Some(code.into()), None)),
         };
         send_secret(io, &password)?;
         let ok = wait_regex(io, &t.prompt_regex, timeout)?;
+        let observed_prompt = ok.then(|| io.rx.tail(RX_TAIL_CHARS));
         io.rx.clear();
-        return Ok((ok, (!ok).then(|| timeout_code.into())));
+        return Ok((ok, (!ok).then(|| timeout_code.into()), observed_prompt));
     }
     let ok = wait_regex(io, &t.prompt_regex, timeout)?;
-    Ok((ok, (!ok).then(|| timeout_code.into())))
+    let observed_prompt = ok.then(|| io.rx.tail(RX_TAIL_CHARS));
+    Ok((ok, (!ok).then(|| timeout_code.into()), observed_prompt))
 }
 
 /// `_console_tail_line` 的純函式部分：`clean_text(tail).rstrip("\r\n").split("\n")[-1]`。
@@ -718,7 +741,7 @@ fn ensure_console_unlocked(
         }
         // 此 buffer 已在空行 probe 前清空；接受等待期間到達的新 prompt。
         if search_or_raise(&t.prompt_regex, &clean_text(&io.rx.text_from(0)))? {
-            return finalize_ready(io, p);
+            return finalize_ready(io, p, None);
         }
         if io.rx.idle_s(io.clock.mono_ns()) < t.console_unlock_idle_s {
             return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
@@ -729,5 +752,5 @@ fn ensure_console_unlocked(
             return Ok(Some("CONSOLE_UNLOCK_PROMPT_TIMEOUT".into()));
         }
     }
-    finalize_ready(io, p)
+    finalize_ready(io, p, None)
 }

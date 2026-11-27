@@ -407,17 +407,23 @@ serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
 Agent `line` and `background` commands without `--completion-regex` anchor prompt
 search after the full command echo and use one RX snapshot for completion and
 stdout extraction. The prompt must also match epoch-local literal evidence from
-a recognizable READY result or a complete echo prefix; output such as `Path => `
-cannot complete the command merely because it matches a broad regex. For output
-without a trailing newline, only a known complete prompt containing a letter or
-digit may be removed as a same-line suffix, so `printf abc` returns `abc` and a
-U+0000 byte is preserved. A short known suffix or an unknown tail candidate is
-never guessed from inline output and produces a partial result when the original
-deadline expires. Prefix
-prompts remain supported, and text before the command echo is excluded from
-normal stdout. A no-echo terminal can still complete when a known tail prompt
-is present and no human TX intervened; if post-TX RX was necessarily trimmed by
-the bounded window, completion is `ok:true, partial:true` with no error code.
+a recognizable READY output (an independent nonce line followed immediately by
+the same prompt as before the probe) or a complete echo prefix; output such as
+`Path => ` cannot complete the command merely because it matches a broad regex.
+Exact prompts such as `router=> ` remain valid when that source proves them.
+Without a trailing newline, only a known complete prompt containing a letter or
+digit may be removed as a same-line suffix after the command echo, so
+`printf abc` returns `abc` and a U+0000 byte is preserved. Prefix prompts remain
+supported, and text before the command echo is excluded from normal stdout.
+A no-echo terminal can still complete, but its known prompt must begin the final
+line; an inline `abcroot@host:/# ` is only a candidate, not a completion. A tail
+candidate is either a final line fully matched by the prompt regex or an exact
+known-prompt suffix at the snapshot tail. If a candidate cannot be identified,
+the original deadline returns `PROMPT_TIMEOUT`, `partial:true`,
+`recovery_action=NONE` without rescue keys; a timeout with no candidate and no
+human TX keeps the 9af187ca recovery behavior. If post-TX RX was necessarily
+trimmed by the bounded window, completion is `ok:true, partial:true` with no
+error code.
 Compatibility limitation: if the first line after the echo exactly equals the
 command and more output follows, that line is treated as a repeated echo and
 removed. Use `completion_regex` or a marker when that output must be preserved.
@@ -2500,13 +2506,17 @@ serialwrap cmd status --cmd-id <cmd_id>
 未指定 `--completion-regex` 的 agent `line`／`background` 命令，會以完整命令
 echo 作為 prompt 搜尋下界；完成與 stdout 擷取共用同一份 RX snapshot，支援
 prefix prompt，echo 前的文字不納入一般 stdout。真正 prompt 另須符合 epoch 內
-的字面證據，只來自可辨識 READY 結果或完整 echo 前綴；`Path => ` 等輸出只因
-寬鬆 regex 命中時不算完成。無換行 stdout 只以已知、至少含字母或數字的完整
-prompt suffix 裁切，因此 `printf abc` 回傳 `abc`，U+0000 原樣保留；短已知
-suffix 或未知尾端候選不從同行輸出猜測，原期限到期後回 partial。沒有
-human TX 交錯時，無
-echo 終端仍可由已知尾端 prompt 完成；若必要 post-TX RX 已確定被有界視窗
-修剪，回 `ok:true`、`partial:true` 且不帶 error_code。相容限制：echo 之後的
+的字面證據，只來自可辨識 READY probe 輸出（獨立 nonce 行後立刻接回 probe
+前同一 prompt）或完整 echo 前綴；probe 自身 echo、舊 prompt 與 `Path => ` 等
+非同步輸出不得只因寬鬆 regex 命中成為 evidence，精確 `router=> ` 則可由來源
+證實。無換行 stdout 只有在已找到本命令 echo 時，才以已知、至少含字母或數字
+的完整 prompt suffix 裁切，因此 `printf abc` 回傳 `abc`，U+0000 原樣保留；
+短已知 suffix 不從同行輸出猜測。沒有 human TX 交錯時，無 echo 終端仍可由
+位於最後一行行首的已知 prompt 完成；同行 `abcroot@t:/# ` 只是候選。候選
+指最後一行完整符合 prompt regex，或 snapshot 尾端為已知 prompt 字面；有候選
+但身分不足時到原期限回 `PROMPT_TIMEOUT`／partial 且不送救援鍵，無 human 且
+完全沒有候選時維持 9af187ca 的既有 recovery 與 TX。若必要 post-TX RX
+已確定被有界視窗修剪，回 `ok:true`、`partial:true` 且不帶 error_code。相容限制：echo 之後的
 第一行恰好等於命令、而且後面還有輸出時，視為重複 echo 並刪除；需要保留
 這種輸出時，請使用 `completion_regex` 或 marker。
 

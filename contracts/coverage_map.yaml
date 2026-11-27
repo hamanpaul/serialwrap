@@ -96,7 +96,7 @@ entries:
     - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
     - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
     owner_phase: P7
-  # i294：human pending 維持 write 後 watermark、完整視窗與 timeout 消耗；一般 echo／無 echo 命令另外要求 epoch 內 READY 或完整 echo 前綴的 prompt 字面證據。已知含字母／數字的 prompt 可作同行 suffix；短／未知 prompt 不猜；NUL 保留。=> 輸出不完成，無 echo 且修剪必要 RX 後的成功回 ok:true／partial:true。各 timeout 依 human 訊號分流；沒有 prompt 身分歧義的無 human timeout／recover_after_failure 維持基線逐位元組結果，歧義則保留 stdout 走 partial，另涵蓋跨接管 tuple、close fence 與保守代價。
+  # i294：human pending 維持 write 後 watermark、完整視窗與 timeout 消耗；echo／無 echo 命令要求同 epoch 的 READY probe 輸出或完整 echo 前綴證據，寫回原子驗證 revision／profile／watermark／epoch。同行 suffix 僅適用已找到 echo 的已知完整 prompt；無 echo 必須行首。Path => 不完成，router=> 可由精確來源證實。candidate＝最後一行完整 regex match 或已知字面 suffix；無 human 且無候選採 9af187ca baseline recovery，有候選但身分不足走 PROMPT_TIMEOUT／partial／NONE、零 rescue。NUL、跨接管與修剪 partial 保留。
   bc:BC-22:
     nodeids:
     - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
@@ -190,6 +190,13 @@ entries:
     - cargo:sw-core::command_exec::i271_short_prompt_does_not_cut_inline_stdout
     - cargo:sw-core::command_exec::i271_complete_echo_prefix_updates_changed_prompt_evidence
     - cargo:sw-core::command_exec::i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix
+    - cargo:sw-core::command_exec::i294_r1_ready_evidence_rejects_probe_echo_old_prompt_and_async_output
+    - cargo:sw-core::command_exec::i294_r1_no_echo_known_prompt_requires_true_last_line_start
+    - cargo:sw-core::command_exec::i294_r1_timeout_candidate_matrix_preserves_no_candidate_recovery
+    - cargo:sw-core::command_exec::i294_r1_prompt_evidence_writeback_clear_profile_and_takeover_barriers
+    - cargo:sw-core::command_exec::i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo
+    - cargo:sw-core::command_exec::i294_r1_path_arrow_output_cannot_become_echo_prefix_evidence
+    - cargo:sw-core::command_exec::i271_r1_shipped_prefix_profiles_preserve_inline_stdout_and_nul
     - cargo:sw-daemon::rpc_console::i262_rpc_arrow_output_is_complete
     - cargo:sw-daemon::rpc_console::i271_rpc_no_newline_and_nul_stdout
     owner_phase: P5

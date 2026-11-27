@@ -90,7 +90,7 @@ impl<'a> CompletionEvaluator<'a> {
             return (Evaluation::Uncertain { stdout }, None);
         }
 
-        match prompt_evidence_tail_range(&cleaned, prompt_evidence) {
+        match prompt_evidence_line_start_tail_range(&cleaned, prompt_evidence) {
             Some(prompt) if trimmed_before_from => (
                 Evaluation::Partial {
                     stdout: char_slice(&cleaned, 0..prompt.start)
@@ -379,6 +379,19 @@ fn prompt_evidence_tail_range(cleaned: &str, evidence: Option<&str>) -> Option<R
         return None;
     }
     Some(range)
+}
+
+fn prompt_evidence_line_start_tail_range(
+    cleaned: &str,
+    evidence: Option<&str>,
+) -> Option<Range<usize>> {
+    let range = prompt_evidence_suffix_range(cleaned, evidence)?;
+    let chars = cleaned.chars().collect::<Vec<_>>();
+    let line_start = chars[..range.start]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |index| index + 1);
+    (range.start == line_start).then_some(range)
 }
 
 fn prompt_evidence_suffix_range(cleaned: &str, evidence: Option<&str>) -> Option<Range<usize>> {

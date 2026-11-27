@@ -248,8 +248,16 @@ fn i262_arrow_output_segments_are_preserved() {
     );
     let h = ActorRig::new(&profile).ready();
     let command = "obuspa -c get Device.DNS.Diagnostics.";
+    let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = waiter_tx.send(());
+        })));
     let id = h.submit_ok(command);
     wait_tx(&h, format!("{command}\n").as_bytes());
+    waiter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ActorRig completion deadline 與 waiter 已建立");
 
     h.inject_rx_processed(
         format!(
@@ -262,6 +270,18 @@ fn i262_arrow_output_segments_are_preserved() {
         h.command_get(&id)["status"],
         PyValue::from("running"),
         "=> 輸出尾端不得被當成 command prompt"
+    );
+    let (checks, end) = h.rx.snapshot_wait_progress_for_test();
+    h.clock.advance(Duration::from_millis(51));
+    assert!(
+        h.rx
+            .wait_for_snapshot_wait_progress_for_test(checks, end, Duration::from_secs(5)),
+        "B =>  後 evaluator 應已跨過 50 ms poll 間隔"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "跨過 poll 間隔後，B =>  仍不得完成"
     );
 
     h.inject_rx_processed(
@@ -278,6 +298,415 @@ Device.DNS.Diagnostics.HostName => 1"
         )
     );
     assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile);
+    h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+    let h = h.attach();
+    let probe_wait = format!(
+        "READY probe TX 已送出: response={response}, fragmented={fragmented}"
+    );
+    h.wait_for(&probe_wait, |rig| {
+        rig.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload.starts_with(b"echo __READY__"))
+    });
+    let probe = h
+        .wal_tx_payloads()
+        .into_iter()
+        .find(|payload| payload.starts_with(b"echo __READY__"))
+        .expect("READY probe payload");
+    let probe_text = String::from_utf8(probe).expect("READY probe UTF-8");
+    let nonce = probe_text
+        .split("__READY__")
+        .nth(1)
+        .expect("READY probe nonce")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    let rx = match response {
+        "probe-echo" => format!("echo __READY__{nonce}\r\nAsyncPath# "),
+        "old-prompt" => format!("\r\necho __READY__{nonce}\r\nroot@t:/# "),
+        "async-output" => format!("\r\n__READY__{nonce}\r\nAsyncPath# "),
+        other => panic!("未知 READY evidence case: {other}"),
+    };
+    let bytes = rx.as_bytes();
+    if fragmented {
+        let split = bytes.len() / 2;
+        h.inject_rx_reader_processed(&bytes[..split]);
+        h.inject_rx_reader_processed(&bytes[split..]);
+    } else {
+        h.inject_rx_reader_processed(bytes);
+    }
+    let ready_wait = format!("READY: response={response}, fragmented={fragmented}");
+    h.wait_for(&ready_wait, |rig| {
+        rig.get_state()["state"].as_str() == Some("READY")
+    });
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf EVIDENCE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf EVIDENCE\n");
+    h.inject_rx_processed(b"printf EVIDENCE\r\nAsyncPath# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "nonce echo／舊 prompt／非同步輸出不得建立 prompt evidence: response={response}, fragmented={fragmented}"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "READY evidence 反例 timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf EVIDENCE\n",
+        "錯誤 READY evidence 不得觸發救援 TX"
+    );
+}
+
+#[test]
+fn i294_r1_ready_evidence_rejects_probe_echo_old_prompt_and_async_output() {
+    for response in ["probe-echo", "old-prompt", "async-output"] {
+        for fragmented in [false, true] {
+            i294_r1_run_ready_evidence_case(response, fragmented);
+        }
+    }
+}
+
+#[test]
+fn i294_r1_no_echo_known_prompt_requires_true_last_line_start() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf INLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf INLINE\n");
+
+    h.inject_rx_processed(b"abc");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無 echo 的 stdout 片段不能完成"
+    );
+    h.inject_rx_processed(b"root@t:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無 echo 的同行已知 prompt suffix 不得當作行首 prompt"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "no-echo inline prompt timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf INLINE\n");
+
+    let line_start = h.submit_ok("printf LINE");
+    wait_tx(&h, b"printf LINE\n");
+    h.inject_rx_processed(b"line output\r\nroot");
+    assert_eq!(h.command_get(&line_start)["status"], PyValue::from("running"));
+    h.inject_rx_processed(b"@t:/# ");
+    let result = h.wait_done(&line_start);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("line output"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_r1_timeout_candidate_matrix_preserves_no_candidate_recovery() {
+    for silence_entry in [false, true] {
+        for echo_found in [false, true] {
+            let label = format!("candidate/no-candidate silence={silence_entry} echo={echo_found}");
+            let h = ActorRig::new(SHELL_PROFILE).ready();
+            h.dev
+                .on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+            let tx_count = h.wal_tx_payloads().len();
+            let command = format!("printf R1_{silence_entry}_{echo_found}");
+            let id = h.submit_with(&command, |request| {
+                request.timeout_s = 0.2;
+                if silence_entry {
+                    request.expected_duration_s = Some(1.0);
+                }
+            });
+            wait_tx(&h, format!("{command}\n").as_bytes());
+            let mut raw = if echo_found {
+                format!("{command}\r\nno candidate\r\n").into_bytes()
+            } else {
+                b"no candidate\r\n".to_vec()
+            };
+            h.inject_rx_processed(&raw);
+            advance_until(
+                &h,
+                Duration::from_millis(100),
+                &format!("{label} recovery"),
+                |h| is_done(h, &id),
+            );
+            let result = h.wait_done(&id);
+            assert_eq!(result["status"], PyValue::from("done"), "{label}: {result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{label}: {result:?}");
+            assert_eq!(result["partial"], PyValue::Bool(true), "{label}: {result:?}");
+            let expected_tx = format!("{command}\n").into_bytes();
+            raw = expected_tx;
+            raw.push(0x03);
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                raw,
+                "{label}: 無候選必須保留基線救援 TX"
+            );
+        }
+    }
+
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    for silence_entry in [false, true] {
+        let h = ActorRig::new(&profile).ready();
+        let tx_count = h.wal_tx_payloads().len();
+        let command = format!("printf R1_CANDIDATE_{silence_entry}");
+        let id = h.submit_with(&command, |request| {
+            request.timeout_s = 0.2;
+            if silence_entry {
+                request.expected_duration_s = Some(1.0);
+            }
+        });
+        wait_tx(&h, format!("{command}\n").as_bytes());
+        h.inject_rx_processed(
+            format!("{command}\r\ncandidate root@new:/# ")
+                .as_bytes(),
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "歧義候選不得在尾端提前完成"
+        );
+        advance_until(
+            &h,
+            Duration::from_millis(100),
+            "歧義候選 timeout",
+            |h| is_done(h, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            format!("{command}\n").as_bytes(),
+            "有歧義候選的 timeout 不送救援 TX"
+        );
+    }
+}
+
+fn i294_r1_prompt_evidence_barrier(kind: &str) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.dev
+        .on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_prompt_evidence_before_write_hook_for_test(Some(Arc::new(move |snapshot| {
+            entered_tx
+                .send(snapshot.clone())
+                .expect("prompt evidence barrier snapshot");
+            release_rx.recv().expect("release prompt evidence barrier");
+        })));
+
+    let id = h.submit_with("cd /new", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_reader_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let stale = entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已辨識新 prompt evidence");
+    assert!(stale.prompt_evidence.is_some(), "READY 應已提供舊 evidence");
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^other@host:.*# "),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 prompt evidence barrier: {other}"),
+    }
+    h.advance(Duration::from_millis(201));
+    release_tx.send(()).expect("release evidence writeback");
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "stale completion recheck",
+        |h| is_done(h, &id),
+    );
+    let first = h.wait_done(&id);
+    assert!(
+        first["status"].as_str() != Some("done")
+            || first["recovery_action"].as_str() == Some("CTRL_C"),
+        "{kind}: 舊 snapshot 不得在 barrier 後直接完成：{first:?}"
+    );
+
+    let tx_count = h.wal_tx_payloads().len();
+    let second = h.submit_with("printf AFTER_BARRIER", |request| {
+        request.timeout_s = 0.2
+    });
+    wait_tx(&h, b"printf AFTER_BARRIER\n");
+    h.inject_rx_processed(b"AFTER\r\nroot@new:/# ");
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "{kind}: stale evidence 不得復活並完成後續命令"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "stale evidence 後續命令",
+        |h| is_done(h, &second),
+    );
+    let result = h.wait_done(&second);
+    assert_eq!(result["status"], PyValue::from("error"), "{kind}: {result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{kind}: {result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{kind}: {result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf AFTER_BARRIER\n");
+}
+
+#[test]
+fn i294_r1_prompt_evidence_writeback_clear_profile_and_takeover_barriers() {
+    for kind in ["clear", "profile", "takeover"] {
+        i294_r1_prompt_evidence_barrier(kind);
+    }
+}
+
+#[test]
+fn i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo() {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", r"(?m)^router=>[ \t]*$");
+    let h = ActorRig::new(&profile).ready_with_prompt(b"router=> ");
+
+    let ready = h.submit_with("printf READY", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf READY\n");
+    h.inject_rx_processed(b"printf READY\r\nREADY\r\nrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router READY evidence",
+        |h| is_done(h, &ready),
+    );
+    let result = h.wait_done(&ready);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("READY"));
+
+    h.rx.clear();
+    let echo = h.submit_with("printf ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf ECHO\n");
+    h.inject_rx_processed(b"router=> printf ECHO\r\nECHOrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router complete echo evidence",
+        |h| is_done(h, &echo),
+    );
+    let result = h.wait_done(&echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ECHO"));
+
+    let no_echo = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    h.inject_rx_processed(b"NO ECHO\r\nrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router no-echo evidence",
+        |h| is_done(h, &no_echo),
+    );
+    let result = h.wait_done(&no_echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("NO ECHO"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_r1_path_arrow_output_cannot_become_echo_prefix_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^.*=>[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready_with_prompt(b"Path => ");
+    h.rx.clear();
+    let id = h.submit_with("printf PATH", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf PATH\n");
+    h.inject_rx_processed(b"Path => printf PATH\r\nPath => ");
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "Path arrow output ambiguity",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+}
+
+fn i271_r1_run_shipped_prefix_inline(prompt_regex: &str, prompt: &str) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new(&profile).ready_with_prompt(prompt.as_bytes());
+
+    let plain = h.submit_with("printf abc", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(format!("printf abc\r\nabc{prompt}").as_bytes());
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "prefix printf abc",
+        |h| is_done(h, &plain),
+    );
+    let result = h.wait_done(&plain);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("abc"));
+
+    let nul = h.submit_with("cat model", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cat model\n");
+    let mut raw = b"cat model\r\nmodel\0".to_vec();
+    raw.extend_from_slice(prompt.as_bytes());
+    h.inject_rx_processed(&raw);
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "prefix NUL stdout",
+        |h| is_done(h, &nul),
+    );
+    let result = h.wait_done(&nul);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("model\0"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_r1_shipped_prefix_profiles_preserve_inline_stdout_and_nul() {
+    i271_r1_run_shipped_prefix_inline(
+        r"(?m)^root@prplOS:.*# ",
+        "root@prplOS:~# ",
+    );
+    i271_r1_run_shipped_prefix_inline(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+    );
 }
 
 #[test]
