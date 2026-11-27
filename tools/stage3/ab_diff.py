@@ -1651,6 +1651,7 @@ def _difference(
     case_changes: Mapping[str, str],
     source_a: str | None,
     source_b: str | None,
+    unverified_case_ids: set[str],
 ) -> dict[str, Any]:
     return {
         "case": case_id,
@@ -1658,7 +1659,30 @@ def _difference(
         "kind": kind,
         "registered_change": case_changes.get(case_id),
         "source_refs": {"a": source_a, "b": source_b},
+        "verified": (
+            run_a.identity_verified
+            and run_a.case_identity_verified
+            and run_b.identity_verified
+            and run_b.case_identity_verified
+            and _call_source_verified(run_a, source_a)
+            and _call_source_verified(run_b, source_b)
+            and case_id not in unverified_case_ids
+        ),
     }
+
+
+def _call_source_verified(run: _Run, source_ref: str | None) -> bool:
+    """確認差分引用的 CLI 觀測來源已由該 run 的原始 hash 清單核實。"""
+    if source_ref is None:
+        return True
+    if not isinstance(source_ref, str) or not source_ref:
+        return False
+    relative = source_ref.split("#", 1)[0]
+    run_prefix = run.path.relative_to(run.report_root).as_posix() + "/"
+    if not relative.startswith(run_prefix):
+        return False
+    source_path = relative[len(run_prefix):]
+    return source_path in run.verified_sources
 
 
 def _compare_run_pair(
@@ -1667,6 +1691,7 @@ def _compare_run_pair(
     *,
     rules: Mapping[str, Any],
     case_changes: Mapping[str, str],
+    unverified_case_ids: set[str],
 ) -> list[dict[str, Any]]:
     differences: list[dict[str, Any]] = []
     case_id = run_a.case_id
@@ -1675,6 +1700,7 @@ def _compare_run_pair(
             run_a, run_b, case_id, "comparison.verdict", "verdict", case_changes,
             run_a.verdict_ref or run_a.ref("comparison.json"),
             run_b.verdict_ref or run_b.ref("comparison.json"),
+            unverified_case_ids,
         ))
     placeholder = rules.get("instance_root_placeholder", "<ROOT>")
     left_logical: list[tuple[str, ...]] = []
@@ -1692,6 +1718,7 @@ def _compare_run_pair(
             run_a, run_b, case_id, f"call[{index}]", "call_count", case_changes,
             call_a.source_ref if call_a is not None else None,
             call_b.source_ref if call_b is not None else None,
+            unverified_case_ids,
         ))
 
     for index in range(paired_count):
@@ -1701,11 +1728,13 @@ def _compare_run_pair(
             differences.append(_difference(
                 run_a, run_b, case_id, f"call[{index}].argv", "argv", case_changes,
                 call_a.source_ref, call_b.source_ref,
+                unverified_case_ids,
             ))
         if call_a.rc != call_b.rc:
             differences.append(_difference(
                 run_a, run_b, case_id, f"call[{index}].rc", "rc", case_changes,
                 call_a.source_ref, call_b.source_ref,
+                unverified_case_ids,
             ))
         if not call_a.response_valid or not call_b.response_valid:
             continue
@@ -1725,6 +1754,7 @@ def _compare_run_pair(
             differences.append(_difference(
                 run_a, run_b, case_id, value_path, "value", case_changes,
                 call_a.source_ref, call_b.source_ref,
+                unverified_case_ids,
             ))
     return differences
 
@@ -1781,6 +1811,15 @@ def diff_l15(
             if not runs_by_case.get(case_id):
                 _add_problem(problems[side], f"missing required case: {case_id}")
 
+    baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
+        {"a": runs_a, "b": runs_b}, required_case_ids,
+    )
+    unverified_case_ids = {
+        row["case"]
+        for row in unverified_failures
+        if isinstance(row.get("case"), str)
+    }
+
     differences: list[dict[str, Any]] = []
     cli_pairing: list[dict[str, Any]] = []
     for case_id in sorted(set(runs_a) | set(runs_b)):
@@ -1804,11 +1843,13 @@ def diff_l15(
             if cli_match is False:
                 _add_problem(problems["b"], "artifact identity mismatch: artifacts.cli.sha256")
                 _add_problem(run_b.problems, "artifact identity mismatch: artifacts.cli.sha256")
-            differences.extend(_compare_run_pair(run_a, run_b, rules=rules, case_changes=case_changes))
-
-    baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
-        {"a": runs_a, "b": runs_b}, required_case_ids,
-    )
+            differences.extend(_compare_run_pair(
+                run_a,
+                run_b,
+                rules=rules,
+                case_changes=case_changes,
+                unverified_case_ids=unverified_case_ids,
+            ))
 
     for side, runs_by_case in (("a", runs_a), ("b", runs_b)):
         for case_runs in runs_by_case.values():

@@ -238,6 +238,11 @@
    也須保留差異。將整個欄位無條件刪除會掩蓋這些差異。此項未經獨立審查或擁有者
    追認，不得凍結為 approved normalization。
 
+8. ``differences[]`` 每列含 ``verified: bool``。只有 A/B run identity 與 case identity
+   均核實、該列引用到的 CLI 原始觀測檔 hash 已核實，且該 case 在任一側都沒有
+   ``unverified_failures`` 時才為 true。``call_count`` 列只有一側觀測引用，另一側
+   ``source_refs`` 為 null；可信度只需核對存在的觀測來源，但仍要求兩側 run 身分已核實。
+
 這份契約只規範 T7B loader／fixture 與後續 T5B adapter 的讀取介面。它不代表目前
 repo 已有非 bridge adapter，也不宣稱純資料 fixture 是產品執行證據。
 """

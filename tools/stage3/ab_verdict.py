@@ -35,6 +35,7 @@ _LAYERS: frozenset[str] = frozenset({"l1.5", "l2", "l3"})
 _SUITE_STATUSES: frozenset[str] = frozenset({PASS, FAIL, INFRA_ERROR})
 _AB_PARTICIPATION: frozenset[str] = frozenset({"diff", "absolute_only"})
 _REQUIRED_SKIP_VERDICTS: frozenset[str] = frozenset({"SKIP", "ERROR"})
+_L2_COMPARABLE_VERDICTS: frozenset[str] = L2_VERDICTS - _REQUIRED_SKIP_VERDICTS
 
 _COMPARATOR = "HARNESS_COMPARATOR_ERROR"
 _SUITE = "HARNESS_SUITE_INFRA_ERROR"
@@ -45,6 +46,27 @@ _INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
 _XFAIL = "XFAIL"
 _XPASS = "XPASS"
 _A_BASELINE_RESULTS: frozenset[str] = frozenset({PASS, FAIL, _INSUFFICIENT})
+_GATE_SCHEMA = "release-gate.v1"
+_GATE_RESULTS: frozenset[str] = frozenset({
+    PASS, FAIL, _INSUFFICIENT, "BLOCKED", "NOT_APPLICABLE_BASELINE",
+})
+_GATE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "created_at",
+    "platform",
+    "mode",
+    "engine_result",
+    "release_gate_result",
+    "baseline_result",
+    "acceptance",
+    "run",
+    "checks",
+    "counts",
+    "stuck",
+    "walscan",
+    "evidence_hashes",
+    "excl_evidence_hashes",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -146,17 +168,32 @@ def combine(
     if malformed_baselines:
         shape_errors.append("baseline_failures 結構不符")
     shape_errors.extend(_other_shape_errors(diff))
-    status_relevant = layer == "l1.5" or (layer == "l3" and isinstance(diff, Mapping) and diff.get("kind") == "longrun")
-    notes = _unique([*_diagnostic_notes(diff, a_status, b_status, include_status=status_relevant), *shape_errors])
+    notes = _unique([*_diagnostic_notes(diff, a_status, b_status), *shape_errors])
+    if a_status == INFRA_ERROR or b_status == INFRA_ERROR:
+        notes = _unique([*notes, "suite reported INFRA_ERROR"])
+    difference_failures: list[dict[str, str]] = []
+    difference_notes: list[str] = []
+    difference_errors: list[str] = []
+    if layer == "l1.5" and isinstance(diff, Mapping):
+        difference_failures, difference_notes, difference_errors = _l15_difference_findings(diff, registered, products)
+        shape_errors.extend(difference_errors)
+        notes = _unique([*difference_notes, *notes, *difference_errors])
+        for row in difference_failures:
+            if not any(_failure_side(existing) == "b" and existing.get("case") == row["case"] for existing in products):
+                products.append(row)
+        notes = _unique(notes)
     if safety:
         return FAIL, None, _unique([*(f"safety violation: {item}" for item in safety), *notes])
     if products:
         return FAIL, None, notes
-    if shape_errors:
-        return INFRA_ERROR, _COMPARATOR, notes
+
+    if a_status == INFRA_ERROR or b_status == INFRA_ERROR:
+        return INFRA_ERROR, _SUITE, _unique([*notes, "suite reported INFRA_ERROR"])
 
     if layer == "l2":
         # L2 只依逐案比較；run 層級狀態／rc 不代表產品失敗。
+        if shape_errors:
+            return INFRA_ERROR, _COMPARATOR, notes
         return _combine_cases(diff, notes)
     if layer == "l3":
         if diff is None:
@@ -164,14 +201,24 @@ def combine(
         kind = diff.get("kind")
         if kind == "cases":
             # 1.0.0 非長跑 L3 使用 required cases，且不讀取 release-gate.json。
+            if shape_errors:
+                return INFRA_ERROR, _COMPARATOR, notes
             return _combine_cases(diff, notes)
         if kind != "longrun":
             return INFRA_ERROR, _COMPARATOR, _unique([f"未知的 L3 比較種類：{kind!r}", *notes])
 
-    if a_status == INFRA_ERROR or b_status == INFRA_ERROR:
-        return INFRA_ERROR, _SUITE, _unique([*notes, "suite reported INFRA_ERROR"])
+    if shape_errors:
+        return INFRA_ERROR, _COMPARATOR, notes
     if a_status not in _SUITE_STATUSES or b_status not in _SUITE_STATUSES:
         return INFRA_ERROR, _SUITE, _unique([*notes, f"unknown suite status: A={a_status!r} B={b_status!r}"])
+    if layer == "l1.5" and isinstance(diff, Mapping):
+        differences = diff.get("differences")
+        if isinstance(differences, list) and any(
+            isinstance(row, Mapping)
+            and row.get("verified") is False
+            for row in differences
+        ):
+            return INFRA_ERROR, _COMPARATOR, _unique([*notes, "L1.5 含未核實差異"])
     integrity = diff.get("integrity") if isinstance(diff, Mapping) else None
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：比較器完整性未通過"])
@@ -195,6 +242,71 @@ def _rows(diff: Mapping[str, Any] | None, key: str) -> list[Any]:
 
 def _failure_side(row: Any) -> str | None:
     return row.get("side") if isinstance(row, Mapping) and isinstance(row.get("side"), str) else None
+
+
+def _l15_difference_findings(
+    diff: Mapping[str, Any],
+    registered: Mapping[str, str],
+    existing_products: list[Mapping[str, Any]],
+) -> tuple[list[dict[str, str]], list[str], list[str]]:
+    """從可信的 T7B 差異建產品 FAIL 記錄；未核實差異僅保留診斷。"""
+    differences = diff.get("differences")
+    if not isinstance(differences, list):
+        return [], [], ["L1.5 differences 結構不符"]
+    b_cases = diff.get("b_cases") if isinstance(diff.get("b_cases"), Mapping) else {}
+    failures: list[dict[str, str]] = []
+    notes: list[str] = []
+    errors: list[str] = []
+    for index, item in enumerate(differences):
+        if not isinstance(item, Mapping):
+            errors.append(f"L1.5 difference[{index}] 列結構不符")
+            continue
+        case = item.get("case")
+        path = item.get("path")
+        if not isinstance(case, str) or not case or not isinstance(path, str) or not path:
+            errors.append(f"L1.5 difference[{index}] 缺少 case 或 path")
+            continue
+        verified = item.get("verified")
+        if not isinstance(verified, bool):
+            errors.append(f"L1.5 difference[{index}] verified 缺漏或非布林值")
+            continue
+        source_refs = item.get("source_refs")
+        if not isinstance(source_refs, Mapping):
+            errors.append(f"L1.5 difference[{index}] source_refs 結構不符")
+            continue
+        source_a = source_refs.get("a")
+        source_b = source_refs.get("b")
+        if source_a is not None and (not isinstance(source_a, str) or not source_a):
+            errors.append(f"L1.5 difference[{index}] source_refs.a 結構不符")
+            continue
+        if source_b is not None and (not isinstance(source_b, str) or not source_b):
+            errors.append(f"L1.5 difference[{index}] source_refs.b 結構不符")
+            continue
+        source_ref = source_b or source_a
+        if not source_ref:
+            errors.append(f"L1.5 difference[{index}] 缺少可核對來源")
+            continue
+        if not verified:
+            notes.append(f"unverified difference: {case} {path} (a={source_a or 'null'} b={source_b or 'null'})")
+            continue
+
+        change = item.get("registered_change")
+        participation = registered.get(change) if isinstance(change, str) else None
+        if participation == "absolute_only":
+            if b_cases.get(case) == PASS:
+                continue
+            reason = f"rust_only case failed absolute: {case}"
+        elif participation == "diff":
+            reason = f"both-scope change differs: {change} {case}"
+        else:
+            reason = f"unregistered difference: {case} {path}"
+
+        row = {"side": "b", "case": case, "source_ref": source_ref, "reason": reason}
+        if not any(existing.get("side") == "b" and existing.get("case") == case for existing in existing_products):
+            failures.append(row)
+        notes.append(reason)
+        notes.append(_record_note("difference source", row))
+    return failures, _unique(notes), errors
 
 
 def _checked_text_rows(diff: Mapping[str, Any] | None, key: str) -> tuple[list[str], bool]:
@@ -250,6 +362,10 @@ def _other_shape_errors(diff: Mapping[str, Any] | None) -> list[str]:
     for key in ("a_cases", "b_cases"):
         if key in diff and not isinstance(diff.get(key), Mapping):
             errors.append(f"{key} 結構不符")
+    if "safety_failure_sources" in diff:
+        rows = diff.get("safety_failure_sources")
+        if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+            errors.append("safety_failure_sources 結構不符")
     for key in ("missing", "duplicates", "unknown_verdicts", "required_skips"):
         if key not in diff:
             continue
@@ -323,6 +439,12 @@ def _diagnostic_notes(
                 notes.extend(f"{side.upper()} integrity: {item}" for item in side_problems)
             elif side_problems:
                 notes.append(f"{side.upper()} integrity: {side_problems}")
+    safety_sources = diff.get("safety_failure_sources")
+    if isinstance(safety_sources, list):
+        for row in safety_sources:
+            notes.append(_record_note("safety source", row))
+    elif "safety_failure_sources" in diff:
+        notes.append("safety_failure_sources 結構不符")
     for field, label in (
         ("missing", "missing required case"),
         ("duplicates", "duplicate case"),
@@ -388,30 +510,6 @@ def _combine_l15(
         return FAIL, None, diagnostics
     if diff is None:
         return INFRA_ERROR, _COMPARATOR, _unique(["缺少 L1.5 差分輸出", *diagnostics])
-
-    notes: list[str] = []
-    b_cases = diff.get("b_cases") if isinstance(diff.get("b_cases"), Mapping) else {}
-    differences = diff.get("differences")
-    if not isinstance(differences, list):
-        return INFRA_ERROR, _COMPARATOR, _unique([*diagnostics, "L1.5 differences 結構不符"])
-    for item in differences:
-        if not isinstance(item, Mapping):
-            return INFRA_ERROR, _COMPARATOR, _unique([*diagnostics, "L1.5 difference 列結構不符"])
-        case = str(item.get("case"))
-        path = str(item.get("path"))
-        change = item.get("registered_change")
-        scope = registered.get(change) if isinstance(change, str) else None
-        if scope == "absolute_only":
-            # rust_only：不參與差分，但 B 側必須通過絕對契約。
-            if b_cases.get(case) != PASS:
-                notes.append(f"rust_only case failed absolute: {case}")
-        elif scope == "diff":
-            # both：Python 已先實作，A/B 不應有差。
-            notes.append(f"both-scope change differs: {change} {case}")
-        else:
-            notes.append(f"unregistered difference: {case} {path}")
-    if notes:
-        return FAIL, None, _unique([*notes, *diagnostics])
     return PASS, None, diagnostics
 
 
@@ -576,9 +674,10 @@ def _case_of(cases: Mapping[str, Any], case_id: str) -> Mapping[str, Any]:
     return case if isinstance(case, Mapping) else {}
 
 
-def _result_ref(item: Mapping[str, Any], index: int) -> str:
-    """從 TestPilot evidence 取相對來源；沒有可用引用時指向原始結果列。"""
+def _evidence_refs(item: Mapping[str, Any]) -> list[str]:
+    """整理附加 evidence 引用；主要 FAIL 來源仍是逐案結果列。"""
     evidence = item.get("evidence")
+    refs: list[str] = []
     if isinstance(evidence, list):
         for row in evidence:
             if not isinstance(row, Mapping):
@@ -594,15 +693,35 @@ def _result_ref(item: Mapping[str, Any], index: int) -> str:
                 and not any(part in {"", ".", ".."} for part in parsed.parts)
                 and ":" not in (parsed.parts[0] if parsed.parts else "")
             ):
-                return normalized
-    return f"report.json#/results/{index}"
+                if normalized not in refs:
+                    refs.append(normalized)
+    return refs
 
 
-def _l2_failure(case_id: str, item: Mapping[str, Any], index: int, reason: str) -> dict[str, str]:
+def _validated_report_ref(value: Any, label: str) -> str:
+    """驗證相對側 report_dir 的 POSIX 報告路徑。"""
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise HarnessError(_COMPARATOR, f"{label} report_ref 必須是相對 POSIX 路徑")
+    parsed = PurePosixPath(value)
+    if parsed.is_absolute() or any(part in {"", ".", ".."} for part in parsed.parts):
+        raise HarnessError(_COMPARATOR, f"{label} report_ref 必須是安全的相對 POSIX 路徑")
+    if ":" in (parsed.parts[0] if parsed.parts else ""):
+        raise HarnessError(_COMPARATOR, f"{label} report_ref 不得包含磁碟代號")
+    return parsed.as_posix()
+
+
+def _l2_failure(
+    case_id: str,
+    item: Mapping[str, Any],
+    index: int,
+    reason: str,
+    report_ref: str,
+) -> dict[str, Any]:
     return {
         "side": "b",
         "case": case_id,
-        "source_ref": _result_ref(item, index),
+        "source_ref": f"{report_ref}#/results/{index}",
+        "evidence_refs": _evidence_refs(item),
         "reason": reason,
     }
 
@@ -615,12 +734,14 @@ def _needs_review(
     registered: Mapping[str, str],
 ) -> bool:
     """判斷是否需人工審查，包括 XFAIL 案例的兩側結果差異。"""
+    if case.get("expected") == "XFAIL":
+        # §15.10：XFAIL 案例兩側結果不同一律審查，哨兵轉綠須由外部結果證實並登記。
+        if a_verdict not in _L2_COMPARABLE_VERDICTS or b_verdict not in _L2_COMPARABLE_VERDICTS:
+            return False
+        return a_verdict != b_verdict
     if b_verdict == _XPASS:
         # 既有哨兵未再重現：須確認真修復與行為變更，不得自動刪除哨兵（§11.4）。
         return True
-    if case.get("expected") == "XFAIL":
-        # §15.10：XFAIL 案例兩側結果不同一律審查，哨兵轉綠須由外部結果證實並登記。
-        return a_verdict != b_verdict
     return b_verdict == PASS and a_verdict == FAIL and case_id not in registered
 
 
@@ -632,17 +753,21 @@ def compare_l2_reports(
     cases: Mapping[str, Mapping[str, Any]],
     registered_case_changes: Mapping[str, str],
     now: str,
+    a_report_ref: str,
+    b_report_ref: str,
 ) -> dict[str, Any]:
     """逐案比較兩側 L2 報告；先完整性、後判定。
 
-    B 側 FAIL／XFAIL 的案例若帶安全不變量（`invariants` 非空），每個不變量產生 `B:<case>:<invariant>` 列入
-    `safety_violations`，由 `combine` 第一列直接判 FAIL（即使其他必要案例不完整）。此類案例不得由哨兵豁免。
-    A 側不在此判定安全（plan rule 3）。
+    TestPilot 逐案結果沒有明確安全或 invariant verdict，所以 L2 的
+    `safety_violations` 固定為空；`cases.yaml` 的覆蓋清單不是執行結果證據。
+    產品失敗主來源指向原始結果列，附加 evidence 引用另列於 `evidence_refs`。
     """
     if not isinstance(required_case_ids, (set, frozenset)) or not all(isinstance(item, str) for item in required_case_ids):
         raise HarnessError(_COMPARATOR, "required_case_ids 必須是字串集合")
     if not isinstance(cases, Mapping) or not isinstance(registered_case_changes, Mapping):
         raise HarnessError(_COMPARATOR, "cases 與 registered_case_changes 必須是映射")
+    a_report_ref = _validated_report_ref(a_report_ref, "A")
+    b_report_ref = _validated_report_ref(b_report_ref, "B")
     required = set(required_case_ids)
     try:
         now_dt = parse_iso(now)
@@ -656,37 +781,39 @@ def compare_l2_reports(
     expired_sentinels: list[str] = []
     needs_review: list[dict[str, str]] = []
     safety_violations: list[str] = []
-    product_failures: list[dict[str, str]] = []
+    product_failures: list[dict[str, Any]] = []
     b_result_index: dict[str, tuple[Mapping[str, Any], int]] = {}
     for case_id, b_item, index in sorted(b_side["rows"], key=lambda row: (row[0], row[2])):
         b_result_index.setdefault(case_id, (b_item, index))
         b_verdict = _verdict_of(b_item)
         a_verdict = _verdict_of(a_side["by_id"].get(case_id))
         case = _case_of(cases, case_id)
-        invariants = _invariants_of(case_id, case)
-        if invariants is None:
-            b_side["integrity"] = False
-            b_side["problems"].append(f"B 案例 {case_id} 的 invariants 結構不符")
-            invariants = []
         if b_verdict in (FAIL, _XFAIL):
-            safety_violations.extend(f"B:{case_id}:{inv}" for inv in invariants)
             waiver = _sentinel_waiver(case_id, case, b_item.get("reason"), now_dt)
             if waiver == "accepted":
                 xfail_accepted.append(case_id)
             elif waiver == "expired":
                 if case_id not in expired_sentinels:
                     expired_sentinels.append(case_id)
-                product_failures.append(_l2_failure(case_id, b_item, index, "sentinel expired"))
+                product_failures.append(_l2_failure(case_id, b_item, index, "sentinel expired", b_report_ref))
             else:
                 if case_id not in b_failures:
                     b_failures.append(case_id)
-                product_failures.append(_l2_failure(case_id, b_item, index, str(b_item.get("reason") or b_verdict)))
+                product_failures.append(_l2_failure(
+                    case_id, b_item, index, str(b_item.get("reason") or b_verdict), b_report_ref,
+                ))
         if _needs_review(case_id, case, a_verdict, b_verdict, registered_case_changes):
             review = {"case": case_id, "a": a_verdict or "MISSING", "b": b_verdict or "MISSING"}
             if review not in needs_review:
                 needs_review.append(review)
                 review_item, review_index = b_result_index[case_id]
-                product_failures.append(_l2_failure(case_id, review_item, review_index, "unregistered behavior change needs review"))
+                product_failures.append(_l2_failure(
+                    case_id,
+                    review_item,
+                    review_index,
+                    "unregistered behavior change needs review",
+                    b_report_ref,
+                ))
 
     integrity = {"a": a_side["integrity"], "b": b_side["integrity"]}
     if product_failures or safety_violations:
@@ -745,6 +872,35 @@ def _revision_of(gate: Mapping[str, Any]) -> str | int | None:
     return revision
 
 
+def _gate_problems(gate: Mapping[str, Any], label: str) -> list[str]:
+    """驗證 P2 release-gate.v1 的實際輸出欄位與必要型別。"""
+    problems: list[str] = []
+    for key in _GATE_REQUIRED_FIELDS:
+        if key not in gate:
+            problems.append(f"{label} release-gate.json 缺少必要欄位：{key}")
+    if gate.get("schema_version") != _GATE_SCHEMA:
+        problems.append(f"{label} release-gate.json schema_version 無效：{gate.get('schema_version')!r}")
+    for key in ("created_at", "platform", "mode"):
+        value = gate.get(key)
+        if not isinstance(value, str) or not value:
+            problems.append(f"{label} release-gate.json {key} 缺漏或格式錯誤")
+    if not isinstance(gate.get("engine_result"), Mapping):
+        problems.append(f"{label} release-gate.json engine_result 缺漏或非物件")
+    release_result = gate.get("release_gate_result")
+    if not isinstance(release_result, str) or release_result not in _GATE_RESULTS:
+        problems.append(f"{label} release-gate.json release_gate_result 無效：{release_result!r}")
+    baseline_result = gate.get("baseline_result")
+    mode = gate.get("mode")
+    if mode == "candidate" and baseline_result is None:
+        pass
+    elif not isinstance(baseline_result, str) or baseline_result not in _A_BASELINE_RESULTS:
+        problems.append(f"{label} release-gate.json baseline_result 無效：{baseline_result!r}")
+    for key in ("acceptance", "run", "counts", "stuck", "walscan", "evidence_hashes", "excl_evidence_hashes"):
+        if not isinstance(gate.get(key), Mapping):
+            problems.append(f"{label} release-gate.json {key} 缺漏或非物件")
+    return problems
+
+
 def _checks_of(gate: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], list[str]]:
     checks = gate.get("checks")
     if not isinstance(checks, list):
@@ -752,10 +908,21 @@ def _checks_of(gate: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], list[s
     rows: list[Mapping[str, Any]] = []
     problems: list[str] = []
     for index, check in enumerate(checks):
-        if isinstance(check, Mapping):
-            rows.append(check)
-        else:
+        if not isinstance(check, Mapping):
             problems.append(f"checks[{index}] 非物件")
+            continue
+        valid = True
+        for key in ("group", "id", "result"):
+            value = check.get(key)
+            if not isinstance(value, str) or not value:
+                problems.append(f"checks[{index}].{key} 缺漏或非字串")
+                valid = False
+        result = check.get("result")
+        if isinstance(result, str) and result not in _GATE_RESULTS:
+            problems.append(f"checks[{index}].result 未知：{result!r}")
+            valid = False
+        if valid:
+            rows.append(check)
     return rows, problems
 
 
@@ -765,18 +932,38 @@ def _evidence_intact(checks: list[Mapping[str, Any]]) -> bool:
     return bool(results) and all(result != _INSUFFICIENT for result in results)
 
 
-def _l3_safety_failures(a_gate: Mapping[str, Any] | None, b_gate: Mapping[str, Any] | None) -> list[str]:
-    failures: list[str] = []
-    for side, gate in (("A", a_gate), ("B", b_gate)):
+def _gate_side_verified(gate: Mapping[str, Any] | None, expected_mode: str) -> bool:
+    return gate is not None and gate.get("schema_version") == _GATE_SCHEMA and gate.get("mode") == expected_mode
+
+
+def _l3_safety_sources(
+    a_gate: Mapping[str, Any] | None,
+    b_gate: Mapping[str, Any] | None,
+) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for side, gate in (("a", a_gate), ("b", b_gate)):
         checks = gate.get("checks") if gate is not None else None
         if not isinstance(checks, list):
             continue
-        failures.extend(
-            f"{side}:{check.get('id')}"
-            for check in checks
-            if isinstance(check, Mapping) and check.get("group") == "safety" and check.get("result") == FAIL
-        )
-    return failures
+        for index, check in enumerate(checks):
+            if (
+                isinstance(check, Mapping)
+                and isinstance(check.get("id"), str)
+                and bool(check.get("id"))
+                and check.get("group") == "safety"
+                and check.get("result") == FAIL
+            ):
+                sources.append({
+                    "side": side,
+                    "case": check["id"],
+                    "source_ref": f"release-gate.json#/checks/{index}",
+                    "reason": "safety check FAIL",
+                })
+    return sources
+
+
+def _l3_safety_failures(a_gate: Mapping[str, Any] | None, b_gate: Mapping[str, Any] | None) -> list[str]:
+    return [f"{row['side'].upper()}:{row['case']}" for row in _l3_safety_sources(a_gate, b_gate)]
 
 
 def _l3_baseline_failures(gate: Mapping[str, Any] | None) -> list[dict[str, str]]:
@@ -831,29 +1018,41 @@ def _preserve_l3_findings_or_raise(
     a_gate: Mapping[str, Any] | None,
     b_gate: Mapping[str, Any] | None,
     detail: str,
+    *,
+    a_valid: bool,
+    b_valid: bool,
+    problems: Mapping[str, list[str]],
 ) -> dict[str, Any]:
     """Comparator mismatch 時仍回傳先前可核實的產品／安全 FAIL。"""
-    safety = _l3_safety_failures(a_gate, b_gate)
-    products = _l3_product_failures(b_gate)
+    trusted_a = a_gate if a_valid else None
+    trusted_b = b_gate if b_valid else None
+    safety_sources = _l3_safety_sources(trusted_a, trusted_b)
+    safety = [f"{row['side'].upper()}:{row['case']}" for row in safety_sources]
+    products = _l3_product_failures(trusted_b)
     if not safety and not products:
         raise HarnessError(_COMPARATOR, detail)
-    a_checks, _ = _checks_of(a_gate or {})
-    b_checks, _ = _checks_of(b_gate or {})
+    a_checks, _ = _checks_of(trusted_a or {})
+    b_checks, _ = _checks_of(trusted_b or {})
     compatible = [check for check in b_checks if check.get("id") == "baseline_compatible"]
+    failure_problems = {
+        "a": _unique([*problems.get("a", []), detail]),
+        "b": _unique([*problems.get("b", []), detail]),
+    }
     return {
         "kind": "longrun",
         "a_mode": a_gate.get("mode") if a_gate else None,
         "b_mode": b_gate.get("mode") if b_gate else None,
-        "a_engine_verdict": _raw_engine_verdict(a_gate),
-        "a_baseline_result": a_gate.get("baseline_result") if a_gate else None,
-        "b_engine_verdict": _raw_engine_verdict(b_gate),
-        "b_release_gate_result": b_gate.get("release_gate_result") if b_gate else None,
+        "a_engine_verdict": _raw_engine_verdict(trusted_a),
+        "a_baseline_result": trusted_a.get("baseline_result") if trusted_a else None,
+        "b_engine_verdict": _raw_engine_verdict(trusted_b),
+        "b_release_gate_result": trusted_b.get("release_gate_result") if trusted_b else None,
         "b_baseline_compatible": compatible[0].get("result") == PASS if len(compatible) == 1 else None,
-        "acceptance_revision": _revision_of(a_gate) if a_gate else None,
+        "acceptance_revision": _revision_of(trusted_a) if trusted_a else None,
         "safety_violations": safety,
-        "baseline_failures": _l3_baseline_failures(a_gate),
+        "safety_failure_sources": safety_sources,
+        "baseline_failures": _l3_baseline_failures(trusted_a),
         "product_failures": products,
-        "integrity_problems": {"a": [detail], "b": [detail]},
+        "integrity_problems": failure_problems,
         "integrity": {"a": False, "b": False},
     }
 
@@ -867,7 +1066,7 @@ def _raw_engine_verdict(gate: Mapping[str, Any] | None) -> str | None:
 def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
     """讀取 A（baseline）、B（candidate）兩側 release-gate.json，回傳供 `combine("l3", …)` 使用的摘要。
 
-    兩側 `mode`、`acceptance.revision`、`platform` 不符為比較器錯誤。
+    依 P2 `release-gate.v1` 核對必要欄位與每筆 check；先驗證側別 mode，再收集該側 FAIL。
     """
     try:
         a_gate_path = Path(a_gate_path)
@@ -881,12 +1080,29 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
         problems["a"].append(a_error)
     if b_error:
         problems["b"].append(b_error)
+    if a_gate is not None:
+        problems["a"].extend(_gate_problems(a_gate, "A"))
+    if b_gate is not None:
+        problems["b"].extend(_gate_problems(b_gate, "B"))
 
     a_mode = a_gate.get("mode") if a_gate else None
     b_mode = b_gate.get("mode") if b_gate else None
-    if a_gate is not None and b_gate is not None:
-        if a_mode != "baseline" or b_mode != "candidate":
-            return _preserve_l3_findings_or_raise(a_gate, b_gate, f"模式不符：A={a_mode!r} B={b_mode!r}")
+    a_valid = _gate_side_verified(a_gate, "baseline")
+    b_valid = _gate_side_verified(b_gate, "candidate")
+    mode_mismatch = (a_gate is not None and a_mode != "baseline") or (b_gate is not None and b_mode != "candidate")
+    if a_gate is not None and a_mode != "baseline":
+        problems["a"].append(f"A mode 應為 baseline，實際為 {a_mode!r}")
+    if b_gate is not None and b_mode != "candidate":
+        problems["b"].append(f"B mode 應為 candidate，實際為 {b_mode!r}")
+    if mode_mismatch:
+        return _preserve_l3_findings_or_raise(
+            a_gate,
+            b_gate,
+            f"模式不符：A={a_mode!r} B={b_mode!r}",
+            a_valid=a_valid,
+            b_valid=b_valid,
+            problems=problems,
+        )
 
     a_revision = _revision_of(a_gate) if a_gate else None
     b_revision = _revision_of(b_gate) if b_gate else None
@@ -896,7 +1112,12 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
         problems["b"].append("acceptance.revision 缺漏或格式錯誤")
     if a_revision is not None and b_revision is not None and a_revision != b_revision:
         return _preserve_l3_findings_or_raise(
-            a_gate, b_gate, f"acceptance.revision 不同：A={a_revision} B={b_revision}"
+            a_gate,
+            b_gate,
+            f"acceptance.revision 不同：A={a_revision} B={b_revision}",
+            a_valid=a_valid,
+            b_valid=b_valid,
+            problems=problems,
         )
 
     a_platform = a_gate.get("platform") if a_gate else None
@@ -906,13 +1127,23 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
     if b_gate is not None and (not isinstance(b_platform, str) or not b_platform):
         problems["b"].append("platform 缺漏或格式錯誤")
     if isinstance(a_platform, str) and isinstance(b_platform, str) and a_platform != b_platform:
-        return _preserve_l3_findings_or_raise(a_gate, b_gate, "兩側 platform 不同")
+        return _preserve_l3_findings_or_raise(
+            a_gate,
+            b_gate,
+            "兩側 platform 不同",
+            a_valid=a_valid,
+            b_valid=b_valid,
+            problems=problems,
+        )
 
     a_checks, a_check_problems = _checks_of(a_gate or {})
     b_checks, b_check_problems = _checks_of(b_gate or {})
     problems["a"].extend(f"A {item}" for item in a_check_problems)
     problems["b"].extend(f"B {item}" for item in b_check_problems)
-    safety = _l3_safety_failures(a_gate, b_gate)
+    trusted_a = a_gate if a_valid else None
+    trusted_b = b_gate if b_valid else None
+    safety_sources = _l3_safety_sources(trusted_a, trusted_b)
+    safety = [f"{row['side'].upper()}:{row['case']}" for row in safety_sources]
 
     # B 側必須恰有一筆 baseline_compatible 檢查；重複或缺漏不以任意一筆掩蓋。
     compatible_checks = [check for check in b_checks if check.get("id") == "baseline_compatible"]
@@ -921,6 +1152,9 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
             a_gate,
             b_gate,
             f"B 側 baseline_compatible 檢查必須恰好一筆，實際 {len(compatible_checks)} 筆",
+            a_valid=a_valid,
+            b_valid=b_valid,
+            problems=problems,
         )
     if b_gate is not None and b_check_problems:
         problems["b"].append("無法完整驗證 baseline_compatible 檢查")
@@ -929,19 +1163,22 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
         a_engine = _engine_verdict(a_gate, "A") if a_gate is not None else None
         b_engine = _engine_verdict(b_gate, "B") if b_gate is not None else None
     except HarnessError as exc:
-        return _preserve_l3_findings_or_raise(a_gate, b_gate, exc.detail)
+        return _preserve_l3_findings_or_raise(
+            a_gate,
+            b_gate,
+            exc.detail,
+            a_valid=a_valid,
+            b_valid=b_valid,
+            problems=problems,
+        )
     a_baseline_result = a_gate.get("baseline_result") if a_gate else None
     b_release_gate_result = b_gate.get("release_gate_result") if b_gate else None
-    if a_gate is not None and (not isinstance(a_baseline_result, str) or a_baseline_result not in _A_BASELINE_RESULTS):
-        problems["a"].append(f"baseline_result 無效：{a_baseline_result!r}")
-    if b_gate is not None and not isinstance(b_release_gate_result, str):
-        problems["b"].append("release_gate_result 缺漏或格式錯誤")
     for label, gate, checks in (("A", a_gate, a_checks), ("B", b_gate, b_checks)):
         if gate is not None and not any(check.get("group") == "evidence" for check in checks):
             problems[label.lower()].append("缺少 evidence checks")
 
-    product_failures = _l3_product_failures(b_gate)
-    baseline_failures = _l3_baseline_failures(a_gate)
+    product_failures = _l3_product_failures(trusted_b)
+    baseline_failures = _l3_baseline_failures(trusted_a)
 
     a_integrity = (
         a_gate is not None
@@ -967,6 +1204,7 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict[str, Any]:
         "b_baseline_compatible": compatible_checks[0].get("result") == PASS if compatible_checks else None,
         "acceptance_revision": a_revision,
         "safety_violations": safety,
+        "safety_failure_sources": safety_sources,
         "baseline_failures": baseline_failures,
         "product_failures": product_failures,
         "integrity_problems": problems,

@@ -1692,6 +1692,53 @@ def test_call_count_difference_has_one_entry_per_missing_call(tmp_path: Path):
                for item in count_differences)
 
 
+def test_difference_verification_tracks_run_identity_and_observation_hash(tmp_path: Path):
+    case_id = "verified-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [_call(["daemon", "status"], {"ok": True, "state": "baseline"})]
+    calls_b = [_call(["daemon", "status"], {"ok": True, "state": "candidate"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", calls=calls_b)
+
+    verified = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in verified["differences"] if item["kind"] == "value")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"] and difference["source_refs"]["b"]
+
+    manifest_path = b_dir / case_id / "bridge" / "1" / "manifest.json"
+    manifest = fakes.read_json(manifest_path)
+    manifest["evidence"]["cli_log"]["sha256"] = "0" * 64
+    fakes.write_json(manifest_path, manifest)
+
+    unverified = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in unverified["differences"] if item["kind"] == "value")
+    assert difference["verified"] is False
+    assert unverified["integrity"]["b"] is False
+
+
+def test_call_count_difference_verifies_only_present_observation_source(tmp_path: Path):
+    case_id = "verified-call-count-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [
+        _call(["session", "list"], {"ok": True}),
+        _call(["daemon", "status"], {"ok": True, "state": "extra"}),
+    ]
+    calls_b = [_call(["session", "list"], {"ok": True})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", calls=calls_b)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "call_count")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"]
+    assert difference["source_refs"]["b"] is None
+
+
 @pytest.mark.parametrize("flag", ["--endpoint", "--socket", "--bench"])
 def test_logical_argv_ignores_cli_path_and_instance_endpoint(tmp_path: Path, flag: str):
     case_id = f"argv-instance-only-{flag[2:]}"

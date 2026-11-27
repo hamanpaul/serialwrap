@@ -99,6 +99,7 @@ def _compare_l2(
     *,
     cases: dict[str, dict[str, Any]] | None = None,
     registered: dict[str, str] | None = None,
+    report_ref: str = "testpilot/report.json",
 ) -> dict[str, Any]:
     return ab_verdict.compare_l2_reports(
         a_report,
@@ -107,6 +108,8 @@ def _compare_l2(
         cases=cases or {},
         registered_case_changes=registered or {},
         now=_NOW,
+        a_report_ref=report_ref,
+        b_report_ref=report_ref,
     )
 
 
@@ -121,32 +124,44 @@ def _write_gate(
     platform: str = "linux",
     revision: str = "2026-11-21.1",
     engine_verdict: str = "PASS",
-    baseline_result: str = "PASS",
+    baseline_result: str | None = None,
     release_gate_result: str = "PASS",
     baseline_compatible: str = "PASS",
     evidence_results: tuple[str, ...] = ("PASS",),
     safety_results: tuple[tuple[str, str], ...] = (),
 ) -> Path:
     checks = [
-        {"id": f"evidence-{index}", "group": "evidence", "result": result, "detail": {}}
+        {"id": f"evidence-{index}", "group": "evidence", "status": "evaluated", "result": result, "detail": {}}
         for index, result in enumerate(evidence_results)
     ]
-    checks.append({"id": "baseline_compatible", "group": "evidence", "result": baseline_compatible, "detail": {}})
+    checks.append({"id": "baseline_compatible", "group": "evidence", "status": "evaluated", "result": baseline_compatible, "detail": {}})
     checks.extend(
-        {"id": check_id, "group": "safety", "result": result, "detail": {}}
+        {"id": check_id, "group": "safety", "status": "evaluated", "result": result, "detail": {}}
         for check_id, result in safety_results
     )
     gate = {
-        "schema_version": 1,
-        "format": "release-gate.v1",
+        "schema_version": "release-gate.v1",
+        "created_at": "2026-11-27T00:00:00+00:00",
         "platform": platform,
         "mode": mode,
         "engine_result": {"verdict": engine_verdict, "metrics": {"samples": 1}},
         "release_gate_result": release_gate_result,
-        "baseline_result": baseline_result,
-        "acceptance": {"revision": revision, "workload_contract_sha256": "a" * 64},
+        "baseline_result": "PASS" if baseline_result is None and mode == "baseline" else baseline_result,
+        "acceptance": {
+            "path": "acceptance.yaml",
+            "revision": revision,
+            "sha256": "a" * 64,
+            "git_blob_sha1": "b" * 40,
+            "workload_contract_sha256": "c" * 64,
+            "effective_content": {},
+        },
         "run": {"cli_identity": {"resolved": "<bundle>/bin/serialwrap", "sha256": "b" * 64}},
         "checks": checks,
+        "counts": {},
+        "stuck": {},
+        "walscan": {},
+        "evidence_hashes": {},
+        "excl_evidence_hashes": {},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes((json.dumps(gate, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
@@ -379,7 +394,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             "PASS",
             _empty_diff(
-                differences=[{"case": "sc15-x", "path": "call[0].state", "kind": "value", "registered_change": "SC-15"}],
+                differences=[{"case": "sc15-x", "path": "call[0].state", "kind": "value", "registered_change": "SC-15", "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}],
                 b_cases={"sc15-x": "PASS"},
             ),
             {"SC-15": "absolute_only"},
@@ -392,7 +407,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             "PASS",
             _empty_diff(
-                differences=[{"case": "unregistered-case", "path": "call[0].ok", "kind": "value", "registered_change": None}]
+                differences=[{"case": "unregistered-case", "path": "call[0].ok", "kind": "value", "registered_change": None, "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}]
             ),
             {},
             ("FAIL", None),
@@ -404,7 +419,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             "PASS",
             _empty_diff(
-                differences=[{"case": "unknown-change-case", "path": "call[0].ok", "kind": "rc", "registered_change": "BC-99"}]
+                differences=[{"case": "unknown-change-case", "path": "call[0].ok", "kind": "rc", "registered_change": "BC-99", "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}]
             ),
             {},
             ("FAIL", None),
@@ -416,7 +431,7 @@ def _source_ref_exists(report_dir: Path, source_ref: str) -> bool:
             "PASS",
             "PASS",
             _empty_diff(
-                differences=[{"case": "bc01-x", "path": "call[0].ok", "kind": "verdict", "registered_change": "BC-01"}]
+                differences=[{"case": "bc01-x", "path": "call[0].ok", "kind": "verdict", "registered_change": "BC-01", "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}]
             ),
             {"BC-01": "diff"},
             ("FAIL", None),
@@ -563,7 +578,7 @@ def test_rust_only_difference_skipped_but_absolute_must_pass():
         "ok": False,
         "integrity": {"a": True, "b": True},
         "safety_violations": [],
-        "differences": [{"case": "sc15-x", "path": "call[0].state", "kind": "value", "registered_change": "SC-15"}],
+        "differences": [{"case": "sc15-x", "path": "call[0].state", "kind": "value", "registered_change": "SC-15", "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}],
         "a_cases": {"sc15-x": "PASS"},
         "b_cases": {"sc15-x": "PASS"},
     }
@@ -581,21 +596,23 @@ def test_both_scope_difference_is_fail():
         "ok": False,
         "integrity": {"a": True, "b": True},
         "safety_violations": [],
-        "differences": [{"case": "bc01-x", "path": "call[0].ok", "kind": "value", "registered_change": "BC-01"}],
+        "differences": [{"case": "bc01-x", "path": "call[0].ok", "kind": "value", "registered_change": "BC-01", "verified": True, "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"}}],
         "a_cases": {"bc01-x": "PASS"},
         "b_cases": {"bc01-x": "PASS"},
     }
     verdict, _reason_code, notes = ab_verdict.combine(
         "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={"BC-01": "diff"}
     )
-    assert verdict == "FAIL" and notes == ["both-scope change differs: BC-01 bc01-x"]
+    assert verdict == "FAIL"
+    assert notes[0] == "both-scope change differs: BC-01 bc01-x"
+    assert len(notes) == 2 and "b/call.json#L1" in notes[1]
 
 
 @pytest.mark.parametrize("kind", ["value", "rc", "verdict", "argv", "call_count"])
 def test_registered_difference_kinds_follow_change_participation(kind: str):
     diff = _empty_diff(
         differences=[
-            {"case": "rust-case", "path": "call[0]", "kind": kind, "registered_change": "SC-15", "source_refs": {"a": "rust-case/a.json#L1", "b": "rust-case/b.json#L1"}}
+            {"case": "rust-case", "path": "call[0]", "kind": kind, "registered_change": "SC-15", "verified": True, "source_refs": {"a": "rust-case/a.json#L1", "b": "rust-case/b.json#L1"}}
         ],
         b_cases={"rust-case": "PASS"},
     )
@@ -844,7 +861,7 @@ def test_l2_xfail_requires_sentinel_and_signature():
         cases={xfail_id: unsafe_xfail_case},
     )
     assert unsafe_xfail["xfail_accepted"] == []
-    assert unsafe_xfail["safety_violations"] == [f"B:{xfail_id}:zero_tx_on_reject"]
+    assert unsafe_xfail["safety_violations"] == []
     assert unsafe_xfail["b_failures"] == [xfail_id]
 
     ordinary_id = "f4-background-result-tail-consistent"
@@ -857,8 +874,8 @@ def test_l2_xfail_requires_sentinel_and_signature():
     assert ordinary["b_failures"] == [ordinary_id] and ordinary["verdict"] == "FAIL"
 
 
-def test_l2_safety_failure_and_product_failure_win_over_missing_required_case():
-    case_id = "safety-case"
+def test_l2_product_failure_with_invariant_coverage_and_missing_required_case():
+    case_id = "ordinary-failure-case"
     required = {case_id, "missing-required"}
     cases = {case_id: {"invariants": ["zero_tx_on_reject"], "expected": "PASS", "sentinel": None}}
     a_report = _l2_report(_l2_result(case_id))
@@ -866,13 +883,13 @@ def test_l2_safety_failure_and_product_failure_win_over_missing_required_case():
         _l2_result(
             case_id,
             verdict="FAIL",
-            reason="target rejected unexpectedly",
+            reason="functional assertion failed",
             evidence=[{"source_ref": "testpilot/report.json#results[0]"}],
         )
     )
     result = _compare_l2(a_report, b_report, required, cases=cases)
     assert result["verdict"] == "FAIL" and result["integrity"]["b"] is False
-    assert result["safety_violations"] == [f"B:{case_id}:zero_tx_on_reject"]
+    assert result["safety_violations"] == []
     assert result["product_failures"][0]["case"] == case_id
 
 
@@ -1154,8 +1171,8 @@ def test_t7b_baseline_failure_stays_out_of_product_failures(tmp_path: Path):
     ]
     assert diff["product_failures"] == []
     assert ab_verdict.combine("l1.5", a_status="FAIL", b_status="PASS", diff=diff, registered={})[:2] == (
-        "BASELINE_INVALID",
-        "HARNESS_BASELINE_INVALID",
+        "INFRA_ERROR",
+        "HARNESS_COMPARATOR_ERROR",
     )
 
 
@@ -1279,4 +1296,425 @@ def test_t7b_argv_and_call_count_differences_fail_when_unregistered(
         "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={}
     )
     assert verdict == "FAIL"
-    assert notes == [f"unregistered difference: {case_id} {expected_path}"]
+    assert notes[0] == f"unregistered difference: {case_id} {expected_path}"
+    assert len(notes) == 2 and difference["source_refs"]["b"] in notes[1]
+
+
+def _write_l15_unregistered_difference(tmp_path: Path, *, bad_observation_hash: bool = False):
+    case_id = "r1-01-unregistered"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "a"}}]
+    calls_b = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "b"}}]
+    fakes_ab_diff.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes_ab_diff.write_run(b_dir, case_id, side="b", calls=calls_b)
+    if bad_observation_hash:
+        manifest_path = b_dir / case_id / "bridge" / "1" / "manifest.json"
+        manifest = fakes_ab_diff.read_json(manifest_path)
+        manifest["evidence"]["cli_log"]["sha256"] = "0" * 64
+        fakes_ab_diff.write_json(manifest_path, manifest)
+    diff = diff_l15(
+        a_dir,
+        b_dir,
+        registered={},
+        case_changes={},
+        required_case_ids={case_id, "another-required"},
+        rules_path=RULES_PATH,
+    )
+    return case_id, a_dir, b_dir, diff
+
+
+def test_r1_01_verified_difference_wins_over_missing_required_case(tmp_path: Path):
+    case_id, _a_dir, _b_dir, diff = _write_l15_unregistered_difference(tmp_path)
+    difference = next(row for row in diff["differences"] if row["case"] == case_id)
+    assert difference["verified"] is True
+    assert diff["integrity"] == {"a": False, "b": False}
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert any("unregistered difference: r1-01-unregistered" in note for note in notes)
+    assert difference["source_refs"]["b"] in " ".join(notes)
+    assert "another-required" in " ".join(notes)
+
+
+def test_r1_01_verified_difference_wins_over_suite_infra(tmp_path: Path):
+    case_id, _a_dir, _b_dir, diff = _write_l15_unregistered_difference(tmp_path)
+    difference = next(row for row in diff["differences"] if row["case"] == case_id)
+    assert difference["verified"] is True
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="INFRA_ERROR", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert difference["source_refs"]["b"] in " ".join(notes)
+    assert "B suite status: INFRA_ERROR" in notes
+    assert "suite reported INFRA_ERROR" in notes
+
+
+def test_r1_01_unverified_difference_is_infra_and_kept_in_notes(tmp_path: Path):
+    case_id, _a_dir, _b_dir, diff = _write_l15_unregistered_difference(tmp_path, bad_observation_hash=True)
+    difference = next(row for row in diff["differences"] if row["case"] == case_id)
+    assert difference["verified"] is False
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+    assert case_id in " ".join(notes) and difference["source_refs"]["b"] in " ".join(notes)
+
+
+def test_r1_01_unverified_difference_in_baseline_failure_case_is_infra():
+    case_id = "baseline-unverified-difference"
+    diff = _empty_diff(
+        differences=[{
+            "case": case_id,
+            "path": "call[0].state",
+            "kind": "value",
+            "verified": False,
+            "source_refs": {"a": "a/call.json#L1", "b": "b/call.json#L1"},
+        }],
+        baseline_failures=[_failure(side="a", case=case_id)],
+        a_cases={case_id: "FAIL"},
+        b_cases={case_id: "PASS"},
+    )
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="PASS", b_status="PASS", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+    assert case_id in " ".join(notes)
+
+
+def test_r1_01_verified_difference_in_baseline_failure_case_is_product_fail():
+    case_id = "baseline-verified-difference"
+    source_ref = "b/call.json#L1"
+    diff = _empty_diff(
+        differences=[{
+            "case": case_id,
+            "path": "call[0].state",
+            "kind": "value",
+            "verified": True,
+            "source_refs": {"a": "a/call.json#L1", "b": source_ref},
+        }],
+        baseline_failures=[_failure(side="a", case=case_id)],
+        a_cases={case_id: "FAIL"},
+        b_cases={case_id: "PASS"},
+    )
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l1.5", a_status="FAIL", b_status="PASS", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert any(source_ref in note for note in notes)
+    assert any("baseline failure A" in note for note in notes)
+
+
+@pytest.mark.parametrize("layer", ["l2", "l3-cases"])
+def test_r1_02_suite_infra_without_case_failure_is_infra(layer: str):
+    diff = _empty_diff(kind="cases", verdict="PASS", integrity={"a": True, "b": True})
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l2" if layer == "l2" else "l3",
+        a_status="INFRA_ERROR",
+        b_status="PASS",
+        diff=diff,
+        registered={},
+    )
+
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR")
+    assert "A suite status: INFRA_ERROR" in notes
+
+
+@pytest.mark.parametrize("layer", ["l2", "l3-cases"])
+def test_r1_02_confirmed_failure_precedes_suite_infra(layer: str):
+    source_ref = "testpilot/report.json#/results/1"
+    diff = _empty_diff(
+        kind="cases",
+        verdict="FAIL",
+        integrity={"a": True, "b": True},
+        product_failures=[{**_failure(), "source_ref": source_ref}],
+    )
+
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l2" if layer == "l2" else "l3",
+        a_status="PASS",
+        b_status="INFRA_ERROR",
+        diff=diff,
+        registered={},
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert source_ref in " ".join(notes)
+    assert "B suite status: INFRA_ERROR" in notes
+
+
+def test_r1_03_l2_does_not_infer_safety_from_cases_yaml_invariants():
+    result = _compare_l2(
+        _l2_report(_l2_result("ordinary-failure")),
+        _l2_report(_l2_result("ordinary-failure", verdict="FAIL", reason="functional assertion")),
+        {"ordinary-failure"},
+        cases={"ordinary-failure": {"invariants": ["zero_tx_on_reject"]}},
+    )
+
+    assert result["safety_violations"] == []
+    assert result["product_failures"][0]["side"] == "b"
+
+
+def test_r1_03_l3_safety_failure_keeps_side_and_source(tmp_path: Path):
+    a_path = _write_gate(
+        tmp_path / "a" / "release-gate.json",
+        mode="baseline",
+        safety_results=(("safety_unauthorized_tx", "FAIL"),),
+    )
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+
+    assert diff["safety_violations"] == ["A:safety_unauthorized_tx"]
+    assert diff["safety_failure_sources"] == [
+        {
+            "side": "a",
+            "case": "safety_unauthorized_tx",
+            "source_ref": "release-gate.json#/checks/2",
+            "reason": "safety check FAIL",
+        }
+    ]
+    assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[0] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "a_mode,a_verdict,b_verdict",
+    [
+        pytest.param("missing", "PASS", "PASS", id="a-missing"),
+        pytest.param("unknown", "PASS", "PASS", id="a-unknown"),
+        pytest.param("skip", "PASS", "XFAIL", id="a-skip-b-xfail"),
+        pytest.param("error", "PASS", "PASS", id="a-error"),
+    ],
+)
+def test_r1_04_xfail_needs_two_valid_observations(a_mode: str, a_verdict: str, b_verdict: str):
+    case_id = "xfail-needs-two-observations"
+    a_results = [] if a_mode == "missing" else [_l2_result(case_id, verdict={"unknown": "WEIRD", "skip": "SKIP", "error": "ERROR"}.get(a_mode, a_verdict))]
+    b_reason = "known signature" if b_verdict == "XFAIL" else ""
+    cases = {
+        case_id: {
+            "expected": "XFAIL",
+            "invariants": [],
+            "sentinel": {"issue": "#159", "signature": "known signature", "expires": "2027-01-01T00:00:00+00:00"},
+        }
+    }
+
+    result = _compare_l2(
+        _l2_report(*a_results),
+        _l2_report(_l2_result(case_id, verdict=b_verdict, reason=b_reason)),
+        {case_id},
+        cases=cases,
+    )
+
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["needs_review"] == []
+    assert result["product_failures"] == []
+
+
+def test_r1_04_xfail_difference_with_two_valid_observations_needs_review():
+    case_id = "xfail-valid-difference"
+    cases = {case_id: {"expected": "XFAIL", "invariants": [], "sentinel": None}}
+
+    result = _compare_l2(
+        _l2_report(_l2_result(case_id, verdict="XFAIL")),
+        _l2_report(_l2_result(case_id, verdict="PASS")),
+        {case_id},
+        cases=cases,
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["needs_review"] == [{"case": case_id, "a": "XFAIL", "b": "PASS"}]
+    assert result["product_failures"][0]["source_ref"] == "testpilot/report.json#/results/0"
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "missing-schema-version",
+        "wrong-schema-version",
+        "missing-top-level-field",
+        "missing-check-group",
+        "null-check-id",
+        "missing-check-result",
+        "null-check-result",
+        "unknown-check-result",
+    ],
+)
+def test_r1_05_invalid_p2_gate_shape_is_integrity_error(tmp_path: Path, problem: str):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+    gate = json.loads(b_path.read_bytes().decode("utf-8"))
+    if problem == "missing-schema-version":
+        del gate["schema_version"]
+    elif problem == "wrong-schema-version":
+        gate["schema_version"] = "release-gate.v0"
+    elif problem == "missing-top-level-field":
+        del gate["run"]
+    elif problem == "missing-check-group":
+        del gate["checks"][0]["group"]
+    elif problem == "null-check-id":
+        gate["checks"][0]["id"] = None
+    elif problem == "missing-check-result":
+        del gate["checks"][0]["result"]
+    elif problem == "null-check-result":
+        gate["checks"][0]["result"] = None
+    else:
+        gate["checks"][0]["result"] = "UNRECOGNIZED"
+    b_path.write_bytes((json.dumps(gate, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+
+    assert diff["integrity"]["b"] is False
+    assert diff["integrity_problems"]["b"]
+    assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[:2] == (
+        "INFRA_ERROR",
+        "HARNESS_COMPARATOR_ERROR",
+    )
+
+
+def test_r1_05_valid_candidate_failure_survives_other_side_gate_integrity_error(tmp_path: Path):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    gate_a = json.loads(a_path.read_bytes().decode("utf-8"))
+    gate_a["checks"][0]["result"] = None
+    a_path.write_bytes((json.dumps(gate_a, sort_keys=True) + "\n").encode("utf-8"))
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL",
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+
+    assert diff["integrity"]["a"] is False
+    assert any(row["side"] == "b" for row in diff["product_failures"])
+    assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[0] == "FAIL"
+
+
+@pytest.mark.parametrize("b_mode", ["baseline", "missing"])
+def test_r1_06_invalid_candidate_mode_does_not_confirm_b_engine_failure(tmp_path: Path, b_mode: str):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="baseline" if b_mode == "baseline" else "candidate",
+        engine_verdict="FAIL",
+    )
+    if b_mode == "missing":
+        gate = json.loads(b_path.read_bytes().decode("utf-8"))
+        del gate["mode"]
+        b_path.write_bytes((json.dumps(gate, sort_keys=True) + "\n").encode("utf-8"))
+
+    with pytest.raises(HarnessError) as exc_info:
+        ab_verdict.compare_l3(a_path, b_path)
+
+    assert exc_info.value.code == "HARNESS_COMPARATOR_ERROR"
+
+
+def test_r1_06_other_side_safety_failure_survives_invalid_candidate_mode(tmp_path: Path):
+    a_path = _write_gate(
+        tmp_path / "a" / "release-gate.json",
+        mode="baseline",
+        safety_results=(("safety_unauthorized_tx", "FAIL"),),
+    )
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL",
+    )
+    gate_b = json.loads(b_path.read_bytes().decode("utf-8"))
+    del gate_b["mode"]
+    b_path.write_bytes((json.dumps(gate_b, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+
+    assert diff["product_failures"] == []
+    assert diff["safety_violations"] == ["A:safety_unauthorized_tx"]
+    assert ab_verdict.combine("l3", a_status="PASS", b_status="PASS", diff=diff, registered={})[0] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "mismatch,update",
+    [
+        pytest.param("revision", {"revision": "2026-11-22.1"}, id="revision"),
+        pytest.param("platform", {"platform": "windows"}, id="platform"),
+    ],
+)
+def test_r1_06_verified_candidate_failure_survives_comparison_mismatch(
+    tmp_path: Path, mismatch: str, update: dict[str, Any],
+):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL",
+        **update,
+    )
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={}
+    )
+
+    assert (verdict, reason_code) == ("FAIL", None)
+    assert any(row["side"] == "b" for row in diff["product_failures"])
+    assert mismatch in " ".join(notes)
+
+
+@pytest.mark.parametrize(
+    "report_folder,report_ref,layer",
+    [
+        pytest.param("testpilot", "testpilot/report.json", "l2", id="l2-testpilot"),
+        pytest.param("realhw", "realhw/report.json", "l3-cases", id="l3-realhw"),
+    ],
+)
+def test_r1_07_result_source_ref_reads_failed_row_from_report_dir(
+    tmp_path: Path, report_folder: str, report_ref: str, layer: str,
+):
+    a_dir = tmp_path / "baseline"
+    b_dir = tmp_path / "candidate"
+    for report_dir, verdict in ((a_dir, "PASS"), (b_dir, "FAIL")):
+        report_path = report_dir / report_folder / "report.json"
+        report_path.parent.mkdir(parents=True)
+        payload = _l2_report(
+            _l2_result(
+                "failed-case",
+                verdict=verdict,
+                reason="functional failure" if verdict == "FAIL" else "",
+                evidence=[{"source_ref": "evidence/trace.json#/events/0"}] if verdict == "FAIL" else None,
+            )
+        )
+        report_path.write_bytes((json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    a_report = json.loads((a_dir / report_ref).read_bytes().decode("utf-8"))
+    b_report = json.loads((b_dir / report_ref).read_bytes().decode("utf-8"))
+
+    diff = ab_verdict.compare_l2_reports(
+        a_report,
+        b_report,
+        required_case_ids={"failed-case"},
+        cases={},
+        registered_case_changes={},
+        now=_NOW,
+        a_report_ref=report_ref,
+        b_report_ref=report_ref,
+    )
+    if layer == "l3-cases":
+        diff = _cases_diff(diff)
+    failure = diff["product_failures"][0]
+    relative, fragment = failure["source_ref"].split("#", 1)
+    source_report = json.loads((b_dir / relative).read_bytes().decode("utf-8"))
+    result_index = int(fragment.rsplit("/", 1)[1])
+
+    assert failure["source_ref"] == f"{report_ref}#/results/0"
+    assert source_report["results"][result_index]["id"] == "failed-case"
+    assert source_report["results"][result_index]["verdict"] == "FAIL"
+    assert failure["evidence_refs"] == ["evidence/trace.json#/events/0"]
