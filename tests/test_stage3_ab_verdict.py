@@ -1090,8 +1090,8 @@ def test_t7b_rust_only_difference_is_skipped_only_when_absolute_passes(tmp_path:
     case_id = "bc06-shutdown-self-test-flush"
     registered = ab_verdict.load_registered_changes(BEHAVIOR_CHANGES_PATH)
     case_changes = ab_verdict.case_changes(BEHAVIOR_CHANGES_PATH)
-    calls_a = [{"argv": ["daemon", "status"], "response": {"ok": True, "state": "python"}}]
-    calls_b = [{"argv": ["daemon", "status"], "response": {"ok": True, "state": "rust"}}]
+    calls_a = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "python"}}]
+    calls_b = [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "state": "rust"}}]
 
     a_dir = tmp_path / "pass" / "a"
     b_dir = tmp_path / "pass" / "b"
@@ -1228,17 +1228,17 @@ def test_t7b_only_unverified_failure_is_infra_not_product_fail(tmp_path: Path):
     "a_calls,b_calls,expected_kind,expected_path",
     [
         pytest.param(
-            [{"argv": ["daemon", "status"], "response": {"ok": True}}],
-            [{"argv": ["session", "list"], "response": {"ok": True}}],
+            [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True}}],
+            [{"argv": ["session", "list"], "rc": 0, "response": {"ok": True}}],
             "argv",
             "call[0].argv",
             id="argv",
         ),
         pytest.param(
-            [{"argv": ["daemon", "status"], "response": {"ok": True}}],
+            [{"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True}}],
             [
-                {"argv": ["daemon", "status"], "response": {"ok": True}},
-                {"argv": ["session", "list"], "response": {"ok": True}},
+                {"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True}},
+                {"argv": ["session", "list"], "rc": 0, "response": {"ok": True}},
             ],
             "call_count",
             "call[1]",
@@ -1268,10 +1268,11 @@ def test_t7b_argv_and_call_count_differences_fail_when_unregistered(
     )
     difference = next(item for item in diff["differences"] if item["kind"] == expected_kind)
     assert difference["path"] == expected_path
-    assert _source_ref_exists(a_dir, difference["source_refs"]["a"])
     if expected_kind == "argv":
+        assert _source_ref_exists(a_dir, difference["source_refs"]["a"])
         assert _source_ref_exists(b_dir, difference["source_refs"]["b"])
     else:
+        assert difference["source_refs"]["a"] is None
         assert difference["source_refs"]["b"] is not None
     assert {item["side"] for item in diff["case_maps"]} == {"a", "b"}
     verdict, _reason_code, notes = ab_verdict.combine(
