@@ -1086,6 +1086,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                             .as_ref()
                             .map(|evidence| evidence.literal.as_str()),
                         snapshot.trimmed_before_from,
+                        snapshot.line_prefix_before_from.as_deref(),
                     );
                     if let Some(observed_prompt) = observed_prompt {
                         #[cfg(feature = "test-fakes")]
@@ -1148,6 +1149,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                         raw_half_line,
                         prompt_evidence,
                         snapshot.trimmed_before_from,
+                        snapshot.line_prefix_before_from.as_deref(),
                     );
                     if human_tx_seen
                         || matches!(
@@ -1163,6 +1165,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                                 human_tx_seen,
                                 raw_half_line,
                                 prompt_evidence,
+                                snapshot.line_prefix_before_from.as_deref(),
                             ),
                         };
                     }
@@ -1234,6 +1237,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 raw_half_line,
                 prompt_evidence,
                 snapshot.trimmed_before_from,
+                snapshot.line_prefix_before_from.as_deref(),
             );
             // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
             let stdout = evaluator.partial_stdout(
@@ -1241,6 +1245,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 human_tx_seen,
                 raw_half_line,
                 prompt_evidence,
+                snapshot.line_prefix_before_from.as_deref(),
             );
             if human_tx_seen
                 || matches!(

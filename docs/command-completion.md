@@ -32,9 +32,13 @@ echo 前的 human 殘餘不進入一般 stdout。
   snapshot revision；不改第 1 項的 human submit 計數、pending tuple、writer
   guard 或 timeout 消耗規則。
 - 已找到本命令 echo 且 evidence 遺失、被拒或 PS1 與既有 evidence 不同時，
-  echo 行前綴只有同時滿足以下條件才可完成並建立新 evidence：從真實行首
-  完整匹配目前 profile regex；字面至少含一個字母或數字；echo 後真實最後一行
-  行首到 snapshot 尾端重現完全相同字面。任一條件不符仍維持 Uncertain。
+  echo 前綴固定為「echo 起點所在行的真實行首到 echo 起點」的完整清理字面；
+  不剝除既有 evidence，也不只取後段 suffix。此範圍可跨 command TX 邊界往前，
+  但必須與 TX 同 epoch、仍在 RX window 且沒有被修剪、真實行首可證明。
+  前綴須完整匹配目前 profile regex、至少含一個字母或數字，且 echo 後真實
+  最後一行行首到 snapshot 尾端重現完全相同字面，才可完成並建立 evidence。
+  互證失敗時，已有 evidence 若完整等於 snapshot 尾端仍可完成；否則維持
+  Uncertain。跨 TX 前綴遇 human 訊號時不做互證，沿既有 human 路徑。
   `A => `、只作命令輸出的 `Path => ` 不得只因寬鬆 regex 命中而完成或成為
   evidence；可信來源證實的 `router => `、`router=> ` 均可辨識。
 - stdout 不以換行結尾時，只有已找到本命令 echo 的情況，才可用已知且至少含
@@ -55,6 +59,10 @@ echo 前的 human 殘餘不進入一般 stdout。
   不完成。若判斷視窗已修剪掉命令 TX 後的必要早期 RX，回
   `ok:true`、`partial:true`、不帶 error_code，stdout 只含仍保留的部分；
   echo 仍在視窗內時維持 `partial=false`。
+- 已知限制：若 echo 前綴所在行首已被 RX window 修剪而無法證明，或 prompt
+  與 echo 不在同一行，該前綴不參與互證，不能恢復 evidence；有候選但身分
+  不足時保留 stdout 回 partial。同一清理行內連續 prompt（例如舊 prompt 後
+  直接接 PS1 新 prompt）仍是 SPEC-GAP，不從後段 suffix 學習。
 - 有 human TX／pending 人類行而找不到可辨識 echo 時，才依既有 human 交錯
   規則在原等待上限回 partial；一般無 echo 且無 human 訊號不沿用這項判準。
 - silence chunk 與絕對 deadline 兩入口採同一矩陣：無 human 且無候選時維持

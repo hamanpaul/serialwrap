@@ -351,7 +351,7 @@ fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
     let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("printf EVIDENCE", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf EVIDENCE\n");
-    h.inject_rx_processed(b"printf EVIDENCE\r\nAsyncPath# ");
+    h.inject_rx_processed(b"printf EVIDENCE\r\nAsyncOther# ");
     assert_eq!(
         h.command_get(&id)["status"],
         PyValue::from("running"),
@@ -389,12 +389,12 @@ fn i294_r2_run_liveness_sequence(h: &ActorRig, label: &str) {
         ),
         (
             "printf R2_ECHO_ONE",
-            "root@t:/# printf R2_ECHO_ONE\r\nECHO ONE\r\nroot@t:/# ",
+            "printf R2_ECHO_ONE\r\nECHO ONE\r\nroot@t:/# ",
             "ECHO ONE",
         ),
         (
             "printf R2_ECHO_TWO",
-            "root@t:/# printf R2_ECHO_TWO\r\nECHO TWO\r\nroot@t:/# ",
+            "printf R2_ECHO_TWO\r\nECHO TWO\r\nroot@t:/# ",
             "ECHO TWO",
         ),
     ];
@@ -499,6 +499,7 @@ fn i294_r2_run_router_arrow_matrix(prompt_regex: &str, prompt: &str) {
     assert_eq!(result["stdout"], PyValue::from("READY"), "{result:?}");
 
     h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\n");
     let echo = h.submit_with("printf R2_ECHO", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf R2_ECHO\n");
     h.inject_rx_processed(
@@ -578,6 +579,381 @@ fn i294_r2_path_arrow_output_never_completes_or_becomes_evidence() {
         "Path => 命令輸出不得成為 prompt evidence"
     );
     assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R2_PATH\n");
+}
+
+fn i294_r3_advance_until_done(h: &ActorRig, id: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let result = h.command_get(id);
+        if result
+            .get("done_at")
+            .is_some_and(|value| !value.is_null())
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "推進逾時：{what}：{result:?}"
+        );
+        h.clock.advance(Duration::from_millis(200));
+        h.send_control(ControlEvent::Tick);
+        std::thread::sleep(Duration::from_millis(3));
+    }
+}
+
+fn i294_r3_no_evidence_rig(kind: &str) -> ActorRig {
+    if kind == "READY rejected" {
+        let profile = SHELL_PROFILE.replace(
+            "(?m)^root@t:.*# ",
+            r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+        );
+        let h = ActorRig::new(&profile);
+        h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+        let h = h.attach();
+        h.wait_for("R3 混合來源 READY probe TX", |rig| {
+            rig.wal_tx_payloads()
+                .iter()
+                .any(|payload| payload.starts_with(b"echo __READY__"))
+        });
+        let probe = h
+            .wal_tx_payloads()
+            .into_iter()
+            .find(|payload| payload.starts_with(b"echo __READY__"))
+            .expect("R3 mixed READY probe");
+        let probe = String::from_utf8(probe).expect("R3 READY probe UTF-8");
+        let nonce = probe
+            .split("__READY__")
+            .nth(1)
+            .expect("R3 READY nonce")
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect::<String>();
+        h.inject_rx_reader_processed(
+            format!("\r\n__READY__{nonce}\r\nAsyncPath# ").as_bytes(),
+        );
+        h.wait_for("R3 混合來源仍可完成登入", |rig| {
+            rig.get_state()["state"].as_str() == Some("READY")
+        });
+        return h;
+    }
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^root@t:[^\r\n]*# [ \t]*"),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 R3 evidence barrier: {other}"),
+    }
+    h
+}
+
+#[test]
+fn i294_r3_bare_echo_crosses_tx_boundary_after_each_evidence_barrier() {
+    for kind in ["clear", "READY rejected", "profile", "takeover"] {
+        let h = i294_r3_no_evidence_rig(kind);
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "{kind}: barrier 釋放前必須沒有 evidence"
+        );
+        h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+        let tx_count = h.wal_tx_payloads().len();
+        let mut expected_tx = Vec::new();
+        for index in 0..3 {
+            let command = format!("printf R3_BARE_{index}");
+            let stdout = format!("BARE {index}");
+            expected_tx.extend_from_slice(format!("{command}\n").as_bytes());
+            let id = h.submit_with(&command, |request| request.timeout_s = 0.2);
+            wait_tx(&h, format!("{command}\n").as_bytes());
+            h.inject_rx_processed(
+                format!("{command}\r\n{stdout}\r\nroot@t:/# ").as_bytes(),
+            );
+            i294_r3_advance_until_done(&h, &id, &format!("{kind}: bare echo {index}"));
+            let result = h.wait_done(&id);
+            assert_eq!(result["status"], PyValue::from("done"), "{kind}: {result:?}");
+            assert_eq!(
+                result["stdout"],
+                PyValue::from(stdout),
+                "{kind}: bare echo {index}: {result:?}"
+            );
+            assert_eq!(result["partial"], PyValue::Bool(false), "{kind}: {result:?}");
+            assert_eq!(
+                h.rx.prompt_evidence_literal_for_test().as_deref(),
+                Some("root@t:/# "),
+                "{kind}: 第一筆互證後應保持同一 evidence"
+            );
+        }
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            expected_tx,
+            "{kind}: bare echo liveness 不得重送或送救援 TX"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_cross_boundary_prefix_yields_to_human_path() {
+    for kind in ["clear", "READY rejected", "profile", "takeover"] {
+        let h = i294_r3_no_evidence_rig(kind);
+        h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf R3_HUMAN_PREFIX", |request| {
+            request.timeout_s = 0.2
+        });
+        wait_tx(&h, b"printf R3_HUMAN_PREFIX\n");
+        h.rx
+            .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        h.inject_rx_processed(
+            b"printf R3_HUMAN_PREFIX\r\nHUMAN PREFIX\r\nroot@t:/# ",
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "{kind}: TX 前前綴不得繞過 human 訊號"
+        );
+        advance_until(
+            &h,
+            Duration::from_millis(200),
+            &format!("{kind}: human prefix timeout"),
+            |rig| is_done(rig, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{kind}: {result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{kind}: {result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{kind}: {result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{kind}: {result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_HUMAN_PREFIX\n",
+            "{kind}: human 路徑不得送救援或重送 TX"
+        );
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "{kind}: human 路徑不得由跨 TX 前綴學習 evidence"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_contiguous_prompt_prefix_must_not_replace_evidence_with_suffix() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        assert_eq!(
+            h.rx.prompt_evidence_literal_for_test().as_deref(),
+            Some("root@t:/# ")
+        );
+        let tx_count = h.wal_tx_payloads().len();
+        let command = "printf R3_CONTIGUOUS";
+        let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_CONTIGUOUS\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(
+            b"root@t:/# root@t:/new# printf R3_CONTIGUOUS\r\nOUT\r\nroot@t:/new# ",
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "連續 prompt 的完整前綴不同於尾端，不得用 suffix 互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 contiguous prompt timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(
+            h.rx.prompt_evidence_literal_for_test().as_deref(),
+            Some("root@t:/# "),
+            "完整前綴不互證時不得學習後段 suffix"
+        );
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_CONTIGUOUS\n",
+            "互證失敗不得增加救援或重送 TX"
+        );
+    }
+}
+
+fn i294_r3_assert_barrier_does_not_revive_evidence(kind: &str, human_tx_seen: bool) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^root@(?:t|new):/#[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_prompt_evidence_before_write_hook_for_test(Some(Arc::new(move |snapshot| {
+            entered_tx
+                .send(snapshot.clone())
+                .expect("R3 prompt evidence barrier snapshot");
+            release_rx.recv().expect("R3 release evidence barrier");
+        })));
+
+    h.inject_rx_reader_processed(b"\r\n");
+    let first = h.submit_with("cd /new", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_reader_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let stale = entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("R3 evaluator 已辨識新 prompt evidence");
+    assert!(stale.prompt_evidence.is_some(), "R3 READY 應先提供舊 evidence");
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^other@host:.*# "),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 R3 evidence barrier: {other}"),
+    }
+    h.advance(Duration::from_millis(201));
+    release_tx.send(()).expect("R3 release evidence writeback");
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "R3 stale completion recheck",
+        |rig| is_done(rig, &first),
+    );
+    let _ = h.wait_done(&first);
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test(),
+        None,
+        "{kind}: barrier 後被攔截的 root@new:/# 不得寫回 evidence"
+    );
+
+    let tx_count = h.wal_tx_payloads().len();
+    let second = h.submit_with("printf R3_STALE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R3_STALE\n");
+    if human_tx_seen {
+        h.rx
+            .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+    }
+    h.inject_rx_processed(b"printf R3_STALE\r\nSTAL Eroot@new:/# ");
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "{kind}: stale root@new:/# 不得完成後續命令：human={human_tx_seen}"
+    );
+    i294_r3_advance_until_done(&h, &second, "R3 stale evidence follow-up timeout");
+    let result = h.wait_done(&second);
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "{kind}: 後續歧義不得重新學習 root@new:/#"
+    );
+    if human_tx_seen {
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_STALE\n"
+        );
+    } else {
+        match result["status"].as_str() {
+            Some("done") => {
+                assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+                assert_eq!(
+                    wal_tx_bytes_since(&h, tx_count),
+                    b"printf R3_STALE\n\x03"
+                );
+            }
+            Some("error") => {
+                assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+                assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+                assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+                let tx = wal_tx_bytes_since(&h, tx_count);
+                assert!(
+                    tx.strip_prefix(b"printf R3_STALE\n").is_some_and(|rescue| {
+                        rescue
+                            .iter()
+                            .all(|byte| matches!(*byte, b'\x03' | b'\x04' | b'\n'))
+                    }),
+                    "{kind}: timeout 只可沿既有 recovery 傳救援鍵，不得重送命令：{tx:?}"
+                );
+            }
+            other => panic!("stale evidence 後續命令得到非預期狀態：{other:?}: {result:?}"),
+        }
+    }
+}
+
+#[test]
+fn i294_r3_barriers_never_revive_stale_evidence_with_human_or_without_human() {
+    for kind in ["clear", "profile", "takeover"] {
+        for human_tx_seen in [false, true] {
+            i294_r3_assert_barrier_does_not_revive_evidence(kind, human_tx_seen);
+        }
+    }
+}
+
+#[test]
+fn i294_r3_long_prefix_with_different_tail_never_completes_or_learns() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.rx.clear();
+        let prefix = format!("root@t:/{}# ", "x".repeat(2_000));
+        h.inject_rx_reader_processed(format!("\r\n{prefix}").as_bytes());
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf R3_LONG", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_LONG\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(b"printf R3_LONG\r\nOUT\r\nroot@t:/different# ");
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "長前綴與不同尾端不得互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 long prefix timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "長前綴與不同尾端不得學成 evidence"
+        );
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_LONG\n"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.rx.clear();
+        let prefix = format!("root@t:/{}# ", "x".repeat(131_060));
+        h.inject_rx_reader_processed(format!("\r\n{prefix}").as_bytes());
+        let id = h.submit_with("printf R3_TRIM", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_TRIM\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(b"printf R3_TRIM\r\nOUT\r\nroot@t:/different# ");
+        assert!(
+            h.rx.snapshot_from(0).trimmed_before_from,
+            "R3 測試必須確實修剪跨 TX 前綴所在行首"
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "前綴行首被修剪後不得互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 trimmed prefix timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert!(h.rx.prompt_evidence_literal_for_test().is_none());
+    }
 }
 
 #[test]
@@ -737,6 +1113,7 @@ fn i294_r1_prompt_evidence_barrier(kind: &str) {
             release_rx.recv().expect("release prompt evidence barrier");
         })));
 
+    h.inject_rx_reader_processed(b"\r\n");
     let id = h.submit_with("cd /new", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"cd /new\n");
     h.inject_rx_reader_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
@@ -766,14 +1143,20 @@ fn i294_r1_prompt_evidence_barrier(kind: &str) {
             || first["recovery_action"].as_str() == Some("CTRL_C"),
         "{kind}: 舊 snapshot 不得在 barrier 後直接完成：{first:?}"
     );
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test(),
+        None,
+        "{kind}: barrier 後不得寫回被攔截的新 evidence"
+    );
 
+    h.inject_rx_reader_processed(b"\r\n");
     let tx_count = h.wal_tx_payloads().len();
     let second = h.submit_with("printf AFTER_BARRIER", |request| {
         request.timeout_s = 0.2
     });
     wait_tx(&h, b"printf AFTER_BARRIER\n");
     h.inject_rx_processed(
-        b"root@t:/# printf AFTER_BARRIER\r\nAFTERroot@t:/# ",
+        b"printf AFTER_BARRIER\r\nAFTER\r\nroot@new:/# ",
     );
     assert_eq!(
         h.command_get(&second)["status"],
@@ -789,8 +1172,13 @@ fn i294_r1_prompt_evidence_barrier(kind: &str) {
     let result = h.wait_done(&second);
     assert_eq!(result["status"], PyValue::from("error"), "{kind}: {result:?}");
     assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{kind}: {result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{kind}: {result:?}");
     assert_eq!(result["partial"], PyValue::Bool(true), "{kind}: {result:?}");
     assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf AFTER_BARRIER\n");
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "{kind}: 後續命令不得讓 stale evidence 復活"
+    );
 }
 
 #[test]
@@ -819,6 +1207,7 @@ fn i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo() {
     assert_eq!(result["stdout"], PyValue::from("READY"));
 
     h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\n");
     let echo = h.submit_with("printf ECHO", |request| request.timeout_s = 0.2);
     wait_tx(&h, b"printf ECHO\n");
     h.inject_rx_processed(b"router=> printf ECHO\r\nECHO\r\nrouter=> ");
@@ -1040,7 +1429,7 @@ fn i271_complete_echo_prefix_updates_changed_prompt_evidence() {
         r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
     );
     let h = ActorRig::new(&profile).ready();
-
+    h.inject_rx_reader_processed(b"\r\n");
     let cd = h.submit_ok("cd /new");
     wait_tx(&h, b"cd /new\n");
     h.inject_rx_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
@@ -1086,6 +1475,7 @@ fn i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix() {
         "清除證據後不得假設舊 prompt：{result:?}"
     );
 
+    h.inject_rx_reader_processed(b"\r\n");
     let relearn = h.submit_ok("printf after");
     wait_tx(&h, b"printf after\n");
     h.inject_rx_processed(
@@ -3816,7 +4206,7 @@ fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
     }
 
     let changed_prompt = format!("root@t:/{}# ", "e".repeat(2_000));
-    let raw = format!("{changed_prompt}echo x\r\nx\r\n{changed_prompt}");
+    let raw = format!("\r\n{changed_prompt}echo x\r\nx\r\n{changed_prompt}");
     h.inject_rx_processed(raw.as_bytes());
     h.advance(Duration::from_millis(200));
 

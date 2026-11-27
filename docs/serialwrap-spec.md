@@ -242,15 +242,19 @@ sequenceDiagram
 4. 未指定 `completion_regex` 時，搜尋完整命令 echo；完成判定與 stdout 擷取
    共用同一份 RX snapshot，echo 前的文字不進入一般 stdout
 5. epoch 內既有 prompt evidence 只取自可辨識 READY 結果；evidence 遺失或
-   與 echo 前綴不同時，前綴須從真實行首完整匹配目前 profile regex、至少含
-   字母或數字，且 echo 後行首到 snapshot 尾端重現相同字面，才能完成並原子
-   更新。`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而完成或學習
+   與 echo 前綴不同時，前綴固定為 echo 行真實行首到 echo 起點的完整字面，
+   同 epoch、未修剪、行首可證明時可跨 TX 前延伸。不得剝舊 evidence 或取後段
+   suffix；該完整字面須匹配目前 profile、且 echo 後真實行首到 snapshot 尾端
+   重現相同字面才能原子更新。互證不成立時，舊 evidence 完整等於 tail 才完成，
+   否則 partial；`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而學習
 6. 已知完整 prompt 若含字母或數字，可作無換行 stdout 的尾端 suffix；只移除
    suffix。短／未知 prompt 不猜測，NUL 原樣保留
 7. 無 echo 且無 human 訊號時不要求 prompt evidence；目前 profile regex 由
    真實最後一行行首完整匹配至 snapshot 尾端即可完成；必要 RX 已被窗口修剪
    則回 `ok:true`、`partial:true`、無 error_code
-8. `stdout` 寫回 `command.get`
+8. echo 前綴行首被修剪、prompt 與 echo 不在同一行，或同一行連續 prompt 時，
+   不以後段 suffix 恢復 evidence；身分不足的候選保守回 partial
+9. `stdout` 寫回 `command.get`
 
 #### 命令限制
 

@@ -201,6 +201,12 @@ entries:
     - cargo:sw-core::command_exec::i294_r2_rejected_ready_evidence_recovers_no_echo_then_echo_sequence
     - cargo:sw-core::command_exec::i294_r2_exact_spaced_and_compact_router_arrow_matrix
     - cargo:sw-core::command_exec::i294_r2_path_arrow_output_never_completes_or_becomes_evidence
+    - cargo:sw-core::command_exec::i294_r3_bare_echo_crosses_tx_boundary_after_each_evidence_barrier
+    - cargo:sw-core::command_exec::i294_r3_cross_boundary_prefix_yields_to_human_path
+    - cargo:sw-core::command_exec::i294_r3_contiguous_prompt_prefix_must_not_replace_evidence_with_suffix
+    - cargo:sw-core::command_exec::i294_r3_barriers_never_revive_stale_evidence_with_human_or_without_human
+    - cargo:sw-core::command_exec::i294_r3_long_prefix_with_different_tail_never_completes_or_learns
+    - cargo:sw-core::command_exec::i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms
     - cargo:sw-daemon::rpc_console::i262_rpc_arrow_output_is_complete
     - cargo:sw-daemon::rpc_console::i271_rpc_no_newline_and_nul_stdout
     owner_phase: P5

@@ -307,6 +307,8 @@ struct RxWindow {
     text: String,
     prompt_evidence: Option<PromptEvidence>,
     trimmed: u64,
+    /// 目前 watermark epoch 在 `text` 中開始的絕對字元偏移。
+    epoch_start: u64,
     total_bytes: u64,
     last_rx_mono: Mono,
     watermark: (u64, u64),
@@ -631,6 +633,10 @@ impl RxShared {
         }
         let prompt_regex = self.actor_dispatch_gate.prompt_regex();
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let end_offset = window
+            .trimmed
+            .saturating_add(window.text.chars().count() as u64);
+        window.epoch_start = end_offset;
         window.watermark.0 = epoch;
         window.prompt_evidence = None;
         window.revision = window.revision.saturating_add(1);
@@ -1384,6 +1390,7 @@ impl RxShared {
             human.active_rx_epoch = Some(epoch);
         }
         let now = event_time();
+        let epoch_changed = window.watermark.0 != epoch;
         window.watermark = (epoch, rx_seq);
         window.revision = window.revision.saturating_add(1);
         if !data.is_empty() {
@@ -1396,6 +1403,9 @@ impl RxShared {
             let start_offset = window
                 .trimmed
                 .saturating_add(window.text.chars().count() as u64);
+            if epoch_changed {
+                window.epoch_start = start_offset;
+            }
             window.text.push_str(&decoded);
             window.trim_to_limit();
             if window.completion_capture_op_id.is_some()
@@ -1552,6 +1562,16 @@ impl RxShared {
             .unwrap_or_else(|error| error.into_inner());
         let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         snapshot_from_window(&window, from, &human)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn prompt_evidence_literal_for_test(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .prompt_evidence
+            .as_ref()
+            .map(|evidence| evidence.literal.clone())
     }
 
     /// 回傳最近可信 human TX 世代、其 TX 前 RX offset 與目前 raw 輸入是否仍是半行。
@@ -2206,6 +2226,8 @@ pub struct RxMatch {
 pub struct RxSnapshot {
     /// 此 snapshot 實際保留文字的絕對起點。
     pub base: u64,
+    /// `from` 前同一 epoch 且可證明真實行首的 raw 前綴；`None` 表示起點行首無法證明。
+    pub line_prefix_before_from: Option<String>,
     /// 已解碼的 RX 文字。
     pub text: String,
     /// 同一把鎖下讀取的 `(epoch, rx_seq)`。
@@ -2357,6 +2379,11 @@ fn snapshot_from_window(
     let prompt_revision = human.prompt_revision;
     RxSnapshot {
         base,
+        line_prefix_before_from: proven_line_prefix_before_from(
+            window,
+            from,
+            watermark.0,
+        ),
         text: window.text_from(base).to_string(),
         watermark,
         human_tx_state: human_tx_state(human, window.watermark.0),
@@ -2405,6 +2432,7 @@ fn snapshot_from_window_at(
     let prompt_revision = human.prompt_revision;
     RxSnapshot {
         base,
+        line_prefix_before_from: proven_line_prefix_before_from(window, from, watermark.0),
         text,
         watermark,
         human_tx_state: human_tx_state_for_epoch(human_tx_state, window.watermark.0),
@@ -2416,6 +2444,45 @@ fn snapshot_from_window_at(
         prompt_revision,
         prompt_evidence: snapshot_prompt_evidence(window, watermark, prompt_revision),
     }
+}
+
+fn proven_line_prefix_before_from(
+    window: &RxWindow,
+    from: u64,
+    epoch: u64,
+) -> Option<String> {
+    if window.watermark.0 != epoch || from < window.trimmed {
+        return None;
+    }
+    let end = window
+        .trimmed
+        .saturating_add(window.text.chars().count() as u64);
+    if from > end {
+        return None;
+    }
+    let relative_chars = usize::try_from(from.saturating_sub(window.trimmed)).ok()?;
+    let before_end = window
+        .text
+        .char_indices()
+        .nth(relative_chars)
+        .map_or(window.text.len(), |(index, _)| index);
+    let before = &window.text[..before_end];
+    let (line_start_bytes, line_start) =
+        if let Some(newline) = before.rfind('\n') {
+            let start_bytes = newline.saturating_add(1);
+            let start = window
+                .trimmed
+                .saturating_add(before[..start_bytes].chars().count() as u64);
+            (start_bytes, start)
+        } else if window.trimmed == 0 && window.epoch_start == 0 {
+            (0, 0)
+        } else {
+            return None;
+        };
+    if line_start < window.epoch_start {
+        return None;
+    }
+    Some(before[line_start_bytes..].to_string())
 }
 
 fn snapshot_prompt_evidence(

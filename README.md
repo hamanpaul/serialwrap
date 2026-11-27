@@ -409,12 +409,18 @@ search after the full command echo and use one RX snapshot for completion and
 stdout extraction. Existing epoch-local prompt evidence can come from a
 recognizable READY output (an independent nonce line followed immediately by
 the same prompt as before the probe). If that evidence is absent or rejected, or
-PS1 changes it, the complete echo prefix may establish a replacement only when
-the literal starts at the real line start, fully matches the current profile
-regex, contains a letter or digit, and the same literal reappears at the real
-start of the final line through the snapshot tail. The evidence is then replaced
-atomically; `Path => ` appearing only as command output cannot learn its prompt
-identity. Exact prompts `router => ` and `router=> ` remain valid from those
+PS1 changes it, the echo prefix is the complete cleaned literal from the echo
+line's real start to the echo itself. It may extend before the command TX only
+within the same epoch, while its bytes remain in the RX window and its real line
+start is still provable; existing evidence is never stripped to choose a suffix.
+The literal must fully match the current profile regex, contain a letter or
+digit, and reappear exactly from the real start of the final line through the
+snapshot tail before it atomically replaces the evidence. If mutual proof
+fails, existing evidence still completes only when it exactly equals the tail;
+otherwise the result is partial. A human TX signal follows the existing human
+path and does not learn a cross-TX prefix. `Path => ` appearing only as command
+output cannot learn its prompt identity. Exact prompts `router => ` and
+`router=> ` remain valid from those
 trusted sources. Without a trailing newline, only known complete prompt evidence
 containing a letter or digit may be removed as a same-line suffix after the
 command echo, so `printf abc` returns `abc` and a U+0000 byte is preserved.
@@ -431,7 +437,10 @@ the original deadline returns `PROMPT_TIMEOUT`, `partial:true`,
 `recovery_action=NONE` without rescue keys; a timeout with no candidate and no
 human TX keeps the 9af187ca recovery behavior. If post-TX RX was necessarily
 trimmed by the bounded window, completion is `ok:true, partial:true` with no
-error code.
+error code. Known limitations: an echo-prefix line start that was trimmed, or a
+prompt not on the same line as the echo, cannot establish mutual proof and may
+return partial; consecutive prompts on one line are also not learned from a
+suffix.
 Compatibility limitation: if the first line after the echo exactly equals the
 command and more output follows, that line is treated as a repeated echo and
 removed. Use `completion_regex` or a marker when that output must be preserved.
@@ -2515,9 +2524,13 @@ serialwrap cmd status --cmd-id <cmd_id>
 echo 作為 prompt 搜尋下界；完成與 stdout 擷取共用同一份 RX snapshot，支援
 prefix prompt，echo 前的文字不納入一般 stdout。既有 epoch 字面 evidence 可來
 自可辨識 READY probe 輸出（獨立 nonce 行後立刻接回 probe 前同一 prompt）。
-evidence 遺失、被拒或 PS1 改變時，完整 echo 所在行前綴只有同時滿足：從真實
-行首完整符合目前 profile regex、含至少一個字母或數字，且 echo 後最後一行
-行首到 snapshot 尾端重現完全相同字面，才能完成並原子更新 evidence；只把
+evidence 遺失、被拒或 PS1 改變時，前綴固定為 echo 所在行真實行首到 echo
+起點的完整清理字面，不剝除舊 evidence、不只取 suffix；與 TX 同 epoch、仍在
+RX window 且行首可證明時可往 TX 前延伸。前綴須完整符合目前 profile regex、
+含至少一個字母或數字，且 echo 後最後一行行首到 snapshot 尾端重現完全相同
+字面，才能完成並原子更新 evidence；互證不成立時，只有既有 evidence 與 tail
+完整相等才可完成，否則回 partial。跨 TX 前綴遇 human TX 訊號時走既有 human
+路徑，不以此學習；只把
 `Path => ` 當命令輸出時不得學成 evidence。精確 `router => ` 與 `router=> `
 均可由上述可信來源證實。無換行 stdout 只有在已找到本命令 echo 時，才以
 已知、至少含字母或數字的完整 prompt suffix 裁切，因此 `printf abc` 回傳
@@ -2530,7 +2543,9 @@ snapshot 尾端等於已知 prompt 字面，或可辨識的純符號短 suffix�
 完全沒有候選時維持 9af187ca 的既有 recovery 與 TX。若必要 post-TX RX
 已確定被有界視窗修剪，回 `ok:true`、`partial:true` 且不帶 error_code。相容限制：echo 之後的
 第一行恰好等於命令、而且後面還有輸出時，視為重複 echo 並刪除；需要保留
-這種輸出時，請使用 `completion_regex` 或 marker。
+這種輸出時，請使用 `completion_regex` 或 marker。若 echo 前綴所在行首已被
+修剪、prompt 與 echo 不同行，或同一行連續 prompt，目前不由後段 suffix
+恢復 evidence，身分不足的候選保守回 partial。
 
 對於沒有回 shell prompt 的 noisy console，`cmd submit --completion-regex` 可在
 `line` 或 `background` 模式等待命令專屬的 producer 完成標記。請使用每次新產生、
