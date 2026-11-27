@@ -562,7 +562,7 @@ fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
     let nonce_pattern = if unlock && t.ready_probe == DEFAULT_READY_PROBE {
         format!("(?m)^__READY__{}\\r?$", escape(&nonce))
     } else {
-        nonce
+        nonce.clone()
     };
     if !wait_regex(io, &nonce_pattern, timeout)? {
         if tail_requires_login(io, p) {
@@ -573,6 +573,8 @@ fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
     if !wait_regex(io, &t.prompt_regex, timeout)? {
         return Ok(Some("READY_PROMPT_TIMEOUT".into()));
     }
+    let prompt = compile_or_raise(&t.prompt_regex)?;
+    io.rx.observe_ready_prompt_evidence(&prompt, &nonce);
     Ok(None)
 }
 

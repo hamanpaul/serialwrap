@@ -241,6 +241,227 @@ fn line_command_stdout_extraction_and_done() {
 }
 
 #[test]
+fn i262_arrow_output_segments_are_preserved() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    let command = "obuspa -c get Device.DNS.Diagnostics.";
+    let id = h.submit_ok(command);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+
+    h.inject_rx_processed(
+        format!(
+            "{command}\r\nDevice.DNS.Diagnostics.NumberOfRepetitions => 0\r\n"
+        )
+        .as_bytes(),
+    );
+    h.inject_rx_processed(b"Device.DNS.Diagnostics.DNSServer => ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "=> 輸出尾端不得被當成 command prompt"
+    );
+
+    h.inject_rx_processed(
+        b"\r\nDevice.DNS.Diagnostics.HostName => 1\r\nroot@t:/# ",
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(
+        result["stdout"],
+        PyValue::from(
+            "Device.DNS.Diagnostics.NumberOfRepetitions => 0\n\
+Device.DNS.Diagnostics.DNSServer => \n\
+Device.DNS.Diagnostics.HostName => 1"
+        )
+    );
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_no_newline_stdout_and_nul_are_exact() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+
+    let plain = h.submit_ok("printf abc");
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabcroot@t:/# ");
+    let plain_result = h.wait_done(&plain);
+    assert_eq!(plain_result["stdout"], PyValue::from("abc"));
+    assert_eq!(plain_result["partial"], PyValue::Bool(false));
+
+    let nul = h.submit_ok("cat /proc/device-tree/model");
+    wait_tx(&h, b"cat /proc/device-tree/model\n");
+    h.inject_rx_processed(
+        b"cat /proc/device-tree/model\r\nmodel\0root@t:/# ",
+    );
+    let nul_result = h.wait_done(&nul);
+    assert_eq!(nul_result["stdout"], PyValue::from("model\0"));
+    assert_eq!(nul_result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_trimmed_no_echo_completion_is_partial() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_ok("printf TRIM");
+    wait_tx(&h, b"printf TRIM\n");
+
+    let filler = "x".repeat(131_200);
+    h.inject_rx_processed(format!("{filler}TAIL\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.ends_with("TAIL")),
+        "修剪後仍須保留 snapshot 內的可用輸出：{result:?}"
+    );
+}
+
+#[test]
+fn i271_unknown_prompt_keeps_output_partial() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf UNKNOWN", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf UNKNOWN\n");
+
+    h.inject_rx_processed(b"printf UNKNOWN\r\nUNKNOWNroot@new:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "未知 prompt 不得從任意 regex match 學習"
+    );
+    advance_until(&h, Duration::from_millis(200), "unknown prompt timeout", |h| {
+        is_done(h, &id)
+    });
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("UNKNOWN")),
+        "未知 prompt 不得丟掉可用 stdout：{result:?}"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf UNKNOWN\n",
+        "prompt 身分歧義不得自動送救援鍵"
+    );
+}
+
+#[test]
+fn i271_short_prompt_does_not_cut_inline_stdout() {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", r"(?m)^#[ \t]*$");
+    let h = ActorRig::new(&profile).ready_with_prompt(b"# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf abc", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabc# ");
+    advance_until(&h, Duration::from_millis(200), "short prompt ambiguity", |h| {
+        is_done(h, &id)
+    });
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("abc")),
+        "短 prompt 同行候選不得刪掉 stdout：{result:?}"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf abc\n",
+        "短 prompt 歧義不得送 Ctrl-C／Ctrl-D"
+    );
+
+    let line_prompt = h.submit_ok("printf ok");
+    wait_tx(&h, b"printf ok\n");
+    h.inject_rx_processed(b"printf ok\r\nok\r\n# ");
+    let result = h.wait_done(&line_prompt);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("ok"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_complete_echo_prefix_updates_changed_prompt_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+
+    let cd = h.submit_ok("cd /new");
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let cd_result = h.wait_done(&cd);
+    assert_eq!(cd_result["status"], PyValue::from("done"));
+    assert_eq!(cd_result["stdout"], PyValue::from(""));
+    assert_eq!(cd_result["partial"], PyValue::Bool(false));
+
+    let inline = h.submit_ok("printf abc");
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabcroot@new:/# ");
+    let result = h.wait_done(&inline);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("abc"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.rx.clear();
+
+    let uncertain = h.submit_with("printf before", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf before\n");
+    h.inject_rx_processed(b"printf before\r\nbefore root@t:/# ");
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "cleared prompt evidence ambiguity",
+        |h| is_done(h, &uncertain),
+    );
+    let result = h.wait_done(&uncertain);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("before")),
+        "清除證據後不得假設舊 prompt：{result:?}"
+    );
+
+    let relearn = h.submit_ok("printf after");
+    wait_tx(&h, b"printf after\n");
+    h.inject_rx_processed(
+        b"root@t:/# printf after\r\nafterroot@t:/# ",
+    );
+    let result = h.wait_done(&relearn);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("after"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
 fn i294_human_prompt_before_agent_echo_does_not_complete() {
     let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
     let console = h.attach_pty_console("i294-human");

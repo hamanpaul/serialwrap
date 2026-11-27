@@ -1043,6 +1043,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let wait_re = compile_or_never(completion_pattern.as_deref().unwrap_or("(?!)"));
     let mut matched = false;
     let mut completion_stdout = None;
+    let mut completion_partial = false;
     let mut completion_timeout_snapshot: Option<RxSnapshot> = None;
     let mut completion_silence_expired = false;
     let mut timeout_rescue_guard = None;
@@ -1064,22 +1065,40 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                 &*ctx.clock,
                 |snapshot| {
                     let human_tx_state = snapshot.human_tx_state;
-                    match evaluator.evaluate(
+                    let (evaluation, observed_prompt) = evaluator.evaluate_snapshot(
                         &snapshot.text,
                         pending_human_before
                             || snapshot.human_submit_start_count > human_submit_start_before
                             || human_tx_state.generation > human_tx_before.generation,
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open,
-                    ) {
-                        CompletionEvaluation::Complete { stdout } => Some(stdout),
+                        snapshot
+                            .prompt_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.literal.as_str()),
+                        snapshot.trimmed_before_from,
+                    );
+                    if let Some(observed_prompt) = observed_prompt {
+                        ctx.rx.remember_prompt_evidence(
+                            observed_prompt,
+                            snapshot.watermark,
+                            snapshot.prompt_revision,
+                        );
+                    }
+                    match evaluation {
+                        CompletionEvaluation::Complete { stdout } => Some((stdout, false)),
+                        CompletionEvaluation::Partial { stdout } => Some((stdout, true)),
                         CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => {
                             None
                         }
                     }
                 },
             ) {
-                SnapshotWaitResult::Matched { value: stdout, .. } => {
+                SnapshotWaitResult::Matched {
+                    value: (stdout, partial),
+                    ..
+                } => {
                     completion_stdout = Some(stdout);
+                    completion_partial = partial;
                     matched = true;
                     break;
                 }
@@ -1105,7 +1124,23 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                     let human_tx_state = snapshot.human_tx_state;
                     let raw_half_line =
                         human_tx_before.raw_line_open || human_tx_state.raw_line_open;
-                    if human_tx_seen {
+                    let prompt_evidence = snapshot
+                        .prompt_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.literal.as_str());
+                    let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
+                        &snapshot.text,
+                        human_tx_seen,
+                        raw_half_line,
+                        prompt_evidence,
+                        snapshot.trimmed_before_from,
+                    );
+                    if human_tx_seen
+                        || matches!(
+                            timeout_evaluation,
+                            CompletionEvaluation::Uncertain { .. }
+                        )
+                    {
                         #[cfg(feature = "test-fakes")]
                         ctx.rx.human_timeout_decision_hook_for_test();
                         return OpOutcome::CompletionUncertain {
@@ -1113,6 +1148,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
                                 &snapshot.text,
                                 human_tx_seen,
                                 raw_half_line,
+                                prompt_evidence,
                             ),
                         };
                     }
@@ -1174,9 +1210,30 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             let human_tx_state = snapshot.human_tx_state;
             let raw_half_line =
                 human_tx_before.raw_line_open || human_tx_state.raw_line_open;
+            let prompt_evidence = snapshot
+                .prompt_evidence
+                .as_ref()
+                .map(|evidence| evidence.literal.as_str());
+            let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
+                &snapshot.text,
+                human_tx_seen,
+                raw_half_line,
+                prompt_evidence,
+                snapshot.trimmed_before_from,
+            );
             // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
-            let stdout = evaluator.partial_stdout(&snapshot.text, human_tx_seen, raw_half_line);
-            if human_tx_seen {
+            let stdout = evaluator.partial_stdout(
+                &snapshot.text,
+                human_tx_seen,
+                raw_half_line,
+                prompt_evidence,
+            );
+            if human_tx_seen
+                || matches!(
+                    timeout_evaluation,
+                    CompletionEvaluation::Uncertain { .. }
+                )
+            {
                 #[cfg(feature = "test-fakes")]
                 ctx.rx.human_timeout_decision_hook_for_test();
                 return OpOutcome::CompletionUncertain { stdout };
@@ -1244,7 +1301,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         "ok" => true,
         "execution_mode" => mode.clone(),
         "stdout" => stdout,
-        "partial" => false,
+        "partial" => completion_partial,
     };
     if mode == "background" {
         result.insert("background_capture_id", PyValue::from(cmd_id));

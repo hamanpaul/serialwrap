@@ -1,7 +1,7 @@
-//! Rust agent line／background 命令的 echo 錨定完成判定（i294-i1）。
+//! Rust agent line／background 命令的 echo 與 prompt 身分完成判定（i294）。
 //!
 //! producer completion、passthrough、human 命令與其他 op 保留既有路徑。此 evaluator 只把同一份 RX snapshot
-//! 中的完整 command echo 作為 prompt 搜尋下界；prompt 身分與無換行輸出裁切由 i294-i2 處理。
+//! 中的完整 command echo 與 epoch 內 prompt 字面證據作為完成邊界，並以同一邊界裁切無換行 stdout。
 
 use std::ops::Range;
 
@@ -12,11 +12,13 @@ use crate::op_runner::{
     match_wrapped_echo_ending_at, WrapEvidence, WrappedEchoCandidate, WrappedEchoMatchMetrics,
     WRAP_MIN_SEGMENT,
 };
+use crate::uart_bridge::prompt_evidence_literal_is_identifiable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Evaluation {
     Pending,
     Complete { stdout: String },
+    Partial { stdout: String },
     Uncertain { stdout: String },
 }
 
@@ -31,12 +33,14 @@ impl<'a> CompletionEvaluator<'a> {
         Self { command, prompt }
     }
 
-    pub(crate) fn evaluate(
+    pub(crate) fn evaluate_snapshot(
         &self,
         raw: &str,
         human_tx_seen: bool,
         raw_half_line: bool,
-    ) -> Evaluation {
+        prompt_evidence: Option<&str>,
+        trimmed_before_from: bool,
+    ) -> (Evaluation, Option<String>) {
         let (cleaned, source_ranges) = clean_text_with_source_ranges(raw);
         let wraps = WrapEvidence::from_raw(raw, &cleaned, &source_ranges);
 
@@ -45,30 +49,73 @@ impl<'a> CompletionEvaluator<'a> {
             if let Some(echo) =
                 find_command_echo(&cleaned, self.command, self.prompt, &wraps, &mut metrics)
             {
-                let Some(prompt) = tail_prompt_range(&cleaned, self.prompt)
-                    .filter(|prompt| prompt.start >= echo.after_line)
-                else {
-                    return Evaluation::Pending;
+                let observed_prompt = echo.prompt_evidence;
+                let observed_range =
+                    prompt_evidence_tail_range(&cleaned, observed_prompt.as_deref())
+                        .filter(|prompt| prompt.start >= echo.after_line);
+                let existing_range = prompt_evidence_tail_range(&cleaned, prompt_evidence)
+                    .filter(|prompt| prompt.start >= echo.after_line);
+                let Some(prompt) = observed_range.clone().or(existing_range) else {
+                    let learned_prompt =
+                        prompt_evidence.is_none().then(|| observed_prompt.clone()).flatten();
+                    if regex_tail_prompt_range(&cleaned, self.prompt).is_some()
+                        || prompt_evidence_suffix_range(&cleaned, observed_prompt.as_deref())
+                            .is_some()
+                        || prompt_evidence_suffix_range(&cleaned, prompt_evidence).is_some()
+                    {
+                        let stdout = char_slice(
+                            &cleaned,
+                            echo.after_line..cleaned.chars().count(),
+                        )
+                        .trim_matches('\n')
+                        .to_string();
+                        return (Evaluation::Uncertain { stdout }, learned_prompt);
+                    }
+                    return (Evaluation::Pending, learned_prompt);
                 };
                 let body = char_slice(&cleaned, echo.after_line..prompt.start);
-                return Evaluation::Complete {
-                    stdout: strip_repeated_echo_compat(&body, self.command),
-                };
+                return (
+                    Evaluation::Complete {
+                        stdout: strip_repeated_echo_compat(&body, self.command),
+                    },
+                    observed_range.and(observed_prompt),
+                );
             }
         }
 
         if human_tx_seen {
-            let stdout = tail_prompt_range(&cleaned, self.prompt)
+            let stdout = prompt_evidence_tail_range(&cleaned, prompt_evidence)
                 .map(|prompt| char_slice(&cleaned, 0..prompt.start).trim_matches('\n').to_string())
                 .unwrap_or_else(|| cleaned.clone());
-            return Evaluation::Uncertain { stdout };
+            return (Evaluation::Uncertain { stdout }, None);
         }
 
-        match tail_prompt_range(&cleaned, self.prompt) {
-            Some(prompt) => Evaluation::Complete {
-                stdout: char_slice(&cleaned, 0..prompt.start).trim_matches('\n').to_string(),
-            },
-            None => Evaluation::Pending,
+        match prompt_evidence_tail_range(&cleaned, prompt_evidence) {
+            Some(prompt) if trimmed_before_from => (
+                Evaluation::Partial {
+                    stdout: char_slice(&cleaned, 0..prompt.start)
+                        .trim_matches('\n')
+                        .to_string(),
+                },
+                None,
+            ),
+            Some(prompt) => (
+                Evaluation::Complete {
+                    stdout: char_slice(&cleaned, 0..prompt.start)
+                        .trim_matches('\n')
+                        .to_string(),
+                },
+                None,
+            ),
+            None if regex_tail_prompt_range(&cleaned, self.prompt).is_some()
+                || prompt_evidence_suffix_range(&cleaned, prompt_evidence).is_some() =>
+            (
+                Evaluation::Uncertain {
+                    stdout: cleaned.trim_matches('\n').to_string(),
+                },
+                None,
+            ),
+            None => (Evaluation::Pending, None),
         }
     }
 
@@ -78,11 +125,31 @@ impl<'a> CompletionEvaluator<'a> {
         raw: &str,
         human_tx_seen: bool,
         raw_half_line: bool,
+        prompt_evidence: Option<&str>,
     ) -> String {
-        match self.evaluate(raw, human_tx_seen, raw_half_line) {
-            Evaluation::Complete { stdout } | Evaluation::Uncertain { stdout } => stdout,
+        let (evaluation, _) =
+            self.evaluate_snapshot(raw, human_tx_seen, raw_half_line, prompt_evidence, false);
+        match evaluation {
+            Evaluation::Complete { stdout }
+            | Evaluation::Partial { stdout }
+            | Evaluation::Uncertain { stdout } => stdout,
             Evaluation::Pending => clean_text(raw).trim_matches('\n').to_string(),
         }
+    }
+
+    #[cfg(test)]
+    fn evaluate(&self, raw: &str, human_tx_seen: bool, raw_half_line: bool) -> Evaluation {
+        let (cleaned, _) = clean_text_with_source_ranges(raw);
+        let evidence = regex_tail_prompt_range(&cleaned, self.prompt)
+            .map(|prompt| char_slice(&cleaned, prompt));
+        self.evaluate_snapshot(
+            raw,
+            human_tx_seen,
+            raw_half_line,
+            evidence.as_deref(),
+            false,
+        )
+        .0
     }
 }
 
@@ -105,6 +172,8 @@ struct EchoRange {
     _command: Range<usize>,
     /// command echo 結束換行後的第一個字元。
     after_line: usize,
+    /// 已確認完整 echo 前方、完整匹配 profile regex 的 prompt 字面。
+    prompt_evidence: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -197,6 +266,11 @@ fn find_command_echo(
                 return Some(EchoRange {
                     _command: command_start..line_end,
                     after_line: line_end + 1,
+                    prompt_evidence: echo_prompt_prefix(
+                        &chars,
+                        line_start_by_char[command_start],
+                        command_start,
+                    ),
                 });
             }
 
@@ -232,6 +306,11 @@ fn find_command_echo(
                     return Some(EchoRange {
                         _command: command_start..line_end,
                         after_line: line_end + 1,
+                        prompt_evidence: echo_prompt_prefix(
+                            &chars,
+                            line_start_by_char[command_start],
+                            command_start,
+                        ),
                     });
                 }
             }
@@ -277,8 +356,45 @@ fn lcp_lengths(pattern: &[char], text: &[char], operations: &mut usize) -> Vec<u
     z[text_start..].to_vec()
 }
 
-/// 無 echo 的相容降階只接受 snapshot 尾端、最後一行行首的完整 prompt match。
-fn tail_prompt_range(cleaned: &str, prompt: &PyRegex) -> Option<Range<usize>> {
+fn echo_prompt_prefix(chars: &[char], line_start: usize, command_start: usize) -> Option<String> {
+    let literal: String = chars
+        .get(line_start..command_start)?
+        .iter()
+        .collect();
+    prompt_evidence_literal_is_identifiable(&literal).then_some(literal)
+}
+
+fn prompt_evidence_tail_range(cleaned: &str, evidence: Option<&str>) -> Option<Range<usize>> {
+    let range = prompt_evidence_suffix_range(cleaned, evidence)?;
+    let chars = cleaned.chars().collect::<Vec<_>>();
+    let line_start = chars[..range.start]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |index| index + 1);
+    if range.start != line_start
+        && !chars[range.clone()]
+            .iter()
+            .any(|ch| ch.is_alphanumeric())
+    {
+        return None;
+    }
+    Some(range)
+}
+
+fn prompt_evidence_suffix_range(cleaned: &str, evidence: Option<&str>) -> Option<Range<usize>> {
+    let evidence_chars = evidence?.chars().collect::<Vec<_>>();
+    if evidence_chars.is_empty() {
+        return None;
+    }
+    let chars = cleaned.chars().collect::<Vec<_>>();
+    let start = chars.len().checked_sub(evidence_chars.len())?;
+    if chars.get(start..)? != evidence_chars {
+        return None;
+    }
+    Some(start..chars.len())
+}
+
+fn regex_tail_prompt_range(cleaned: &str, prompt: &PyRegex) -> Option<Range<usize>> {
     let len = cleaned.chars().count();
     let line_start = cleaned
         .chars()
@@ -330,7 +446,7 @@ mod tests {
             before_watermark,
             &*clock,
             |snapshot| match evaluator.evaluate(&snapshot.text, false, false) {
-                Evaluation::Complete { stdout } => {
+                Evaluation::Complete { stdout } | Evaluation::Partial { stdout } => {
                     clock.advance(Duration::from_nanos(10));
                     Some(stdout)
                 }
@@ -442,6 +558,25 @@ mod tests {
                 false,
             ),
             Evaluation::Complete { stdout: "next".into() }
+        );
+
+        let arrow = evaluator(
+            "cat /tmp/job",
+            r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+        );
+        let (evaluation, learned) = arrow.evaluate_snapshot(
+            "Path => cat /tmp/job\r\nB => ",
+            false,
+            false,
+            None,
+            false,
+        );
+        assert_eq!(learned, None, "=> 輸出不能成為 prompt evidence");
+        assert_eq!(
+            evaluation,
+            Evaluation::Uncertain {
+                stdout: "B => ".into()
+            }
         );
     }
 

@@ -239,9 +239,16 @@ sequenceDiagram
 1. queue 出隊
 2. 送出原始 command + newline
 3. 記錄 RX 起點 offset
-4. 等 prompt regex 再次出現
-5. 清除 echo / prompt
-6. `stdout` 寫回 `command.get`
+4. 未指定 `completion_regex` 時，搜尋完整命令 echo；完成判定與 stdout 擷取
+   共用同一份 RX snapshot，echo 前的文字不進入一般 stdout
+5. 只接受 epoch 內有字面證據的真正 prompt：證據來源限可辨識 READY 結果或
+   完整 echo 前綴；一般 prompt 在 echo 後、最後一行行首並終止於 snapshot
+   尾端。`=> ` 類輸出不能只因寬鬆 regex 命中而完成
+6. 已知完整 prompt 若含字母或數字，可作無換行 stdout 的尾端 suffix；只移除
+   suffix。短／未知 prompt 不猜測，NUL 原樣保留
+7. 無 echo 且無 human 訊號時，可信尾端 prompt 仍可完成；必要 RX 已被窗口
+   修剪則回 `ok:true`、`partial:true`、無 error_code
+8. `stdout` 寫回 `command.get`
 
 #### 命令限制
 

@@ -57,17 +57,17 @@
 
 ## 已知問題
 
-以下問題已確認存在於 0.5.0，預定於 0.5.1 修正（括號內為 GitHub issue 編號）。
+以下問題已確認存在於 0.5.0；0.5.1 已修項另行標註（括號內為 GitHub issue 編號）。
 
 1. **檔案推送進行中停止或重啟 daemon**（#282、#296）
    - DUT 的輸入列可能殘留沒送完的半行。重啟後 session 可能停在 `ATTACHED`／`PROMPT_UNAVAILABLE`，需要手動送 Ctrl-C 清除。
    - 進行中的 `file push`／`file pull` 偶爾回 `EXCEPTION`（`session actor stopped`），而不是 `COMMAND_ABORTED_IN_FLIGHT`／`FLUSHED_BY_RECOVERY`。
    - 避免方式：推送進行中不要停止或重啟 daemon。
 2. **停機時進行中的 `session self-test`、`session recover`、interactive 操作會回 `EXCEPTION`**（#297）。呼叫端請視為已中止，daemon 重新啟動後再重試。
-3. **human 與 agent 同時操作同一個 session**（#294）
-   - human 送出一行、該行的 prompt 還沒回來時，若 agent 命令剛好送出，agent 命令可能回 `done`，但輸出是空的，或只含 human 那一行的殘餘輸出。DUT 仍會執行該命令。
-   - 避免方式：agent 命令加 `--completion-regex` 並在命令中輸出唯一記號。
-   - 不帶行尾錨點的 `prompt_regex`（例如 prpl、Speedport 範本）尚未驗證，風險可能較高。
+3. **human／agent 完成判定（#294，0.5.1 已修，含 #262、#271）**
+   - 0.5.0 可能讓 human 的舊 prompt 或 `Path => ` 命令輸出提前完成 agent 命令，也可能從 regex match 起點裁掉 `printf abc` 與 NUL 尾端檔案的同行 stdout。
+   - 0.5.1 的 Rust daemon 已用本命令 echo 與 epoch 內 prompt 字面證據共同判定；只在可辨識完整 prompt suffix 時裁切無換行 stdout，保留 U+0000。無 echo 且無 human TX、prompt 可信時仍可完成；必要 RX 已被有界窗口修剪時回 `ok:true`、`partial:true`。
+   - 已知短 suffix、未知／變更的尾端 regex 候選，或 human 交錯且無 echo 時，等待原上限後回 partial，不重送、不另送救援鍵；完全沒有候選時維持既有 timeout。producer `--completion-regex` 契約不變；prpl／Speedport prefix prompt 已納入 Rust Cargo／RPC 驗收。
 4. **USB 序列埠短暫斷線又回來後，不會自動接回**（#300）
    - 裝置在 1 秒內斷線又回來（例如 USB 重新列舉）時，session 停在 `DETACHED`，`last_error` 為 `ATTACH_FAILED:FileNotFoundError`，之後不會自動接回。0.4.x 也有同樣的限制。
    - 恢復方式：`serialwrap session attach --selector <COM>`。

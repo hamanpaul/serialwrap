@@ -16,6 +16,35 @@ END 行，避免 shell 回顯含有字面標記的命令被誤當成執行結果
 ONLCR 產生的多個 CR。呼叫端仍須驗證唯一 payload、BEGIN／END 與實際 RC 值，
 broker 的非 partial 完成不代表 target 命令成功或測試通過。
 
+## Rust 一般 agent 命令的 prompt 身分
+
+未指定 `completion_regex` 的非 passthrough `line`／`background` agent 命令，
+仍先尋找本命令完整 echo。只有清理後行尾錨定、符合既有單一 BusyBox／readline
+折行規則的 echo 可成為輸出下界；完成判定與 stdout 使用同一份 RX snapshot，
+echo 前的 human 殘餘不進入一般 stdout。
+
+- 真正 prompt 必須有 epoch 內字面證據：證據只能來自可辨識的 READY 結果，
+  或該命令前已確認完整 echo 的 prompt 前綴。`clear`、換 bridge epoch 與
+  profile rebind 後舊證據立即失效；不得由輸出中任意 regex match 學 prompt。
+- 一般 prompt 必須位於 echo 後、最後一行行首並結束於 snapshot 尾端。
+  `A => `、`Path => ` 這類只符合寬鬆 regex 的輸出不算完成；會繼續等待真正
+  prompt。
+- stdout 不以換行結尾時，只允許已知且至少含一個字母或數字的完整 prompt
+  字面作同行 suffix。只移除該 suffix，所以 `printf abc` 回 `abc`，檔案尾端的
+  U+0000 仍保留。`> `、`# `、`$ ` 等短 prompt 只能在最後一行行首裁切。
+- 已知短 prompt 與 stdout 黏在同一行，或尾端 regex 已命中、但 prompt 字面
+  未知／變更而無可靠邊界時，等待原期限後回 `PROMPT_TIMEOUT`、
+  `partial=true`、`recovery_action=NONE`；可用 stdout 保留，不重送命令、
+  不額外送 Ctrl-C／Ctrl-D。完全沒有尾端候選時仍走既有 no-prompt timeout。
+- 沒有 human TX 交錯的無 echo 終端仍可由可信尾端 prompt 完成，不要求製造
+  echo。若判斷視窗已修剪掉命令 TX 後的必要早期 RX，回
+  `ok:true`、`partial:true`、不帶 error_code，stdout 只含仍保留的部分；
+  echo 仍在視窗內時維持 `partial=false`。
+- 有 human TX／pending 人類行而找不到可辨識 echo 時，才依既有 human 交錯
+  規則在原等待上限回 partial；一般無 echo 且無 human 訊號不沿用這項判準。
+
+`--completion-regex` 的 producer 路徑不要求 echo，也不加入以上 prompt 證據規則。
+
 ## CLI／RPC／結果契約
 
 - CLI：`cmd submit --completion-regex <pattern>`。
@@ -71,5 +100,6 @@ PTY 測試使用 producer 先回顯命令、再輸出 numeric RC／END 並刻意
 prompt，驗證 line／background 非 partial 完成與完整 stdout。另覆蓋 echo-only、
 歷史 marker、無效 regex 零 TX、預設 prompt、CLI→RPC→queue→execute 傳遞、結果
 metadata、前置 prompt 不截斷 stdout 與 reboot 不覆寫。此 broker 行為可由 pytest
-覆蓋；產品 rootfs／factory
+覆蓋；Cargo 與 RPC 覆蓋 `=> ` 分段輸出、無換行 `abc`、NUL、短／未知 prompt、
+READY／echo 前綴證據來源、clear 失效與 RX 修剪 partial。產品 rootfs／factory
 reset 的真機時序由獨立 TestPilot ST-06 case 驗證。

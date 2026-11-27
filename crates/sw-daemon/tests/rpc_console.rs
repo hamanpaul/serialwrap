@@ -379,6 +379,110 @@ fn i294_rpc_human_prompt_before_agent_echo_does_not_complete() {
     assert!(!observed_tx.contains(&0x03) && !observed_tx.contains(&0x04), "不得送救援鍵");
 }
 
+fn broad_prompt_rig() -> ServiceRig {
+    ServiceRig::build(RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^(?:[ \\t]*|.*[^>#\\s])[>#][ \\t]*$'\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    })
+}
+
+fn rpc_command(r: &ServiceRig, command: &str) -> String {
+    let submitted = r.call(
+        "command.submit",
+        &format!(
+            r#"{{"selector":"COM0","cmd":"{}","mode":"line","timeout_s":2.0}}"#,
+            command
+        ),
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    s(&submitted, "cmd_id")
+}
+
+fn rpc_wait_done(r: &ServiceRig, cmd_id: &str) -> PyDict {
+    wait_for("RPC command 完成", || {
+        let got = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(got.get("command"), Some(PyValue::Dict(command)) if command.get("done_at").is_some_and(|v| !v.is_null()))
+    });
+    let done = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    match done.get("command") {
+        Some(PyValue::Dict(command)) => command.clone(),
+        other => panic!("command.get command：{other:?}"),
+    }
+}
+
+fn rpc_rx_bytes(r: &ServiceRig) -> u64 {
+    r.session("COM0")
+        .expect("COM0 session")
+        .get("rx_bytes_last_10s")
+        .and_then(PyValue::as_i64)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .expect("rx_bytes_last_10s")
+}
+
+#[test]
+fn i262_rpc_arrow_output_is_complete() {
+    let r = broad_prompt_rig();
+    let dev = r.device(REAL_A);
+    let command = "obuspa -c get Device.DNS.Diagnostics.";
+    let cmd_id = rpc_command(&r, command);
+
+    wait_for("RPC command TX", || {
+        dev.take_tx()
+            .windows(format!("{command}\n").len())
+            .any(|window| window == format!("{command}\n").as_bytes())
+    });
+    let first = format!("{command}\r\nA => \r\n");
+    let rx_before = rpc_rx_bytes(&r);
+    dev.push_rx(first.as_bytes());
+    wait_for("第一段箭頭輸出已到 RX", || {
+        rpc_rx_bytes(&r) >= rx_before.saturating_add(first.len() as u64)
+    });
+    let rx_before = rpc_rx_bytes(&r);
+    dev.push_rx(b"B => ");
+    wait_for("B =>  已由 RX reader 處理", || {
+        rpc_rx_bytes(&r) >= rx_before.saturating_add(b"B => ".len() as u64)
+    });
+    let running = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert!(
+        matches!(running.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "running"),
+        "RPC 不得在 B =>  尾端提前完成：{}",
+        j(&running)
+    );
+    dev.push_rx(b"\r\nC => 1\r\nroot@t:/# ");
+
+    let command = rpc_wait_done(&r, &cmd_id);
+    assert_eq!(s(&command, "status"), "done");
+    assert_eq!(s(&command, "stdout"), "A => \nB => \nC => 1");
+    assert_eq!(command.get("partial"), Some(&PyValue::Bool(false)));
+}
+
+#[test]
+fn i271_rpc_no_newline_and_nul_stdout() {
+    let r = broad_prompt_rig();
+    let dev = r.device(REAL_A);
+
+    let plain = rpc_command(&r, "printf abc");
+    wait_for("printf RPC TX", || dev.take_tx().ends_with(b"printf abc\n"));
+    dev.push_rx(b"printf abc\r\nabcroot@t:/# ");
+    let plain_result = rpc_wait_done(&r, &plain);
+    assert_eq!(s(&plain_result, "stdout"), "abc");
+    assert_eq!(plain_result.get("partial"), Some(&PyValue::Bool(false)));
+
+    let nul = rpc_command(&r, "cat /proc/device-tree/model");
+    wait_for("cat RPC TX", || {
+        dev.take_tx().ends_with(b"cat /proc/device-tree/model\n")
+    });
+    dev.push_rx(b"cat /proc/device-tree/model\r\nmodel\0root@t:/# ");
+    let nul_result = rpc_wait_done(&r, &nul);
+    assert_eq!(s(&nul_result, "stdout"), "model\0");
+    assert_eq!(nul_result.get("partial"), Some(&PyValue::Bool(false)));
+}
+
 #[test]
 fn console_methods_no_longer_deferred() {
     let r = ServiceRig::with_console_backend("pty");
