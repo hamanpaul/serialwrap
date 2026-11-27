@@ -229,12 +229,8 @@ def combine(
     if not isinstance(integrity, Mapping) or integrity.get("a") is not True or integrity.get("b") is not True:
         return INFRA_ERROR, _COMPARATOR, _unique([*notes, "證據不足：比較器完整性未通過"])
 
-    if layer == "l3" and isinstance(diff, Mapping) and diff.get("kind") == "longrun":
-        release = diff.get("b_release_gate_result")
-        if release == "BLOCKED":
-            return INFRA_ERROR, _OD09_NOT_FROZEN, _unique([*notes, "release gate BLOCKED"])
-        if release == _INSUFFICIENT or diff.get("b_baseline_compatible") is False:
-            return INFRA_ERROR, _SUITE, _unique([*notes, "release gate 證據不足或 baseline 不相容"])
+    if layer == "l3":
+        return _combine_l3(a_status, b_status, diff, notes)
 
     if layer == "l1.5":
         baseline_failures = _rows(diff, "baseline_failures")
@@ -967,12 +963,21 @@ def _evidence_check_problems(gate: Mapping[str, Any]) -> list[str]:
     mode = gate.get("mode")
     problems: list[str] = []
     for check in checks:
-        if not isinstance(check, Mapping) or check.get("group") != "evidence":
+        if not isinstance(check, Mapping):
             continue
+        group = check.get("group")
+        check_id = check.get("id")
         result = check.get("result")
+        if (
+            not isinstance(group, str) or not group
+            or not isinstance(check_id, str) or not check_id
+            or not isinstance(result, str) or not result
+            or group != "evidence"
+        ):
+            continue
         if result == PASS or (mode == "baseline" and result == "NOT_APPLICABLE_BASELINE"):
             continue
-        problems.append(f"evidence check not PASS: {check.get('id')}={result}")
+        problems.append(f"evidence check not PASS: {check_id}={result}")
     return problems
 
 
@@ -1040,16 +1045,21 @@ def _l3_safety_sources(
         if not isinstance(checks, list):
             continue
         for index, check in enumerate(checks):
+            if not isinstance(check, Mapping):
+                continue
+            group = check.get("group")
+            check_id = check.get("id")
+            result = check.get("result")
             if (
-                isinstance(check, Mapping)
-                and isinstance(check.get("id"), str)
-                and bool(check.get("id"))
-                and check.get("group") == "safety"
-                and check.get("result") == FAIL
+                isinstance(group, str) and group
+                and isinstance(check_id, str) and check_id
+                and isinstance(result, str) and result
+                and group == "safety"
+                and result == FAIL
             ):
                 sources.append({
                     "side": side,
-                    "case": check["id"],
+                    "case": check_id,
                     "source_ref": f"release-gate.json#/checks/{index}",
                     "reason": "safety check FAIL",
                 })
@@ -1100,19 +1110,27 @@ def _l3_product_failures(gate: Mapping[str, Any] | None) -> list[dict[str, str]]
     checks = gate.get("checks")
     if isinstance(checks, list):
         for index, check in enumerate(checks):
+            if not isinstance(check, Mapping):
+                continue
+            group = check.get("group")
+            check_id = check.get("id")
+            result = check.get("result")
             if (
-                isinstance(check, Mapping)
-                and check.get("group") in _GATE_GROUPS - {"evidence", "safety"}
-                and check.get("result") == FAIL
-                and check.get("id") != "engine_verdict"
-                and isinstance(check.get("id"), str)
-                and check.get("id")
+                not isinstance(group, str) or not group
+                or not isinstance(check_id, str) or not check_id
+                or not isinstance(result, str) or not result
+            ):
+                continue
+            if (
+                group in _GATE_GROUPS - {"evidence", "safety"}
+                and result == FAIL
+                and check_id != "engine_verdict"
             ):
                 failures.append({
                     "side": "b",
-                    "case": check["id"],
+                    "case": check_id,
                     "source_ref": f"release-gate.json#/checks/{index}",
-                    "reason": f"candidate {check['group']} check FAIL",
+                    "reason": f"candidate {group} check FAIL",
                 })
     return failures
 

@@ -2066,3 +2066,136 @@ def test_r3_intact_blocked_longrun_gate_keeps_od09_reason(tmp_path: Path):
     assert diff["integrity"] == {"a": True, "b": True}
     assert diff["integrity_problems"] == {"a": [], "b": []}
     assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_OD09_NOT_FROZEN")
+
+
+@pytest.mark.parametrize("broken_group", [[], {}], ids=["list-group", "object-group"])
+@pytest.mark.parametrize("failure_kind", ["engine", "check", "both-sides-safety"])
+def test_r4_corrupt_gate_check_does_not_mask_independent_failures(
+    tmp_path: Path,
+    broken_group: Any,
+    failure_kind: str,
+):
+    safety_results = (("safety_unauthorized_tx", "FAIL"),) if failure_kind == "both-sides-safety" else ()
+    a_path = _write_gate(
+        tmp_path / "a" / "release-gate.json",
+        mode="baseline",
+        safety_results=safety_results,
+    )
+    b_path = _write_gate(
+        tmp_path / "b" / "release-gate.json",
+        mode="candidate",
+        engine_verdict="FAIL" if failure_kind == "engine" else "PASS",
+        safety_results=safety_results,
+    )
+    b_gate = json.loads(b_path.read_bytes().decode("utf-8"))
+    b_gate["checks"].append({
+        "id": "damaged_check",
+        "group": broken_group,
+        "status": "evaluated",
+        "result": "PASS",
+        "detail": {},
+    })
+    if failure_kind == "check":
+        b_gate["checks"].append({
+            "id": "resources_failure",
+            "group": "resources",
+            "status": "evaluated",
+            "result": "FAIL",
+            "detail": {},
+        })
+        b_gate["release_gate_result"] = "FAIL"
+    b_path.write_bytes((json.dumps(b_gate, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"]["b"] is False
+    assert any("checks[" in item and ".group" in item for item in diff["integrity_problems"]["b"])
+    assert (verdict, reason_code) == ("FAIL", None)
+    if failure_kind == "engine":
+        assert any(row["case"] == "engine_result" for row in diff["product_failures"])
+    elif failure_kind == "check":
+        assert any(row["case"] == "resources_failure" for row in diff["product_failures"])
+    else:
+        assert diff["safety_violations"] == ["A:safety_unauthorized_tx", "B:safety_unauthorized_tx"]
+    assert any("integrity" in item.lower() for item in notes)
+
+
+@pytest.mark.parametrize("broken_group", [[], {}], ids=["list-group", "object-group"])
+def test_r4_only_corrupt_gate_check_returns_comparator_error(
+    tmp_path: Path,
+    broken_group: Any,
+):
+    a_path = _write_gate(tmp_path / "a" / "release-gate.json", mode="baseline")
+    b_path = _write_gate(tmp_path / "b" / "release-gate.json", mode="candidate")
+    b_gate = json.loads(b_path.read_bytes().decode("utf-8"))
+    b_gate["checks"].append({
+        "id": "damaged_check",
+        "group": broken_group,
+        "status": "evaluated",
+        "result": "PASS",
+        "detail": {},
+    })
+    b_path.write_bytes((json.dumps(b_gate, sort_keys=True) + "\n").encode("utf-8"))
+
+    diff = ab_verdict.compare_l3(a_path, b_path)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status="PASS", diff=diff, registered={},
+    )
+
+    assert diff["integrity"]["b"] is False
+    assert any("checks[" in item and ".group" in item for item in diff["integrity_problems"]["b"])
+    assert (verdict, reason_code) == ("INFRA_ERROR", "HARNESS_COMPARATOR_ERROR")
+    assert any("checks[" in item and ".group" in item for item in notes)
+
+
+@pytest.mark.parametrize(
+    "updates, b_status, expected",
+    [
+        pytest.param(
+            {"a_baseline_result": "FAIL", "b_release_gate_result": "BLOCKED"},
+            "PASS",
+            ("BASELINE_INVALID", "HARNESS_BASELINE_INVALID"),
+            id="baseline-invalid-before-blocked",
+        ),
+        pytest.param(
+            {"b_engine_verdict": "FAIL", "b_release_gate_result": "BLOCKED"},
+            "PASS",
+            ("FAIL", None),
+            id="engine-fail-before-blocked",
+        ),
+        pytest.param(
+            {"b_engine_verdict": "PASS", "b_release_gate_result": "BLOCKED"},
+            "FAIL",
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            id="suite-engine-inconsistent-before-blocked",
+        ),
+        pytest.param(
+            {"b_engine_verdict": "UNKNOWN", "b_release_gate_result": "BLOCKED"},
+            "PASS",
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            id="unknown-engine-before-blocked",
+        ),
+        pytest.param(
+            {"b_engine_verdict": "INSUFFICIENT_EVIDENCE", "b_release_gate_result": "BLOCKED"},
+            "PASS",
+            ("INFRA_ERROR", "HARNESS_SUITE_INFRA_ERROR"),
+            id="insufficient-engine-before-blocked",
+        ),
+    ],
+)
+def test_r4_longrun_gate_verdict_follows_first_matching_decision_row(
+    updates: dict[str, Any],
+    b_status: str,
+    expected: tuple[str, str | None],
+):
+    diff = _longrun_diff(**updates)
+    verdict, reason_code, notes = ab_verdict.combine(
+        "l3", a_status="PASS", b_status=b_status, diff=diff, registered={},
+    )
+
+    assert (verdict, reason_code) == expected
+    if b_status == "FAIL" and diff["b_engine_verdict"] == "PASS":
+        assert "suite/engine inconsistent" in notes
