@@ -56,6 +56,8 @@ _RUNNER_FILES: dict[str, tuple[str, ...]] = {
     ),
 }
 _VALID_VERDICTS = frozenset({"PASS", "FAIL"})
+_VALID_RUNNER_OUTCOMES = frozenset({"passed", "failed"})
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
 _EXCEPTION = "EXCEPTION"
 _ROOT_SEGMENT_CHARS = "A-Za-z0-9._-"
@@ -101,6 +103,15 @@ class _Run:
     verdict_ref: str = ""
     l1_document: dict[str, Any] | None = None
     instance_roots: tuple[str, ...] = ()
+    identity_verified: bool = False
+    case_identity_verified: bool = False
+    verified_sources: set[str] = field(default_factory=set)
+    failure_ref: str = ""
+    failure_reason: str = ""
+    failure_verified: bool = False
+    invariant_failures: list[dict[str, Any]] = field(default_factory=list)
+    unverified_invariant_failures: list[dict[str, Any]] = field(default_factory=list)
+    case_map: dict[str, str] | None = None
 
     @property
     def run_index(self) -> str:
@@ -216,17 +227,33 @@ def _nested(value: Any, *parts: str) -> Any:
     return current
 
 
-def _check_identity_fields(run: _Run) -> None:
-    for dotted in (
-        "cli.sha256",
-        "daemon.implementation",
-        "daemon.sha256",
-        "daemon.tree_sha256",
-        "release_manifest_sha256",
-    ):
+def _valid_sha256(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _check_identity_fields(run: _Run) -> bool:
+    """依 daemon implementation 驗證適用的 artifact 身分欄位。"""
+    valid = True
+    for dotted in ("cli.sha256", "release_manifest_sha256"):
         value = _nested(run.artifacts, *dotted.split("."))
-        if not _nonempty_string(value):
+        if not _valid_sha256(value):
             _add_problem(run.problems, f"missing artifact identity: artifacts.{dotted}")
+            valid = False
+    implementation = _nested(run.artifacts, "daemon", "implementation")
+    if not isinstance(implementation, str) or implementation not in {"python", "rust"}:
+        _add_problem(run.problems, "missing artifact identity: artifacts.daemon.implementation")
+        valid = False
+    if implementation == "python":
+        tree_sha = _nested(run.artifacts, "daemon", "tree_sha256")
+        if not _valid_sha256(tree_sha):
+            _add_problem(run.problems, "missing artifact identity: artifacts.daemon.tree_sha256")
+            valid = False
+    elif implementation == "rust":
+        daemon_sha = _nested(run.artifacts, "daemon", "sha256")
+        if not _valid_sha256(daemon_sha):
+            _add_problem(run.problems, "missing artifact identity: artifacts.daemon.sha256")
+            valid = False
+    return valid
 
 
 def _bridge_artifacts(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -314,6 +341,22 @@ def _manifest_evidence(manifest: Mapping[str, Any], run: _Run) -> None:
     if not isinstance(evidence, Mapping):
         _add_problem(run.problems, "invalid manifest evidence")
         return
+    required_paths = {
+        "wire": "wire.ndjson",
+        "control": "control.ndjson",
+        "correlation": "correlation.ndjson",
+        "dut_stderr": "dut.stderr.log",
+        "cli_log": "cli.ndjson",
+        "wal_dir": "wal",
+    }
+    for key, expected_path in required_paths.items():
+        if key not in evidence:
+            _add_problem(run.problems, f"missing manifest evidence: evidence.{key}")
+            continue
+        item = evidence[key]
+        declared_path = item if key == "wal_dir" else item.get("path") if isinstance(item, Mapping) else None
+        if declared_path != expected_path:
+            _add_problem(run.problems, f"invalid manifest path: evidence.{key}")
     for key, item in evidence.items():
         if key == "wal_dir":
             relative = _safe_relative(item)
@@ -321,6 +364,8 @@ def _manifest_evidence(manifest: Mapping[str, Any], run: _Run) -> None:
                 _add_problem(run.problems, "invalid manifest path: evidence.wal_dir")
             elif not (run.path / Path(*PurePosixPath(relative).parts)).is_dir():
                 _add_problem(run.problems, f"missing source file: {relative}")
+            else:
+                run.verified_sources.add(relative)
             continue
         if not isinstance(item, Mapping):
             _add_problem(run.problems, f"invalid manifest evidence: {key}")
@@ -339,8 +384,10 @@ def _manifest_evidence(manifest: Mapping[str, Any], run: _Run) -> None:
         except OSError:
             _add_problem(run.problems, f"unreadable source file: {relative}")
             continue
-        if not isinstance(expected, str) or actual != expected:
+        if not _valid_sha256(expected) or actual != expected:
             _add_problem(run.problems, f"source hash mismatch: {relative}")
+        else:
+            run.verified_sources.add(relative)
 
 
 def _comparison_integrity(comparison: Mapping[str, Any], run: _Run) -> None:
@@ -350,12 +397,21 @@ def _comparison_integrity(comparison: Mapping[str, Any], run: _Run) -> None:
         return
     wire_sha = integrity.get("wire_sha256")
     expected_wire_sha = integrity.get("wire_sha256_expected")
-    if not _nonempty_string(wire_sha):
+    if not _valid_sha256(wire_sha):
         _add_problem(run.problems, "invalid comparison integrity: wire_sha256")
-    if expected_wire_sha is not None and not _nonempty_string(expected_wire_sha):
+    if not _valid_sha256(expected_wire_sha):
         _add_problem(run.problems, "invalid comparison integrity: wire_sha256_expected")
-    elif _nonempty_string(expected_wire_sha) and wire_sha != expected_wire_sha:
+    elif wire_sha != expected_wire_sha:
         _add_problem(run.problems, "comparison integrity mismatch: wire_sha256")
+    wire_path = run.path / "wire.ndjson"
+    if wire_path.is_file():
+        try:
+            actual_wire_sha = sha256_file(wire_path)
+        except OSError:
+            actual_wire_sha = ""
+            _add_problem(run.problems, "unreadable source file: wire.ndjson")
+        if actual_wire_sha and (wire_sha != actual_wire_sha or expected_wire_sha != actual_wire_sha):
+            _add_problem(run.problems, "comparison integrity mismatch: wire_sha256")
     wal_files = integrity.get("wal_files")
     if not isinstance(wal_files, list) or not all(isinstance(item, str) and item for item in wal_files):
         _add_problem(run.problems, "invalid comparison integrity: wal_files")
@@ -389,7 +445,7 @@ def _load_bridge_run(run: _Run) -> None:
         if manifest.get("schema_version") != "l15-manifest.v1":
             _add_problem(run.problems, "invalid manifest schema_version")
         run.artifacts = _bridge_artifacts(manifest)
-        _check_identity_fields(run)
+        run.identity_verified = _check_identity_fields(run)
         _manifest_evidence(manifest, run)
         expected_bridge_hash = manifest.get("bridge_manifest_sha256")
         bridge_path = run.path / "bridge-manifest.json"
@@ -409,8 +465,12 @@ def _load_bridge_run(run: _Run) -> None:
         run.verdict = verdict if isinstance(verdict, str) else None
         if verdict == _INSUFFICIENT:
             _add_problem(run.problems, f"invalid comparison verdict: {_INSUFFICIENT}")
-        elif verdict not in _VALID_VERDICTS:
+        elif not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
             _add_problem(run.problems, f"invalid comparison verdict: {verdict!r}")
+        elif verdict == "FAIL":
+            run.failure_ref = run.verdict_ref
+            reasons = comparison.get("reasons")
+            run.failure_reason = "; ".join(item for item in reasons if isinstance(item, str)) if isinstance(reasons, list) else ""
         reasons = comparison.get("reasons")
         if isinstance(reasons, list):
             run.reason = "; ".join(str(reason) for reason in reasons if isinstance(reason, str))
@@ -423,10 +483,16 @@ def _load_bridge_run(run: _Run) -> None:
                     continue
                 invariant_id = invariant.get("id")
                 invariant_verdict = invariant.get("verdict")
-                if not _nonempty_string(invariant_id) or invariant_verdict not in _VALID_VERDICTS:
+                if not _nonempty_string(invariant_id) or not isinstance(invariant_verdict, str) or invariant_verdict not in _VALID_VERDICTS:
                     _add_problem(run.problems, f"invalid comparison invariant: {index}")
                     continue
                 run.invariants.append({"id": invariant_id, "result": invariant_verdict})
+                if invariant_verdict == "FAIL":
+                    run.invariant_failures.append({
+                        "id": invariant_id,
+                        "source_ref": run.ref("comparison.json", f"#invariants[{index}]"),
+                        "reason": f"invariant {invariant_id} FAIL",
+                    })
 
     if bridge_manifest is not None:
         if bridge_manifest.get("closed_cleanly") is not True:
@@ -438,6 +504,27 @@ def _load_bridge_run(run: _Run) -> None:
             _add_problem(run.problems, "runner incomplete: bridge")
 
     _parse_bridge_calls(run)
+    if manifest is not None and comparison is not None:
+        manifest_case = manifest.get("case_id")
+        comparison_case = comparison.get("case_id")
+        manifest_run = manifest.get("run_id")
+        comparison_run = comparison.get("run_id")
+        identity_ok = (
+            isinstance(run.run_index, str)
+            and run.run_index.isascii()
+            and run.run_index.isdecimal()
+            and int(run.run_index) > 0
+            and manifest_case == run.case_id
+            and comparison_case == run.case_id
+            and _nonempty_string(manifest_run)
+            and comparison_run == manifest_run
+        )
+        if not identity_ok:
+            _add_problem(run.problems, "bridge case/run identity mismatch")
+        run.case_identity_verified = bool(identity_ok)
+        run.failure_verified = run.identity_verified and run.case_identity_verified
+    else:
+        _add_problem(run.problems, "bridge case/run identity unavailable")
 
 
 def _source_file_map(run: _Run, envelope: Mapping[str, Any]) -> dict[str, str]:
@@ -455,7 +542,7 @@ def _source_file_map(run: _Run, envelope: Mapping[str, Any]) -> dict[str, str]:
         if relative is None:
             _add_problem(run.problems, f"invalid source file path: source_files[{index}]")
             continue
-        if not _nonempty_string(digest):
+        if not _valid_sha256(digest):
             _add_problem(run.problems, f"missing source hash: {relative}")
             continue
         if relative in hashes:
@@ -474,6 +561,8 @@ def _source_file_map(run: _Run, envelope: Mapping[str, Any]) -> dict[str, str]:
         try:
             if sha256_file(candidate) != digest:
                 _add_problem(run.problems, f"source hash mismatch: {relative}")
+            else:
+                run.verified_sources.add(relative)
         except OSError:
             _add_problem(run.problems, f"unreadable source file: {relative}")
     for relative in _RUNNER_FILES[run.runner]:
@@ -485,22 +574,33 @@ def _source_file_map(run: _Run, envelope: Mapping[str, Any]) -> dict[str, str]:
     return hashes
 
 
-def _release_identity(run: _Run, release: Mapping[str, Any], digest: str) -> None:
+def _release_identity(run: _Run, release: Mapping[str, Any], digest: str) -> bool:
     cli = _nested(release, "components", "cli")
     daemon = _nested(release, "components", "daemon")
+    implementation = _nested(run.artifacts, "daemon", "implementation")
     expected = {
         "cli.sha256": _nested(cli, "sha256"),
         "daemon.implementation": _nested(daemon, "implementation"),
-        "daemon.sha256": _nested(daemon, "launcher", "sha256"),
-        "daemon.tree_sha256": _nested(daemon, "package", "tree_sha256"),
         "release_manifest_sha256": digest,
     }
+    if implementation == "python":
+        expected["daemon.tree_sha256"] = _nested(daemon, "package", "tree_sha256")
+    elif implementation == "rust":
+        expected["daemon.sha256"] = _nested(daemon, "launcher", "sha256")
+    else:
+        _add_problem(run.problems, "missing artifact identity: artifacts.daemon.implementation")
+        return False
+    valid = True
     for dotted, source_value in expected.items():
         envelope_value = _nested(run.artifacts, *dotted.split("."))
-        if not _nonempty_string(envelope_value):
-            continue
-        if not _nonempty_string(source_value) or source_value != envelope_value:
+        if dotted == "daemon.implementation":
+            values_valid = isinstance(source_value, str) and isinstance(envelope_value, str)
+        else:
+            values_valid = _valid_sha256(source_value) and _valid_sha256(envelope_value)
+        if not values_valid or source_value != envelope_value:
             _add_problem(run.problems, f"artifact identity mismatch: artifacts.{dotted}")
+            valid = False
+    return valid
 
 
 def _source_ref_path(report_root: Path, source_ref: str) -> tuple[Path | None, int | None]:
@@ -651,74 +751,203 @@ def _load_l1_report(run: _Run) -> None:
         _add_problem(run.problems, f"invalid runner source: {relative}")
 
 
-def _load_runner_invariants(run: _Run, envelope: Mapping[str, Any]) -> None:
-    envelope_items = envelope.get("invariants")
-    source_path = run.path / "source/invariant-evidence.json"
-    source = _json_object(source_path, run, "source/invariant-evidence.json")
+def _load_runner_invariants(run: _Run, envelope: Mapping[str, Any] | None) -> None:
+    """獨立保全原始 invariant；envelope 僅作一致性核對。"""
+    source = _json_object(run.path / "source/invariant-evidence.json", run, "source/invariant-evidence.json")
     source_items = source.get("invariants") if source is not None else None
-    if not isinstance(envelope_items, list):
-        _add_problem(run.problems, "invalid runner invariants")
-        return
+    normalized_source: list[dict[str, str]] = []
     if not isinstance(source_items, list):
         if source is not None:
             _add_problem(run.problems, "invalid invariant evidence")
+    else:
+        if source.get("schema_version") != "stage3-invariant-evidence.v1":
+            _add_problem(run.problems, "invalid invariant evidence schema_version")
+        for index, item in enumerate(source_items):
+            if not isinstance(item, Mapping):
+                _add_problem(run.problems, f"invalid invariant evidence item: {index}")
+                continue
+            invariant_id = item.get("id")
+            result = item.get("result")
+            if not _nonempty_string(invariant_id) or not isinstance(result, str) or result not in _VALID_VERDICTS:
+                _add_problem(run.problems, f"invalid invariant evidence item: {index}")
+                continue
+            normalized_source.append({"id": invariant_id, "result": result})
+            if result == "FAIL":
+                run.invariant_failures.append({
+                    "id": invariant_id,
+                    "source_ref": run.ref("source/invariant-evidence.json", f"#invariants[{index}]"),
+                    "reason": f"invariant {invariant_id} FAIL",
+                })
+    run.invariants = normalized_source
+
+    if envelope is None:
         return
-    if source.get("schema_version") != "stage3-invariant-evidence.v1":
-        _add_problem(run.problems, "invalid invariant evidence schema_version")
+    envelope_items = envelope.get("invariants")
+    if not isinstance(envelope_items, list):
+        _add_problem(run.problems, "invalid runner invariants")
+        return
+    normalized_envelope: list[dict[str, str]] = []
     for index, item in enumerate(envelope_items):
         if not isinstance(item, Mapping):
             _add_problem(run.problems, f"invalid runner invariant: {index}")
             continue
         invariant_id = item.get("id")
         result = item.get("result")
-        if not _nonempty_string(invariant_id) or result not in _VALID_VERDICTS:
+        if not _nonempty_string(invariant_id) or not isinstance(result, str) or result not in _VALID_VERDICTS:
             _add_problem(run.problems, f"invalid runner invariant: {index}")
             continue
-        run.invariants.append({"id": invariant_id, "result": result})
-        if index >= len(source_items) or not isinstance(source_items[index], Mapping):
-            _add_problem(run.problems, f"invariant evidence mismatch: {index}")
-        elif source_items[index].get("id") != invariant_id or source_items[index].get("result") != result:
-            _add_problem(run.problems, f"invariant evidence mismatch: {index}")
-    if len(source_items) != len(envelope_items):
-        _add_problem(run.problems, "invariant evidence count mismatch")
+        normalized_envelope.append({"id": invariant_id, "result": result})
+        if result == "FAIL" and {"id": invariant_id, "result": result} not in normalized_source:
+            run.unverified_invariant_failures.append({
+                "id": invariant_id,
+                "source_ref": run.ref("runner-observation.json", f"#invariants[{index}]"),
+                "reason": f"invariant {invariant_id} FAIL is not corroborated by raw invariant evidence",
+            })
+    if normalized_source != normalized_envelope:
+        _add_problem(run.problems, "invariant evidence mismatch")
+
+
+def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
+    case_identity_ok = (
+        envelope.get("case_id") == run.case_id
+        and envelope.get("runner") == run.runner
+        and str(envelope.get("run_index")) == run.run_index
+        and run.run_index.isascii()
+        and run.run_index.isdecimal()
+        and int(run.run_index) > 0
+    )
+    if not case_identity_ok:
+        _add_problem(run.problems, "runner observation identity mismatch")
+
+    case_map = envelope.get("case_map")
+    case_map_ok = False
+    if not isinstance(case_map, Mapping):
+        _add_problem(run.problems, "invalid case_map")
+    else:
+        map_path = _safe_relative(case_map.get("path"))
+        map_sha = case_map.get("sha256")
+        if map_path is None or not _valid_sha256(map_sha):
+            _add_problem(run.problems, "invalid case_map")
+        else:
+            run.case_map = {"path": map_path, "sha256": map_sha}
+            case_map_ok = True
+
+    rows = envelope.get("case_results")
+    if not isinstance(rows, list):
+        _add_problem(run.problems, "invalid case_results")
+        rows = []
+    if not rows:
+        _add_problem(run.problems, "missing required observation: case_results")
+
+    document = run.l1_document
+    raw_results = document.get("results") if isinstance(document, Mapping) else None
+    collected = document.get("collected") if isinstance(document, Mapping) else None
+    if not isinstance(raw_results, list):
+        _add_problem(run.problems, "invalid runner results: source/l1-results.json")
+        raw_results = []
+    if not isinstance(collected, list) or not all(isinstance(item, str) for item in collected):
+        _add_problem(run.problems, "invalid runner collected: source/l1-results.json")
+        collected = []
+
+    mapped_indices: set[int] = set()
+    failed_refs: list[str] = []
+    executed_outcomes: list[str] = []
+    for map_index, mapping in enumerate(rows):
+        if not isinstance(mapping, Mapping):
+            _add_problem(run.problems, f"invalid case_results[{map_index}]")
+            continue
+        nodeid = mapping.get("nodeid")
+        source_ref = mapping.get("source_ref")
+        if not _nonempty_string(nodeid) or not isinstance(source_ref, str):
+            _add_problem(run.problems, f"invalid case_results[{map_index}]")
+            continue
+        match = re.fullmatch(
+            re.escape(run.ref("source/l1-results.json")) + r"#results\[([0-9]+)\]",
+            source_ref,
+        )
+        if match is None:
+            _add_problem(run.problems, f"invalid case result source_ref: case_results[{map_index}]")
+            continue
+        result_index = int(match.group(1))
+        if result_index >= len(raw_results):
+            _add_problem(run.problems, f"missing case result: case_results[{map_index}]")
+            continue
+        if result_index in mapped_indices:
+            _add_problem(run.problems, f"duplicate case result: case_results[{map_index}]")
+            continue
+        mapped_indices.add(result_index)
+        raw_row = raw_results[result_index]
+        if not isinstance(raw_row, Mapping):
+            _add_problem(run.problems, f"invalid runner result: results[{result_index}]")
+            continue
+        if raw_row.get("nodeid") != nodeid:
+            _add_problem(run.problems, f"case result nodeid mismatch: results[{result_index}]")
+            continue
+        if nodeid not in collected:
+            _add_problem(run.problems, f"case result was not collected: results[{result_index}]")
+            continue
+        outcome = raw_row.get("outcome")
+        if not isinstance(outcome, str):
+            _add_problem(run.problems, f"invalid runner result outcome: results[{result_index}]")
+            continue
+        if outcome not in _VALID_RUNNER_OUTCOMES:
+            _add_problem(run.problems, f"required case result not executed: {outcome}")
+            continue
+        executed_outcomes.append(outcome)
+        if outcome == "failed":
+            failed_refs.append(source_ref)
+
+    if not executed_outcomes:
+        _add_problem(run.problems, "required case has no executed result: source/l1-results.json")
+        run.verdict = None
+    else:
+        raw_verdict = "FAIL" if "failed" in executed_outcomes else "PASS"
+        envelope_verdict = envelope.get("verdict")
+        if not isinstance(envelope_verdict, str) or envelope_verdict not in _VALID_VERDICTS:
+            _add_problem(run.problems, f"invalid runner verdict: {envelope_verdict!r}")
+        elif envelope_verdict != raw_verdict:
+            _add_problem(run.problems, "runner result mismatch: verdict")
+        run.verdict = raw_verdict
+        if failed_refs:
+            run.failure_ref = failed_refs[0]
+            run.failure_verified = (
+                case_identity_ok
+                and case_map_ok
+                and run.identity_verified
+                and "source/l1-results.json" in run.verified_sources
+            )
+    run.case_identity_verified = bool(case_identity_ok and case_map_ok)
 
 
 def _runner_completion(run: _Run, envelope: Mapping[str, Any]) -> None:
     completion = envelope.get("completion")
     if not isinstance(completion, Mapping):
         _add_problem(run.problems, f"runner incomplete: {run.runner}")
-        return
+        completion = {}
     status = completion.get("status")
     finished = completion.get("finished")
     exit_code = completion.get("exit_code")
     if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         _add_problem(run.problems, "missing required observation: completion.exit_code")
+    elif exit_code != 0:
+        _add_problem(run.problems, f"runner exit code nonzero: {run.runner}")
     if status != "completed" or finished is not True:
         _add_problem(run.problems, f"runner incomplete: {run.runner}")
-    if run.l1_document is not None and run.l1_document.get("finished") is not True:
-        _add_problem(run.problems, f"runner incomplete: {run.runner}")
+    if run.l1_document is not None:
+        if run.l1_document.get("finished") is not True:
+            _add_problem(run.problems, f"runner incomplete: {run.runner}")
+        source_exit = run.l1_document.get("exit_code")
+        if not isinstance(source_exit, int) or isinstance(source_exit, bool):
+            _add_problem(run.problems, "missing required observation: source/l1-results.json.exit_code")
+        else:
+            if source_exit != 0:
+                _add_problem(run.problems, f"runner source exit code nonzero: {run.runner}")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool) and source_exit != exit_code:
+                _add_problem(run.problems, "runner exit code mismatch: source/l1-results.json")
     if run.runner == "rust-l1":
         provenance = run.l1_document.get("provenance") if run.l1_document is not None else None
         if not isinstance(provenance, Mapping) or provenance.get("schema") != "cargo-l1-provenance.v1" or provenance.get("complete") is not True:
             _add_problem(run.problems, f"runner incomplete: {run.runner}")
-
-
-def _l1_failed_for_case(run: _Run) -> bool:
-    document = run.l1_document
-    results = document.get("results") if isinstance(document, Mapping) else None
-    if not isinstance(results, list):
-        _add_problem(run.problems, "invalid runner results: source/l1-results.json")
-        return False
-    matching_case = False
-    for row in results:
-        if not isinstance(row, Mapping):
-            continue
-        nodeid = row.get("nodeid")
-        if isinstance(nodeid, str) and (nodeid == run.case_id or run.case_id in nodeid):
-            matching_case = True
-            if row.get("outcome") == "failed":
-                return True
-    return False if matching_case else False
 
 
 def _load_runner_run(run: _Run) -> None:
@@ -726,19 +955,12 @@ def _load_runner_run(run: _Run) -> None:
     envelope = _json_object(run.path / "runner-observation.json", run, "runner-observation.json")
     _load_l1_report(run)
     if envelope is None:
+        _load_runner_invariants(run, None)
+        _runner_completion(run, {})
         return
     if envelope.get("schema_version") != "stage3-runner-observation.v1":
         _add_problem(run.problems, "invalid runner observation schema_version")
-    if envelope.get("runner") != run.runner or envelope.get("case_id") != run.case_id or str(envelope.get("run_index")) != run.run_index:
-        _add_problem(run.problems, "runner observation identity mismatch")
-
-    run.verdict_ref = run.ref("source/l1-results.json", "#L1")
-    verdict = envelope.get("verdict")
-    run.verdict = verdict if isinstance(verdict, str) else None
-    if verdict == _INSUFFICIENT:
-        _add_problem(run.problems, f"invalid runner verdict: {_INSUFFICIENT}")
-    elif verdict not in _VALID_VERDICTS:
-        _add_problem(run.problems, f"invalid runner verdict: {verdict!r}")
+    run.verdict_ref = run.ref("source/l1-results.json")
     reason = envelope.get("reason")
     if isinstance(reason, str):
         run.reason = reason
@@ -748,7 +970,7 @@ def _load_runner_run(run: _Run) -> None:
     run.artifacts = dict(artifacts) if isinstance(artifacts, Mapping) else {}
     if not isinstance(artifacts, Mapping):
         _add_problem(run.problems, "missing runner observation field: artifacts")
-    _check_identity_fields(run)
+    run.identity_verified = _check_identity_fields(run)
 
     source_hashes = _source_file_map(run, envelope)
     release_path = run.path / "source/release-manifest.json"
@@ -763,10 +985,11 @@ def _load_runner_run(run: _Run) -> None:
             _add_problem(run.problems, "invalid release manifest schema_version")
         if source_hashes.get("source/release-manifest.json") != release_digest:
             _add_problem(run.problems, "source hash mismatch: source/release-manifest.json")
-        _release_identity(run, release, release_digest)
+        run.identity_verified = _release_identity(run, release, release_digest) and run.identity_verified
 
     _load_runner_invariants(run, envelope)
     _parse_runner_calls(run, envelope)
+    _load_runner_case_results(run, envelope)
     _runner_completion(run, envelope)
 
     if run.l1_document is not None:
@@ -804,10 +1027,13 @@ def _load_runner_run(run: _Run) -> None:
 def _load_run(case_id: str, path: Path, report_root: Path) -> _Run:
     runner = _runner_for_path(path)
     run = _Run(case_id=case_id, runner=runner, path=path, report_root=report_root)
-    if runner == "bridge":
-        _load_bridge_run(run)
-    else:
-        _load_runner_run(run)
+    try:
+        if runner == "bridge":
+            _load_bridge_run(run)
+        else:
+            _load_runner_run(run)
+    except Exception as exc:
+        _add_problem(run.problems, f"invalid report data: {type(exc).__name__}")
     return run
 
 
@@ -910,12 +1136,17 @@ def _normalize_tree(value: Any, *, volatile: frozenset[str], g1: bool, roots: Se
             if exception_message and key == "message":
                 continue
             new_key = key
-            if isinstance(key, str):
+            preserve_holder_subtree = key == _B11_FOREIGN_HOLDERS_KEY
+            if isinstance(key, str) and not preserve_holder_subtree:
                 for root in roots:
                     new_key = _root_substitute(new_key, root, placeholder)
-            grouped.setdefault(new_key, []).append(_normalize_tree(
-                child, volatile=volatile, g1=g1, roots=roots, placeholder=placeholder,
-            ))
+            if preserve_holder_subtree:
+                normalized_child = _copy_json(child)
+            else:
+                normalized_child = _normalize_tree(
+                    child, volatile=volatile, g1=g1, roots=roots, placeholder=placeholder,
+                )
+            grouped.setdefault(new_key, []).append(normalized_child)
         return {
             key: values[0] if len(values) == 1 else sorted(values, key=_canonical)
             for key, values in grouped.items()
@@ -1087,38 +1318,98 @@ def _failure_reason(run: _Run) -> str:
     return ""
 
 
-def _collect_failures_and_safety(runs_by_side: Mapping[str, Mapping[str, Sequence[_Run]]]) -> tuple[list[dict[str, str]], list[str]]:
-    failures: list[dict[str, str]] = []
+def _collect_failures_and_safety(
+    runs_by_side: Mapping[str, Mapping[str, Sequence[_Run]]],
+    required_case_ids: set[str],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    baseline_failures: list[dict[str, str]] = []
+    product_failures: list[dict[str, str]] = []
+    unverified_failures: list[dict[str, Any]] = []
     safety: list[str] = []
     for side, label in (("a", "A"), ("b", "B")):
         for case_id, runs in sorted(runs_by_side[side].items()):
             for run in runs:
-                if run.runner == "bridge":
-                    if run.verdict == "FAIL" and run.verdict_ref:
-                        failures.append({
-                            "side": side,
-                            "case": case_id,
-                            "source_ref": run.verdict_ref,
-                            "reason": _failure_reason(run),
-                        })
-                elif _l1_failed_for_case(run):
-                    source_ref = run.ref("source/l1-results.json")
-                    failures.append({
+                failure_ref = run.failure_ref
+                failure_reason = run.failure_reason or _failure_reason(run)
+                if failure_ref:
+                    row = {
                         "side": side,
                         "case": case_id,
-                        "source_ref": source_ref,
-                        "reason": _failure_reason(run),
-                    })
-                    if run.verdict != "FAIL":
-                        _add_problem(run.problems, "runner result mismatch: verdict")
-                elif run.verdict == "FAIL":
-                    _add_problem(run.problems, "runner FAIL lacks per-case failed result: source/l1-results.json")
-                for invariant in run.invariants:
-                    if invariant.get("result") == "FAIL":
-                        token = f"{label}:{case_id}:{invariant.get('id')}"
+                        "source_ref": failure_ref,
+                        "reason": failure_reason,
+                    }
+                    if run.failure_verified:
+                        if side == "a":
+                            baseline_failures.append(row)
+                        elif case_id in required_case_ids:
+                            product_failures.append(row)
+                        else:
+                            unverified_failures.append({
+                                **row,
+                                "problems": ["FAIL case is not in required_case_ids"],
+                            })
+                    else:
+                        problems = list(dict.fromkeys(run.problems))
+                        unverified_failures.append({**row, "problems": problems or ["failure source identity unverified"]})
+
+                if run.runner != "bridge" and run.l1_document is not None:
+                    raw_results = run.l1_document.get("results")
+                    if isinstance(raw_results, list):
+                        for index, item in enumerate(raw_results):
+                            if not isinstance(item, Mapping) or item.get("outcome") != "failed":
+                                continue
+                            source_ref = run.ref("source/l1-results.json", f"#results[{index}]")
+                            if source_ref == run.failure_ref:
+                                continue
+                            unverified_failures.append({
+                                "side": side,
+                                "case": case_id,
+                                "source_ref": source_ref,
+                                "reason": "原始 runner FAIL 尚未核實對應此 required case",
+                                "problems": list(dict.fromkeys(run.problems)) or ["case mapping unverified"],
+                            })
+                    envelope_path = run.path / "runner-observation.json"
+                    envelope = _json_document(envelope_path, run, "runner-observation.json", required=False)
+                    if (
+                        not (run.failure_ref and run.failure_verified)
+                        and isinstance(envelope, Mapping)
+                        and envelope.get("verdict") == "FAIL"
+                        and run.verdict != "FAIL"
+                    ):
+                        unverified_failures.append({
+                            "side": side,
+                            "case": case_id,
+                            "source_ref": run.ref("runner-observation.json"),
+                            "reason": "runner envelope FAIL 未對應到原始 required-case FAIL",
+                            "problems": list(dict.fromkeys(run.problems)) or ["raw case result unavailable"],
+                        })
+
+                for invariant_failure in run.invariant_failures:
+                    verified = run.identity_verified and run.case_identity_verified
+                    if run.runner != "bridge":
+                        verified = verified and "source/invariant-evidence.json" in run.verified_sources
+                    token = f"{label}:{case_id}:{invariant_failure['id']}"
+                    if verified:
                         if token not in safety:
                             safety.append(token)
-    return failures, safety
+                    else:
+                        _add_problem(run.problems, "invariant FAIL source identity unverified")
+                        unverified_failures.append({
+                            "side": side,
+                            "case": case_id,
+                            "source_ref": invariant_failure["source_ref"],
+                            "reason": invariant_failure["reason"],
+                            "problems": list(dict.fromkeys(run.problems)),
+                        })
+                for invariant_failure in run.unverified_invariant_failures:
+                    unverified_failures.append({
+                        "side": side,
+                        "case": case_id,
+                        "source_ref": invariant_failure["source_ref"],
+                        "reason": invariant_failure["reason"],
+                        "problems": list(dict.fromkeys(run.problems)) or ["invariant source mismatch"],
+                    })
+    return baseline_failures, product_failures, unverified_failures, safety
 
 
 def _run_pair_key(run: _Run) -> tuple[str, str]:
@@ -1264,14 +1555,6 @@ def diff_l15(
             if not runs_by_case.get(case_id):
                 _add_problem(problems[side], f"missing required case: {case_id}")
 
-    product_failures, safety_violations = _collect_failures_and_safety({"a": runs_a, "b": runs_b})
-
-    for side, runs_by_case in (("a", runs_a), ("b", runs_b)):
-        for case_runs in runs_by_case.values():
-            for run in case_runs:
-                for issue in run.problems:
-                    _add_problem(problems[side], issue)
-
     differences: list[dict[str, Any]] = []
     for case_id in sorted(set(runs_a) | set(runs_b)):
         a_runs = runs_a.get(case_id, [])
@@ -1280,9 +1563,22 @@ def diff_l15(
         for run_a, run_b in pairs:
             cli_a = _nested(run_a.artifacts, "cli", "sha256")
             cli_b = _nested(run_b.artifacts, "cli", "sha256")
-            if _nonempty_string(cli_a) and _nonempty_string(cli_b) and cli_a != cli_b:
+            if _valid_sha256(cli_a) and _valid_sha256(cli_b) and cli_a != cli_b:
                 _add_problem(problems["b"], "artifact identity mismatch: artifacts.cli.sha256")
+                _add_problem(run_b.problems, "artifact identity mismatch: artifacts.cli.sha256")
+                run_b.identity_verified = False
+                run_b.failure_verified = False
             differences.extend(_compare_run_pair(run_a, run_b, rules=rules, case_changes=case_changes))
+
+    baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
+        {"a": runs_a, "b": runs_b}, required_case_ids,
+    )
+
+    for side, runs_by_case in (("a", runs_a), ("b", runs_b)):
+        for case_runs in runs_by_case.values():
+            for run in case_runs:
+                for issue in run.problems:
+                    _add_problem(problems[side], issue)
 
     integrity = {"a": not problems["a"], "b": not problems["b"]}
     a_cases = {
@@ -1309,7 +1605,22 @@ def diff_l15(
         "differences": differences,
         "a_cases": a_cases,
         "b_cases": b_cases,
+        "baseline_failures": baseline_failures,
+        "unverified_failures": unverified_failures,
         "product_failures": product_failures,
+        "case_maps": [
+            {
+                "side": side,
+                "case": case_id,
+                "runner": run.runner,
+                "path": run.case_map["path"],
+                "sha256": run.case_map["sha256"],
+            }
+            for side, runs_by_case in (("a", runs_a), ("b", runs_b))
+            for case_id, case_runs in sorted(runs_by_case.items())
+            for run in case_runs
+            if run.case_map is not None
+        ],
     }
 
 
@@ -1319,11 +1630,15 @@ def safety_tokens(report_dir: Path, label: str) -> list[str]:
     side_runs = _load_side(Path(report_dir).resolve())
     for case_id, runs in sorted(side_runs.items()):
         for run in runs:
-            for invariant in run.invariants:
-                if invariant.get("result") == "FAIL":
-                    token = f"{label}:{case_id}:{invariant.get('id')}"
-                    if token not in tokens:
-                        tokens.append(token)
+            verified = run.identity_verified and run.case_identity_verified
+            if run.runner != "bridge":
+                verified = verified and "source/invariant-evidence.json" in run.verified_sources
+            if not verified:
+                continue
+            for invariant in run.invariant_failures:
+                token = f"{label}:{case_id}:{invariant['id']}"
+                if token not in tokens:
+                    tokens.append(token)
     return tokens
 
 

@@ -14,16 +14,23 @@
    ``bridge-manifest.json``、``wire.ndjson``、``cli.ndjson``、
    ``daemon.log`` 及 ``wal/``。manifest 的 artifact 身分讀
    ``artifacts.cli.sha256``、``artifacts.daemon.implementation``、
-   ``artifacts.daemon.sha256``、Python daemon 的
-   ``artifacts.daemon.package_tree_sha256``（正規化為 ``tree_sha256``）及
-   ``artifacts.release_manifest_sha256``；daemon 的 ``tree_sha256`` 是 T7B
-   讀取視圖欄名，原始 manifest 位元組不改寫。comparison 的 verdict 必須是
+   ``artifacts.daemon.sha256``、``artifacts.daemon.package_tree_sha256`` 及
+   ``artifacts.release_manifest_sha256``。Python daemon 必須有 package tree
+   SHA，``sha256`` 可為 null；Rust daemon 必須有 executable SHA，
+   ``package_tree_sha256`` 可為 null。未適用欄位不要求非空。daemon 的
+   ``tree_sha256`` 是 T7B 讀取視圖欄名，原始 manifest 位元組不改寫。
+   manifest 與 comparison 的 ``case_id``／``run_id`` 必須一致，``case_id``
+   必須與目錄名稱一致；目錄 ``run_index`` 是 A/B 配對依據。comparison 的
+   verdict 必須是
    ``PASS`` 或 ``FAIL``；``INSUFFICIENT_EVIDENCE`` 不能成為完整證據。
    P2 comparison schema 的 invariant 欄位實際叫 ``verdict``，T7B 以此讀取；
    若其他 runner 原始格式使用 ``result``，adapter 只在讀取視圖中映射，不產生
    或偽造 ``comparison.json``。``cli.ndjson`` 每筆保留 argv、整數 rc、stdout；
-   第 i 筆以 rc 及 stdout JSON 進行比較。wire、CLI、daemon log、WAL 等原始檔
-   保持原位元組與 P2 manifest／comparison 所記的 hash。
+   第 i 筆以 rc 及 stdout JSON 進行比較。P2 manifest 必須宣告 ``wire``、
+   ``control``、``correlation``、``dut_stderr``、``cli_log``、``wal_dir``；必要
+   路徑分別對應實際檔案／目錄，檔案 SHA 必須與實際位元組相符。comparison 的
+   ``integrity.wire_sha256`` 與 ``wire_sha256_expected`` 都必須等於實際
+   ``wire.ndjson`` SHA。原始檔保持原位元組。
 
 2. 其他 runner 的 run 目錄為
    ``<report-dir>/<case_id>/<runner>/<run_index>/``，其中 runner 僅為
@@ -34,15 +41,31 @@
    envelope 必含 ``case_id``、``runner``、``run_index``、
    ``completion: {status: "completed", finished: true, exit_code: <int>}``、
    ``artifacts``、``verdict``、``reason``、``invariants``、
-   ``cli_observations``、``source_files``。artifact 身分欄位與 bridge
+   ``cli_observations``、``source_files``、
+   ``case_results: [{nodeid, source_ref}]``、``case_map: {path, sha256}``。
+   ``case_results.nodeid`` 必須與 ``source/l1-results.json`` 結果中的 nodeid
+   完全相等，不得用子字串比對；``source_ref`` 格式為
+   ``<case>/<runner>/<run_index>/source/l1-results.json#results[<index>]``，
+   定位該原始結果列；該列 nodeid 必須列在原始 ``collected`` 且完全相等。
+   ``case_map.path`` 是相對 POSIX 路徑，``sha256`` 是 64 位小寫十六進位字串；
+   T7B 僅驗欄位格式並於輸出 ``case_maps`` 保留來源，
+   不判斷它是否等於凍結的權威映射。哪個 nodeid 代表哪個 required case，屬
+   T5B 與 T6 責任，列為 SPEC-GAP。artifact 身分欄位與 bridge
    manifest 對齊：``artifacts.cli.sha256``、
    ``artifacts.daemon.implementation``、``artifacts.daemon.sha256``、
-   ``artifacts.daemon.tree_sha256``、``artifacts.release_manifest_sha256``。
+   ``artifacts.daemon.tree_sha256``、``artifacts.release_manifest_sha256``；
+   Python daemon 驗 ``tree_sha256`` 並允許 ``sha256: null``，Rust daemon 驗
+   ``sha256`` 並允許 ``tree_sha256: null``。
    依 §0.4 契約 3，A／B 的 ``artifacts.cli.sha256`` 必須相等；不符使用
    ``artifact identity mismatch: artifacts.cli.sha256`` 並使完整性失敗。daemon
    implementation／hash 屬當側 release artifact，兩側不要求相等。
-   envelope 內 ``verdict`` 映射到 comparison.verdict；每個 invariant 的
-   ``{id, result}`` 映射到 comparison.invariants 的 ``{id, verdict}``。
+   envelope ``verdict`` 必須和 ``case_results`` 原始結果推得的判定一致：任一
+   mapped outcome 為 ``failed`` 即 FAIL，``source_ref`` 指向該列；全部 mapped
+   outcome 都是 ``passed`` 才是 PASS。空映射、缺結果、未執行、``skipped``、
+   ``error`` 或其他 outcome 都是完整性問題。兩者不一致時以原始結果為準，並記
+   完整性問題。每個 invariant 的 ``{id, result}`` 映射到
+   comparison.invariants 的 ``{id, verdict}``；安全結果另從原始
+   ``source/invariant-evidence.json`` 獨立載入。
    ``cli_observations`` 依原呼叫順序列出 ``{argv, rc, stdout, source_ref}``；
    每筆 rc 必須是整數、stdout 必須是字串，不存在呼叫記錄不得補空字串。每個
    ``source/release-manifest.json``（現行 release manifest、``schema_version: 1``）
@@ -89,10 +112,18 @@
    <relative_path>``；缺 CLI 記錄、rc 或 stdout 為
    ``missing required observation: cli_observations[<i>].<field>``（例如 argv、rc、stdout）；缺 CLI／daemon
    身分欄位或必要身分值為 ``missing artifact identity: <dotted_field>``；
-   envelope 的 status 非 ``completed`` 或 finished 非 true 為
-   ``runner incomplete: <runner>``。已完成 runner 的非零 ``exit_code`` 只作執行
-   狀態來源，不能單獨推導產品 FAIL；只有有逐案原始 FAIL 來源的 verdict 才進
-   ``product_failures``。bridge 缺
+   envelope 或原始 runner 未完成、envelope／原始退出碼非零或不一致、必要 case
+   結果非 passed/failed、缺結果或未執行，都記入 ``integrity_problems`` 並令該側
+   ``integrity=false``；envelope 缺漏時仍檢查原始 L1 報告的完成狀態與退出碼。
+   退出碼不能單獨推導產品 FAIL。輸出新增
+   ``baseline_failures``（A 側一般 FAIL）、``unverified_failures``（來源／身分／
+   案例未核實的 FAIL 線索，另含 ``problems``）、``product_failures``（只含 B 側
+   身分與來源已核實且對應 required case 的一般 FAIL）。安全 invariant FAIL 兩側
+   都保留在 ``safety_violations``；來源未核實者另記於 ``unverified_failures`` 並
+   令該側 integrity=false。只有對應 ``required_case_ids`` 的 B 側一般 FAIL 才列入
+   ``product_failures``；A 側一般 FAIL 列入 ``baseline_failures``。任何可解析但尚未
+   核實的 FAIL 線索都保留在 ``unverified_failures``。資料欄位型別錯誤轉成該 run
+   的完整性診斷並繼續掃描；只有呼叫端參數無效才回報 HarnessError。bridge 缺
    ``manifest.json``、``comparison.json``、``bridge-manifest.json``、
    ``wire.ndjson``、``cli.ndjson``、``daemon.log`` 或 ``wal/``，逐項使用
    ``missing source file: <relative_path>``；P2 manifest 宣告的任一檔案 SHA 不符
@@ -106,22 +137,24 @@
    當成兩側相同。
 
 4. ``scope: "rust_only"`` 且 ``ab_participation: "absolute_only"`` 的 BC
-   不作 A/B 差分；依 B 側絕對驗收 verdict 判定，A 側不同不能產生 A/B difference，
-   但 B 側 FAIL 仍須進 ``product_failures`` 並留可核對 source_ref。現行依據是
+   仍由 T7B 保留差異與 ``registered_change``；T7 依 ``absolute_only`` 處理，
+   B 側 FAIL 仍須保留。現行依據是
    ``contracts/behavior_changes.yaml`` 的 ``changes[]`` 欄位
    ``scope``、``ab_participation``、``case_ids``；例如 BC-06 為 rust_only /
    absolute_only，且列出 ``bc06-shutdown-self-test-flush``。
 
 5. 產品／安全 FAIL 先收集，再彙整 integrity；不得因缺案或 runner 未完成提前返回。
-   ``product_failures`` 每筆為 ``{side, case, source_ref, reason}``，source_ref
-   相對該側 report-dir 且必須指向原始可解析 FAIL 來源。安全 invariant FAIL
-   另外保留為 ``<A|B>:<case>:<invariant_id>``；安全 FAIL 不受 B11 欄位正規化
+   ``baseline_failures`` 與 ``product_failures`` 每筆為
+   ``{side, case, source_ref, reason}``；``unverified_failures`` 每筆另含
+   ``problems``。來源引用相對該側 report-dir 且必須指向原始可解析 FAIL 來源。
+   安全 invariant FAIL 另外保留為 ``<A|B>:<case>:<invariant_id>``；安全 FAIL 不受 B11 欄位正規化
    影響。每筆差異必含 ``source_refs: {a, b}``，分別為兩側觀測的相對來源引用，
    且可定位原始觀測檔／line；不以 report 根絕對路徑作 provenance。
 
 6. B11 暫定觀測範圍：候選規則只允許忽略邏輯命令為 ``daemon status`` 或
    ``health.status``、CLI ``rc == 0`` 且 stdout JSON ``ok is true`` 的回應中最上層
-   ``foreign_holders`` 掃描快照。命令不符、非成功回應、巢狀同名欄位、危險 holder、
+   ``foreign_holders`` 掃描快照。通用 volatile key 刪除與 instance-root 替換不進入
+   ``foreign_holders`` 子樹。命令不符、非成功回應、巢狀同名欄位、危險 holder、
    ``holder_unknown`` 及任何安全 invariant 都必須保留。本 fixture 的允許正例限於
    ``foreign_holders`` map 只含與回應 ``pid`` 相同的 daemon 自身 PID；含外來 PID
    或 unknown 欄位時，即使位於成功 status 回應最上層也須保留差異。將整個欄位
@@ -171,8 +204,8 @@ def _artifact_identity(side: str) -> dict[str, Any]:
     is_a = side.lower() == "a"
     daemon: dict[str, Any] = {
         "implementation": "python" if is_a else "rust",
-        "sha256": "2" * 64 if is_a else "3" * 64,
-        "tree_sha256": "4" * 64 if is_a else "5" * 64,
+        "sha256": None if is_a else "3" * 64,
+        "tree_sha256": "4" * 64 if is_a else None,
     }
     return {
         "cli": {"sha256": "1" * 64},
@@ -280,6 +313,7 @@ def _source_specs(
     complete: bool,
     verdict: str,
     invariants: Iterable[Mapping[str, Any]],
+    source_invariants: Iterable[Mapping[str, Any]] | None,
     release_manifest: bytes,
     runner_exit_code: int | None,
 ) -> dict[str, bytes]:
@@ -321,7 +355,7 @@ def _source_specs(
         "source/l1-results.json": _json_bytes(l1_report),
         "source/invariant-evidence.json": _json_bytes({
             "schema_version": "stage3-invariant-evidence.v1",
-            "invariants": [dict(item) for item in invariants],
+            "invariants": [dict(item) for item in (invariants if source_invariants is None else source_invariants)],
         }),
     }
     if runner in {"contract-blackbox", "windows-native"}:
@@ -373,6 +407,10 @@ def write_run(
     identity_missing: Iterable[str] = (),
     artifact_overrides: Mapping[str, Any] | None = None,
     observations: Iterable[Mapping[str, Any]] | None = None,
+    l1_results: Iterable[Mapping[str, Any]] | None = None,
+    case_results: Iterable[Mapping[str, str]] | None = None,
+    case_map: Mapping[str, Any] | None = None,
+    source_invariants: Iterable[Mapping[str, Any]] | None = None,
 ) -> Path:
     """在 report_dir 建立一筆 run；missing 使用 run 內相對路徑。"""
     if runner not in RUNNERS:
@@ -520,18 +558,30 @@ def write_run(
         complete=complete,
         verdict=verdict,
         invariants=normalized_invariants,
+        source_invariants=source_invariants,
         release_manifest=release_manifest,
         runner_exit_code=runner_exit_code,
     )
+    case_nodeids: list[str] = []
     if runner in {"contract-blackbox", "windows-native"}:
         l1 = json.loads(source_specs["source/l1-results.json"].decode("utf-8"))
-        l1["collected"] = [case_id]
-        l1["results"][0]["nodeid"] = case_id
+        nodeid = "tests/contract_blackbox/test_l15_observation.py::test_required_observation"
+        l1["collected"] = [nodeid]
+        l1["results"][0]["nodeid"] = nodeid
+        case_nodeids = [nodeid]
         source_specs["source/l1-results.json"] = _json_bytes(l1)
     else:
         l1 = json.loads(source_specs["source/l1-results.json"].decode("utf-8"))
-        l1["collected"] = [f"cargo:fixture::{case_id}::case"]
-        l1["results"][0]["nodeid"] = f"cargo:fixture::{case_id}::case"
+        nodeid = "serialwrap::tests::stage3::required_observation"
+        l1["collected"] = [nodeid]
+        l1["results"][0]["nodeid"] = nodeid
+        case_nodeids = [nodeid]
+        source_specs["source/l1-results.json"] = _json_bytes(l1)
+    if l1_results is not None:
+        l1 = json.loads(source_specs["source/l1-results.json"].decode("utf-8"))
+        l1["results"] = [dict(row) for row in l1_results]
+        case_nodeids = [row["nodeid"] for row in l1["results"] if isinstance(row.get("nodeid"), str)]
+        l1["collected"] = list(case_nodeids)
         source_specs["source/l1-results.json"] = _json_bytes(l1)
     raw_call_rows = [
         {
@@ -548,6 +598,19 @@ def write_run(
             _write_bytes(run_dir / rel, data)
 
     source_rows = _source_rows(run_dir, source_specs)
+    if case_results is None:
+        normalized_case_results = [
+            {
+                "nodeid": nodeid,
+                "source_ref": f"{case_id}/{runner}/{run_index}/source/l1-results.json#results[{index}]",
+            }
+            for index, nodeid in enumerate(case_nodeids)
+        ]
+    else:
+        normalized_case_results = [dict(row) for row in case_results]
+    case_map_value = {"path": "tests/acceptance/cases.yaml", "sha256": "e" * 64}
+    if case_map is not None:
+        case_map_value = dict(case_map)
     envelope_observations = [
         {
             "argv": list(row.get("argv", ())),
@@ -573,6 +636,8 @@ def write_run(
         "invariants": normalized_invariants,
         "cli_observations": envelope_observations,
         "source_files": source_rows,
+        "case_results": normalized_case_results,
+        "case_map": case_map_value,
     }
     _write_json(run_dir / "runner-observation.json", envelope)
     return run_dir
