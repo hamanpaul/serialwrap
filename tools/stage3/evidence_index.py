@@ -1662,8 +1662,7 @@ def _platform_status(
         target_errors.append(str(exc))
     if item.stage == "3":
         current_round = index.get("current_candidate_round_id")
-        is_od09 = item.item_id == "S3-OD09-ALL-FROZEN"
-        if not is_od09 and target.get("candidate_round_id") != current_round:
+        if target.get("candidate_round_id") != current_round:
             target_errors.append("target is not in the current candidate round")
 
     required_lock_doc: Mapping[str, Any] | None = None
@@ -1709,8 +1708,7 @@ def _platform_status(
         if item.required_case_set is not None and entry.get("case_list_sha256") != target.get("case_list_sha256"):
             reasons.append(f"stale case_list_sha256: {entry_id}")
         if item.stage == "3":
-            is_od09 = item.item_id == "S3-OD09-ALL-FROZEN"
-            if not is_od09 and entry.get("candidate_round_id") != target.get("candidate_round_id"):
+            if entry.get("candidate_round_id") != target.get("candidate_round_id"):
                 reasons.append(f"stale candidate_round_id: {entry_id}")
             if entry.get("archive_sha256") != target.get("archive_sha256"):
                 reasons.append(f"stale archive_sha256: {entry_id}")
@@ -1828,6 +1826,20 @@ def _item_status_full(
     for platform, status, reasons, _ in results:
         if status == "FAIL":
             return "FAIL", [f"{platform}: {reason}" for reason in reasons], []
+    if item.stage == "3" and item.evidence_kind != "od09-freeze":
+        # T1 candidate_context 尚無原始報告引用欄位，無法證明附件屬於該次執行。
+        # 此限制同樣套用到 reference；stage_status 仍只用 required 項判定完成性。
+        reasons = ["raw report binding unverifiable"]
+        reasons.extend(
+            f"{platform}: {reason}"
+            for platform, _, platform_reasons, _ in results
+            for reason in platform_reasons
+        )
+        if _bop919_pending(item):
+            pending = f"BO-P9-19 pending: no owner-approved public verification for {item.evidence_kind}"
+            if not any("BO-P9-19 pending" in reason for reason in reasons):
+                reasons.append(pending)
+        return "STALE", reasons, []
     if all(status == "SATISFIED" for _, status, _, _ in results):
         return "SATISFIED", [], [entry for _, _, _, entries in results for entry in entries]
     priority = {"HASH_MISMATCH": 5, "STALE": 4, "NO_TARGET": 3, "MISSING": 2, "SATISFIED": 1}
@@ -1935,36 +1947,43 @@ def _source_inventory_obligations(
     *,
     evidence_root: Path,
 ) -> tuple[dict[str, dict[str, Any]], set[str], list[str]]:
-    """只接受來源快照內可機器解析的義務 key／平台／案例／證據 kind。"""
+    """逐一要求 scope 宣告的每份來源提供非空、可核對的義務鍵與範圍。"""
     obligations: dict[str, dict[str, Any]] = {}
     inventory_sources: set[str] = set()
     errors: list[str] = []
     for source_id, source in sources_by_id.items():
         snapshot = source.get("snapshot")
         if not isinstance(snapshot, Mapping):
+            errors.append(f"SPEC-GAP: source {source_id} has no machine-readable obligation snapshot")
             continue
         raw, read_error = _read_evidence_file(evidence_root, snapshot.get("path"))
         if read_error or raw is None:
+            errors.append(f"SPEC-GAP: source {source_id} cannot be parsed for obligation keys: {read_error}")
             continue
         try:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError):
+            errors.append(f"SPEC-GAP: source {source_id} is not machine-readable JSON with obligation keys")
             continue
         if not isinstance(document, dict) or "obligations" not in document:
+            errors.append(f"SPEC-GAP: source {source_id} has no machine-readable obligation keys")
             continue
         rows = document.get("obligations")
         if not isinstance(rows, list):
-            errors.append(f"source inventory {source_id} obligations must be an array")
+            errors.append(f"SPEC-GAP: source {source_id} obligations must be a machine-readable array")
+            continue
+        if not rows:
+            errors.append(f"SPEC-GAP: source {source_id} has an empty obligation inventory")
             continue
         inventory_sources.add(source_id)
         for number, row in enumerate(rows):
             fields = {"key", "platform", "case_ids", "evidence_kinds"}
             if not isinstance(row, dict) or set(row) != fields:
-                errors.append(f"source inventory {source_id} obligations[{number}] lacks machine-readable keys")
+                errors.append(f"SPEC-GAP: source {source_id} obligations[{number}] lacks machine-readable keys")
                 continue
             key = row.get("key")
-            if not isinstance(key, str) or not key or key in obligations:
-                errors.append(f"source inventory has an empty or duplicate obligation key: {key!r}")
+            if not isinstance(key, str) or not key:
+                errors.append(f"SPEC-GAP: source {source_id} has an empty obligation key")
                 continue
             if (
                 row.get("platform") not in PLATFORMS
@@ -1977,11 +1996,22 @@ def _source_inventory_obligations(
                 or any(not isinstance(kind, str) or not kind for kind in row["evidence_kinds"])
                 or len(set(row["evidence_kinds"])) != len(row["evidence_kinds"])
             ):
-                errors.append(f"source inventory obligation {key} has an invalid platform, case set, or evidence kind")
+                errors.append(f"SPEC-GAP: source {source_id} obligation {key} has an invalid platform, case set, or evidence kind")
                 continue
-            obligations[key] = {**row, "source_id": source_id}
+            existing = obligations.get(key)
+            if existing is not None:
+                if source_id in existing["source_ids"]:
+                    errors.append(f"SPEC-GAP: source {source_id} repeats obligation key {key}")
+                    continue
+                same_scope = all(existing.get(field) == row.get(field) for field in ("platform", "case_ids", "evidence_kinds"))
+                if not same_scope:
+                    errors.append(f"SPEC-GAP: source obligation {key} has conflicting declared scopes")
+                    continue
+                existing["source_ids"].append(source_id)
+            else:
+                obligations[key] = {**row, "source_ids": [source_id]}
     if not inventory_sources:
-        errors.append("SPEC-GAP: source inventory has no machine-readable obligation key format")
+        errors.append("SPEC-GAP: no declared source has a non-empty machine-readable obligation inventory")
     return obligations, inventory_sources, errors
 
 
@@ -2019,28 +2049,35 @@ def validate_legacy_scope(
     for number, source in enumerate(scope["sources"]):
         if not isinstance(source, dict) or set(source) != {"source_id", "version", "snapshot"}:
             errors.append(f"legacy source row {number} has invalid fields")
+            errors.append(f"SPEC-GAP: source row {number} cannot be mapped to machine-readable obligation keys")
             continue
         source_id = source.get("source_id")
         snapshot = source.get("snapshot")
         if not isinstance(source_id, str) or not source_id or source_id in sources_by_id:
             errors.append(f"legacy source row {number} has an empty or duplicate source_id")
+            errors.append(f"SPEC-GAP: source row {number} cannot be uniquely mapped to obligation keys")
             continue
         if not isinstance(source.get("version"), str) or not source["version"]:
             errors.append(f"legacy source {source_id} lacks a version")
+            errors.append(f"SPEC-GAP: source {source_id} declaration cannot be fully verified")
             continue
         if not isinstance(snapshot, dict) or set(snapshot) != {"path", "sha256"}:
             errors.append(f"legacy source {source_id} snapshot pointer is invalid")
+            errors.append(f"SPEC-GAP: source {source_id} has no parseable obligation snapshot")
             continue
         if not _relative_public_path(snapshot.get("path")) or not isinstance(snapshot.get("sha256"), str) or not _SHA256.fullmatch(snapshot["sha256"]):
             errors.append(f"legacy source {source_id} snapshot path or SHA is invalid")
+            errors.append(f"SPEC-GAP: source {source_id} has no verifiable obligation snapshot")
             continue
         snapshot_bytes, snapshot_error = _read_evidence_file(evidence_root, snapshot["path"])
         if snapshot_error or snapshot_bytes is None:
             errors.append(f"legacy source {source_id} snapshot {snapshot_error}")
+            errors.append(f"SPEC-GAP: source {source_id} cannot be parsed for obligation keys")
             continue
         actual_hash = _sha256_bytes(snapshot_bytes)
         if actual_hash != snapshot["sha256"]:
             errors.append(f"legacy source {source_id} snapshot hash mismatch")
+            errors.append(f"SPEC-GAP: source {source_id} obligation snapshot bytes are not verified")
         sources_by_id[source_id] = source
         source_hashes.append({"source_id": source_id, "sha256": snapshot["sha256"]})
 
@@ -2150,16 +2187,18 @@ def validate_legacy_scope(
         for key, row in obligations_by_key.items()
         if row.get("stage") == "legacy" and row.get("item_id") not in catalog
     }
-    if set(scoped_non_catalog) != set(source_inventory):
-        missing = sorted(set(source_inventory) - set(scoped_non_catalog))
-        extra = sorted(set(scoped_non_catalog) - set(source_inventory))
+    source_non_catalog_keys = set(source_inventory) - set(expected)
+    if set(scoped_non_catalog) != source_non_catalog_keys:
+        missing = sorted(source_non_catalog_keys - set(scoped_non_catalog))
+        extra = sorted(set(scoped_non_catalog) - source_non_catalog_keys)
         if missing:
             errors.append("legacy scope omits source inventory obligations: " + ", ".join(missing))
         if extra:
             errors.append("legacy scope contains obligations absent from source inventory: " + ", ".join(extra))
     for key, source_row in source_inventory.items():
-        scope_row = scoped_non_catalog.get(key)
+        scope_row = obligations_by_key.get(key)
         if scope_row is None:
+            errors.append(f"legacy scope omits source inventory obligation: {key}")
             continue
         if (
             scope_row.get("platform") != source_row.get("platform")
@@ -2167,7 +2206,8 @@ def validate_legacy_scope(
             or scope_row["required_scope"].get("case_ids") != source_row.get("case_ids")
             or not isinstance(scope_row.get("allowed_evidence"), dict)
             or scope_row["allowed_evidence"].get("kinds") != source_row.get("evidence_kinds")
-            or source_row.get("source_id") not in scope_row.get("source_refs", [])
+            or not isinstance(scope_row.get("source_refs"), list)
+            or not set(source_row.get("source_ids", [])).issubset(set(scope_row["source_refs"]))
         ):
             errors.append(f"legacy obligation {key} does not cover its source inventory scope")
     for key, scope_row in scoped_non_catalog.items():
@@ -2221,7 +2261,12 @@ def _resolution_files_valid(files: Any, evidence_root: Path) -> tuple[bool, str 
 def _legacy_formal_failures(
     index: Mapping[str, Any], catalog: Mapping[str, ExitItem],
 ) -> list[tuple[str, Mapping[str, Any]]]:
-    """先找出可連到目前或歷史 target 的 Stage 0～2.4 正式 FAIL。"""
+    """先找出適用目前 Stage 0～2.4 target artifact 的正式 FAIL。
+
+    target_history 保留已替換 artifact 的失敗紀錄，但歷史 artifact 不再是目前
+    legacy gate 的適用對象；revision 變更不改 artifact_id，因此同 artifact FAIL
+    仍會命中目前 target。
+    """
     target_artifacts: set[tuple[str, str, str]] = set()
     for stage, platforms in index.get("stage_targets", {}).items():
         if not isinstance(platforms, Mapping):
@@ -2229,17 +2274,6 @@ def _legacy_formal_failures(
         for platform, target in platforms.items():
             if isinstance(target, Mapping) and isinstance(target.get("artifact_id"), str):
                 target_artifacts.add((str(stage), str(platform), target["artifact_id"]))
-    for history in index.get("target_history", []):
-        if not isinstance(history, Mapping):
-            continue
-        target = history.get("target", history)
-        if not isinstance(target, Mapping):
-            continue
-        stage, platform = history.get("stage", target.get("stage")), history.get("platform", target.get("platform"))
-        artifact = target.get("artifact_id")
-        if isinstance(stage, str) and isinstance(platform, str) and isinstance(artifact, str):
-            target_artifacts.add((stage, platform, artifact))
-
     failures: list[tuple[str, Mapping[str, Any]]] = []
     for row in index.get("entries", []):
         if not isinstance(row, Mapping) or row.get("result") != "FAIL":

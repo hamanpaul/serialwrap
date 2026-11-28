@@ -163,21 +163,18 @@ def _write_legacy_scope(root: Path, index_path: Path, catalog: dict[str, Any]) -
     source_hashes: list[dict[str, str]] = []
     for number, source_id in enumerate(source_ids):
         source_path = evidence_root / "legacy-sources" / f"source-{number:03d}.json"
-        if source_id == "fixture:legacy-source-inventory":
-            snapshot_doc = {
-                "obligations": [
-                    {
-                        "key": row["key"],
-                        "platform": row["platform"],
-                        "case_ids": row["required_scope"]["case_ids"],
-                        "evidence_kinds": row["allowed_evidence"]["kinds"],
-                    }
-                    for row in obligations
-                    if row["stage"] == "legacy"
-                ]
-            }
-        else:
-            snapshot_doc = {"fixture_source_id": source_id}
+        snapshot_doc = {
+            "obligations": [
+                {
+                    "key": row["key"],
+                    "platform": row["platform"],
+                    "case_ids": row["required_scope"]["case_ids"],
+                    "evidence_kinds": row["allowed_evidence"]["kinds"],
+                }
+                for row in obligations
+                if source_id in row["source_refs"]
+            ]
+        }
         _write_json(source_path, snapshot_doc)
         source_sha256 = _file_sha256(source_path)
         sources.append(
