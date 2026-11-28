@@ -152,8 +152,8 @@ def _reuse_fixture(
     previous_tree: str | None = None,
     previous_tree_none: bool = False,
     current_tree: str | None = None,
-    previous_workload: str | None = "w" * 64,
-    current_workload: str | None = "w" * 64,
+    previous_workload: str | None = "7" * 64,
+    current_workload: str | None = "7" * 64,
     add_previous: bool = True,
     delete_previous_file: bool = False,
 ):
@@ -709,7 +709,7 @@ def test_reuse_by_runtime_digest(tmp_path):
     assert _status(idx, tmp_path / "same", cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "SATISFIED"
 
     stale_idx, stale_cat, _previous, _current = _reuse_fixture(
-        tmp_path / "workload-drift", previous_workload="x" * 64, current_workload="w" * 64
+        tmp_path / "workload-drift", previous_workload="8" * 64, current_workload="7" * 64
     )
     assert _status(stale_idx, tmp_path / "workload-drift", stale_cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "STALE"
 
@@ -779,6 +779,18 @@ def test_entry_tree_none_against_tree_target_stale(tmp_path):
     no_tree_idx = fakes_evidence.evidence_index(
         no_tree_root, stage="2.4", contract="c" * 40, platforms=("linux",)
     )
+    # 將舊版歷史 target 還原成契約允許的無 tree 形狀；一般 fixture 的 bundle
+    # 含 SHA256SUMS，set_target 會自動記錄兩個 tree digest。
+    no_tree_index = json.loads(no_tree_idx.read_bytes())
+    no_tree_index["stage_targets"]["2.4"]["linux"].pop("bundle_tree_sha256", None)
+    no_tree_index["stage_targets"]["2.4"]["linux"].pop("runtime_tree_sha256", None)
+    no_tree_history = next(
+        row for row in reversed(no_tree_index["target_history"])
+        if row.get("stage") == "2.4" and row.get("platform") == "linux"
+    )
+    no_tree_history.pop("bundle_tree_sha256", None)
+    no_tree_history.pop("runtime_tree_sha256", None)
+    _write_json(no_tree_idx, no_tree_index)
     no_tree_cat = evidence_index.load_exit_catalog()
     evidence_index.add_entry(
         no_tree_idx,
@@ -852,7 +864,7 @@ def test_reuse_refuses_source_after_stage_target_reset(tmp_path):
     reset_bundle = fakes_evidence.make_bundle(
         root / "bundles" / "stage-0-reset" / "linux",
         stage="0",
-        target="x86_64-unknown-linux-gnu",
+        target="aarch64-unknown-linux-gnu",
     )
     evidence_index.set_target(
         idx,
@@ -899,9 +911,14 @@ def test_reuse_cycle_stale(tmp_path):
     )
     a = replace(a, entry_id="entry-a")
     b = replace(b, entry_id="entry-b")
-    evidence_index.add_entry(idx, a, catalog=cat)
-    evidence_index.add_entry(idx, b, catalog=cat)
-    status, reasons = _status(idx, tmp_path, cat, "S24-L3-LRMIXED-48H-LINUX")
+    cycle_index = evidence_index.load_index(idx)
+    cycle_index["entries"] = [evidence_index._entry_dict(a), evidence_index._entry_dict(b)]
+    status, reasons = evidence_index.item_status(
+        cycle_index,
+        cat["S24-L3-LRMIXED-48H-LINUX"],
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+    )
     assert status == "STALE"
     assert any("reuse cycle" in reason for reason in reasons)
 
@@ -1654,7 +1671,7 @@ def test_od09_and_legacy_round_exceptions(tmp_path):
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
-    frozen_path = Path(__file__).resolve().parent / "acceptance" / "longrun_acceptance.yaml"
+    frozen_path = Path(__file__).resolve().parents[1] / "realhw" / "acceptance" / "longrun_acceptance.yaml"
     frozen_before = frozen_path.read_bytes()
     entries = []
     for platform in ("linux", "windows"):
@@ -1762,11 +1779,8 @@ def test_required_seed_is_bound_to_designated_source(tmp_path):
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     evidence_root = _evidence_root(tmp_path)
     manifest = json.loads((evidence_root / "denominators" / "source-manifest.json").read_bytes())
-    reader = lambda revision, path: (
-        Path(__file__).resolve().parents[1].joinpath(*path.split("/")).read_bytes()
-    )
     assert required_cases.verify_seed_sources(
-        manifest, evidence_root=evidence_root, source_reader=reader
+        manifest, evidence_root=evidence_root, source_reader=fakes_evidence.read_seed_revision
     ) == []
     target = evidence_index.load_index(idx)["stage_targets"]["3"]["linux"]
     assert target["required_cases_lock"]["sha256"]
@@ -1775,7 +1789,7 @@ def test_required_seed_is_bound_to_designated_source(tmp_path):
     undisclosed = json.loads(json.dumps(manifest))
     undisclosed["sources"][0]["revision"] = "0" * 40
     errors = required_cases.verify_seed_sources(
-        undisclosed, evidence_root=evidence_root, source_reader=reader
+        undisclosed, evidence_root=evidence_root, source_reader=fakes_evidence.read_seed_revision
     )
     assert errors
 
@@ -1789,9 +1803,8 @@ def test_required_seed_rejects_attachment_sha_mismatch(tmp_path):
     manifest = json.loads(manifest_path.read_bytes())
     attachment = evidence_root / manifest["sources"][0]["attachment"]
     attachment.write_bytes(attachment.read_bytes() + b"changed")
-    reader = lambda revision, path: Path(__file__).resolve().parents[1].joinpath(*path.split("/")).read_bytes()
     errors = required_cases.verify_seed_sources(
-        manifest, evidence_root=evidence_root, source_reader=reader
+        manifest, evidence_root=evidence_root, source_reader=fakes_evidence.read_seed_revision
     )
     assert errors
 

@@ -267,7 +267,7 @@ def test_pr_ci_rejects_index_history_rewrite(tmp_path):
     _set_ref(repo, "refs/heads/main", base)
     head = _commit(repo, base, [fail, _row("5" * 20)], "append")
     _set_ref(repo, "refs/heads/pr", head)
-    _check_pr_range(repo, "refs/heads/main", "refs/heads/pr")
+    _check_pr_range(repo, base, "refs/heads/pr")
 
 
 @pytest.mark.parametrize("removed_kind", ["ordinary", "restricted"])
@@ -287,10 +287,10 @@ def test_pr_ci_rejects_fail_added_then_removed(tmp_path, removed_kind):
     _set_ref(repo, "refs/heads/pr", head)
     assert _index_blob(repo, base) == _index_blob(repo, head)
     with pytest.raises(HistoryGuardError, match="只增檢查"):
-        _check_pr_range(repo, "refs/heads/main", "refs/heads/pr")
+        _check_pr_range(repo, base, "refs/heads/pr")
 
     # 若保留中途 FAIL，對照分支可只增通過。
-    _check_pr_range(repo, "refs/heads/main", middle)
+    _check_pr_range(repo, base, middle)
 
 
 def test_pr_ci_checks_merge_parents_and_force_push(tmp_path):
@@ -413,7 +413,7 @@ def test_pr_ci_index_base_fail_closed(tmp_path):
         shallow_path = shallow_repo / shallow_path
     shallow_path.write_bytes((base + "\n").encode("ascii"))
     with pytest.raises(HistoryGuardError, match="shallow"):
-        _check_pr_range(shallow_repo, "refs/heads/main", head)
+        _check_pr_range(shallow_repo, base, head)
 
     missing_repo = _init_repo(tmp_path / "missing-object")
     base = _commit_tree(missing_repo, {INDEX_PATH: _index_bytes([])}, message="object base")
@@ -426,7 +426,7 @@ def test_pr_ci_index_base_fail_closed(tmp_path):
     assert commit_object.is_file()
     commit_object.unlink()
     with pytest.raises(HistoryGuardError):
-        _check_pr_range(missing_repo, "refs/heads/main", head)
+        _check_pr_range(missing_repo, base, head)
 
     unrelated_repo = _init_repo(tmp_path / "unrelated")
     unrelated_base = _commit_tree(

@@ -59,6 +59,20 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def read_seed_revision(revision: str, repo_path: str) -> bytes | None:
+    """從指定 Git revision 取回測試所需的原始 seed blob。"""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{repo_path}"],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
 def _payload_sha256(value: Any) -> str:
     data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
@@ -184,21 +198,34 @@ def _write_legacy_scope(root: Path, index_path: Path, catalog: dict[str, Any]) -
 
 
 def _copy_denominator_inputs(root: Path) -> None:
-    """把公開的靜態種子與目前分母鎖放入隔離 evidence root。"""
+    """保存指定 Git revision 的公開 seed 與目前分母鎖快照。"""
+    import subprocess
+
+    from tools.stage3 import required_cases
+
     repo_root = Path(__file__).resolve().parents[1]
     evidence_root = _evidence_root(root)
-    for source, relative in (
-        (repo_root / "tests" / "acceptance" / "cases.yaml", "denominators/cases.yaml"),
-        (repo_root / "tests" / "acceptance" / "cases.lock.json", "denominators/cases.lock.json"),
-        (
-            repo_root / "tests" / "acceptance" / "stage3_required_cases.lock.json",
-            "stage3-required-cases.lock.json",
-        ),
-        (
-            repo_root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json",
-            "denominators/source-manifest.json",
-        ),
+    sources = [
+        (repo_root / "tests" / "acceptance" / "stage3_required_cases.lock.json", "stage3-required-cases.lock.json"),
+        (repo_root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json", "denominators/source-manifest.json"),
+    ]
+    for repo_path, relative in (
+        ("tests/acceptance/cases.yaml", "denominators/cases.yaml"),
+        ("tests/acceptance/cases.lock.json", "denominators/cases.lock.json"),
     ):
+        result = subprocess.run(
+            ["git", "show", f"{required_cases.SEED_REVISION}:{repo_path}"],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"無法讀取指定 seed {repo_path}: {result.stderr.decode('utf-8', errors='replace')}")
+        target = evidence_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(result.stdout)
+    for source, relative in sources:
         target = evidence_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
@@ -338,8 +365,8 @@ def entry(
     ledger_records = 100 + n if evidence_kind == "canary-report" else None
     values: dict[str, Any] = {
         "exit_catalog_sha256": target.get("exit_catalog_sha256", "0" * 64),
-        "candidate_round_id": target.get("candidate_round_id"),
-        "archive_sha256": target.get("archive_sha256"),
+        "candidate_round_id": target.get("candidate_round_id") if stage == "3" else None,
+        "archive_sha256": target.get("archive_sha256") if stage == "3" else None,
         "entry_id": "",
         "item_id": item_id,
         "platform": platform,
@@ -351,7 +378,7 @@ def entry(
         "contract_revision": target["contract_revision"],
         "tool_revision": target["tool_revision"],
         "case_list_sha256": target["case_list_sha256"],
-        "required_cases_sha256": target.get("required_cases_sha256"),
+        "required_cases_sha256": target.get("required_cases_sha256") if stage == "3" else None,
         "l1_set_sha256": None,
         "workload_sha256": "f" * 64 if is_l3 else None,
         "environment_id": api.environment_id(ENV_DOC),
