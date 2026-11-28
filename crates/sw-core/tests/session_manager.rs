@@ -8603,3 +8603,139 @@ fn wp510r_i20_actor_spawn_failure_close_pause_keeps_manager_responsive() {
         sw_core::custody::TerminalHandle::Closed
     );
 }
+
+#[test]
+fn i294_r15_handoff_replay_keeps_effect_guard_and_timeout_gate_on_current_rx() {
+    use sw_core::human_console::ConsoleTransportKind;
+    use sw_core::mailbox::{ControlEvent, DataEvent};
+    use sw_core::admission::FreezeOutcome;
+    use std::sync::Arc;
+
+    const NEW_REAL: &str = "/dev/ttyI294R15";
+    const CLIENT: &str = "i294-r15-preserved-console";
+
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let control = m
+        .mgr
+        .actor_control_for_test(&sid)
+        .expect("ManagerExec actor control sender");
+    control
+        .send(ControlEvent::ConsoleConnected {
+            client_id: CLIENT.into(),
+            client_lifetime: 1,
+            label: "127.0.0.1:29415".into(),
+            vtty: "127.0.0.1:29415".into(),
+            kind: ConsoleTransportKind::TcpTelnet,
+            close_gen: 0,
+        })
+        .expect("既有 stream console 已送入 ManagerExec actor");
+    let _ = m.mgr.route(&sid, SessionRequest::GetState, RPC).expect("console connect barrier");
+    let (old_rx, data, probe, old_epoch) = m
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("原始 ManagerExec RX 快照");
+    let fence = m.mgr.fence_for_test("COM0").expect("COM0 fence");
+
+    let gate = m.reg.admission_gate();
+    let (open_entered_tx, open_entered_rx) = crossbeam_channel::bounded(1);
+    let (open_release_tx, open_release_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_open_job_post_commit_hook_for_test(
+        &sid,
+        Box::new(move || {
+            open_entered_tx.send(()).expect("新 bridge 已 commit、BridgeOpened 尚未送達");
+            open_release_rx.recv().expect("釋放 BridgeOpened 送達");
+        }),
+    );
+    m.retarget_by_id_no_wait("/s/by-id/usb-A", NEW_REAL);
+    open_entered_rx
+        .recv_timeout(RPC)
+        .expect("接管路徑已開啟新 bridge 並停在 post-commit hook");
+    let _ = m.mgr.route(&sid, SessionRequest::GetState, RPC).expect("hook 期間 actor 仍可回覆");
+    let freeze = match gate.freeze_if_idle("i294-r15-handoff-replay") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        outcome => panic!("沒有操作票據時應建立 handoff freeze：{outcome:?}"),
+    };
+    let controls_before_bridge = probe.entries("Control").len();
+    open_release_tx.send(()).expect("新 bridge worker 等待放行");
+    wait_until("BridgeOpened 已由 actor 收到並在 handoff freeze 下延後", || {
+        probe.entries("Control").len() > controls_before_bridge
+    });
+    let _ = m.mgr.route(&sid, SessionRequest::GetState, RPC).expect("BridgeOpened defer barrier");
+
+    // Rebound 會保留既有 client record、重設舊 raw owner；同一個保留 client 的 stream accept
+    // completion 於 freeze 期間排在 BridgeOpened 後，讓 replay 先恢復 owner 再派送原輸入。
+    control
+        .send(ControlEvent::ConsoleConnected {
+            client_id: CLIENT.into(),
+            client_lifetime: 1,
+            label: "127.0.0.1:29415".into(),
+            vtty: "127.0.0.1:29415".into(),
+            kind: ConsoleTransportKind::TcpTelnet,
+            close_gen: 0,
+        })
+        .expect("保留 console 的 accept completion 已送入 handoff queue");
+    let _ = m.mgr.route(&sid, SessionRequest::GetState, RPC).expect("console owner defer barrier");
+    let input_epoch = fence.with(|state| state.input_epoch);
+    let data_before = probe.data_items();
+    data.send(DataEvent::ConsoleInputBytes {
+        client_id: CLIENT.into(),
+        client_lifetime: 1,
+        input_epoch,
+        bytes: b"R15_HANDOFF_KEY".to_vec(),
+    })
+    .expect("handoff 期間的既有 console input 已送入 data lane");
+    wait_until("console input 已在 handoff freeze 下延後", || probe.data_items() > data_before);
+    let (still_old_rx, _, _, _) = m
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("freeze 期間 actor RX 快照");
+    assert!(Arc::ptr_eq(&old_rx, &still_old_rx), "BridgeOpened 延後期間仍是舊 epoch");
+
+    assert!(gate.thaw(&freeze), "handoff freeze 已撤銷");
+    let _ = m.mgr.route(&sid, SessionRequest::GetState, RPC).expect("同次 replay dispatch barrier");
+    let (new_rx, _, _, new_epoch) = m
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("接管後 ManagerExec RX 快照");
+    assert!(!Arc::ptr_eq(&old_rx, &new_rx), "接管建立新 RX epoch");
+    assert_ne!(old_epoch, new_epoch, "effect permit 所屬 bridge epoch 已更換");
+    assert!(
+        Arc::ptr_eq(&old_rx.actor_dispatch_gate(), &new_rx.actor_dispatch_gate()),
+        "同一 session 的不同 RX epoch 共用 dispatch／decision reservation"
+    );
+
+    let new_dev = m.device(NEW_REAL);
+    let human_deadline = Instant::now() + RPC;
+    while !new_dev
+        .tx_since(0)
+        .windows(b"R15_HANDOFF_KEY".len())
+        .any(|part| part == b"R15_HANDOFF_KEY")
+    {
+        assert!(
+            Instant::now() < human_deadline,
+            "handoff replay 沒有送出 HumanTx：new_tx={:?}, warnings={:?}, state={:?}, input_epoch={}, old_rx={:?}, new_rx={:?}",
+            new_dev.tx_since(0),
+            m.warnings(),
+            m.state_of("COM0"),
+            fence.with(|state| state.input_epoch),
+            old_rx.human_tx_state(),
+            new_rx.human_tx_state(),
+        );
+        std::thread::yield_now();
+    }
+    wait_until("new epoch HumanTx observer 更新 session signal", || {
+        new_rx.human_tx_state().generation > 0
+    });
+    assert_eq!(
+        old_rx.human_tx_state().generation,
+        new_rx.human_tx_state().generation,
+        "不同 epoch 的 RX snapshot 對外呈現同一 session-wide generation"
+    );
+
+    // 同一 session gate 可由任一 epoch 的 OpRunner decision 進入；兩者均讀到 session-wide HumanTx 訊號。
+    assert!(old_rx.timeout_rescue_human_seen_for_test(0, 0), "舊 epoch decision 走 human tuple");
+    assert!(new_rx.timeout_rescue_human_seen_for_test(0, 0), "新 epoch decision 走 human tuple");
+    let bytes = new_dev.tx_since(0);
+    assert!(!bytes.contains(&0x03) && !bytes.contains(&0x04), "handoff replay 沒有救援 TX：{bytes:?}");
+}

@@ -150,6 +150,123 @@ entries:
     - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
     - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
     owner_phase: P7
+  # i294：human pending 維持 write 後 watermark、完整視窗與 timeout 消耗；READY evidence 或完整 echo 前綴／尾 prompt 互證可建立 evidence，寫回原子驗證 revision／profile／watermark／epoch。同行 suffix 僅適用已找到 echo 的已知完整 prompt；無 echo／無 human 不要求 evidence，只接受最後一行真實行首到 tail 的 profile match。Path => 輸出不完成，router =>／router=> 可由可信來源證實。candidate＝最後一行完整 regex match、已知字面 suffix 或純符號短 suffix；無 human 且無候選採 9af187ca baseline recovery，同一 timeout_recovery_keys 設定下逐位元組相同，預設依 BC-09 為 [CTRL_C]；有候選但身分不足走 PROMPT_TIMEOUT／partial／NONE、零 rescue。NUL、跨接管與修剪 partial 保留。
+  bc:BC-22:
+    nodeids:
+    - cargo:sw-core::command_completion::tests::complete_echo_and_prefix_prompt_share_snapshot
+    - cargo:sw-core::command_completion::tests::echo_boundary_preserves_command_like_output_lines
+    - cargo:sw-core::command_completion::tests::i294_r8_ambiguous_fold_search_has_linear_work_bound
+    - cargo:sw-core::command_completion::tests::i294_end_anchored_prompt_prefix_keeps_echo_stdout_boundary
+    - cargo:sw-core::command_completion::tests::i294_long_rx_echo_search_is_bounded
+    - cargo:sw-core::command_completion::tests::no_echo_human_tx_is_uncertain_but_clean_no_echo_tail_prompt_completes
+    - cargo:sw-core::command_completion::tests::raw_half_line_is_not_accepted_as_clean_echo
+    - cargo:sw-core::command_completion::tests::i294_r8_snapshot_evaluator_that_finishes_after_deadline_is_timed_out
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::command_boundary_retries_after_would_block
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::human_tx_observation_tracks_only_accepted_segments
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::i294_r8_os_accepted_before_deadline_is_pending_until_observer_registration
+    - cargo:sw-core::tx_writer::observed_tx_submit_tests::i294_r8_submit_started_after_timeout_is_not_in_deadline_snapshot
+    - cargo:sw-core::command_exec::i294_background_uses_command_echo_boundary
+    - cargo:sw-core::command_exec::i294_completion_before_deadline_still_completes
+    - cargo:sw-core::command_exec::i294_late_echo_and_prompt_after_deadline_do_not_complete
+    - cargo:sw-core::command_exec::i294_deferred_human_prompt_between_queued_commands_does_not_complete_next
+    - cargo:sw-core::command_exec::i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line
+    - cargo:sw-core::command_exec::i294_fragmented_wrapped_echo_waits_for_complete_command
+    - cargo:sw-core::command_exec::i294_human_prompt_before_agent_echo_does_not_complete
+    - cargo:sw-core::command_exec::i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx
+    - cargo:sw-core::command_exec::i294_no_echo_without_pending_human_tx_uses_tail_prompt
+    - cargo:sw-core::command_exec::i294_prompt_before_command_tx_is_outside_no_echo_window
+    - cargo:sw-core::command_exec::i294_r8_completion_decided_before_deadline_remains_done
+    - cargo:sw-core::command_exec::i294_r8_expired_before_first_wait_returns_timeout_partial
+    - cargo:sw-core::command_exec::i294_r8_timeout_after_deadline_snapshot_keeps_partial_and_baseline_recovery
+    - cargo:sw-core::command_exec::i294_r8_tx_submit_pending_at_settlement_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_silence_timeout_full_echo_with_human_tx_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_silence_timeout_full_echo_with_pending_submit_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_silence_timeout_without_echo_with_human_tx_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_silence_timeout_without_echo_with_pending_submit_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_deadline_timeout_full_echo_with_human_tx_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_deadline_timeout_full_echo_with_pending_submit_suppresses_recovery
+    - cargo:sw-core::command_exec::i294_r9_stale_no_echo_completion_rechecked_after_human_tx
+    - cargo:sw-core::command_exec::i294_r9_stale_no_echo_completion_rechecked_after_pending_submit
+    - cargo:sw-core::command_exec::i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit
+    - cargo:sw-core::command_exec::i294_r10_snapshot_pending_then_submit_completes_before_settlement_with_echo
+    - cargo:sw-core::command_exec::i294_r10_snapshot_pending_then_submit_completes_before_settlement_without_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_with_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_without_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_with_echo
+    - cargo:sw-core::command_exec::i294_r10_submit_starts_after_cutoff_before_decision_without_echo
+    - cargo:sw-core::command_exec::i294_r11_human_job_queued_before_command_submit_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r11_fence_rejected_human_job_before_report_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r12_human_job_guarded_before_pump_take_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r12_human_job_guarded_after_pump_take_suppresses_rescue
+    - cargo:sw-core::command_exec::i294_r13_actor_transition_effect_barrier_holds_unstarted_guard
+    - cargo:sw-core::command_exec::i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states
+    - cargo:sw-core::command_exec::i294_r13_transition_to_effect_barrier_guards_both_timeout_entries
+    - cargo:sw-core::human_tx_lane::i294_r13_handoff_replay_is_included_in_preflight
+    - cargo:sw-core::human_tx_lane::i294_r13_human_completion_preflight_covers_later_backlog_job
+    - cargo:sw-core::human_tx_lane::i294_r13_overprediction_without_effect_drops_guard_and_history
+    - cargo:sw-core::human_tx_lane::i294_r13_pre_event_guard_cleans_up_on_panic_refusal_and_cancel
+    - cargo:sw-core::human_tx_lane::i294_r13_pre_event_guard_does_not_record_submit_without_human_tx
+    - cargo:sw-core::human_console::human_tx::tests::i294_r12_pump_full_and_writer_channel_closed_drop_guards
+    - cargo:sw-core::command_completion::tests::i294_r9_direct_echo_search_has_linear_work_bound
+    - cargo:sw-core::i294_r9_baseline_diff::i294_r9_no_human_timeout_stdout_matches_baseline_for_both_echo_states
+    - cargo:sw-core::command_exec::i294_raw_half_line_does_not_anchor_agent_echo
+    - cargo:sw-core::command_exec::i294_raw_half_line_does_not_poison_next_agent_echo
+    - cargo:sw-core::command_exec::i294_shipped_prefix_prompts_handle_split_and_co_packed_rx
+    - cargo:sw-core::command_exec::i294_completion_snapshot_ignores_later_rx
+    - cargo:sw-daemon::rpc_console::i294_rpc_human_prompt_before_agent_echo_does_not_complete
+    - cargo:sw-core::command_exec::i294_r15_pump_yields_timeout_decision_while_writer_queue_is_full
+    - cargo:sw-core::command_exec::i294_r15_human_line_full_queue_timeout_entries_finish_before_writer_release
+    - cargo:sw-core::session_manager::i294_r15_handoff_replay_keeps_effect_guard_and_timeout_gate_on_current_rx
+    - cargo:sw-core::uart_bridge::r15_tests::i294_r15_blocked_human_enqueue_does_not_hold_rescue_gate
+    - cargo:sw-core::command_exec::i294_r17_human_prompt_must_follow_tx_boundary
+    - cargo:sw-core::command_exec::i294_r17_profile_switch_new_prompt_settles_old_human
+    - cargo:sw-core::command_exec::i294_r17_profile_switch_rejects_old_regex_prompt_for_both_timeouts
+    - cargo:sw-core::command_exec::i294_r17_reconnect_waits_for_old_guard_then_unblocks_commands
+    - cargo:sw-core::command_exec::i294_r18_prompt_received_before_human_os_write_return_is_before_boundary
+    - cargo:sw-core::command_exec::i294_r18_split_prompt_settles_only_after_complete_post_boundary_line
+    - cargo:sw-core::command_exec::i294_r18_prompt_line_start_before_tx_boundary_does_not_settle
+    - cargo:sw-core::command_exec::i294_r18_trimmed_line_start_does_not_settle
+    - cargo:sw-core::command_exec::i294_r18_cross_boundary_prompt_silence_timeout_has_no_rescue_tx
+    - cargo:sw-core::command_exec::i294_r18_cross_boundary_prompt_operation_deadline_has_no_rescue_tx
+    - cargo:sw-core::command_exec::i294_r18_late_old_writer_accepted_prompt_uses_active_epoch
+    - cargo:sw-core::command_exec::i294_r18_real_human_writer_handoff_result_matrix
+    - cargo:sw-core::command_exec::i294_r18_real_writer_reconnect_unblocks_consecutive_no_echo_commands
+    - cargo:sw-core::command_exec::i294_r19_trimmed_window_head_never_counts_as_a_real_line_start
+    - cargo:sw-core::command_exec::i294_r19_stale_pending_timeout_consumes_after_one_partial
+    - cargo:sw-core::command_exec::i294_r19_pending_timeout_keeps_new_human_submit_until_next_timeout
+    - cargo:sw-core::command_exec::i294_r19_pending_timeout_keeps_inflight_human_writer
+    - cargo:sw-core::command_exec::i294_r19_timeout_submit_interleavings_preserve_pending
+    - cargo:sw-core::command_exec::i262_arrow_output_segments_are_preserved
+    - cargo:sw-core::command_exec::i271_no_newline_stdout_and_nul_are_exact
+    - cargo:sw-core::command_exec::i294_trimmed_no_echo_completion_is_partial
+    - cargo:sw-core::command_exec::i271_unknown_prompt_keeps_output_partial
+    - cargo:sw-core::command_exec::i271_short_prompt_does_not_cut_inline_stdout
+    - cargo:sw-core::command_exec::i271_complete_echo_prefix_updates_changed_prompt_evidence
+    - cargo:sw-core::command_exec::i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix
+    - cargo:sw-core::command_exec::i294_r1_ready_evidence_rejects_probe_echo_old_prompt_and_async_output
+    - cargo:sw-core::command_exec::i294_r1_no_echo_known_prompt_requires_true_last_line_start
+    - cargo:sw-core::command_exec::i294_r1_timeout_candidate_matrix_preserves_no_candidate_recovery
+    - cargo:sw-core::command_exec::i294_r1_prompt_evidence_writeback_clear_profile_and_takeover_barriers
+    - cargo:sw-core::command_exec::i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo
+    - cargo:sw-core::command_exec::i294_r1_path_arrow_output_cannot_become_echo_prefix_evidence
+    - cargo:sw-core::command_exec::i271_r1_shipped_prefix_profiles_preserve_inline_stdout_and_nul
+    - cargo:sw-core::command_exec::i294_r2_clear_without_evidence_completes_then_reestablishes_from_echo
+    - cargo:sw-core::command_exec::i294_r2_rejected_ready_evidence_recovers_no_echo_then_echo_sequence
+    - cargo:sw-core::command_exec::i294_r2_exact_spaced_and_compact_router_arrow_matrix
+    - cargo:sw-core::command_exec::i294_r2_path_arrow_output_never_completes_or_becomes_evidence
+    - cargo:sw-core::command_exec::i294_r3_bare_echo_crosses_tx_boundary_after_each_evidence_barrier
+    - cargo:sw-core::command_exec::i294_r3_cross_boundary_prefix_yields_to_human_path
+    - cargo:sw-core::command_exec::i294_r3_contiguous_prompt_prefix_must_not_replace_evidence_with_suffix
+    - cargo:sw-core::command_exec::i294_r3_barriers_never_revive_stale_evidence_with_human_or_without_human
+    - cargo:sw-core::command_exec::i294_r3_long_prefix_with_different_tail_never_completes_or_learns
+    - cargo:sw-core::command_exec::i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms
+    - cargo:sw-core::command_exec::i294_r4_cross_tx_prefix_waits_for_real_human_effect_guard
+    - cargo:sw-core::command_exec::i294_r20_empty_recovery_releases_timeout_rescue_guard_and_allows_later_human_submit
+    - cargo:sw-core::command_exec::i294_r20_non_ctrl_c_first_key_releases_timeout_rescue_guard_at_enqueue
+    - cargo:sw-daemon::rpc_console::i262_rpc_arrow_output_is_complete
+    - cargo:sw-daemon::rpc_console::i271_rpc_no_newline_and_nul_stdout
+    owner_phase: P5
   bc:BC-23:
     nodeids:
     - cargo:sw-core::tcp_console_lease::tcp_mirror_lifecycle_and_guards
@@ -2792,6 +2909,7 @@ l1_only_approvals:
   "bc:BC-09": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-13": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-22": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-22 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-23": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

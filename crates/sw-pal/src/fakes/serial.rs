@@ -290,6 +290,8 @@ pub enum FakeWriteStep {
     PauseBeforeSubmit,
     /// R0-F1：gate 已重驗通過、`os_submit` 閉包內（持 Fence 鎖）暫停。
     PauseInsideSubmit,
+    /// 先讓 `gate.submit` 回 WouldBlock，再於 gate 外暫停；釋放後重試一次完整寫入。
+    WouldBlockThenPause,
     /// R0-F1：第一次 `gate.submit` 接受 n bytes，隨後回 WouldBlock 並於 gate 外暫停；`release_pause` 後經 gate 提交剩餘。
     AcceptThenWouldBlock(usize),
 }
@@ -328,6 +330,7 @@ pub(crate) struct FakeDeviceInner {
     configs: Mutex<Vec<SerialConfig>>,
     read_errors: AtomicUsize,
     on_os_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    on_os_submit_after_write_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     paused: Mutex<bool>,
     paused_cond: Condvar,
     pause_released: Mutex<bool>,
@@ -367,6 +370,7 @@ impl FakeDeviceInner {
             configs: Mutex::new(Vec::new()),
             read_errors: AtomicUsize::new(0),
             on_os_submit_hook: Mutex::new(None),
+            on_os_submit_after_write_hook: Mutex::new(None),
             paused: Mutex::new(false),
             paused_cond: Condvar::new(),
             pause_released: Mutex::new(false),
@@ -757,6 +761,15 @@ impl FakeDevice {
         *self
             .inner
             .on_os_submit_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// 測試同步點：Fake OS 已接收這次寫入、`write_gated` 尚未回傳時呼叫；僅供 `test-fakes` 交錯測試使用。
+    pub fn on_os_submit_after_write(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .on_os_submit_after_write_hook
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
@@ -1187,6 +1200,60 @@ impl SerialWriter for FakeSerialWriter {
                     },
                 }
             }
+            FakeWriteStep::WouldBlockThenPause => {
+                let first_submit = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    SubmitStep::WouldBlock
+                });
+                if first_submit.is_err() {
+                    return TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    };
+                }
+
+                do_pause(&self.inner);
+                let mut committed = 0;
+                let retry_submit = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    self.inner
+                        .tx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(data);
+                    check_tx_triggers_and_matches(&self.inner);
+                    committed = data.len();
+                    SubmitStep::Accepted(data.len())
+                });
+                match retry_submit {
+                    Ok(_) => TxResult {
+                        outcome: TxOutcome::Completed(committed),
+                        error: None,
+                    },
+                    Err(SubmitRevoked) => TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    },
+                }
+            }
             FakeWriteStep::AcceptThenWouldBlock(n) => {
                 let to_accept = n.min(data.len());
                 let mut committed = 0;
@@ -1277,6 +1344,15 @@ impl SerialWriter for FakeSerialWriter {
                         .unwrap_or_else(|e| e.into_inner())
                         .extend_from_slice(&data[..to_accept]);
                     check_tx_triggers_and_matches(&self.inner);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_after_write_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
                     committed = to_accept;
                     SubmitStep::Accepted(to_accept)
                 });

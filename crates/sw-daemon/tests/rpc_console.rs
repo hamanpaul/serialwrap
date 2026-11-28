@@ -5,6 +5,7 @@
 #![cfg(feature = "test-fakes")]
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::*;
@@ -318,6 +319,193 @@ fn console_input_reaches_uart_and_rx_fans_out() {
     wait_for("RX 分流到 console", || {
         String::from_utf8_lossy(&io.written()).contains("hello-from-dut")
     });
+}
+
+#[test]
+fn i294_rpc_human_prompt_before_agent_echo_does_not_complete() {
+    let r = ServiceRig::with_console_backend("pty");
+    attach(&r, r#"{"selector":"COM0"}"#);
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+
+    io.push_input(b"echo HUMAN\n");
+    let mut observed_tx = Vec::new();
+    wait_for("human line 寫到 UART", || {
+        observed_tx.extend(dev.take_tx());
+        observed_tx.windows(b"echo HUMAN\n".len()).any(|w| w == b"echo HUMAN\n")
+    });
+
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo RPC_AGENT","mode":"line","timeout_s":2.0}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id");
+    wait_for("agent line 寫到 UART", || {
+        observed_tx.extend(dev.take_tx());
+        observed_tx
+            .windows(b"echo RPC_AGENT\n".len())
+            .any(|w| w == b"echo RPC_AGENT\n")
+    });
+
+    dev.push_rx(b"root@t:/# ");
+    wait_for("human 舊 prompt 已由 RX reader 處理", || {
+        String::from_utf8_lossy(&io.written()).contains("root@t:/# ")
+    });
+    let running = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let command = match running.get("command") {
+        Some(PyValue::Dict(command)) => command,
+        other => panic!("command.get command：{other:?}"),
+    };
+    assert_eq!(
+        s(command, "status"),
+        "running",
+        "RPC 不得以 human prompt 提前完成：{}",
+        j(&running)
+    );
+
+    dev.push_rx(b"echo RPC_AGENT\r\nRPC_AGENT\r\nroot@t:/# ");
+    wait_for("RPC agent 命令完成", || {
+        let got = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(got.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "done")
+    });
+    let done = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let command = match done.get("command") {
+        Some(PyValue::Dict(command)) => command,
+        other => panic!("command.get command：{other:?}"),
+    };
+    assert_eq!(s(command, "stdout"), "RPC_AGENT", "{}", j(&done));
+    assert_eq!(command.get("partial"), Some(&PyValue::Bool(false)));
+    observed_tx.extend(dev.take_tx());
+    assert!(!observed_tx.contains(&0x03) && !observed_tx.contains(&0x04), "不得送救援鍵");
+}
+
+fn broad_prompt_rig() -> ServiceRig {
+    ServiceRig::build(RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^(?:[ \\t]*|.*[^>#\\s])[>#][ \\t]*$'\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    })
+}
+
+fn rpc_command(r: &ServiceRig, command: &str) -> String {
+    let submitted = r.call(
+        "command.submit",
+        &format!(
+            r#"{{"selector":"COM0","cmd":"{}","mode":"line","timeout_s":2.0}}"#,
+            command
+        ),
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    s(&submitted, "cmd_id")
+}
+
+fn rpc_wait_done(r: &ServiceRig, cmd_id: &str) -> PyDict {
+    wait_for("RPC command 完成", || {
+        let got = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(got.get("command"), Some(PyValue::Dict(command)) if command.get("done_at").is_some_and(|v| !v.is_null()))
+    });
+    let done = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    match done.get("command") {
+        Some(PyValue::Dict(command)) => command.clone(),
+        other => panic!("command.get command：{other:?}"),
+    }
+}
+
+fn rpc_rx_bytes(r: &ServiceRig) -> u64 {
+    r.session("COM0")
+        .expect("COM0 session")
+        .get("rx_bytes_last_10s")
+        .and_then(PyValue::as_i64)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .expect("rx_bytes_last_10s")
+}
+
+#[test]
+fn i262_rpc_arrow_output_is_complete() {
+    let r = broad_prompt_rig();
+    let dev = r.device(REAL_A);
+    let sid = r.mgr.resolve("COM0").expect("COM0 session id");
+    let (rx, _, _, _) = r
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("COM0 actor snapshot");
+    let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
+    rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        let _ = waiter_tx.send(());
+    })));
+    let command = "obuspa -c get Device.DNS.Diagnostics.";
+    let cmd_id = rpc_command(&r, command);
+
+    wait_for("RPC command TX", || {
+        dev.take_tx()
+            .windows(format!("{command}\n").len())
+            .any(|window| window == format!("{command}\n").as_bytes())
+    });
+    waiter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RPC completion deadline 與 waiter 已建立");
+    let first = format!("{command}\r\nA => \r\n");
+    let rx_before = rpc_rx_bytes(&r);
+    dev.push_rx(first.as_bytes());
+    wait_for("第一段箭頭輸出已到 RX", || {
+        rpc_rx_bytes(&r) >= rx_before.saturating_add(first.len() as u64)
+    });
+    let rx_before = rpc_rx_bytes(&r);
+    dev.push_rx(b"B => ");
+    wait_for("B =>  已由 RX reader 處理", || {
+        rpc_rx_bytes(&r) >= rx_before.saturating_add(b"B => ".len() as u64)
+    });
+    let running = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert!(
+        matches!(running.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "running"),
+        "RPC 不得在 B =>  尾端提前完成：{}",
+        j(&running)
+    );
+    let (checks, end) = rx.snapshot_wait_progress_for_test();
+    r.clock.advance(Duration::from_millis(51));
+    wait_for("RPC evaluator 跨過 50 ms poll 間隔", || {
+        let (now_checks, now_end) = rx.snapshot_wait_progress_for_test();
+        now_checks > checks && now_end >= end
+    });
+    let running_after_poll = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert!(
+        matches!(running_after_poll.get("command"), Some(PyValue::Dict(command)) if s(command, "status") == "running"),
+        "RPC 跨過 poll 間隔後仍不得在 B =>  完成：{}",
+        j(&running_after_poll)
+    );
+    dev.push_rx(b"\r\nC => 1\r\nroot@t:/# ");
+
+    let command = rpc_wait_done(&r, &cmd_id);
+    assert_eq!(s(&command, "status"), "done");
+    assert_eq!(s(&command, "stdout"), "A => \nB => \nC => 1");
+    assert_eq!(command.get("partial"), Some(&PyValue::Bool(false)));
+}
+
+#[test]
+fn i271_rpc_no_newline_and_nul_stdout() {
+    let r = broad_prompt_rig();
+    let dev = r.device(REAL_A);
+
+    let plain = rpc_command(&r, "printf abc");
+    wait_for("printf RPC TX", || dev.take_tx().ends_with(b"printf abc\n"));
+    dev.push_rx(b"printf abc\r\nabcroot@t:/# ");
+    let plain_result = rpc_wait_done(&r, &plain);
+    assert_eq!(s(&plain_result, "stdout"), "abc");
+    assert_eq!(plain_result.get("partial"), Some(&PyValue::Bool(false)));
+
+    let nul = rpc_command(&r, "cat /proc/device-tree/model");
+    wait_for("cat RPC TX", || {
+        dev.take_tx().ends_with(b"cat /proc/device-tree/model\n")
+    });
+    dev.push_rx(b"cat /proc/device-tree/model\r\nmodel\0root@t:/# ");
+    let nul_result = rpc_wait_done(&r, &nul);
+    assert_eq!(s(&nul_result, "stdout"), "model\0");
+    assert_eq!(nul_result.get("partial"), Some(&PyValue::Bool(false)));
 }
 
 #[test]

@@ -241,9 +241,24 @@ Rust 0.5.1（BC-23）在 Windows TCP/Telnet raw owner 上補 session-layer lifet
 1. queue 出隊
 2. 送出原始 command + newline
 3. 記錄 RX 起點 offset
-4. 等 prompt regex 再次出現
-5. 清除 echo / prompt
-6. `stdout` 寫回 `command.get`
+4. 未指定 `completion_regex` 時，搜尋完整命令 echo；完成判定與 stdout 擷取
+   共用同一份 RX snapshot，echo 前的文字不進入一般 stdout
+5. epoch 內既有 prompt evidence 只取自可辨識 READY 結果；evidence 遺失或
+   與 echo 前綴不同時，前綴固定為 echo 行真實行首到 echo 起點的完整字面，
+   同 epoch、未修剪、行首可證明時可跨 TX 前延伸。不得剝舊 evidence 或取後段
+   suffix；該完整字面須匹配目前 profile、且 echo 後真實行首到 snapshot 尾端
+   重現相同字面才能原子更新。互證不成立時，舊 evidence 完整等於 tail 才完成，
+   否則 partial；跨 TX 判讀另包含同一 snapshot 的 human_in_flight 與
+   tx_submit_pending，在途訊號未消失前不得互證，revision 更新後才重評，不新增
+   TX 閘門。`Path => ` 只作命令輸出時不能只因寬鬆 regex 命中而學習
+6. 已知完整 prompt 若含字母或數字，可作無換行 stdout 的尾端 suffix；只移除
+   suffix。短／未知 prompt 不猜測，NUL 原樣保留
+7. 無 echo 且無 human 訊號時不要求 prompt evidence；目前 profile regex 由
+   真實最後一行行首完整匹配至 snapshot 尾端即可完成；必要 RX 已被窗口修剪
+   則回 `ok:true`、`partial:true`、無 error_code
+8. echo 前綴行首被修剪、prompt 與 echo 不在同一行，或同一行連續 prompt 時，
+   不以後段 suffix 恢復 evidence；身分不足的候選保守回 partial
+9. `stdout` 寫回 `command.get`
 
 #### 命令限制
 
@@ -971,6 +986,12 @@ targets:
 - background mode 可用 `result-tail` 取得後續 chunk
 - background capture 建立前的 `result-tail` 回傳 `from_seq=0, last_seq=0` sentinel
 - prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
+- 未指定 `completion_regex` 時，tail completion candidate 是最後一行完整符合 profile
+  prompt regex、snapshot 尾端完整等於 epoch 內已知 prompt 字面，或可由 profile
+  辨識的純符號短 suffix；只有有候選但身分不足才走 `PROMPT_TIMEOUT`／partial／NONE，
+  無 human 且無候選則維持基線 recovery。無 echo 且無 human 時不要求既有 evidence，
+  但 prompt 只接受真實最後一行行首到 snapshot 尾端；同行 suffix 裁切只套用已
+  確認本命令 echo。
 - `_recover_after_failure` 成功恢復 prompt 時回 `ok: true`（含 `PROMPT_TIMEOUT_RECOVERED`）
 - `expected_duration_s` 可延長前景命令總期限（靜默上限 `min(timeout_s, 30s)` 不變）
 - interactive lease 可建立、送 key、關閉

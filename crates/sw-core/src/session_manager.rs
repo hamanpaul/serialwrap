@@ -15,7 +15,7 @@
 //!   （`serialwrap-attach-<by_id>`）處理：**先獨占開埠一次**，PROBE 偵測直接在該 handle 上做，命中後把同一 handle
 //!   原樣交給正式 bridge（Python P1 T10 凍結「PROBE 與正式 bridge 共用同一預開 port」，parity #51）。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -61,7 +61,8 @@ use crate::state_store::{
     StateStore,
 };
 use crate::tx_writer::{
-    spawn_tx_writer, Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterHandle,
+    spawn_tx_writer, Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterContext,
+    TxWriterHandle,
 };
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
@@ -69,6 +70,9 @@ use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 /// P8 Task 6：`file.push`／`file.pull` 的回覆等待上限（arch §6.3 的 600 s）。shutdown 時 drain Phase 1 取消傳輸等待，
 /// 引擎盡快返回，不以此上限阻塞停止序。
 const FILE_TRANSFER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[cfg(not(any(feature = "test-fakes", debug_assertions)))]
+static MISSING_DISPATCH_HUMAN_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
 const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
@@ -237,6 +241,10 @@ impl SerialHandle for ReassembledHandle {
 struct SessionIo {
     sid: Mutex<String>,
     profile: Mutex<SessionProfile>,
+    /// 穩定的 actor gate；每個 bridge epoch 的 RxShared 都共用此 instance。
+    actor_dispatch_gate: Arc<crate::uart_bridge::ActorDispatchGate>,
+    #[cfg(feature = "test-fakes")]
+    current_rx: Mutex<Arc<RxShared>>,
     preopened: Mutex<Option<Preopened>>,
     /// P6 Task 10：RPC thread 預建、等待 core `ConsoleAdopt`／`ConsoleDiscard` 的 PTY（token → PtyPair）。
     pending_pty: Mutex<HashMap<u64, sw_pal::PtyPair>>,
@@ -879,6 +887,14 @@ pub struct SessionManager {
     _console: Arc<dyn ConsoleTransportFactory>,
     _caps: Capabilities,
 }
+
+#[cfg(feature = "test-fakes")]
+pub type ActorSnapshotForTest = (
+    Arc<RxShared>,
+    crossbeam_channel::Sender<crate::mailbox::DataEvent>,
+    Arc<crate::actor::ActorLatencyProbe>,
+    Option<u64>,
+);
 
 /// console／interactive_open 查無 session（Python `{"ok":False,"error_code":"SESSION_NOT_READY","selector":selector}`）。
 fn console_not_ready(selector: &str) -> PyDict {
@@ -2138,7 +2154,14 @@ impl Shared {
             f.handoff_frozen = handoff_frozen;
         });
         self.fanout.register(fence.clone());
-        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
+        let actor_dispatch_gate = crate::uart_bridge::ActorDispatchGate::new_for_session(
+            &profile.template.prompt_regex,
+        );
+        let rx = RxShared::new_with_actor_dispatch_gate(
+            RX_WINDOW_MAX_CHARS,
+            self.clock.mono_ns(),
+            actor_dispatch_gate.clone(),
+        );
         let clock = self.clock.clone();
         let fs = self.fs.clone();
         let input_epoch_pub = Arc::new(AtomicU64::new(0));
@@ -2234,6 +2257,9 @@ impl Shared {
         let io = Arc::new(SessionIo {
             sid: Mutex::new(sid.clone()),
             profile: Mutex::new(profile.clone()),
+            actor_dispatch_gate,
+            #[cfg(feature = "test-fakes")]
+            current_rx: Mutex::new(rx.clone()),
             preopened: Mutex::new(None),
             pending_pty: Mutex::new(HashMap::new()),
             next_pty_token: AtomicU64::new(0),
@@ -2296,6 +2322,7 @@ impl Shared {
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
             actor_id,
+            prepared_human_guards: VecDeque::new(),
         };
         let actor = match try_spawn_actor_with_reaper(
             core,
@@ -3606,8 +3633,12 @@ impl Shared {
             cancel,
             fence,
             self.wal.clone(),
-            0,
-            control_tx,
+            TxWriterContext {
+                rx: crate::uart_bridge::RxShared::new(1, 0),
+                epoch: 0,
+                control: control_tx,
+                clock: self.clock.clone(),
+            },
         );
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         let job = TxJob {
@@ -4486,6 +4517,8 @@ struct ManagerExec {
     opened_listener: Arc<Mutex<HashSet<u64>>>,
     /// actor 的不可變身分。
     actor_id: crate::custody::ActorId,
+    /// transition 實際輸出的 HumanTx effect 對應 guard，依 effect 順序交給 pump。
+    prepared_human_guards: VecDeque<crate::uart_bridge::HumanInFlightGuard>,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -5187,7 +5220,11 @@ impl OpenCtx {
         }
         let observers = lock(&self.shared.rx_observers).clone();
         // Python 每次 attach 新建 `UARTBridge`：RX 視窗、速率、總量、最後 RX 時刻一律歸零（審查 F51）。
-        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.shared.clock.mono_ns());
+        let rx = RxShared::new_with_actor_dispatch_gate(
+            RX_WINDOW_MAX_CHARS,
+            self.shared.clock.mono_ns(),
+            self.io.actor_dispatch_gate.clone(),
+        );
         let worker = IoWorker::start_observed(
             handle,
             IoWorkerArgs {
@@ -5289,12 +5326,33 @@ impl ManagerExec {
         payload: Vec<u8>,
         control: &Sender<ControlEvent>,
     ) {
+        #[cfg(feature = "test-fakes")]
+        self.rx.human_tx_before_effect_hook_for_test();
+        #[cfg(any(feature = "test-fakes", debug_assertions))]
+        let in_flight = self
+            .prepared_human_guards
+            .pop_front()
+            .expect("Effect::HumanTx 缺少 dispatch 實際輸出建立的 in-flight guard");
+        #[cfg(not(any(feature = "test-fakes", debug_assertions)))]
+        let in_flight = match self.prepared_human_guards.pop_front() {
+            Some(guard) => guard,
+            None => {
+                if !MISSING_DISPATCH_HUMAN_GUARD_WARNED.swap(true, Ordering::AcqRel) {
+                    self.shared.warn(format!(
+                        "Effect::HumanTx 缺少 dispatch 建立的 guard，使用後備 submit guard（com={}）",
+                        self.com()
+                    ));
+                }
+                self.rx.begin_human_submit()
+            }
+        };
         let epoch = permit.epoch;
         if !self.pumps.contains_key(&epoch) {
             if let Some(worker) = lock(&self.workers).get(&epoch) {
                 let pump = crate::human_console::human_tx::HumanTxPump::spawn(
                     &self.com(),
                     worker.tx().clone(),
+                    Arc::clone(&self.rx),
                     control.clone(),
                 );
                 self.pumps.insert(epoch, pump);
@@ -5302,9 +5360,12 @@ impl ManagerExec {
         }
         let refused = match self.pumps.get(&epoch) {
             Some(pump) => pump
-                .try_submit(tag.clone(), permit.clone(), payload)
+                .try_submit(tag.clone(), permit.clone(), payload, in_flight)
                 .is_err(),
-            None => true,
+            None => {
+                drop(in_flight);
+                true
+            }
         };
         if refused {
             if self.pumps.contains_key(&epoch) {
@@ -5915,6 +5976,33 @@ impl EffectExecutor for ManagerExec {
         let by_id = lock(&self.io.profile).device_by_id.clone();
         lock(&self.shared.inner).custody.pending_for(&by_id)
     }
+    fn dispatch_gate(&self) -> Option<Arc<crate::uart_bridge::ActorDispatchGate>> {
+        Some(self.rx.actor_dispatch_gate())
+    }
+    fn prepare_effects(&mut self, effects: &[Effect]) {
+        debug_assert!(self.prepared_human_guards.is_empty());
+        #[cfg(feature = "test-fakes")]
+        self.rx.dispatch_before_guard_registration_hook_for_test();
+        let mut effect_rx = self.rx.clone();
+        for effect in effects {
+            match effect {
+                Effect::AdoptBridge { epoch, .. } => {
+                    if let Some(next_rx) = lock(&self.opened_rx).get(epoch).cloned() {
+                        next_rx.activate_epoch(*epoch);
+                        effect_rx = next_rx;
+                    }
+                }
+                Effect::HumanTx { .. } => {
+                    self.prepared_human_guards
+                        .push_back(effect_rx.begin_human_tx_effect());
+                }
+                _ => {}
+            }
+        }
+    }
+    fn finish_event(&mut self) {
+        self.prepared_human_guards.clear();
+    }
     /// `Effect::ClaimForStop` 在 actor 執行緒上、manager 鎖內處理本 session 的帳本紀錄，結果以立即回饋
     /// `CustodyClaimed` 先於下一個 mailbox 事件交回 actor（設計 §3.1.2 C4、C5）；交出的 handle 交關閉工作者。
     fn execute_with_feedback(
@@ -6108,6 +6196,10 @@ impl EffectExecutor for ManagerExec {
             Effect::AdoptBridge { epoch, worker, .. } => {
                 if let Some(rx) = lock(&self.opened_rx).remove(&epoch) {
                     self.rx = rx;
+                    #[cfg(feature = "test-fakes")]
+                    {
+                        *lock(&self.io.current_rx) = self.rx.clone();
+                    }
                 }
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
@@ -8133,6 +8225,22 @@ impl SessionManager {
     ) -> Option<crossbeam_channel::Sender<crate::mailbox::ControlEvent>> {
         let inner = lock(&self.shared.inner);
         inner.sessions.get(sid).map(|e| e.actor.control.clone())
+    }
+
+    /// 只供測試（test-fakes）：取得同一 actor 的現行 RX、data lane、dispatch probe 與 active epoch。
+    #[cfg(feature = "test-fakes")]
+    pub fn actor_snapshot_for_test(
+        &self,
+        sid: &str,
+    ) -> Option<ActorSnapshotForTest> {
+        let (io, actor, fence) = {
+            let inner = lock(&self.shared.inner);
+            let entry = inner.sessions.get(sid)?;
+            (Arc::clone(&entry.io), Arc::clone(&entry.actor), Arc::clone(&entry.fence))
+        };
+        let rx = lock(&io.current_rx).clone();
+        let epoch = fence.with(|state| state.active_epoch);
+        Some((rx, actor.data.clone(), Arc::clone(&actor.probe), epoch))
     }
 
     /// 只供測試：取得 release 真正使用的 safety lane，以確定性重現「請求未入列」。

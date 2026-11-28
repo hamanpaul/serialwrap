@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；BC-23 依 OD-111／OD-112（2026-11-24，p279）；BC-08 依 OD-111／rulings v051（p289）；BC-09 依 OD-111／rulings v051（p290、issue 308）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-13 依 OD-111（i306）；BC-22 依 OD-111／rulings v051（i294）；BC-23 依 OD-111／OD-112（2026-11-24，p279）；BC-08 依 OD-111／rulings v051（p289）；BC-09 依 OD-111／rulings v051（p290、issue 308）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 24
+revision: 44
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -300,6 +300,47 @@ changes:
     compatibility_impact: "Rust 0.5.1 的 session.self_test 只在當下診斷，不保留後續 RPC 的操作權。前景槽、有效待執行命令、login／Recover、agent interactive lease、另一個 probe 或進行中的 background capture 會得到被動 SESSION_BUSY 或 SESSION_INTERACTIVE_BUSY（recommended_action=wait）：零 probe TX、不 suspend human、不更新 last_probe_at、不 confirm ready；busy 不代表故障。閒置 probe 在同一 actor 仲裁內取得 foreground、pending 與 Fence op-owner 授權，直到成功、失敗或 Shutdown 收尾；明示 Recover 仍可受理，但會使在途 probe 證據失效。執行回應逐項提供 tx_complete、execution_marker、probe_rc_zero、prompt_after_marker；只有完整 TX、TX 外獨立完整執行標記（由 configured ready_probe 成功後的 POSIX shell printf 發出）、零 RC、標記後 prompt，以及仍有效的 op／連線 epoch／FSM 證據世代全成立時才 probe_ok 並 confirm_ready。Rust 框架 TX 長度與拒絕回應長度可不同於凍結的 Python golden；Python 0.4.x 行為及 golden 不變。自訂 ready_probe 必須可在相容的 POSIX shell 框架中執行；不相容時失敗關閉，不退回 nonce 回顯判準。"
     approval_conditions: "依 OD-111、OD-112 授權的 2026-11-23 i306 編排者定案：保持既有前置分類與 Recover/human lease 政策；忙碌零 TX；在同次仲裁保留 foreground；Fence 提交點驗證 SelfTestProbe op-owner；以 TX 外執行標記、configured probe 零 RC 與標記後 prompt 建立證據；probe 執行結果攜帶四個固定布林欄位；確認前驗證連線 epoch 與證據世代；Shutdown Phase 1 立即沖刷且晚到結果不再回覆、回放或確認；不改 Python golden，不新增錯誤碼。"
     related_decisions: ["OD-111", "OD-112"]
+  - id: "BC-22"
+    kind: "BC"
+    title: "一般命令以自身 echo 與 prompt 證據判定完成並保留無換行 stdout（i294）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-24"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 44
+    spec_refs: ["issue-294", "issue-262", "issue-271", "OD-112", "OD-114"]
+    reconciliation_refs: ["issue-294", "issue-262", "issue-271"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P5"]
+    case_ids: ["l15-half-prompt"]
+    compatibility_impact: >-
+      Rust 0.5.1 i294 的一般 agent line／background 命令（未指定 completion_regex、非 passthrough）以本命令完整 echo 作 prompt 搜尋下界；echo 只在清理後行尾錨定找到時接受。prompt 通常從同一 snapshot 最後一行真實行首完整匹配至尾端且不得早於 echo；既有完整字面 evidence 可作 echo 後同行 suffix 的唯一例外。單一 BusyBox 的 CR CR LF 或 readline 的空白加 CR 折行僅在插入點有局部原始串流證據時接受；多次折行、混合折行、無局部證據或其他無法可靠定位的形態一律按無 echo 處理。完成與 stdout 擷取使用同一 RX snapshot；stdout 從已確認 echo 結束位置直接擷取，不因輸出行尾等於命令字串而剝除，echo 前 human 殘餘不進入正常 stdout。相容限制：echo 後第一行恰好等於命令且後面還有輸出時，視為重複 echo 並刪除；需保留時使用 completion_regex 或 marker。
+      同一 session 的 bridge epoch 共用 ActorDispatchGate 與 human 計數域；submit 開始計數、human TX generation、human_in_flight、completion snapshot 與 stale recheck 共讀此域。pending_human 獨立於累計計數，保存最新 human TX `(epoch, 絕對 RX 字元位置)` 邊界。human job 的 OS `submit()` 成功返回後，才以該 writer permit 的 epoch 及 active RX watermark 登錄邊界，不跨 write 持有會阻塞 reader 的 gate／RX 鎖；只對 Accepted／Pending 登錄，WouldBlock、NotSubmitted 與拒絕不建界。tuple `(epoch, offset)` 字典序只增不減；舊 epoch 晚登錄映射至 `(active_epoch, 0)`，接管也把未結案 pending 推進至 `(new_epoch, 0)`。正式 close fence 是 writer／reader join、舊 handle close、WorkerStopped 回報，再允許新 handle 開啟。
+      Human pending 結案只看完整清理視窗真正最後一行：該行必須由可證明的真實行首開始，完整匹配目前 profile regex 並終止於 snapshot 尾端，且該行所有原始來源位元組均在最新 TX 邊界之後。視窗曾修剪（trimmed > 0）且最後一行從保留視窗開頭起算時，行首無法證明，不得結案；只有 trimmed == 0 且窗口起點就是該 epoch 串流起點時，才可把窗口開頭視為行首。CR／重繪依 clean_text 語意；分包 prompt 不完整時不結案。SetProfile／rematerialize 更新 gate regex 並保留 pending；確認 recover 後的 prompt 依同一規則結案。
+      一般無 echo 命令完成：命令起點沒有 pending_human 且命令窗口內沒有可信 human 訊號時，CompletionEvaluator 取得起點為 max(pre_offset, window.trimmed) 的 snapshot；即使 READY evidence 不存在或先前已清除，仍接受目前 profile regex 從真實最後一行行首完整匹配到 snapshot 尾端的 prompt，不要求 evidence。同行 suffix 只可在已確認本命令 echo 後裁切；無 echo 的 abcroot@host:/# 等同行字面不得完成。RX 未修剪必要資料時回 ok=true、partial=false；必要 post-TX RX 已確定修剪時回 ok=true、partial=true、無 error_code。可信 human 訊號包括起點 pending、窗口內 submit 開始、generation 變動及在途 submit；任一成立即不採無 echo 相容完成。
+      「完成候選」的可檢驗判準限定為清理後最後一行從行首到 snapshot 尾端完整符合 profile prompt regex、snapshot 尾端完整等於 epoch 內已知 prompt 字面，或 profile 可辨識的純符號短 suffix；同行字面可形成候選但不可單獨證明裁切邊界。所有 timeout 入口共用矩陣：可信 human 訊號依第 1 項 human 路徑回 PROMPT_TIMEOUT、partial=true、recovery_action=NONE 且抑制 rescue；無 human 且完全沒有候選時，僅在 `timeout_recovery_keys` 設定相同的條件下，status、error_code、partial、recovery_action、輸出與救援 TX 才與 9af187ca 基線逐位元組相同；設定不同時救援 TX 依各自鍵清單，預設鍵集合依 BC-09 為 `[CTRL_C]`；只要有候選但身分或位置不足，就回 CompletionUncertain（PROMPT_TIMEOUT、partial=true、recovery_action=NONE），保留 stdout、零救援、不降級 READY。operation deadline 到時完成尚未線性化者不得以截止 snapshot 事後改判。
+      一般 echo evaluator 命令開始時已有 pending_human，且 timeout 在線性化決策中選擇 human partial 路徑時，只有在 submit 開始計數仍等於起點快照、human TX generation 與 pending `(epoch, offset)` tuple 未變、human_in_flight 為零且沒有 tx_submit_pending 時，才於同一 decision reservation 臨界區原子清除 pending 並登記「timeout 消耗」事件；否則保留。此消耗不改本筆 partial、輸出、TX 或零救援行為；human submit 在決策前開始則 pending 保留，在決策後開始則建立新在途／pending。接管後舊 epoch pending 亦適用。穩定 pending 在 human 無新動作時最多使一筆無 echo 命令 partial，其後恢復基線；若消耗時 human 命令實際仍在裝置執行，下一筆回到基線原有行為，基線本無 human 保護，因此不比基線差。
+      Human pending 保護路徑的保守代價為以下情況各自最多使一筆無 echo agent 命令回 partial：完整 prompt 先於 write return 抵達；Ctrl-L／方向鍵／Tab 等不送換行按鍵；無 echo 終端的無輸出 human 命令使新 prompt 接在同一行；修剪後行首無法證明。此修剪行首限制只套用 human pending 結案；一般無 echo 命令依上段 command snapshot 與 prompt 證據處理。有 echo 終端通常由 human 命令 echo 換行提供真實行首。只有 human 交錯且找不到 echo 時才採 human partial 規則；沒有 human 訊號而 prompt 可辨識時維持一般完成。
+      i294-i2 的 prompt evidence 來源為同一 epoch 的 READY probe 獨立 nonce 輸出，或本命令完整 echo 與其後 prompt 的完整前綴互證。前綴範圍固定為 echo 起點所在行的真實行首到 echo 起點，不剝除既有 evidence、也不改取後段 suffix；可跨 command TX 邊界，僅當前綴與 TX 同 epoch、仍在未修剪 RX window、清理後行首可證明時才延伸。該完整字面須完全匹配目前 profile regex、至少含一個字母或數字，且 echo 後真實最後一行行首到 snapshot 尾端重現完全相同字面，才完成並原子更新 evidence；不符合時，已有 evidence 的尾端仍完整相等才完成，否則 CompletionUncertain。跨 TX 前綴遇到 human 訊號時走既有 human 路徑，不以此互證；判讀除起點 pending、submit 開始計數與 generation 變動外，也以同一 snapshot 的 `human_in_flight > 0` 或 `tx_submit_pending` 為可信在途訊號。任一訊號成立時不得寫回跨 TX evidence；只有在途訊號消失後，revision 變更才再評估，不能因此新增阻擋 TX 的閘門。READY 只在 nonce 輸出後緊接探針前同一完整 prompt 且尾端一致時登錄，probe echo、舊 prompt、非同步寬鬆 regex 輸出與只作命令輸出的 `Path => ` 不計；三類拒絕字面在分包與合包下不得寫入 evidence，後續同字面也不能只因無互證前綴而完成。完成與 stdout 共用 snapshot；精確 `router => `、`router=> ` 可由 READY 或互證 echo 建立。evidence 寫回同時驗證 snapshot window revision、profile revision、RX watermark／epoch 與 active window；clear、換 epoch、profile rebind 或接管任一項不符時 stale 評估不得寫回、完成或裁切。clear／profile／takeover 後被 barrier 攔截的新字面不得復活；已知 evidence 即使重現，也不因失敗的前綴互證被關閉。前綴行首無法證明（例如所在行首已修剪），或 prompt 與 echo 不在同一行時，不使用該前綴恢復；可保留的輸出回 partial。連續 prompt 位於同一清理行仍是 SPEC-GAP，不從後段 suffix 學習。無換行 stdout 只有已找到本命令 echo 時，才可用已知且至少含字母或數字的完整 prompt suffix；保留 `printf abc`、NUL 與 prpl／Speedport prefix。短 prompt（`> `、`# `、`$ `、`=> `）只在最後一行行首接受，不能成為 evidence 或裁切同行 stdout；已知短／未知／變更候選依前述矩陣回 CompletionUncertain。completion_regex、passthrough、登入、reboot／recover、檔案傳輸、Python、錯誤碼集合與案例分母不變。
+    approval_conditions: >-
+      依 OD-111、OD-112、OD-114、2026-11-24 i294 編排者定案與 2026-11-25／26 預先裁決分階段實作；i1 不改 Python、completion_regex、passthrough、登入／recover 行為、錯誤碼集合或既有案例分母。只有清理後行尾錨定的完整 echo 可作命令完成搜尋下界；折行只接受有局部原始串流證據的單一 BusyBox／readline 插入點，其餘依無 echo 規則。完成與 stdout 共用 snapshot，從已確認 echo 結尾擷取；狹義重複 echo 相容條件及 producer 基線保持不變。
+      一般無 echo 命令完成：命令起點沒有 pending_human 且窗口內沒有可信 human 訊號時，不要求 prompt evidence；CompletionEvaluator 只接受目前 profile regex 從最後一行真實行首完整匹配至 snapshot 尾端。同行 suffix 不接受。必要 RX 修剪後成功回 ok=true、partial=true、無 error_code，echo 仍在視窗內則 partial=false。可信訊號包括起點 pending、窗口內 submit 開始、generation 變動及在途 submit；任一成立即沿 human 規則保留輸出並 zero rescue。
+      completion candidate 是最後一行完整符合 prompt regex、snapshot 尾端為已知 prompt 字面，或 profile 可辨識的純符號短 suffix。所有 timeout 入口同一矩陣：無 human 且候選不存在時保留 rescue reservation 並呼叫 recover_after_failure，在相同 `timeout_recovery_keys` 設定下，與 9af187ca 的 status、error_code、partial、recovery_action、輸出及救援 TX 逐位元組相同；預設鍵集合依 BC-09 為 `[CTRL_C]`；有候選但 prompt 身分／位置不足時走 CompletionUncertain、零 rescue；有 human 且無 echo 維持第 1 項 partial。operation deadline 到時若完成尚未線性化，不得使用截止 snapshot 改判。timeout decision 與 dispatch、human enqueue、pending 線性化；producer 只在 gate 內 try_send，queue 滿先釋放 gate 再等容量。無 human 基線保留 rescue reservation 至第一救援鍵入列，deferred 按鍵只在 HumanTx effect 後入在途。
+      Human pending 保存最新 write 後 watermark 邊界。OS submit 成功返回後，才以 writer permit epoch 和 active RX watermark 登錄；只對 Accepted／Pending 建界，WouldBlock、NotSubmitted、拒絕不建界，不跨 OS write 持有會阻塞 reader 的 gate／RX 鎖。pending `(epoch, offset)` tuple 字典序單調遞增；舊 epoch 晚到登錄映射到 `(active_epoch, 0)`，接管把未結案 pending 推至 `(new_epoch, 0)`。正式 close fence 須待 writer／reader join、舊 handle 關閉及 WorkerStopped 回報後才可開新 handle。
+      Human pending 結案須在完整清理視窗真正最後一行，由可證明的真實行首起完整符合目前 profile regex、終止於 snapshot 尾端，且該行全部原始來源位元組均在最新 write 後 TX 邊界之後。trimmed > 0 且最後一行從保留視窗開頭起算時，行首不可證明；只有 trimmed == 0 且窗口起點為 epoch 串流起點才可視為行首。分包不完整或其他任一條件不符均不結案。SetProfile／rematerialize 更新 gate regex 並保留 pending；確認 recover 後的 prompt 使用同一尾端規則。鎖序為 gate state → prompt regex → RX inner，沒有 RX inner → gate state 反向路徑。
+      timeout 消耗僅適用 echo evaluator 且命令起點已有 pending_human、並由靜默 chunk 或絕對 deadline 選擇 human partial 的一般 agent 命令。在同一 timeout decision reservation 臨界區，只有 submit 開始計數、human TX generation、pending tuple 均未改變且 human_in_flight 為零、無 tx_submit_pending 時，才原子清除 pending 並記錄「timeout 消耗」事件；任一條件不成立則保留。這不改本命令結果、TX 或救援行為；決策前的 submit 保留 pending，決策後的 submit 建立新的在途／pending。接管後尚未結案的舊 epoch pending 同樣適用。穩定 pending 在 human 停止後最多使一筆無 echo 命令 partial，之後恢復基線；消耗時 human 命令若仍在裝置執行，後續行為回到本無 human 保護的基線，不會比基線差。
+      Human pending 保護路徑的四項保守代價各自最多造成一筆無 echo partial：prompt 在 write return 前完整抵達；Ctrl-L／方向鍵／Tab 等不送換行按鍵；無 echo 終端的無輸出 human 命令讓 prompt 接續在同一行；修剪後行首無法證明（此判準限於 human pending 結案；一般無 echo 仍要求 command snapshot 最後一行行首）。有 echo 終端通常由 human echo 換行提供真實行首。i2 READY evidence 僅接受 probe 獨立 nonce 輸出後立即重現探針前 prompt；evidence 遺失或 PS1 變更時，完整 echo 前綴固定為 echo 行真實行首到 echo 起點，可在同 epoch、未修剪且行首可證明時跨 TX 前延伸；不得剝除既有 evidence 或只取 suffix。完整前綴與 echo 後真實行首 prompt 完全相等才原子更新；若不互證，已有 evidence 與 tail 相等仍完成，否則 CompletionUncertain。human 訊號與跨 TX 前綴同時存在時走既有 human 路徑，不學前綴；同一 snapshot 的 human_in_flight 或 tx_submit_pending 也在其中，在途消失後 revision 改變才重評。evidence 寫回重驗 window revision、profile revision、watermark／epoch 與 active window，clear、epoch、profile rebind 或接管後不復活；完成 stale recheck 另重驗 profile。profile 切換因此只推進 completion snapshot revision，不改 human submit 計數、pending tuple、writer guard 或 timeout 消耗。`Path => ` 作為輸出只因 regex 命中不得完成或成為 evidence。同一行 stdout 僅在已有 echo 時移除已知含字母或數字的完整 prompt suffix；短 prompt 只可在行首接受且永不成為 evidence，未知／變更候選依 CompletionUncertain 矩陣保守 partial 且零 rescue，NUL 原樣保留。無 echo／無 human 不要求 evidence；修剪必要 RX 的成功必須 partial=true。無 human 且沒有候選維持 9af187ca timeout。echo 前綴行首已修剪、prompt 與 echo 不同一行，或同一行連續 prompt 是保守 partial 限制，不以 suffix 延伸。整包已實作三票並推進 IMPLEMENTED。
+    related_decisions: ["OD-111", "OD-112", "OD-114"]
   - id: "BC-23"
     kind: "BC"
     title: "Windows TCP raw owner 以 lifetime mirror lease 參與 session 仲裁"

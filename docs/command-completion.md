@@ -16,6 +16,67 @@ END 行，避免 shell 回顯含有字面標記的命令被誤當成執行結果
 ONLCR 產生的多個 CR。呼叫端仍須驗證唯一 payload、BEGIN／END 與實際 RC 值，
 broker 的非 partial 完成不代表 target 命令成功或測試通過。
 
+## Rust 一般 agent 命令的 prompt 身分
+
+未指定 `completion_regex` 的非 passthrough `line`／`background` agent 命令，
+仍先尋找本命令完整 echo。只有清理後行尾錨定、符合既有單一 BusyBox／readline
+折行規則的 echo 可成為輸出下界；完成判定與 stdout 使用同一份 RX snapshot，
+echo 前的 human 殘餘不進入一般 stdout。
+
+- 既有 epoch 字面 evidence 只來自可辨識 READY 結果：probe 輸出另有獨立
+  nonce 行、其後緊接與探針前 prompt 相同的完整行首 prompt、且兩者都終止於
+  snapshot 尾端；probe 命令自身的 echo、舊 prompt 與只符合寬鬆 regex
+  的非同步輸出不算證據。`clear`、換 bridge epoch 與 profile rebind 後舊證據
+  立即失效；證據寫回與完成線性化都會重驗 window
+  revision、profile revision、RX watermark／epoch。profile 切換只推進 completion
+  snapshot revision；不改第 1 項的 human submit 計數、pending tuple、writer
+  guard 或 timeout 消耗規則。
+- 已找到本命令 echo 且 evidence 遺失、被拒或 PS1 與既有 evidence 不同時，
+  echo 前綴固定為「echo 起點所在行的真實行首到 echo 起點」的完整清理字面；
+  不剝除既有 evidence，也不只取後段 suffix。此範圍可跨 command TX 邊界往前，
+  但必須與 TX 同 epoch、仍在 RX window 且沒有被修剪、真實行首可證明。
+  前綴須完整匹配目前 profile regex、至少含一個字母或數字，且 echo 後真實
+  最後一行行首到 snapshot 尾端重現完全相同字面，才可完成並建立 evidence。
+  互證失敗時，已有 evidence 若完整等於 snapshot 尾端仍可完成；否則維持
+  Uncertain。跨 TX 前綴遇 human 訊號時不做互證，沿既有 human 路徑；同一
+  snapshot 的 `human_in_flight > 0` 或 `tx_submit_pending` 亦屬可信在途訊號。
+  在途訊號消失後，revision 改變會再次評估，不新增 TX 閘門。
+  `A => `、只作命令輸出的 `Path => ` 不得只因寬鬆 regex 命中而完成或成為
+  evidence；可信來源證實的 `router => `、`router=> ` 均可辨識。
+- stdout 不以換行結尾時，只有已找到本命令 echo 的情況，才可用已知且至少含
+  一個字母或數字的完整 prompt 字面作同行 suffix。只移除該 suffix，所以
+  `printf abc` 回 `abc`，檔案尾端的 U+0000 仍保留。`> `、`# `、`$ `、`=> `
+  等短 prompt 只能在最後一行行首接受，不能裁切同行 stdout，也不能成為
+  evidence。沒有 echo 時，同行 `abcroot@t:/# ` 仍不得完成。
+- 已知短 prompt 與 stdout 黏在同一行，或尾端 regex 已命中、但 prompt 字面
+  未知／變更而無可靠邊界時，等待原期限後回 `PROMPT_TIMEOUT`、
+  `partial=true`、`recovery_action=NONE`；可用 stdout 保留，不重送命令、
+  不額外送 Ctrl-C／Ctrl-D。可檢驗的「候選」限定為：(1) 清理後最後一行從
+  行首到尾端完整符合 profile prompt regex；或 (2) snapshot 尾端完整等於
+  epoch 內已知 prompt 字面，包含不能安全裁切的同行 suffix；純符號短 suffix
+  只要完整匹配 profile 也仍屬候選。三者皆不成立時才是無候選，無 human
+  訊號的 timeout 沿用基線 rescue 結果與 TX。
+- 沒有 human TX 交錯的無 echo 終端不要求 prompt evidence，也不製造 echo：
+  目前 profile regex 必須從真實最後一行行首完整匹配到 snapshot 尾端，否則
+  不完成。若判斷視窗已修剪掉命令 TX 後的必要早期 RX，回
+  `ok:true`、`partial:true`、不帶 error_code，stdout 只含仍保留的部分；
+  echo 仍在視窗內時維持 `partial=false`。
+- 已知限制：若 echo 前綴所在行首已被 RX window 修剪而無法證明，或 prompt
+  與 echo 不在同一行，該前綴不參與互證，不能恢復 evidence；有候選但身分
+  不足時保留 stdout 回 partial。同一清理行內連續 prompt（例如舊 prompt 後
+  直接接 PS1 新 prompt）仍是 SPEC-GAP，不從後段 suffix 學習。
+- 有 human TX／pending 人類行而找不到可辨識 echo 時，才依既有 human 交錯
+  規則在原等待上限回 partial；一般無 echo 且無 human 訊號不沿用這項判準。
+- silence chunk 與絕對 deadline 兩入口採同一矩陣：無 human 且無候選時維持
+  9af187ca 的 timeout／recover_after_failure 結算與救援 TX 在相同
+  `timeout_recovery_keys` 設定下逐位元組相同；預設鍵集合依 BC-09 為 `[CTRL_C]`。
+  有候選但證據不足時
+  回 `CompletionUncertain`、`PROMPT_TIMEOUT`、`partial=true`、
+  `recovery_action=NONE`、保留輸出且不送救援鍵。human 路徑仍沿用第 1 項
+  已定的線性化與 pending 規則。
+
+`--completion-regex` 的 producer 路徑不要求 echo，也不加入以上 prompt 證據規則。
+
 ## CLI／RPC／結果契約
 
 - CLI：`cmd submit --completion-regex <pattern>`。
@@ -71,5 +132,6 @@ PTY 測試使用 producer 先回顯命令、再輸出 numeric RC／END 並刻意
 prompt，驗證 line／background 非 partial 完成與完整 stdout。另覆蓋 echo-only、
 歷史 marker、無效 regex 零 TX、預設 prompt、CLI→RPC→queue→execute 傳遞、結果
 metadata、前置 prompt 不截斷 stdout 與 reboot 不覆寫。此 broker 行為可由 pytest
-覆蓋；產品 rootfs／factory
+覆蓋；Cargo 與 RPC 覆蓋 `=> ` 分段輸出、無換行 `abc`、NUL、短／未知 prompt、
+READY／echo 前綴證據來源、clear 失效與 RX 修剪 partial。產品 rootfs／factory
 reset 的真機時序由獨立 TestPilot ST-06 case 驗證。

@@ -57,17 +57,17 @@
 
 ## 已知問題
 
-以下問題已確認存在於 0.5.0，預定於 0.5.1 修正（括號內為 GitHub issue 編號）。
+以下問題已確認存在於 0.5.0；0.5.1 已修項另行標註（括號內為 GitHub issue 編號）。
 
 1. **檔案推送進行中停止或重啟 daemon**（#282、#296）
    - DUT 的輸入列可能殘留沒送完的半行。重啟後 session 可能停在 `ATTACHED`／`PROMPT_UNAVAILABLE`，需要手動送 Ctrl-C 清除。
    - 進行中的 `file push`／`file pull` 偶爾回 `EXCEPTION`（`session actor stopped`），而不是 `COMMAND_ABORTED_IN_FLIGHT`／`FLUSHED_BY_RECOVERY`。
    - 避免方式：推送進行中不要停止或重啟 daemon。
 2. **停機時進行中的 `session self-test`、`session recover`、interactive 操作會回 `EXCEPTION`**（#297）。呼叫端請視為已中止，daemon 重新啟動後再重試。
-3. **human 與 agent 同時操作同一個 session**（#294）
-   - human 送出一行、該行的 prompt 還沒回來時，若 agent 命令剛好送出，agent 命令可能回 `done`，但輸出是空的，或只含 human 那一行的殘餘輸出。DUT 仍會執行該命令。
-   - 避免方式：agent 命令加 `--completion-regex` 並在命令中輸出唯一記號。
-   - 不帶行尾錨點的 `prompt_regex`（例如 prpl、Speedport 範本）尚未驗證，風險可能較高。
+3. **human／agent 完成判定（#294，0.5.1 已修，含 #262、#271）**
+   - 0.5.0 可能讓 human 的舊 prompt 或 `Path => ` 命令輸出提前完成 agent 命令，也可能從 regex match 起點裁掉 `printf abc` 與 NUL 尾端檔案的同行 stdout。
+   - 0.5.1 的 Rust daemon 已用本命令 echo 與精確尾端邊界判定；READY 只收 probe 獨立輸出 nonce、其後同一已知 prompt。evidence 清除、被拒或 PS1 改變時，echo 前綴固定為該行真實行首到 echo 起點的完整字面；可在同 epoch、未修剪、行首可證明時跨 TX，但不得剝舊 evidence 或取 suffix。前綴與 echo 後行首到 tail 須完全相等才能重建；互證不成立時僅既有 evidence 對 tail 完整相等可完成。同一 snapshot 有 human job 在途或 submit 尚待 observer 登錄時不做跨 TX 互證；在途消失後只由 revision 變動重新評估，不加 TX 閘門。同行 `printf abc` 只在已有本命令 echo 時，以已證實完整 prompt suffix 裁切，保留 U+0000。無 echo 且無 human TX 時不要求 evidence；目前 regex 從真實最後一行行首完整匹配到 snapshot 尾端即可完成，必要 RX 修剪時回 `ok:true`、`partial:true`。echo 前綴行首已修剪、prompt 與 echo 不同行時不以該前綴恢復，同一行連續 prompt 亦保守回 partial。
+   - tail candidate 的判準是最後一行完整符合 prompt regex、snapshot 尾端完整等於已知 prompt，或 profile 可辨識的純符號短 suffix。短／未知／變更候選，或 human 交錯且無 echo 時，等待原上限後回 partial，不重送、不另送救援鍵；無 human 且完全沒有候選時維持 9af187ca 既有 timeout 與救援 TX。producer `--completion-regex` 契約不變；prpl／Speedport prefix prompt 已納入 Rust Cargo／RPC 驗收。
 4. **USB 序列埠短暫斷線又回來後，不會自動接回**（#300）
    - 裝置在 1 秒內斷線又回來（例如 USB 重新列舉）時，session 停在 `DETACHED`，`last_error` 為 `ATTACH_FAILED:FileNotFoundError`，之後不會自動接回。0.4.x 也有同樣的限制。
    - 恢復方式：`serialwrap session attach --selector <COM>`。

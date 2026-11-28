@@ -11,6 +11,7 @@ use crate::pyjson::{PyInt, PyValue};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
+use std::ops::Range;
 
 /// Python `str.isspace` 的 ASCII 與 Unicode 空白集合（與 `Py_UNICODE_ISSPACE` 一致，含 U+001C..U+001F）。
 pub fn py_is_space(c: char) -> bool {
@@ -867,6 +868,170 @@ mod tests {
         assert_eq!(py_repr_str("\u{ad}"), "'\\xad'");
         assert_eq!(py_repr_str("é"), "'é'");
     }
+
+    #[test]
+    fn clean_text_with_source_ranges_matches_text_and_byte_ranges_systematically() {
+        let explicit: &[(&str, &str, &[std::ops::Range<usize>])] = &[
+            ("A\x1b[31mB", "AB", &[0..1, 6..7]),
+            ("A\x07é", "Aé", &[0..1, 2..4]),
+            ("ab\x08c", "ac", &[0..1, 3..4]),
+            ("ab\x7fc", "ac", &[0..1, 3..4]),
+            ("A \r \x08", "A ", &[0..1, 1..2]),
+            ("A \r\x08 ", "A ", &[0..1, 4..5]),
+            ("a\rb", "ab", &[0..1, 2..3]),
+            ("a\r\nb", "a\nb", &[0..1, 1..3, 3..4]),
+            ("é😀z", "é😀z", &[0..2, 2..6, 6..7]),
+            (
+                "é\x1b[31mA\x07b\x08😀\x7fC\rD\r\nE\rZ",
+                "éACD\nEZ",
+                &[0..2, 7..8, 16..17, 18..19, 19..21, 21..22, 23..24],
+            ),
+            ("x\x1b]0;title\x07y", "xy", &[0..1, 11..12]),
+        ];
+
+        #[derive(Clone)]
+        struct ExpectedChar {
+            ch: char,
+            source: std::ops::Range<usize>,
+        }
+
+        // 獨立依 raw char_indices 建立正規化來源，再逐字元套用清理規則；不讀取 API 回傳值，
+        // 因而可辨識重複字元被移除後仍映射到錯誤來源位置的情形。
+        fn expected_model(raw: &str) -> (String, Vec<std::ops::Range<usize>>) {
+            fn ansi_end(text: &str, start: usize) -> Option<usize> {
+                let bytes = text.as_bytes();
+                if bytes.get(start) != Some(&0x1b) {
+                    return None;
+                }
+                match *bytes.get(start + 1)? {
+                    b'[' => {
+                        let mut i = start + 2;
+                        while bytes.get(i).is_some_and(|b| {
+                            b.is_ascii_digit() || matches!(b, b';' | b'?')
+                        }) {
+                            i += 1;
+                        }
+                        bytes
+                            .get(i)
+                            .is_some_and(u8::is_ascii_alphabetic)
+                            .then_some(i + 1)
+                    }
+                    b']' => {
+                        let mut i = start + 2;
+                        let mut last_st = None;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                return Some(i + 1);
+                            }
+                            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                                last_st = Some(i + 2);
+                            }
+                            i += 1;
+                        }
+                        last_st
+                    }
+                    _ => None,
+                }
+            }
+
+            let mut normalized = Vec::<ExpectedChar>::new();
+            let mut input = raw.char_indices().peekable();
+            while let Some((start, ch)) = input.next() {
+                let end = start + ch.len_utf8();
+                if ch == '\r' {
+                    if let Some(&(next_start, '\n')) = input.peek() {
+                        input.next();
+                        normalized.push(ExpectedChar {
+                            ch: '\n',
+                            source: start..next_start + 1,
+                        });
+                    }
+                    continue;
+                }
+                normalized.push(ExpectedChar {
+                    ch,
+                    source: start..end,
+                });
+            }
+            let normalized_text: String = normalized.iter().map(|item| item.ch).collect();
+            let mut output = Vec::<char>::new();
+            let mut sources = Vec::<std::ops::Range<usize>>::new();
+            let mut unit = 0usize;
+            let mut byte = 0usize;
+            while byte < normalized_text.len() {
+                if let Some(end) = ansi_end(&normalized_text, byte) {
+                    let skipped = normalized_text[byte..end].chars().count();
+                    unit += skipped;
+                    byte = end;
+                    continue;
+                }
+                let item = &normalized[unit];
+                unit += 1;
+                byte += item.ch.len_utf8();
+                match item.ch {
+                    '\u{08}' | '\u{7f}' => {
+                        output.pop();
+                        sources.pop();
+                    }
+                    '\u{07}' => {}
+                    ch => {
+                        output.push(ch);
+                        sources.push(item.source.clone());
+                    }
+                }
+            }
+            (output.into_iter().collect(), sources)
+        }
+
+        fn verify(raw: &str) {
+            let (actual, sources) = clean_text_with_source_ranges(raw);
+            assert_eq!(actual, clean_text(raw), "cleaned text differs for {raw:?}");
+            let (expected_text, expected_sources) = expected_model(raw);
+            assert_eq!(actual, expected_text, "independent model text for {raw:?}");
+            assert_eq!(sources, expected_sources, "independent source model for {raw:?}");
+            let chars: Vec<char> = actual.chars().collect();
+            assert_eq!(chars.len(), sources.len(), "range count for {raw:?}");
+            let mut previous_end = 0;
+            for (ch, source) in chars.iter().zip(&sources) {
+                assert!(source.start >= previous_end, "overlapping source ranges for {raw:?}: {sources:?}");
+                assert!(source.start < source.end && source.end <= raw.len(), "invalid source range for {raw:?}: {source:?}");
+                assert!(raw.is_char_boundary(source.start) && raw.is_char_boundary(source.end), "range splits UTF-8 for {raw:?}: {source:?}");
+                let original = &raw[source.clone()];
+                assert!(
+                    original == ch.to_string() || (*ch == '\n' && matches!(original, "\n" | "\r\n")),
+                    "output {ch:?} maps to unexpected original bytes {original:?} at {source:?} in {raw:?}"
+                );
+                previous_end = source.end;
+            }
+        }
+
+        for (raw, expected, ranges) in explicit {
+            let (actual, actual_ranges) = clean_text_with_source_ranges(raw);
+            assert_eq!(&actual, expected, "cleaned text for {raw:?}");
+            assert_eq!(&actual, &clean_text(raw), "clean_text equivalence for {raw:?}");
+            assert_eq!(&actual_ranges, ranges, "source byte ranges for {raw:?}");
+            verify(raw);
+        }
+
+        // 有界組合交錯 ANSI、BEL、BS、DEL、CR、LF、CRLF 與多位元組字元，避免只覆蓋手選排列。
+        fn enumerate(atoms: &[&str], remaining: usize, current: &mut String) {
+            verify(current);
+            if remaining == 0 {
+                return;
+            }
+            for atom in atoms {
+                let previous_len = current.len();
+                current.push_str(atom);
+                enumerate(atoms, remaining - 1, current);
+                current.truncate(previous_len);
+            }
+        }
+        let atoms = [
+            "A", " ", "é", "😀", "\x07", "\x08", "\x7f", "\r", "\n", "\r\n", "\x1b[31m",
+            "\x1b]0;t\x07",
+        ];
+        enumerate(&atoms, 3, &mut String::new());
+    }
 }
 
 /// Python 例外的 RPC 邊界表示（Slice 2.1 Task 0c；紅燈階段骨架）。
@@ -1018,6 +1183,57 @@ pub fn clean_text(text: &str) -> String {
         }
     }
     out
+}
+
+/// 清理 console 文字並保留每個輸出字元在原始 UTF-8 中的來源範圍。
+///
+/// ANSI 序列與 BEL 不產生輸出；backspace／DEL 會同時移除最後一個輸出字元及其來源；
+/// CRLF 產生的 LF 對應整個原始 CRLF 範圍，孤立 CR 則不產生輸出。
+pub fn clean_text_with_source_ranges(text: &str) -> (String, Vec<Range<usize>>) {
+    let mut normalized = String::with_capacity(text.len());
+    let mut normalized_sources = Vec::with_capacity(text.chars().count());
+    let mut input = text.char_indices().peekable();
+    while let Some((start, ch)) = input.next() {
+        let end = start + ch.len_utf8();
+        if ch == '\r' {
+            if let Some(&(next_start, '\n')) = input.peek() {
+                input.next();
+                normalized.push('\n');
+                normalized_sources.push(start..next_start + 1);
+            }
+            continue;
+        }
+        normalized.push(ch);
+        normalized_sources.push(start..end);
+    }
+
+    let mut out = String::with_capacity(normalized.len());
+    let mut sources = Vec::with_capacity(normalized_sources.len());
+    let mut index = 0;
+    let mut source_index = 0;
+    while index < normalized.len() {
+        if let Some(end) = ansi_sequence_end(&normalized, index, AnsiMode::CleanText) {
+            source_index += normalized[index..end].chars().count();
+            index = end;
+            continue;
+        }
+        let ch = normalized[index..].chars().next().expect("字元邊界");
+        index += ch.len_utf8();
+        let source = normalized_sources[source_index].clone();
+        source_index += 1;
+        match ch {
+            '\u{08}' | '\u{7f}' => {
+                out.pop();
+                sources.pop();
+            }
+            '\u{07}' => {}
+            _ => {
+                out.push(ch);
+                sources.push(source);
+            }
+        }
+    }
+    (out, sources)
 }
 
 /// 移除 ANSI escape 序列（Python 基線 regex 語意）。

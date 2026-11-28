@@ -3630,6 +3630,9 @@ impl SessionCore {
                     return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
                 }
                 let binding_changed = self.profile.device_by_id != profile.device_by_id;
+                self.deps
+                    .rx
+                    .set_human_prompt_regex(&profile.template.prompt_regex);
                 self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
                 self.profile = profile;
                 self.profile_source = profile_source;
@@ -8721,6 +8724,16 @@ impl SessionCore {
                     self.transition_to_attached("PROMPT_TIMEOUT", now);
                 }
                 CmdOutcome::Result(prompt_timeout_none())
+            }
+            OpOutcome::CompletionUncertain { stdout } => {
+                self.set_terminal_capture(cmd_id, Some(stdout.clone()), Some("PROMPT_TIMEOUT"), now);
+                CmdOutcome::Result(pydict! {
+                    "ok" => false,
+                    "error_code" => "PROMPT_TIMEOUT",
+                    "stdout" => stdout,
+                    "partial" => true,
+                    "recovery_action" => "NONE",
+                })
             }
             // P6 Task 7（D-10）／OD-74：可信 human 的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner`
             // human 分支，`session_manager.py:6476-6504`）；可信判定同上，不看 source 字首。

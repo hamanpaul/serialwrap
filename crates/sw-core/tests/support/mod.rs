@@ -19,7 +19,7 @@ pub mod handoff;
 /// P8 Task 5：`OpTransferPort` 測試台（`PortRig`／`FakeDut`）。
 pub mod transfer_port;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,7 @@ use sw_core::session_core::{
     CoreDeps, Effect, PublicCtx, SessionCore, SessionRequest, SessionState,
 };
 use sw_core::state_store::StateDelta;
-use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterHandle};
+use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterContext, TxWriterHandle};
 use sw_core::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use sw_core::wal::{WalAppendReq, WalConfig, WalHealthFanout, WalWriter};
 use sw_core::Mono;
@@ -228,6 +228,7 @@ impl CoreHarness {
         wal.set_health_sink(fanout);
 
         let rx = RxShared::new(131_072, clock.mono_ns());
+        rx.set_human_prompt_regex_for_test(&profile.template.prompt_regex);
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
         let fake_device = serial.add_device(REAL_PATH);
@@ -1003,6 +1004,8 @@ struct RigExec {
     registry: Arc<CommandRegistry>,
     /// 測試用：在 BeginDrain 前後暫停 actor，建立可控的 data lane backlog。
     drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
+    /// transition 實際輸出的 HumanTx effect 對應 guard，依 effect 順序轉交給 pump。
+    prepared_human_guards: VecDeque<sw_core::uart_bridge::HumanInFlightGuard>,
 }
 
 struct DrainPauseState {
@@ -1051,6 +1054,25 @@ fn rig_nonce() -> String {
 }
 
 impl EffectExecutor for RigExec {
+    fn dispatch_gate(&self) -> Option<Arc<sw_core::uart_bridge::ActorDispatchGate>> {
+        Some(self.rx.actor_dispatch_gate())
+    }
+
+    fn prepare_effects(&mut self, effects: &[Effect]) {
+        debug_assert!(self.prepared_human_guards.is_empty());
+        self.rx.dispatch_before_guard_registration_hook_for_test();
+        for effect in effects {
+            if matches!(effect, Effect::HumanTx { .. }) {
+                self.prepared_human_guards
+                    .push_back(self.rx.begin_human_tx_effect());
+            }
+        }
+    }
+
+    fn finish_event(&mut self) {
+        self.prepared_human_guards.clear();
+    }
+
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
         match e {
             Effect::Reply(reply, result) => {
@@ -1306,12 +1328,18 @@ impl EffectExecutor for RigExec {
                 permit,
                 payload,
             } => {
+                self.rx.human_tx_before_effect_hook_for_test();
+                let in_flight = self
+                    .prepared_human_guards
+                    .pop_front()
+                    .expect("Effect::HumanTx 缺少 dispatch 實際輸出建立的 in-flight guard");
                 let epoch = permit.epoch;
                 if !self.pumps.contains_key(&epoch) {
                     if let Some(worker) = self.workers.get(&epoch) {
                         let pump = sw_core::human_console::human_tx::HumanTxPump::spawn(
                             "COM0",
                             worker.tx().clone(),
+                            Arc::clone(&self.rx),
                             tx.clone(),
                         );
                         self.pumps.insert(epoch, pump);
@@ -1319,9 +1347,12 @@ impl EffectExecutor for RigExec {
                 }
                 let refused = match self.pumps.get(&epoch) {
                     Some(pump) => pump
-                        .try_submit(tag.clone(), permit.clone(), payload)
+                        .try_submit(tag.clone(), permit.clone(), payload, in_flight)
                         .is_err(),
-                    None => true,
+                    None => {
+                        drop(in_flight);
+                        true
+                    }
                 };
                 if refused {
                     let report = sw_core::tx_writer::TxReport {
@@ -1357,6 +1388,7 @@ pub struct ActorRig {
     pub fence: Arc<Fence>,
     /// Task 14：RX 視窗（`screen` 等斷言用）。
     pub rx: Arc<RxShared>,
+    profile: SessionProfile,
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
     wal: Arc<WalWriter>,
     wfs: Arc<FakeWalFs>,
@@ -1462,6 +1494,7 @@ impl ActorRig {
         fanout.register(fence.clone());
         wal.set_health_sink(fanout);
         let rx = RxShared::new(131_072, clock.mono_ns());
+        rx.set_human_prompt_regex_for_test(&profile.template.prompt_regex);
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
         let dev = serial.add_device(REAL_PATH);
@@ -1494,6 +1527,7 @@ impl ActorRig {
             unconfirmed_closes: sw_core::session_core::UnconfirmedCloses::new(),
         };
         let exec_profile = profile.clone();
+        let rig_profile = exec_profile.clone();
         let mut core = SessionCore::new(profile, "yaml-target", deps);
         setup(&mut core);
         let current_tx: Arc<Mutex<Option<TxWriterHandle>>> = Arc::new(Mutex::new(None));
@@ -1544,6 +1578,7 @@ impl ActorRig {
             pending_pty: pending_pty.clone(),
             registry: reg.clone(),
             drain_pause: drain_pause.clone(),
+            prepared_human_guards: VecDeque::new(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -1553,6 +1588,7 @@ impl ActorRig {
             env,
             fence: rig_fence,
             rx: rig_rx,
+            profile: rig_profile,
             current_tx,
             wal,
             wfs,
@@ -1638,6 +1674,27 @@ impl ActorRig {
         std::thread::sleep(Duration::from_millis(30));
     }
 
+    /// 注入 RX 並以 reader 累計位元組數與 evaluator snapshot 檢查進度作為 processed barrier。
+    pub fn inject_rx_processed(&self, bytes: &[u8]) {
+        let (checks, _) = self.rx.snapshot_wait_progress_for_test();
+        let base = self.rx.snapshot_len();
+        self.inject_rx_reader_processed(bytes);
+        let expected_end =
+            base.saturating_add(String::from_utf8_lossy(bytes).chars().count() as u64);
+        let checked = self.rx.wait_for_snapshot_wait_progress_for_test(checks, expected_end, RIG_WAIT);
+        assert!(checked, "evaluator 未檢查注入後的 RX snapshot：expected_end={expected_end}, progress={:?}, rx_end={}", self.rx.snapshot_wait_progress_for_test(), self.rx.snapshot_len());
+    }
+
+    /// 注入 RX 並等待 reader 已追加完整資料；用於 evaluator 暫停期間安排晚到 RX。
+    pub fn inject_rx_reader_processed(&self, bytes: &[u8]) {
+        let expected = self.rx.total_bytes().saturating_add(bytes.len() as u64);
+        self.dev.push_rx(bytes);
+        assert!(
+            self.rx.wait_for_reader_bytes_for_test(expected, RIG_WAIT),
+            "RX reader 未追加預期位元組：total={expected}"
+        );
+    }
+
     /// 讓之後所有 WAL 寫入失敗（磁碟滿替身；Review Focus 3）。
     pub fn fail_wal_writes(&self, err: PalError) {
         self.wfs
@@ -1697,6 +1754,31 @@ impl ActorRig {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .expect("尚未開出 bridge")
+    }
+
+    /// 回傳此測試 session 實際解析出的逾時救援鍵清單。
+    pub fn timeout_recovery_keys(&self) -> &[sw_proto::config_types::TimeoutRecoveryKey] {
+        &self.profile.template.timeout_recovery_keys
+    }
+
+    /// 建立直接呼叫 OpRunner `send` 測試入口所需的正式 OpCtx。
+    pub fn op_ctx_for_test(&self) -> sw_core::op_runner::OpCtx {
+        sw_core::op_runner::OpCtx {
+            com: "COM0".into(),
+            sid: "actor-rig".into(),
+            profile: self.profile.clone(),
+            rx: self.rx.clone(),
+            tx: self.tx_handle(),
+            wal: self.wal.clone(),
+            clock: self.clock.clone(),
+            control: self.actor.control.clone(),
+            rng: Arc::new(|buf: &mut [u8]| {
+                for (index, byte) in buf.iter_mut().enumerate() {
+                    *byte = index as u8;
+                }
+            }),
+            registry: self.reg.clone(),
+        }
     }
 
     /// Task 14（R1-F8）：現行 worker 的 TX 帳本 gauge。
@@ -1769,6 +1851,48 @@ impl ActorRig {
         );
         let rig = self.attach();
         rig.wait_state("READY");
+        rig
+    }
+
+    /// 使用指定 prompt 回應 attach 與 READY probe，供 prefix 型 profile 的 actor 測試使用。
+    pub fn ready_with_prompt(self, prompt: &[u8]) -> ActorRig {
+        let prompt = String::from_utf8_lossy(prompt).into_owned();
+        let prompt_for_reply = prompt.clone();
+        self.dev.on_tx_reply(b"\n", prompt.as_bytes());
+        self.dev.on_tx_match(
+            r"__READY__[0-9a-f]+",
+            Box::new(move |line: &[u8]| {
+                let text = String::from_utf8_lossy(line).into_owned();
+                let token = text
+                    .split("__READY__")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect::<String>();
+                if let Some(marker_nonce) = text
+                    .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                    .and_then(|(_, rest)| rest.split('\'').next())
+                {
+                    let expected = format!(
+                        "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                    );
+                    if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                        return format!(
+                            "__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\n{prompt_for_reply}"
+                        )
+                        .into_bytes();
+                    }
+                }
+                format!("__READY__{token}\r\n{prompt_for_reply}").into_bytes()
+            }),
+        );
+        let rig = self.attach();
+        rig.wait_state("READY");
+        rig.wait_for("指定 READY prompt 已由 RX reader 追加", |h| {
+            let text = h.rx.snapshot_from(0).text;
+            text.contains("__READY__") && text.ends_with(&prompt)
+        });
         rig
     }
 
@@ -1937,7 +2061,7 @@ impl ActorRig {
 // - UART 獨占診斷與 console 工廠：固定回傳無持有者（測試只需要 PTY 形式）。
 // ===========================================================================
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Condvar;
 
@@ -3417,8 +3541,12 @@ impl TxRig {
             cancel,
             fence.clone(),
             wal,
-            TXRIG_EPOCH,
-            ctl_tx,
+            TxWriterContext {
+                rx: sw_core::uart_bridge::RxShared::new(65_536, 0),
+                epoch: TXRIG_EPOCH,
+                control: ctl_tx,
+                clock: FakeClock::new(),
+            },
         );
         std::mem::forget(_stop);
         TxRig {

@@ -5,11 +5,14 @@
 mod support;
 
 use support::*;
+use sw_core::admission::{AdmissionFlag, FreezeOutcome};
 use sw_core::deferred::InvalidateReason;
+use sw_core::human_console::human_tx::{BacklogItem, BacklogKind, HumanTxTag};
 use sw_core::human_console::ConsoleTransportKind;
+use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::*;
-use sw_core::tx_writer::{FenceReject, TxClass};
-use sw_pal::traits::TxOutcome;
+use sw_core::tx_writer::{FenceReject, TxClass, TxReport};
+use sw_pal::traits::{TxOutcome, TxResult};
 use sw_proto::constants::HUMAN_TX_BACKLOG_MAX_BYTES;
 
 fn human_txs(effects: &[Effect]) -> Vec<(TxClass, String, Vec<u8>)> {
@@ -388,4 +391,205 @@ fn human_tx_ledger_drains_after_1000_keys() {
         assert!(Instant::now() < settle_deadline, "最後結算後 2 s 內 live_ops 應歸 0：{:?}", rig.tx_ledger_gauge().live_ops);
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn i294_r13_human_completion_preflight_covers_later_backlog_job() {
+    let mut h = manual_lease();
+    h.set_auto_complete_human_tx(false);
+    let first_effects = h.input("c1", b"in-flight");
+    let (first_tag, first_permit, first_payload) = first_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::HumanTx { tag, permit, payload } => {
+                Some((tag.clone(), permit.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .expect("第一筆 HumanTx 已進入 lane");
+
+    h.invalidate(InvalidateReason::QuietRearm);
+    let epoch = h.core.generations().input_epoch;
+    let lifetime = h.lifetime("c1");
+    {
+        let lane = &mut h.core.human_console_mut().lane;
+        let stale_seq = lane.next_seq();
+        lane.push_backlog(BacklogItem {
+            tag: HumanTxTag {
+                seq: stale_seq,
+                client_id: "c1".into(),
+                client_lifetime: lifetime,
+                input_epoch: epoch.saturating_sub(1),
+                class: TxClass::HumanRaw,
+                len: 5,
+            },
+            payload: b"stale".to_vec(),
+            kind: BacklogKind::Input,
+        })
+        .expect("第一個 backlog 項目已排入");
+        let later_seq = lane.next_seq();
+        lane.push_backlog(BacklogItem {
+            tag: HumanTxTag {
+                seq: later_seq,
+                client_id: "c1".into(),
+                client_lifetime: lifetime,
+                input_epoch: epoch,
+                class: TxClass::HumanReplay,
+                len: 5,
+            },
+            payload: b"later".to_vec(),
+            kind: BacklogKind::Replay { hold: 1 },
+        })
+        .expect("後續可送出的 backlog 項目已排入");
+    }
+
+    let make_completion = || ControlEvent::HumanTxCompleted {
+        tag: first_tag.clone(),
+        report: TxReport {
+            op_id: first_permit.op_id,
+            epoch: first_permit.epoch,
+            result: TxResult {
+                outcome: TxOutcome::Completed(first_payload.len()),
+                error: None,
+            },
+            wal: None,
+            reject: None,
+        },
+    };
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "transition 前不建立預判 guard");
+    let effects = h.feed(make_completion());
+    assert_eq!(
+        human_txs(&effects),
+        vec![(TxClass::HumanReplay, "human:c1".into(), b"later".to_vec())],
+        "首項因 stale epoch 略過後，transition 仍會送出後續 replay job"
+    );
+    let effect_guard = h.rx.begin_human_tx_effect();
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "只對實際輸出的 HumanTx 建 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+    drop(effect_guard);
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+}
+
+#[test]
+fn i294_r13_handoff_replay_is_included_in_preflight() {
+    let mut h = manual_lease();
+    h.set_auto_complete_human_tx(false);
+    let gate = h.reg.admission_gate();
+    // CoreHarness 的 human lease 已在 gate 發布旗標；此測試只需建立可撤銷凍結，保留 raw ownership。
+    gate.set_flag("COM0", AdmissionFlag::Lease, false);
+    let token = match gate.freeze_if_idle("i294-r13-handoff-replay") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        FreezeOutcome::Busy(busy) => panic!("測試 gate 應可凍結：{busy:?}"),
+    };
+    assert!(h.input("c1", b"echo HANDOFF\n").is_empty());
+    assert!(gate.thaw(&token), "測試凍結已解除");
+
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    let effects = h.feed(ControlEvent::Tick);
+    assert_eq!(
+        human_txs(&effects),
+        vec![(TxClass::HumanRaw, "human:c1".into(), b"echo HANDOFF\n".to_vec())],
+        "解凍後處理 Tick 前，core 先重放 handoff queue 中的 console event"
+    );
+    let effect_guard = h.rx.begin_human_tx_effect();
+    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0);
+    drop(effect_guard);
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0);
+}
+
+#[test]
+fn i294_r13_overprediction_without_effect_drops_guard_and_history() {
+    let mut h = manual_lease();
+    h.set_auto_complete_human_tx(false);
+    let first_effects = h.input("c1", b"in-flight");
+    let (first_tag, first_permit, first_payload) = first_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::HumanTx { tag, permit, payload } => {
+                Some((tag.clone(), permit.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .expect("第一筆 HumanTx 已進入 lane");
+    h.invalidate(InvalidateReason::QuietRearm);
+    let lifetime = h.lifetime("c1");
+    let epoch = h.core.generations().input_epoch;
+    let seq = h.core.human_console_mut().lane.next_seq();
+    h.core
+        .human_console_mut()
+        .lane
+        .push_backlog(BacklogItem {
+            tag: HumanTxTag {
+                seq,
+                client_id: "c1".into(),
+                client_lifetime: lifetime,
+                input_epoch: epoch.saturating_sub(1),
+                class: TxClass::HumanRaw,
+                len: 5,
+            },
+            payload: b"stale".to_vec(),
+            kind: BacklogKind::Input,
+        })
+        .expect("stale backlog 項目已排入");
+    let make_completion = || ControlEvent::HumanTxCompleted {
+        tag: first_tag.clone(),
+        report: TxReport {
+            op_id: first_permit.op_id,
+            epoch: first_permit.epoch,
+            result: TxResult {
+                outcome: TxOutcome::Completed(first_payload.len()),
+                error: None,
+            },
+            wal: None,
+            reject: None,
+        },
+    };
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    let effects = h.feed(make_completion());
+    assert!(human_txs(&effects).is_empty(), "唯一 backlog 項目因 stale epoch 被略過");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+}
+
+#[test]
+fn i294_r13_pre_event_guard_does_not_record_submit_without_human_tx() {
+    let mut h = manual_lease();
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    let effects = h.feed(ControlEvent::Tick);
+    assert!(human_txs(&effects).is_empty());
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(
+        h.rx.human_submit_start_count_for_test(),
+        starts_before,
+        "沒有實際 HumanTx effect 的 transition 不碰 submit 訊號"
+    );
+}
+
+#[test]
+fn i294_r13_pre_event_guard_cleans_up_on_panic_refusal_and_cancel() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let h = manual_lease();
+    let panic_guard = h.rx.begin_human_tx_effect();
+    let panic_result = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = panic_guard;
+        panic!("inject actor panic while transition guard is held");
+    }));
+    assert!(panic_result.is_err());
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "panic 展開時 guard 由 RAII 清理");
+
+    let refused_guard = h.rx.begin_human_tx_effect();
+    drop(refused_guard);
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer 拒絕後 drop 清理 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "拒絕 enqueue 不記 submit 起點");
+
+    let cancelled_guard = h.rx.begin_human_tx_effect();
+    drop(cancelled_guard);
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "pump 取消後 drop 清理 guard");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "取消且未 enqueue 不記 submit 起點");
 }

@@ -5,11 +5,12 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
+use sw_pal::traits::Clock;
 use sw_pal::{
     CancelToken, PalError, PalErrorKind, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep,
     TxOutcome, TxResult,
@@ -274,6 +275,273 @@ mod shutdown_publication_tests {
         );
         drop(state_guard);
         assert_eq!(stop.join().unwrap(), ShutdownFreeze::PendingLine);
+    }
+}
+
+#[cfg(test)]
+mod observed_tx_submit_tests {
+    use super::*;
+    use crate::uart_bridge::RxShared;
+
+    fn permit(op_id: u64, class: TxClass) -> TxPermit {
+        TxPermit {
+            op_id: OpId(op_id),
+            epoch: 7,
+            owner_gen: 0,
+            fsm_gen: 0,
+            class,
+            source: "test".into(),
+            cmd_id: Some("cmd".into()),
+            log: false,
+            input_epoch: None,
+            replay_hold: None,
+            probe_id: None,
+        }
+    }
+
+    #[test]
+    fn command_boundary_retries_after_would_block() {
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(3, TxClass::Command);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: None,
+            human_raw_input: false,
+            command_op_id: Some(3),
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::WouldBlock),
+            Ok(SubmitStep::WouldBlock)
+        ));
+        rx.append(b"stale prompt", 1, 7, 1);
+        let expected_offset = rx.snapshot_len();
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+
+        assert_eq!(
+            rx.command_tx_boundary(3).map(|boundary| boundary.rx_offset),
+            Some(expected_offset),
+            "command RX 起點應取實際接受寫入前的 watermark"
+        );
+    }
+
+    #[test]
+    fn human_tx_observation_tracks_only_accepted_segments() {
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(4, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(88);
+        rx.set_command_completion_deadline(88, deadline);
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: Some(b"abc\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+
+        assert!(matches!(
+            gate.submit(&mut || {
+                clock.advance(std::time::Duration::from_nanos(501));
+                SubmitStep::WouldBlock
+            }),
+            Ok(SubmitStep::WouldBlock)
+        ));
+        assert_eq!(rx.human_tx_state(), crate::uart_bridge::HumanTxState::default());
+        assert!(!rx.tx_submit_pending(), "WouldBlock 結束後不得保留在途旗標");
+        let timed_out = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            crate::uart_bridge::HumanTxState::default(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let crate::uart_bridge::SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = timed_out
+        else {
+            panic!("WouldBlock 對照應取得 deadline snapshot");
+        };
+        assert!(!snapshot.tx_submit_pending, "WouldBlock 不得進入 human timeout 證據");
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(3)),
+            Ok(SubmitStep::Accepted(3))
+        ));
+        let partial = rx.human_tx_state();
+        assert_eq!(partial.generation, 1);
+        assert!(partial.raw_line_open, "尚未接受換行時 raw line 仍在途");
+
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+        let complete = rx.human_tx_state();
+        assert_eq!(complete.generation, 2);
+        assert!(!complete.raw_line_open, "接受換行後 raw line 才結束");
+    }
+
+    #[test]
+    fn i294_r8_os_accepted_before_deadline_is_pending_until_observer_registration() {
+        use crate::uart_bridge::SnapshotWaitResult;
+        use std::time::Duration;
+
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(5, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(99);
+        rx.set_command_completion_deadline(99, deadline);
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: Some(b"human\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+        let before_human = rx.human_tx_state();
+        let before_watermark = rx.watermark();
+        let result = gate.submit(&mut || {
+            let os_accepted_at = clock.mono_ns();
+            assert!(os_accepted_at < deadline, "fake OS 接受時間在 deadline 前");
+            clock.advance(Duration::from_nanos(501));
+            SubmitStep::Accepted(1)
+        });
+        assert!(matches!(result, Ok(SubmitStep::Accepted(1))));
+        assert!(clock.mono_ns() > deadline, "observer 登錄時 FakeClock 已越過 deadline");
+        assert!(
+            rx.human_tx_state().generation > before_human.generation,
+            "TX observer 在 FakeClock deadline 後才登錄"
+        );
+        assert!(!rx.tx_submit_pending(), "submit 返回後須清除在途旗標");
+        let settled = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            before_human,
+            before_watermark,
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = settled
+        else {
+            panic!("deadline 必須以 timeout snapshot 結算");
+        };
+        assert!(
+            snapshot.tx_submit_pending,
+            "OS 在期限前接受、observer 在期限後登錄的 submit window 須留在 deadline snapshot"
+        );
+    }
+
+    #[test]
+    fn i294_r8_submit_started_after_timeout_is_not_in_deadline_snapshot() {
+        use crate::uart_bridge::SnapshotWaitResult;
+        use std::time::Duration;
+
+        let rx = RxShared::new(1024, 0);
+        let clock = sw_pal::fakes::clock::FakeClock::new();
+        let deadline = clock.mono_ns().saturating_add(500);
+        rx.begin_command_completion_observation(100);
+        rx.set_command_completion_deadline(100, deadline);
+        clock.advance(Duration::from_nanos(501));
+        let timed_out = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            rx.human_tx_state(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = timed_out
+        else {
+            panic!("deadline 後應立即結算 timeout");
+        };
+        assert!(!snapshot.tx_submit_pending, "submit 尚未開始，不應進入 timeout snapshot");
+
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let permit = permit(6, TxClass::HumanLine);
+        let inner = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: Cell::new(None),
+        };
+        let gate = ObservedTxSubmitGate {
+            inner: &inner,
+            rx: &rx,
+            clock: &*clock,
+            human_payload: Some(b"late human\n"),
+            human_raw_input: true,
+            command_op_id: None,
+            command_boundary_recorded: Cell::new(false),
+            accepted_human_bytes: Cell::new(0),
+            human_observation_unknown: Cell::new(false),
+        };
+        assert!(clock.mono_ns() > deadline, "control submit 在 deadline 後才開始");
+        assert!(matches!(
+            gate.submit(&mut || SubmitStep::Accepted(1)),
+            Ok(SubmitStep::Accepted(1))
+        ));
+        assert!(rx.human_tx_state().generation > 0, "deadline 後 submit 仍正常登錄");
+        assert!(!snapshot.tx_submit_pending, "已結算的 timeout snapshot 不被事後改寫");
+        let after_late_submit = rx.wait_for_snapshot_until_from(
+            0,
+            deadline,
+            crate::uart_bridge::HumanTxState::default(),
+            rx.watermark(),
+            &*clock,
+            |_| None::<()>,
+        );
+        let SnapshotWaitResult::TimedOut {
+            last_snapshot: Some(snapshot),
+        } = after_late_submit
+        else {
+            panic!("期限後 submit 對照仍須取得 deadline snapshot");
+        };
+        assert!(!snapshot.tx_submit_pending, "期限後才開始的 submit 不得回填 deadline snapshot");
     }
 }
 
@@ -654,6 +922,65 @@ impl SubmitGate for FenceSubmitGate<'_> {
     }
 }
 
+/// fence 已准許後、OS submit 前記錄可信 human TX 或 agent command RX 邊界。
+struct ObservedTxSubmitGate<'a, 'b> {
+    inner: &'b FenceSubmitGate<'a>,
+    rx: &'b crate::uart_bridge::RxShared,
+    clock: &'b dyn Clock,
+    human_payload: Option<&'b [u8]>,
+    human_raw_input: bool,
+    command_op_id: Option<u64>,
+    command_boundary_recorded: Cell<bool>,
+    accepted_human_bytes: Cell<usize>,
+    human_observation_unknown: Cell<bool>,
+}
+
+impl SubmitGate for ObservedTxSubmitGate<'_, '_> {
+    fn submit(
+        &self,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked> {
+        self.inner.submit(&mut || {
+            let human_payload = (!self.human_observation_unknown.get())
+                .then(|| {
+                    self.human_payload.map(|payload| {
+                        (
+                            payload,
+                            self.human_raw_input,
+                            self.accepted_human_bytes.get(),
+                        )
+                    })
+                })
+                .flatten();
+            let (step, command_boundary_recorded) = self.rx.observe_tx_submit(
+                self.command_op_id,
+                self.command_boundary_recorded.get(),
+                self.inner.permit.epoch,
+                human_payload,
+                self.clock,
+                os_submit,
+            );
+            self.command_boundary_recorded
+                .set(command_boundary_recorded);
+            match &step {
+                SubmitStep::Accepted(count) if *count > 0 && human_payload.is_some() => {
+                    let accepted = self
+                        .accepted_human_bytes
+                        .get()
+                        .saturating_add(*count)
+                        .min(self.human_payload.map_or(0, <[u8]>::len));
+                    self.accepted_human_bytes.set(accepted);
+                }
+                SubmitStep::Pending if human_payload.is_some() => {
+                    self.human_observation_unknown.set(true);
+                }
+                _ => {}
+            }
+            step
+        })
+    }
+}
+
 /// 同一時間可未結的聚合緩衝上限（P8 Task 5）。每個 epoch 只有一個前景傳輸，超過即為程式錯誤，
 /// 新開的 `Append` 一律不提交（零 TX）。
 pub const TX_AGGREGATE_OPEN_MAX: usize = 8;
@@ -686,6 +1013,151 @@ pub struct TxJob {
     pub reply: crossbeam_channel::Sender<TxReport>,
     /// P8 Task 5：只有 `OpTransferPort` 的 echo-ACK 節流為 `Some`；其餘建構點一律 `None`。
     pub aggregate: Option<AggregateOp>,
+}
+
+pub(crate) enum QueueEnqueueError<T> {
+    Full(Box<T>),
+    Disconnected,
+}
+
+#[cfg(feature = "test-fakes")]
+type TxQueueEnqueueHook = Arc<dyn Fn(TxClass, OpId) + Send + Sync>;
+
+struct TxQueueCapacityState {
+    generation: u64,
+    closed: bool,
+}
+
+/// writer queue 容量通知。Human producer 在 session enqueue reservation 外等待世代變化，
+/// 因此有界 queue 滿載時不會持有救援 gate。
+pub(crate) struct TxQueueCapacity {
+    state: Mutex<TxQueueCapacityState>,
+    changed: Condvar,
+    #[cfg(feature = "test-fakes")]
+    wait_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(feature = "test-fakes")]
+    enqueue_hook: Mutex<Option<TxQueueEnqueueHook>>,
+    #[cfg(feature = "test-fakes")]
+    panic_on_dequeue_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl TxQueueCapacity {
+    fn new() -> Arc<TxQueueCapacity> {
+        Arc::new(TxQueueCapacity {
+            state: Mutex::new(TxQueueCapacityState { generation: 0, closed: false }),
+            changed: Condvar::new(),
+            #[cfg(feature = "test-fakes")]
+            wait_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            enqueue_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            panic_on_dequeue_hook: Mutex::new(None),
+        })
+    }
+
+    fn notify_capacity(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn try_enqueue(
+        &self,
+        jobs: &Sender<TxJob>,
+        job: TxJob,
+    ) -> Result<(), QueueEnqueueError<TxJob>> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(QueueEnqueueError::Disconnected);
+        }
+        let class = job.permit.class;
+        let op_id = job.permit.op_id;
+        match jobs.try_send(job) {
+            Ok(()) => {
+                self.record_enqueue(class, op_id);
+                Ok(())
+            }
+            Err(crossbeam_channel::TrySendError::Full(job)) => {
+                Err(QueueEnqueueError::Full(Box::new(job)))
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(QueueEnqueueError::Disconnected),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).generation
+    }
+
+    fn wait_for_change(&self, observed: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(feature = "test-fakes")]
+        if state.generation == observed && !state.closed {
+            let hook = self.wait_hook.lock().unwrap_or_else(|error| error.into_inner()).take();
+            if let Some(hook) = hook {
+                drop(state);
+                hook();
+                state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            }
+        }
+        while state.generation == observed && !state.closed {
+            state = self.changed.wait(state).unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_wait_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.wait_hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_enqueue_hook(&self, hook: Option<TxQueueEnqueueHook>) {
+        *self.enqueue_hook.lock().unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn panic_before_capacity_notify_for_test(&self) {
+        let hook = self
+            .panic_on_dequeue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+            panic!("test-fakes injected TxWriter panic after dequeue");
+        }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn set_panic_on_dequeue_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .panic_on_dequeue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn record_enqueue(&self, class: TxClass, op_id: OpId) {
+        if let Some(hook) = self
+            .enqueue_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            hook(class, op_id);
+        }
+    }
+
+    #[cfg(not(feature = "test-fakes"))]
+    fn record_enqueue(&self, _class: TxClass, _op_id: OpId) {}
 }
 
 #[derive(Debug, Clone)]
@@ -795,6 +1267,7 @@ pub struct TxWriterHandle {
     pub jobs: Sender<TxJob>,
     settle: Sender<OpId>,
     gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
     /// P8 Task 5：本 writer 的 Fence（只供 [`TxWriterHandle::fence_verdict`] 分類拒絕原因，不作授權）。
     fence: Arc<Fence>,
 }
@@ -810,8 +1283,65 @@ impl TxWriterHandle {
             jobs,
             settle,
             gauge,
+            capacity: TxQueueCapacity::new(),
             fence,
         }
+    }
+
+    pub(crate) fn try_enqueue_job(
+        &self,
+        job: TxJob,
+    ) -> Result<(), QueueEnqueueError<TxJob>> {
+        self.capacity.try_enqueue(&self.jobs, job)
+    }
+
+    pub(crate) fn enqueue_job_blocking(
+        &self,
+        job: TxJob,
+    ) -> Result<(), ()> {
+        let class = job.permit.class;
+        let op_id = job.permit.op_id;
+        match self.jobs.send(job) {
+            Ok(()) => {
+                self.capacity.record_enqueue(class, op_id);
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    pub(crate) fn capacity_generation(&self) -> u64 {
+        self.capacity.generation()
+    }
+
+    pub(crate) fn wait_for_capacity(&self, generation: u64) {
+        self.capacity.wait_for_change(generation);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_capacity_wait_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.capacity.set_wait_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_enqueue_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn(TxClass, OpId) + Send + Sync>>,
+    ) {
+        self.capacity.set_enqueue_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn set_panic_on_dequeue_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.capacity.set_panic_on_dequeue_hook(hook);
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn close_capacity_for_test(&self) {
+        self.capacity.close();
     }
     /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
@@ -861,6 +1391,38 @@ impl TxWriterHandle {
     }
 }
 
+/// 確保 writer 無論正常 return 或 unwind，都會發布 closed 並喚醒容量等待者。
+struct TxWriterCloseGuard {
+    gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
+    closed: bool,
+}
+
+impl TxWriterCloseGuard {
+    fn new(gauge: Arc<LedgerGaugeCells>, capacity: Arc<TxQueueCapacity>) -> Self {
+        Self {
+            gauge,
+            capacity,
+            closed: false,
+        }
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.gauge.closed.store(true, Ordering::Release);
+        self.capacity.close();
+        self.closed = true;
+    }
+}
+
+impl Drop for TxWriterCloseGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// 只有 IoWorker 持有；send 後 writer 不再接新 job。
 pub struct TxWriterStop(pub(crate) crossbeam_channel::Sender<()>);
 
@@ -882,6 +1444,9 @@ struct TxWriter {
     settle: Receiver<OpId>,
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
+    capacity: Arc<TxQueueCapacity>,
+    rx: Arc<crate::uart_bridge::RxShared>,
+    clock: Arc<dyn Clock>,
     /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
     aggregates: IndexMap<AggregateKey, Vec<u8>>,
 }
@@ -1023,6 +1588,10 @@ impl TxWriter {
     }
 
     fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
+        let mut close_guard = TxWriterCloseGuard::new(
+            Arc::clone(&self.gauge),
+            Arc::clone(&self.capacity),
+        );
         let mut ledger = TxLedger {
             epoch: self.epoch,
             ..TxLedger::default()
@@ -1039,7 +1608,12 @@ impl TxWriter {
                     Err(_) => break,
                 },
                 recv(self.jobs) -> queued => match queued {
-                    Ok(job) => job,
+                    Ok(job) => {
+                        #[cfg(feature = "test-fakes")]
+                        self.capacity.panic_before_capacity_notify_for_test();
+                        self.capacity.notify_capacity();
+                        job
+                    }
                     Err(_) => break,
                 },
             };
@@ -1109,7 +1683,36 @@ impl TxWriter {
                         permit: &job.permit,
                         last_reject: Cell::new(None),
                     };
-                    let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
+                    let human_tx = !job.payload.is_empty()
+                        && is_trusted_human_tx(job.permit.class);
+                    let command_tx = !job.payload.is_empty()
+                        && job.permit.class == TxClass::Command;
+                    let result = if human_tx || command_tx {
+                        let observed_gate = ObservedTxSubmitGate {
+                            inner: &gate,
+                            rx: &self.rx,
+                            clock: &*self.clock,
+                            human_payload: human_tx.then_some(job.payload.as_slice()),
+                            human_raw_input: is_raw_human_input(job.permit.class),
+                            command_op_id: command_tx.then_some(job.permit.op_id.0),
+                            command_boundary_recorded: Cell::new(false),
+                            accepted_human_bytes: Cell::new(0),
+                            human_observation_unknown: Cell::new(false),
+                        };
+                        self.writer
+                            .write_gated(&job.payload, &self.cancel, &observed_gate)
+                    } else {
+                        self.writer.write_gated(&job.payload, &self.cancel, &gate)
+                    };
+                    let confirmed = confirmed_bytes(&result.outcome);
+                    let unknown = matches!(&result.outcome, TxOutcome::Unknown { .. });
+                    if human_tx && is_raw_human_input(job.permit.class) {
+                        self.rx
+                            .finish_human_raw_tx(&job.payload, confirmed, unknown);
+                    }
+                    if command_tx {
+                        self.rx.finish_command_tx(&job.payload, confirmed);
+                    }
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
                     let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
                     let (result, reject) =
@@ -1242,6 +1845,10 @@ impl TxWriter {
                 wal: tx_wal,
                 reject,
             };
+            #[cfg(feature = "test-fakes")]
+            if is_trusted_human_tx(job.permit.class) {
+                self.rx.human_tx_report_hook_for_test();
+            }
             if job.reply.send(report).is_err() {
                 op_ledger.reply_lost = true;
             }
@@ -1253,7 +1860,7 @@ impl TxWriter {
             ledger.settle(op_id);
         }
         // P5-T14：先標記 closed，再收斂佇列；之後才送入的 job 由 `wait_report` 依 closed 旗標收尾。
-        self.gauge.closed.store(true, Ordering::Release);
+        close_guard.close();
         let queued: Vec<TxJob> = self.jobs.try_iter().collect();
         for job in queued {
             // P8 Task 5：佇列中的 Finish 照常落 WAL（它不提交 bytes）；Append 與其他 job 一樣以 Frozen 收斂。
@@ -1396,15 +2003,32 @@ fn confirmed_bytes(outcome: &TxOutcome) -> usize {
     }
 }
 
+fn is_trusted_human_tx(class: TxClass) -> bool {
+    matches!(
+        class,
+        TxClass::HumanRaw | TxClass::HumanReplay | TxClass::HumanLine
+    )
+}
+
+fn is_raw_human_input(class: TxClass) -> bool {
+    matches!(class, TxClass::HumanRaw | TxClass::HumanReplay | TxClass::LeaseOwner)
+}
+
 /// 啟動 TX writer thread（唯一呼叫 `SerialWriter::write_gated` 的地方）。
+pub struct TxWriterContext {
+    pub rx: Arc<crate::uart_bridge::RxShared>,
+    pub epoch: u64,
+    pub control: Sender<ControlEvent>,
+    pub clock: Arc<dyn Clock>,
+}
+
 pub fn spawn_tx_writer(
     com: String,
     writer: Box<dyn SerialWriter>,
     cancel: CancelToken,
     fence: Arc<Fence>,
     wal: Arc<WalWriter>,
-    epoch: u64,
-    control: Sender<ControlEvent>,
+    context: TxWriterContext,
 ) -> (
     TxWriterHandle,
     TxWriterStop,
@@ -1414,10 +2038,18 @@ pub fn spawn_tx_writer(
     let (settle_tx, settle_rx) = crossbeam_channel::bounded(TX_SETTLE_QUEUE_MAX);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let gauge = Arc::new(LedgerGaugeCells::default());
+    let capacity = TxQueueCapacity::new();
+    let TxWriterContext {
+        rx,
+        epoch,
+        control,
+        clock,
+    } = context;
     let handle = TxWriterHandle {
         jobs: job_tx,
         settle: settle_tx,
         gauge: gauge.clone(),
+        capacity: capacity.clone(),
         fence: fence.clone(),
     };
     let stop = TxWriterStop(stop_tx);
@@ -1433,6 +2065,9 @@ pub fn spawn_tx_writer(
         settle: settle_rx,
         stop: stop_rx,
         gauge,
+        capacity,
+        rx,
+        clock,
         aggregates: IndexMap::new(),
     };
     let join = std::thread::spawn(move || worker.run());

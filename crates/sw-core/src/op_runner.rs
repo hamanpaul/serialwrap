@@ -14,12 +14,17 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use sw_pal::traits::{Clock, TxOutcome};
 use sw_proto::config_types::{ProfileTemplate, SessionProfile};
-use sw_proto::pycompat::{a2b_base64_lenient, clean_text, py_strip, splitlines, PyErr};
+use sw_proto::pycompat::{
+    a2b_base64_lenient, clean_text, py_strip, splitlines, PyErr,
+};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{compile, valid_completion_regex, PyFlags, PyRegex};
 
 use crate::arbiter::QueuedCommand;
+use crate::command_completion::{
+    CompletionEvaluator, CompletionHumanContext, Evaluation as CompletionEvaluation,
+};
 use crate::file_transfer::{
     pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles,
     TransferAbort, TransferIds, TxRejection,
@@ -29,7 +34,9 @@ use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared, WaitMatchOutcome, WaitOutcome};
+use crate::uart_bridge::{
+    RunCancel, RxShared, RxSnapshot, SnapshotWaitResult, WaitMatchOutcome, WaitOutcome,
+};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
@@ -82,6 +89,11 @@ pub enum OpOutcome {
     },
     /// 未完成且救援未成功（或 passthrough 無完成條件）；`stdout` 為 `clean_text(pre_offset 起 RX)`。
     PromptTimeout {
+        stdout: String,
+    },
+    /// 有完成候選但 echo／prompt 身分不足，或 human 路徑不允許相容完成；
+    /// 保留輸出並回 PROMPT_TIMEOUT，不降級 session 或送救援鍵。
+    CompletionUncertain {
         stdout: String,
     },
     ToAttached {
@@ -201,15 +213,13 @@ pub fn extract_command_stdout(
             removed = true;
         }
         if !removed {
-            // 修正 PR（fix/wrapped-echo-false-positive 34c3a84）語意：只接受「命令原文＋終端折行插入字元」。
-            // 插入字元須有原始串流證據（rulings/p5.md P5-70f6ce7-1）：換行只在 raw 含 BusyBox `\r\r\n`、
-            // 多一個空白只在 raw 含 readline `" \r"` 時可跳過；一般 CRLF stdout 不得拼接（sol P5-70f6ce7-1）。
-            let wraps = WrapEvidence {
+            // Producer 路徑保留 9af187ca 的演算法與結果；i294 的局部來源判斷只屬 evaluator。
+            let wraps = ProducerWrapEvidence {
                 newline: raw.contains("\r\r\n"),
                 space: raw.contains(" \r"),
             };
             if wraps.newline || wraps.space {
-                if let Some(n) = strip_wrapped_command_echo(&lines, stripped, wraps) {
+                if let Some(n) = strip_wrapped_command_echo_producer(&lines, stripped, wraps) {
                     lines.drain(..n);
                 }
             }
@@ -246,23 +256,95 @@ fn prompt_cut_lines(
 }
 
 /// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt；修正 PR `_WRAP_MIN_SEGMENT`），也以此保守估計回顯最多佔幾行。
-const WRAP_MIN_SEGMENT: usize = 20;
+pub(crate) const WRAP_MIN_SEGMENT: usize = 20;
 
-/// 原始串流中的終端折行證據：`newline` 為 BusyBox `\r\r\n`、`space` 為 bash readline `" \r"`。
+/// 清理後字元索引對應的原始串流折行證據。
+#[derive(Clone, Default)]
+pub(crate) struct WrapEvidence {
+    wrap_kinds: Vec<u8>,
+    wrap_prefix: Vec<usize>,
+    wrap_positions: Vec<usize>,
+}
+
+impl WrapEvidence {
+    pub(crate) fn from_raw(
+        raw: &str,
+        cleaned: &str,
+        source_ranges: &[std::ops::Range<usize>],
+    ) -> Self {
+        let char_count = cleaned.chars().count();
+        let mut evidence = Self {
+            wrap_kinds: vec![0; char_count],
+            wrap_prefix: vec![0; char_count.saturating_add(1)],
+            wrap_positions: Vec::new(),
+        };
+        let bytes = raw.as_bytes();
+        debug_assert_eq!(cleaned.chars().count(), source_ranges.len());
+        for (position, (ch, source)) in cleaned.chars().zip(source_ranges).enumerate() {
+            if ch == '\n'
+                && source.start > 0
+                && bytes.get(source.start - 1..source.end) == Some(b"\r\r\n")
+            {
+                evidence.wrap_kinds[position] = 1;
+            }
+            if ch == ' '
+                && bytes.get(source.start..source.end.saturating_add(1)) == Some(b" \r")
+                && bytes.get(source.end..source.end.saturating_add(3)) != Some(b"\r\r\n")
+            {
+                evidence.wrap_kinds[position] = 2;
+            }
+            if evidence.wrap_kinds[position] != 0 {
+                evidence.wrap_positions.push(position);
+            }
+            evidence.wrap_prefix[position + 1] = evidence.wrap_positions.len();
+        }
+        evidence
+    }
+
+    pub(crate) fn is_wrap_at(&self, position: usize, ch: char) -> bool {
+        matches!(
+            (self.wrap_kinds.get(position), ch),
+            (Some(1), '\n') | (Some(2), ' ')
+        )
+    }
+
+    /// 回傳半開區間內的局部折行標記數；用線性前綴索引避免逐行反覆掃完整命令長度。
+    pub(crate) fn wrap_count(&self, start: usize, end: usize) -> usize {
+        let start = start.min(self.wrap_kinds.len());
+        let end = end.min(self.wrap_kinds.len()).max(start);
+        self.wrap_prefix[end].saturating_sub(self.wrap_prefix[start])
+    }
+
+    /// 半開區間恰有一個標記時，回傳該標記的位置。
+    pub(crate) fn sole_wrap_in(&self, start: usize, end: usize) -> Option<usize> {
+        if self.wrap_count(start, end) != 1 {
+            return None;
+        }
+        let start = start.min(self.wrap_kinds.len());
+        self.wrap_positions.get(self.wrap_prefix[start]).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_slots(&self) -> usize {
+        self.wrap_kinds
+            .len()
+            .saturating_add(self.wrap_prefix.len())
+            .saturating_add(self.wrap_positions.len())
+    }
+}
+
+/// Producer 的基線折行證據（9af187ca）；不可與 evaluator 的來源位置證據共用。
 #[derive(Clone, Copy)]
-struct WrapEvidence {
+struct ProducerWrapEvidence {
     newline: bool,
     space: bool,
 }
 
-/// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
-/// 命令的每個字元（含空白）都必須依序出現；只有換行或多出的空白（且原始串流有對應證據）可以跳過，
-/// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`] 個字元（第一個插入點以第一行欄位計，含殘留 prompt）。
-fn match_wrapped_echo(
+fn match_wrapped_echo_producer(
     text: &[char],
     start: usize,
     command: &[char],
-    wraps: WrapEvidence,
+    wraps: ProducerWrapEvidence,
 ) -> Option<usize> {
     let (mut i, mut j) = (start, 0usize);
     let mut last_wrap: Option<usize> = None;
@@ -287,12 +369,10 @@ fn match_wrapped_echo(
     Some(i)
 }
 
-/// 修正 PR `_strip_wrapped_command_echo`：`lines` 已 `clean_text` 並切行；命令須從第一行開始（容許殘留 prompt），
-/// 完整結束在某一行的行尾，才把這幾行視為回顯。回傳要移除的行數。
-fn strip_wrapped_command_echo(
+fn strip_wrapped_command_echo_producer(
     lines: &[String],
     command: &str,
-    wraps: WrapEvidence,
+    wraps: ProducerWrapEvidence,
 ) -> Option<usize> {
     if command.is_empty() || lines.is_empty() {
         return None;
@@ -301,13 +381,63 @@ fn strip_wrapped_command_echo(
     let window = &lines[..lines.len().min(cmd.len() / WRAP_MIN_SEGMENT + 2)];
     let text: Vec<char> = window.join("\n").chars().collect();
     for start in 0..lines[0].chars().count() {
-        if let Some(end) = match_wrapped_echo(&text, start, &cmd, wraps) {
+        if let Some(end) = match_wrapped_echo_producer(&text, start, &cmd, wraps) {
             if end == text.len() || text[end] == '\n' {
                 return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
             }
         }
     }
     None
+}
+
+pub(crate) struct WrappedEchoCandidate<'a> {
+    pub text: &'a [char],
+    pub end: usize,
+    pub command: &'a [char],
+    pub marker_position: usize,
+    pub prefix_lcp: &'a [usize],
+    pub suffix_lcp: &'a [usize],
+}
+
+#[derive(Default)]
+pub(crate) struct WrappedEchoMatchMetrics {
+    pub matcher_steps: usize,
+    pub max_marker_slots: usize,
+}
+
+/// 從 echo 行尾檢查一個可能的折行插入點。只接受一個局部來源標記；第二個標記即降階為無 echo。
+/// 候選範圍長度固定為 command 長度加一，掃描與比對各線性一次，且不配置回溯狀態。
+pub(crate) fn match_wrapped_echo_ending_at(
+    candidate: WrappedEchoCandidate<'_>,
+    mut valid_start: impl FnMut(usize, Option<usize>) -> bool,
+    metrics: &mut WrappedEchoMatchMetrics,
+) -> Option<usize> {
+    if candidate.command.is_empty() || candidate.end > candidate.text.len() {
+        return None;
+    }
+    let candidate_len = candidate.command.len().saturating_add(1);
+    let start = candidate.end.checked_sub(candidate_len)?;
+    if !(start..candidate.end).contains(&candidate.marker_position) {
+        return None;
+    }
+    metrics.max_marker_slots = metrics.max_marker_slots.max(1);
+    let split = candidate.marker_position - start;
+    if split == 0 || split >= candidate.command.len() {
+        return None;
+    }
+    let suffix_index = candidate.text.len().saturating_sub(candidate.end);
+    metrics.matcher_steps = metrics.matcher_steps.saturating_add(2);
+    if candidate.prefix_lcp.get(start).copied().unwrap_or(0) < split
+        || candidate
+            .suffix_lcp
+            .get(suffix_index)
+            .copied()
+            .unwrap_or(0)
+            < candidate.command.len() - split
+    {
+        return None;
+    }
+    valid_start(start, Some(split)).then_some(start)
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），
@@ -435,6 +565,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 t.platform == "passthrough",
                 None,
                 true,
+                None,
             )
         }
         OpSpec::SelfTestProbe {
@@ -599,6 +730,13 @@ pub(crate) fn self_test_probe_payload(probe: &str, marker_nonce: &str) -> Vec<u8
 }
 
 /// 經 TxWriter 送出一筆 TX 並等待 `TxReport`（writer 已停止時視為 `Frozen` 拒絕）。
+struct SendMeta<'a> {
+    class: TxClass,
+    source: &'a str,
+    cmd_id: Option<&'a str>,
+    log: bool,
+}
+
 fn send(
     ctx: &OpCtx,
     grant: &OpGrant,
@@ -608,16 +746,32 @@ fn send(
     cmd_id: Option<&str>,
     log: bool,
 ) -> TxReport {
+    send_with_enqueue_hook(
+        ctx,
+        grant,
+        payload,
+        SendMeta { class, source, cmd_id, log },
+        || {},
+    )
+}
+
+fn send_with_enqueue_hook(
+    ctx: &OpCtx,
+    grant: &OpGrant,
+    payload: &[u8],
+    meta: SendMeta<'_>,
+    after_enqueue: impl FnOnce(),
+) -> TxReport {
     let (reply, report) = crossbeam_channel::bounded(1);
     let permit = TxPermit {
         op_id: grant.op_id,
         epoch: grant.epoch,
         owner_gen: grant.owner_gen,
         fsm_gen: grant.fsm_gen,
-        class,
-        source: source.to_string(),
-        cmd_id: cmd_id.map(str::to_string),
-        log,
+        class: meta.class,
+        source: meta.source.to_string(),
+        cmd_id: meta.cmd_id.map(str::to_string),
+        log: meta.log,
         // 07 D-03：06 既有 permit 建構點一律 `None`。
         input_epoch: None,
         replay_hold: None,
@@ -639,10 +793,32 @@ fn send(
         reply,
         aggregate: None,
     };
-    if ctx.tx.jobs.send(job).is_err() {
+    let mut human_submit_guard = (meta.class == TxClass::HumanLine).then(|| ctx.rx.begin_human_submit());
+    let queued = if let Some(guard) = human_submit_guard.as_mut() {
+        ctx.rx.with_human_submit_gate(
+            guard,
+            job,
+            |job| ctx.tx.try_enqueue_job(job),
+            || ctx.tx.capacity_generation(),
+            |generation| ctx.tx.wait_for_capacity(generation),
+        )
+    } else {
+        ctx.tx.enqueue_job_blocking(job)
+    };
+    if queued.is_err() {
+        drop(human_submit_guard);
         return frozen;
     }
-    ctx.tx.wait_report(&report).unwrap_or(frozen)
+    after_enqueue();
+    let tx_report = ctx.tx.wait_report(&report).unwrap_or(frozen);
+    drop(human_submit_guard);
+    tx_report
+}
+
+/// `test-fakes` 對 trusted-human `HumanLine` enqueue 的入口覆蓋；共用正式 `send` 的容量等待與 submit guard。
+#[cfg(feature = "test-fakes")]
+pub fn send_human_line_for_test(ctx: &OpCtx, grant: &OpGrant, payload: &[u8]) -> TxReport {
+    send(ctx, grant, payload, TxClass::HumanLine, "human:i294-r15-test", None, true)
 }
 
 fn compile_or_never(pattern: &str) -> PyRegex {
@@ -731,6 +907,18 @@ fn command_tx_class(q: &QueuedCommand) -> TxClass {
     }
 }
 
+struct CompletionObservationGuard {
+    rx: Arc<RxShared>,
+    op_id: u64,
+}
+
+impl Drop for CompletionObservationGuard {
+    fn drop(&mut self) {
+        self.rx
+            .finish_command_completion_observation(self.op_id);
+    }
+}
+
 fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let t = &ctx.profile.template;
     let mode = normalized_mode(&q.req.mode).to_string();
@@ -778,7 +966,24 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     } else {
         Some(completion_regex.unwrap_or(&t.prompt_regex).to_string())
     };
-    let pre_offset = ctx.rx.snapshot_len();
+    let pre_tx_offset = ctx.rx.snapshot_len();
+    let human_tx_before_send = ctx.rx.human_tx_state();
+    let human_submit_start_before_send = ctx.rx.human_submit_start_count();
+    let echo_prompt_re = (!passthrough
+        && completion_regex.is_none()
+        && !q.req.is_trusted_human()
+        && matches!(mode.as_str(), "line" | "background"))
+    .then(|| compile_or_never(&t.prompt_regex));
+    let echo_evaluator = echo_prompt_re
+        .as_ref()
+        .map(|prompt_re| CompletionEvaluator::new(command, prompt_re));
+    let _completion_observation = echo_evaluator.as_ref().map(|_| {
+        ctx.rx.begin_command_completion_observation(grant.op_id.0);
+        CompletionObservationGuard {
+            rx: ctx.rx.clone(),
+            op_id: grant.op_id.0,
+        }
+    });
     if let Some(pattern) = completion_regex {
         let mut meta = PyDict::new();
         meta.insert("event", PyValue::from("command_completion"));
@@ -806,41 +1011,293 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
     }
+    let command_boundary = echo_evaluator
+        .as_ref()
+        .and_then(|_| ctx.rx.command_tx_boundary(grant.op_id.0));
+    let pre_offset = command_boundary
+        .as_ref()
+        .map_or(pre_tx_offset, |boundary| boundary.rx_offset);
+    let human_tx_before = command_boundary
+        .as_ref()
+        .map_or(human_tx_before_send, |boundary| boundary.human_tx_state);
+    let human_submit_start_before = command_boundary.as_ref().map_or(
+        human_submit_start_before_send,
+        |boundary| boundary.human_submit_start_count,
+    );
+    let watermark_before = command_boundary
+        .as_ref()
+        .map_or_else(|| ctx.rx.watermark(), |boundary| boundary.watermark);
+    let completion_identity = command_boundary
+        .as_ref()
+        .map(|boundary| (boundary.watermark.0, boundary.prompt_revision));
+    let pending_human_before = echo_evaluator
+        .as_ref()
+        .is_some_and(|_| human_tx_before.pending_human);
 
-    // heartbeat／keepalive 迴圈（有 RX 就續等；整段 wait_chunk 無新 RX 即視為靜默結束）。
     let effective_timeout = match q.req.expected_duration_s {
         Some(expected) => timeout_s.max(expected),
         None => timeout_s,
     };
-    let silence_limit = timeout_s.min(30.0);
     let deadline = ctx
         .clock
         .mono_ns()
         .saturating_add((effective_timeout.max(0.0) * 1_000_000_000.0) as u64);
+    if echo_evaluator.is_some() {
+        ctx.rx
+            .set_command_completion_deadline(grant.op_id.0, deadline);
+    }
     let wait_re = compile_or_never(completion_pattern.as_deref().unwrap_or("(?!)"));
     let mut matched = false;
-    loop {
-        let now = ctx.clock.mono_ns();
-        if now >= deadline {
-            break;
+    let mut completion_stdout = None;
+    let mut completion_partial = false;
+    let mut completion_timeout_snapshot: Option<RxSnapshot> = None;
+    let mut completion_silence_expired = false;
+    let mut timeout_rescue_guard = None;
+    if let Some(evaluator) = echo_evaluator.as_ref() {
+        // 一般命令改用 snapshot evaluator 後，仍讓既有 prompt-wait 屏障看見等待起點。
+        #[cfg(feature = "test-fakes")]
+        ctx.rx.prompt_completion_wait_started_for_test();
+
+        // 靜默 chunk 與絕對 operation deadline 使用相同的 human TX 救援分流。
+        let silence_limit = timeout_s.min(30.0);
+        'completion_wait: loop {
+            let now = ctx.clock.mono_ns();
+            let chunk_ns = secs(silence_limit)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let wait_deadline = deadline.min(now.saturating_add(chunk_ns));
+            let pre_rx = ctx.rx.snapshot_len();
+            match ctx.rx.wait_for_snapshot_until_from(
+                pre_offset,
+                wait_deadline,
+                human_tx_before,
+                watermark_before,
+                &*ctx.clock,
+                |snapshot| {
+                    if completion_identity.is_some_and(|(epoch, prompt_revision)| {
+                        snapshot.watermark.0 != epoch
+                            || snapshot.prompt_revision != prompt_revision
+                    }) {
+                        return None;
+                    }
+                    let human_tx_state = snapshot.human_tx_state;
+                    let human_tx_seen = pending_human_before
+                        || snapshot.human_submit_start_count > human_submit_start_before
+                        || human_tx_state.generation > human_tx_before.generation;
+                    let human = CompletionHumanContext::new(
+                        human_tx_seen,
+                        snapshot.human_in_flight,
+                        snapshot.tx_submit_pending,
+                    );
+                    let (evaluation, observed_prompt) = evaluator.evaluate_snapshot(
+                        &snapshot.text,
+                        human,
+                        human_tx_before.raw_line_open || human_tx_state.raw_line_open,
+                        snapshot
+                            .prompt_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.literal.as_str()),
+                        snapshot.trimmed_before_from,
+                        snapshot.line_prefix_before_from.as_deref(),
+                    );
+                    if let Some(observed_prompt) = observed_prompt {
+                        #[cfg(feature = "test-fakes")]
+                        ctx.rx
+                            .prompt_evidence_before_write_hook_for_test(snapshot);
+                        ctx.rx.remember_prompt_evidence(
+                            observed_prompt,
+                            snapshot.revision,
+                            snapshot.watermark,
+                            snapshot.prompt_revision,
+                        );
+                    }
+                    match evaluation {
+                        CompletionEvaluation::Complete { stdout } => Some((stdout, false)),
+                        CompletionEvaluation::Partial { stdout } => Some((stdout, true)),
+                        CompletionEvaluation::Pending | CompletionEvaluation::Uncertain { .. } => {
+                            None
+                        }
+                    }
+                },
+            ) {
+                SnapshotWaitResult::Matched {
+                    value: (stdout, partial),
+                    ..
+                } => {
+                    completion_stdout = Some(stdout);
+                    completion_partial = partial;
+                    matched = true;
+                    break;
+                }
+                SnapshotWaitResult::TimedOut { last_snapshot } => {
+                    if ctx.clock.mono_ns() >= deadline {
+                        completion_timeout_snapshot = last_snapshot;
+                        break;
+                    }
+                    let Some(snapshot) = last_snapshot else {
+                        break;
+                    };
+                    if ctx.rx.snapshot_len() != pre_rx {
+                        continue;
+                    }
+
+                    let (rescue_guard, submit_window_has_human_tx) = ctx.rx.begin_timeout_decision(
+                        human_submit_start_before,
+                        human_tx_before,
+                        pending_human_before,
+                        ctx.clock.mono_ns(),
+                    );
+                    let human_tx_seen = pending_human_before || submit_window_has_human_tx;
+                    let human = CompletionHumanContext::new(
+                        human_tx_seen,
+                        snapshot.human_in_flight,
+                        snapshot.tx_submit_pending,
+                    );
+                    let human_tx_state = snapshot.human_tx_state;
+                    let raw_half_line =
+                        human_tx_before.raw_line_open || human_tx_state.raw_line_open;
+                    let prompt_evidence = snapshot
+                        .prompt_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.literal.as_str());
+                    let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
+                        &snapshot.text,
+                        human,
+                        raw_half_line,
+                        prompt_evidence,
+                        snapshot.trimmed_before_from,
+                        snapshot.line_prefix_before_from.as_deref(),
+                    );
+                    if human_tx_seen
+                        || matches!(
+                            timeout_evaluation,
+                            CompletionEvaluation::Uncertain { .. }
+                        )
+                    {
+                        #[cfg(feature = "test-fakes")]
+                        ctx.rx.human_timeout_decision_hook_for_test();
+                        return OpOutcome::CompletionUncertain {
+                            stdout: evaluator.partial_stdout(
+                                &snapshot.text,
+                                human,
+                                raw_half_line,
+                                prompt_evidence,
+                                snapshot.line_prefix_before_from.as_deref(),
+                            ),
+                        };
+                    }
+
+                    // 無 human TX 時，靜默逾時沿用完整基線 recovery 結果。
+                    #[cfg(feature = "test-fakes")]
+                    ctx.rx.timeout_rescue_decision_hook_for_test();
+                    timeout_rescue_guard = Some(rescue_guard);
+                    completion_silence_expired = true;
+                    break 'completion_wait;
+                }
+            }
         }
-        let remaining = (deadline - now) as f64 / 1_000_000_000.0;
-        let wait_chunk = silence_limit.min(remaining);
-        let pre_rx = ctx.rx.snapshot_len();
-        if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
-            matched = true;
-            break;
-        }
-        if ctx.rx.snapshot_len() == pre_rx {
-            break;
+    } else {
+        // completion_regex／producer 路徑保留原有靜默 chunk 與恢復時序。
+        let silence_limit = timeout_s.min(30.0);
+        loop {
+            let now = ctx.clock.mono_ns();
+            if now >= deadline {
+                break;
+            }
+            let remaining = (deadline - now) as f64 / 1_000_000_000.0;
+            let wait_chunk = silence_limit.min(remaining);
+            let pre_rx = ctx.rx.snapshot_len();
+            if wait_regex_from(ctx, &wait_re, pre_offset, wait_chunk) {
+                matched = true;
+                break;
+            }
+            if ctx.rx.snapshot_len() == pre_rx {
+                break;
+            }
         }
     }
     if !matched {
+        if let Some(evaluator) = echo_evaluator.as_ref() {
+            if completion_silence_expired {
+                return recover_after_failure(
+                    ctx,
+                    grant,
+                    timeout_s,
+                    command,
+                    &t.prompt_regex,
+                    pre_offset,
+                    passthrough,
+                    Some((cmd_id, confirmed_of(&report))),
+                    false,
+                    timeout_rescue_guard.take(),
+                );
+            }
+            let snapshot = completion_timeout_snapshot
+                .expect("absolute deadline wait returns its filtered timeout snapshot");
+            let (rescue_guard, submit_window_has_human_tx) = ctx.rx.begin_timeout_decision(
+                human_submit_start_before,
+                human_tx_before,
+                pending_human_before,
+                ctx.clock.mono_ns(),
+            );
+            let human_tx_seen = pending_human_before || submit_window_has_human_tx;
+            let human = CompletionHumanContext::new(
+                human_tx_seen,
+                snapshot.human_in_flight,
+                snapshot.tx_submit_pending,
+            );
+            let human_tx_state = snapshot.human_tx_state;
+            let raw_half_line =
+                human_tx_before.raw_line_open || human_tx_state.raw_line_open;
+            let prompt_evidence = snapshot
+                .prompt_evidence
+                .as_ref()
+                .map(|evidence| evidence.literal.as_str());
+            let (timeout_evaluation, _) = evaluator.evaluate_snapshot(
+                &snapshot.text,
+                human,
+                raw_half_line,
+                prompt_evidence,
+                snapshot.trimmed_before_from,
+                snapshot.line_prefix_before_from.as_deref(),
+            );
+            // 此呼叫只取 partial stdout；即使 snapshot 能匹配 echo/prompt，也不會改判為成功。
+            let stdout = evaluator.partial_stdout(
+                &snapshot.text,
+                human,
+                raw_half_line,
+                prompt_evidence,
+                snapshot.line_prefix_before_from.as_deref(),
+            );
+            if human_tx_seen
+                || matches!(
+                    timeout_evaluation,
+                    CompletionEvaluation::Uncertain { .. }
+                )
+            {
+                #[cfg(feature = "test-fakes")]
+                ctx.rx.human_timeout_decision_hook_for_test();
+                return OpOutcome::CompletionUncertain { stdout };
+            }
+
+            // 無 human TX 時直接採用基線 recovery 的完整結果與 stdout。
+            #[cfg(feature = "test-fakes")]
+            ctx.rx.timeout_rescue_decision_hook_for_test();
+            return recover_after_failure(
+                ctx,
+                grant,
+                timeout_s,
+                command,
+                &t.prompt_regex,
+                pre_offset,
+                passthrough,
+                Some((cmd_id, confirmed_of(&report))),
+                false,
+                Some(rescue_guard),
+            );
+        }
         if q.req.is_trusted_human() {
-            // `_recover_after_failure` human 分支（DF-02／OD-74，Python `session_manager.py:6988-7012`）：可信 human
-            // ＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的 `HumanConsole`（rulings s2 D5），永不看
-            // source 字首；不送救援鍵（CTRL_C／CTRL_D），actor 依前景快照改開 human lease。明寫 `human:<x>` 的
-            // RPC（`trusted_human=false`）照常進下方 agent 救援。
+            // `_recover_after_failure` human 分支（DF-02／OD-74）：不送救援鍵，actor 依前景快照升格 human lease。
             return OpOutcome::PromptTimeout {
                 stdout: clean_text(&ctx.rx.text_from(pre_offset)),
             };
@@ -855,32 +1312,37 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             passthrough,
             Some((cmd_id, confirmed_of(&report))),
             false,
+            None,
         );
     }
-    let raw = ctx.rx.text_from(pre_offset);
-    let prompt_valid = valid_completion_regex(Some(&PyValue::from(t.prompt_regex.clone())));
-    let stdout = match completion_regex {
-        Some(pattern) if passthrough && !prompt_valid => {
-            let end = compile(pattern, PyFlags(0))
-                .ok()
-                .and_then(|re| re.search(&raw))
-                .map(|m| m.end);
-            match end {
-                Some(end) => clean_text(&char_prefix(&raw, end)),
-                None => clean_text(&raw),
+    let stdout = if let Some(stdout) = completion_stdout {
+        stdout
+    } else {
+        let raw = ctx.rx.text_from(pre_offset);
+        let prompt_valid = valid_completion_regex(Some(&PyValue::from(t.prompt_regex.clone())));
+        match completion_regex {
+            Some(pattern) if passthrough && !prompt_valid => {
+                let end = compile(pattern, PyFlags(0))
+                    .ok()
+                    .and_then(|re| re.search(&raw))
+                    .map(|m| m.end);
+                match end {
+                    Some(end) => clean_text(&char_prefix(&raw, end)),
+                    None => clean_text(&raw),
+                }
             }
-        }
-        _ => {
-            let prompt_re = compile_or_never(&t.prompt_regex);
-            let completion_re = completion_regex.map(compile_or_never);
-            extract_command_stdout(&raw, command, &prompt_re, completion_re.as_ref())
+            _ => {
+                let prompt_re = compile_or_never(&t.prompt_regex);
+                let completion_re = completion_regex.map(compile_or_never);
+                extract_command_stdout(&raw, command, &prompt_re, completion_re.as_ref())
+            }
         }
     };
     let mut result = pydict! {
         "ok" => true,
         "execution_mode" => mode.clone(),
         "stdout" => stdout,
-        "partial" => false,
+        "partial" => completion_partial,
     };
     if mode == "background" {
         result.insert("background_capture_id", PyValue::from(cmd_id));
@@ -961,34 +1423,53 @@ fn recover_after_failure(
     passthrough: bool,
     aborted: Option<(&str, usize)>,
     shutdown_cancellable: bool,
+    mut timeout_rescue_guard: Option<crate::uart_bridge::HumanSubmitRescueGuard>,
 ) -> OpOutcome {
     if passthrough {
+        drop(timeout_rescue_guard.take());
         return OpOutcome::PromptTimeout {
             stdout: clean_text(&ctx.rx.text_from(pre_offset)),
         };
     }
     if !begin_general_recovery(ctx, grant) {
+        drop(timeout_rescue_guard.take());
         return OpOutcome::CommandResult(
             pydict! { "ok" => false, "error_code" => "FLUSHED_BY_RECOVERY" },
         );
     }
     let prompt_re = compile_or_never(prompt_regex);
-    for recovery_key in &ctx.profile.template.timeout_recovery_keys {
+    for (index, recovery_key) in ctx.profile.template.timeout_recovery_keys.iter().enumerate() {
         let name = recovery_key.name();
         let offset = ctx.rx.snapshot_len();
-        let report = send(
-            ctx,
-            grant,
-            recovery_key.payload(),
-            TxClass::SystemRecoverKey,
-            "system:recover",
-            None,
-            true,
-        );
+        let report = if index == 0 {
+            send_with_enqueue_hook(
+                ctx,
+                grant,
+                recovery_key.payload(),
+                SendMeta {
+                    class: TxClass::SystemRecoverKey,
+                    source: "system:recover",
+                    cmd_id: None,
+                    log: true,
+                },
+                || drop(timeout_rescue_guard.take()),
+            )
+        } else {
+            send(
+                ctx,
+                grant,
+                recovery_key.payload(),
+                TxClass::SystemRecoverKey,
+                "system:recover",
+                None,
+                true,
+            )
+        };
         if !fully_sent(&report, 1) {
             match report.reject {
                 Some(FenceReject::Quiet | FenceReject::ReconfirmPending) => break,
                 Some(FenceReject::Frozen | FenceReject::Cancelled | FenceReject::StaleEpoch) => {
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::CommandResult(
                         pydict! { "ok" => false, "error_code" => "FLUSHED_BY_RECOVERY" },
                     );
@@ -1018,10 +1499,12 @@ fn recover_after_failure(
                                 meta: Some(meta),
                             });
                         }
+                        drop(timeout_rescue_guard.take());
                         return OpOutcome::CommandResult(
                             pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
                         );
                     }
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(&report, 1)));
                 }
             }
@@ -1036,6 +1519,7 @@ fn recover_after_failure(
                 WaitOutcome::Matched => true,
                 WaitOutcome::TimedOut => false,
                 WaitOutcome::Cancelled => {
+                    drop(timeout_rescue_guard.take());
                     return OpOutcome::CommandResult(
                         pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN" },
                     );
@@ -1045,11 +1529,14 @@ fn recover_after_failure(
             wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0))
         };
         if matched {
+            drop(timeout_rescue_guard.take());
             let raw = ctx.rx.text_from(pre_offset);
             let stdout = extract_command_stdout(&raw, command, &prompt_re, None);
             return OpOutcome::Recovered { key: name, stdout };
         }
     }
+    // 空鍵清單或第一鍵未能入列時也必須在收尾前解除 timeout rescue gate。
+    drop(timeout_rescue_guard.take());
     OpOutcome::PromptTimeout {
         stdout: clean_text(&ctx.rx.text_from(pre_offset)),
     }

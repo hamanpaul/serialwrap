@@ -94,8 +94,12 @@ fn rig() -> Rig {
         cancel.clone(),
         fence.clone(),
         wal.clone(),
-        7,
-        ctl_tx,
+        TxWriterContext {
+            rx: RxShared::new(65_536, 0),
+            epoch: 7,
+            control: ctl_tx,
+            clock: sw_pal::fakes::clock::FakeClock::new(),
+        },
     );
     Rig {
         fence,

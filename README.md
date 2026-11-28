@@ -428,6 +428,50 @@ serialwrap cmd submit --selector COM0 --mode background --source agent:bg --cmd 
 serialwrap cmd result-tail --cmd-id <cmd_id> --from-chunk 0 --limit 200
 ```
 
+Agent `line` and `background` commands without `--completion-regex` anchor prompt
+search after the full command echo and use one RX snapshot for completion and
+stdout extraction. Existing epoch-local prompt evidence can come from a
+recognizable READY output (an independent nonce line followed immediately by
+the same prompt as before the probe). If that evidence is absent or rejected, or
+PS1 changes it, the echo prefix is the complete cleaned literal from the echo
+line's real start to the echo itself. It may extend before the command TX only
+within the same epoch, while its bytes remain in the RX window and its real line
+start is still provable; existing evidence is never stripped to choose a suffix.
+The literal must fully match the current profile regex, contain a letter or
+digit, and reappear exactly from the real start of the final line through the
+snapshot tail before it atomically replaces the evidence. If mutual proof
+fails, existing evidence still completes only when it exactly equals the tail;
+otherwise the result is partial. A human TX signal follows the existing human
+path and does not learn a cross-TX prefix; the same is true when that snapshot
+still has a human job in flight or a TX submit pending observer registration.
+When those in-flight signals disappear, the revision change permits another
+evaluation without adding a TX gate. `Path => ` appearing only as command
+output cannot learn its prompt identity. Exact prompts `router => ` and
+`router=> ` remain valid from those
+trusted sources. Without a trailing newline, only known complete prompt evidence
+containing a letter or digit may be removed as a same-line suffix after the
+command echo, so `printf abc` returns `abc` and a U+0000 byte is preserved.
+Symbol-only prompts such as `=> `, `> `, and `# ` are accepted only at line
+start and never become evidence. Prefix prompts remain supported, and text
+before the command echo is excluded from normal stdout. With no command echo and
+no human TX signal, prompt evidence is not required: the current profile regex
+must fully match from the real start of the final line to the snapshot tail.
+An inline `abcroot@host:/# ` is only a candidate, not a completion. A tail
+candidate is a final line fully matched by the prompt regex, an exact known
+prompt suffix at the snapshot tail, or a matching symbol-only short suffix.
+If a candidate cannot be identified,
+the original deadline returns `PROMPT_TIMEOUT`, `partial:true`,
+`recovery_action=NONE` without rescue keys; a timeout with no candidate and no
+human TX keeps the 9af187ca recovery behavior. If post-TX RX was necessarily
+trimmed by the bounded window, completion is `ok:true, partial:true` with no
+error code. Known limitations: an echo-prefix line start that was trimmed, or a
+prompt not on the same line as the echo, cannot establish mutual proof and may
+return partial; consecutive prompts on one line are also not learned from a
+suffix.
+Compatibility limitation: if the first line after the echo exactly equals the
+command and more output follows, that line is treated as a repeated echo and
+removed. Use `completion_regex` or a marker when that output must be preserved.
+
 `interactive` is for full-screen or key-driven workflows:
 
 ```bash
@@ -1919,10 +1963,10 @@ Line latency has a floor set by the harness: `submit_and_wait` waits a fixed 1.5
 | Python: `sw_core/**/*.py` + `serialwrapd.py` | 19,522 (53) | 29,480 (62) | 29,480 (62) |
 | Rust: `crates/**/*.rs` (including tests) | 0 (0) | 92,142 (194) | 267,061 (449) |
 
-- **0.5.0 known issues** (to be fixed in 0.5.1; "Known issues" in `docs/rust-refactor/stage2-release-install.md`):
+- **0.5.0 known issues** (the 0.5.1 fix status is noted inline; "Known issues" in `docs/rust-refactor/stage2-release-install.md`):
   1. Stopping or restarting the daemon during a file push (#282, #296).
   2. In-flight `session self-test`, `session recover`, and interactive operations return `EXCEPTION` at shutdown (#297).
-  3. When a human and an agent operate the same session at once, the agent command may return `done` with empty output or only the remains of the human's line (#294). The 2 unexpected errors of the Windows long-run candidate are of this kind.
+  3. **Fixed in 0.5.1 (#294; includes #262 and #271):** 0.5.0 could let a human prompt or command output ending in `=> ` complete an agent command too early, and it could discard no-newline stdout by cutting at the prompt regex match start. Rust now uses exact echo/tail boundaries and source-verified prompt evidence; no-echo commands without human interleaving can recover from a real line-start profile match even after evidence is cleared, while NUL and known inline stdout are preserved. The 2 unexpected errors of the Windows long-run candidate were the original 0.5.0 behavior.
   4. A USB serial port that drops briefly and comes back is not re-attached automatically (#300; 0.4.x behaves the same). The official FAIL of the Windows long-run candidate comes from this.
   5. Upgrade install: on Linux, `setup` returns `SESSION_BUSY` while an interactive console is connected; on Windows it may return `TIMEOUT` when the daemon is not running, and the safety check does not read `socket_path` from config.yaml; a `__pycache__` left in the bundle directory makes checksum verification fail.
   6. The Windows zip does not include the optional com0com component.
@@ -2533,6 +2577,34 @@ serialwrap cmd status --cmd-id <cmd_id>
 ```
 
 `command.get` 會直接帶 `stdout`。
+
+未指定 `--completion-regex` 的 agent `line`／`background` 命令，會以完整命令
+echo 作為 prompt 搜尋下界；完成與 stdout 擷取共用同一份 RX snapshot，支援
+prefix prompt，echo 前的文字不納入一般 stdout。既有 epoch 字面 evidence 可來
+自可辨識 READY probe 輸出（獨立 nonce 行後立刻接回 probe 前同一 prompt）。
+evidence 遺失、被拒或 PS1 改變時，前綴固定為 echo 所在行真實行首到 echo
+起點的完整清理字面，不剝除舊 evidence、不只取 suffix；與 TX 同 epoch、仍在
+RX window 且行首可證明時可往 TX 前延伸。前綴須完整符合目前 profile regex、
+含至少一個字母或數字，且 echo 後最後一行行首到 snapshot 尾端重現完全相同
+字面，才能完成並原子更新 evidence；互證不成立時，只有既有 evidence 與 tail
+完整相等才可完成，否則回 partial。跨 TX 前綴遇 human TX 訊號時走既有 human
+路徑；同一 snapshot 仍有 human job 在途或 submit 尚待 observer 登錄時也不以此
+學習。這些訊號消失後以 revision 變動重新評估，不新增 TX 閘門；只把
+`Path => ` 當命令輸出時不得學成 evidence。精確 `router => ` 與 `router=> `
+均可由上述可信來源證實。無換行 stdout 只有在已找到本命令 echo 時，才以
+已知、至少含字母或數字的完整 prompt suffix 裁切，因此 `printf abc` 回傳
+`abc`，U+0000 原樣保留；只含空白與符號的 `=> `、`> `、`# ` 只在行首接受，
+不成為 evidence，也不裁切同行 stdout。沒有 human TX 交錯時，無 echo 終端不要求
+evidence；目前 profile regex 必須從最後一行真實行首完整匹配到 snapshot 尾端。
+同行 `abcroot@t:/# ` 仍只是候選。候選指最後一行完整符合 prompt regex、
+snapshot 尾端等於已知 prompt 字面，或可辨識的純符號短 suffix；有候選
+但身分不足時到原期限回 `PROMPT_TIMEOUT`／partial 且不送救援鍵，無 human 且
+完全沒有候選時維持 9af187ca 的既有 recovery 與 TX。若必要 post-TX RX
+已確定被有界視窗修剪，回 `ok:true`、`partial:true` 且不帶 error_code。相容限制：echo 之後的
+第一行恰好等於命令、而且後面還有輸出時，視為重複 echo 並刪除；需要保留
+這種輸出時，請使用 `completion_regex` 或 marker。若 echo 前綴所在行首已被
+修剪、prompt 與 echo 不同行，或同一行連續 prompt，目前不由後段 suffix
+恢復 evidence，身分不足的候選保守回 partial。
 
 對於沒有回 shell prompt 的 noisy console，`cmd submit --completion-regex` 可在
 `line` 或 `background` 模式等待命令專屬的 producer 完成標記。請使用每次新產生、
@@ -3460,10 +3532,10 @@ line 延遲有 harness 設下的下限：`submit_and_wait` 送出後固定等 1.
 | Python：`sw_core/**/*.py`＋`serialwrapd.py` | 19,522（53） | 29,480（62） | 29,480（62） |
 | Rust：`crates/**/*.rs`（含測試） | 0（0） | 92,142（194） | 267,061（449） |
 
-- **0.5.0 已知問題**（預定 0.5.1 修，`docs/rust-refactor/stage2-release-install.md` 的「已知問題」）：
+- **0.5.0 已知問題**（0.5.1 修復狀態已逐項標註；`docs/rust-refactor/stage2-release-install.md` 的「已知問題」）：
   1. 檔案推送中停止或重啟 daemon（#282、#296）。
   2. 停機時進行中的 `session self-test`、`session recover`、interactive 操作回 `EXCEPTION`（#297）。
-  3. human 與 agent 同時操作同一 session 時，agent 命令可能回 `done`，但輸出是空的或只有 human 那行的殘餘（#294）。Windows 長跑候選的 2 筆非預期錯誤屬這一類。
+  3. **0.5.1 已修（#294，含 #262／#271）**：0.5.0 可能讓 human prompt 或以 `=> ` 結尾的命令輸出提前完成 agent 命令，也可能從 regex match 起點裁掉沒有換行的 stdout。Rust 現在使用精確 echo／尾端邊界與可信來源互證；無 echo 且無 human 交錯時，即使 evidence 被清除或 READY 拒絕仍可由真正行首的 profile match 完成，並保留 NUL 與已知 prompt 前的同行輸出；Windows 長跑候選的 2 筆是 0.5.0 原行為。
   4. USB 序列埠短暫斷線又回來後不會自動接回（#300，0.4.x 也一樣）。Windows 長跑候選的官方 FAIL 由此而來。
   5. 升級安裝：Linux 有互動 console 連著時 `setup` 回 `SESSION_BUSY`；Windows 的 daemon 沒在執行時可能回 `TIMEOUT`，安全檢查也不讀 config.yaml 的 `socket_path`；bundle 目錄內留下的 `__pycache__` 會讓 checksum 驗證失敗。
   6. Windows zip 不含 com0com 選用元件。

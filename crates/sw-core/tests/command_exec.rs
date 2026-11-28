@@ -19,10 +19,11 @@ use sw_core::capture::{BG_CAPTURE_MAX_BYTES, BackgroundCapture};
 use sw_core::mailbox::{ControlEvent, OpenFailure};
 use sw_core::op_runner::{OpOutcome, extract_command_stdout};
 use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::state_store::LoadedState;
 use sw_core::tx_writer::OpId;
 use sw_pal::fakes::serial::FakeWriteStep;
-use sw_pal::traits::PalError;
-use sw_proto::pycompat::{PyErr, clean_text};
+use sw_pal::traits::{Clock, PalError};
+use sw_proto::pycompat::{PyErr, clean_text, py_strip, splitlines};
 use sw_proto::pyjson::{PyDict, PyValue};
 use sw_proto::pyre::{PyFlags, compile};
 
@@ -123,9 +124,93 @@ fn wal_tx_has(h: &ActorRig, payload: &[u8]) -> bool {
     h.wal_tx_payloads().iter().any(|p| p == payload)
 }
 
+fn wal_tx_bytes_since(h: &ActorRig, count: usize) -> Vec<u8> {
+    h.wal_tx_payloads()
+        .into_iter()
+        .skip(count)
+        .flatten()
+        .collect()
+}
+
+fn expected_timeout_tx(h: &ActorRig, command_tx: &[u8]) -> Vec<u8> {
+    let mut expected = command_tx.to_vec();
+    for key in h.timeout_recovery_keys() {
+        expected.extend_from_slice(key.payload());
+    }
+    expected
+}
+
 /// 等 WAL 出現指定 TX（OpRunner 已送出）。
 fn wait_tx(h: &ActorRig, payload: &[u8]) {
     h.wait_for("TX 寫出", |h| wal_tx_has(h, payload));
+}
+
+fn run_i294_shipped_prefix_case(prompt_regex: &str, prompt: &str, co_packed: bool) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new_with_hub(&profile).ready_with_prompt(prompt.as_bytes());
+    let console = h.attach_pty_console("i294-prefix-human");
+    let tx_count = h.wal_tx_payloads().len();
+    let human_generation = h.rx.human_tx_state().generation;
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.wait_for("human TX observation 已提交", |h| {
+        h.rx.human_tx_state().generation > human_generation
+    });
+
+    let evaluator_checks = h.rx.snapshot_wait_progress_for_test().0;
+    let id = h.submit_ok("echo PREFIX");
+    wait_tx(&h, b"echo PREFIX\n");
+    h.wait_running(&id);
+    assert!(
+        h.rx.wait_for_snapshot_wait_progress_for_test(
+            evaluator_checks,
+            h.rx.snapshot_len(),
+            Duration::from_secs(5),
+        ),
+        "command evaluator 應先檢查 TX 後的既有 RX snapshot"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "舊 prompt／echo 尚未到達時命令應維持 running"
+    );
+    if co_packed {
+        let packet = format!(
+            "{prompt}\r\n{prompt}echo PREFIX\r\nPREFIX\r\n{prompt}"
+        );
+        h.inject_rx_processed(packet.as_bytes());
+    } else {
+        h.inject_rx_processed(prompt.as_bytes());
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "分包的 human 舊 prompt 不得完成命令"
+        );
+
+        let response = format!("echo PREFIX\r\nPREFIX\r\n{prompt} extra\r\nmore");
+        h.inject_rx_processed(response.as_bytes());
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "prefix 後仍有資料時，命令必須維持 running"
+        );
+        h.inject_rx_processed(format!("\r\n{prompt}").as_bytes());
+    }
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    let expected_stdout = if co_packed {
+        "PREFIX".to_string()
+    } else {
+        format!("PREFIX\n{prompt} extra\nmore")
+    };
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho PREFIX\n".to_vec(),
+        "prefix 完成判定不增加或重送 TX"
+    );
 }
 
 fn state_of(h: &ActorRig) -> String {
@@ -171,9 +256,4631 @@ fn line_command_stdout_extraction_and_done() {
 }
 
 #[test]
+fn i262_arrow_output_segments_are_preserved() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    let command = "obuspa -c get Device.DNS.Diagnostics.";
+    let (waiter_tx, waiter_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = waiter_tx.send(());
+        })));
+    let id = h.submit_ok(command);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    waiter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ActorRig completion deadline 與 waiter 已建立");
+
+    h.inject_rx_processed(
+        format!(
+            "{command}\r\nDevice.DNS.Diagnostics.NumberOfRepetitions => 0\r\n"
+        )
+        .as_bytes(),
+    );
+    h.inject_rx_processed(b"Device.DNS.Diagnostics.DNSServer => ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "=> 輸出尾端不得被當成 command prompt"
+    );
+    let (checks, end) = h.rx.snapshot_wait_progress_for_test();
+    h.clock.advance(Duration::from_millis(51));
+    assert!(
+        h.rx
+            .wait_for_snapshot_wait_progress_for_test(checks, end, Duration::from_secs(5)),
+        "B =>  後 evaluator 應已跨過 50 ms poll 間隔"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "跨過 poll 間隔後，B =>  仍不得完成"
+    );
+
+    h.inject_rx_processed(
+        b"\r\nDevice.DNS.Diagnostics.HostName => 1\r\nroot@t:/# ",
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(
+        result["stdout"],
+        PyValue::from(
+            "Device.DNS.Diagnostics.NumberOfRepetitions => 0\n\
+Device.DNS.Diagnostics.DNSServer => \n\
+Device.DNS.Diagnostics.HostName => 1"
+        )
+    );
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+fn i294_r1_run_ready_evidence_case(response: &str, fragmented: bool) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile);
+    h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+    let h = h.attach();
+    let probe_wait = format!(
+        "READY probe TX 已送出: response={response}, fragmented={fragmented}"
+    );
+    h.wait_for(&probe_wait, |rig| {
+        rig.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload.starts_with(b"echo __READY__"))
+    });
+    let probe = h
+        .wal_tx_payloads()
+        .into_iter()
+        .find(|payload| payload.starts_with(b"echo __READY__"))
+        .expect("READY probe payload");
+    let probe_text = String::from_utf8(probe).expect("READY probe UTF-8");
+    let nonce = probe_text
+        .split("__READY__")
+        .nth(1)
+        .expect("READY probe nonce")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    let (rx, rejected_literal) = match response {
+        "probe-echo" => (
+            format!("echo __READY__{nonce}\r\nAsyncPath# "),
+            "AsyncPath# ",
+        ),
+        "old-prompt" => (
+            format!("\r\necho __READY__{nonce}\r\nroot@t:/# "),
+            "root@t:/# ",
+        ),
+        "async-output" => (
+            format!("\r\n__READY__{nonce}\r\nAsyncPath# "),
+            "AsyncPath# ",
+        ),
+        other => panic!("未知 READY evidence case: {other}"),
+    };
+    let bytes = rx.as_bytes();
+    if fragmented {
+        let split = bytes.len() / 2;
+        h.inject_rx_reader_processed(&bytes[..split]);
+        h.inject_rx_reader_processed(&bytes[split..]);
+    } else {
+        h.inject_rx_reader_processed(bytes);
+    }
+    let ready_wait = format!("READY: response={response}, fragmented={fragmented}");
+    h.wait_for(&ready_wait, |rig| {
+        rig.get_state()["state"].as_str() == Some("READY")
+    });
+    assert_ne!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some(rejected_literal),
+        "READY 反例不得登錄被拒字面: response={response}, fragmented={fragmented}"
+    );
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "READY 反例不得留下任何 evidence: response={response}, fragmented={fragmented}"
+    );
+    h.inject_rx_reader_processed(b"\r\n");
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf EVIDENCE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf EVIDENCE\n");
+    h.inject_rx_processed(
+        format!("printf EVIDENCE\r\n{rejected_literal}").as_bytes(),
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "nonce echo／舊 prompt／非同步輸出不得建立 prompt evidence: response={response}, fragmented={fragmented}"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "READY evidence 反例 timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf EVIDENCE\n",
+        "錯誤 READY evidence 不得觸發救援 TX"
+    );
+    assert_ne!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some(rejected_literal),
+        "後續不具互證前綴的命令不得反向學入被拒字面"
+    );
+}
+
+fn i294_r2_run_liveness_sequence(h: &ActorRig, label: &str) {
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "{label}: 測試必須從沒有 prompt evidence 的狀態開始"
+    );
+    let tx_count = h.wal_tx_payloads().len();
+    let cases = [
+        (
+            "printf R2_NO_ECHO",
+            "NO ECHO\r\nroot@t:/# ",
+            "NO ECHO",
+        ),
+        (
+            "printf R2_ECHO_ONE",
+            "printf R2_ECHO_ONE\r\nECHO ONE\r\nroot@t:/# ",
+            "ECHO ONE",
+        ),
+        (
+            "printf R2_ECHO_TWO",
+            "printf R2_ECHO_TWO\r\nECHO TWO\r\nroot@t:/# ",
+            "ECHO TWO",
+        ),
+    ];
+    for (index, (command, raw, stdout)) in cases.into_iter().enumerate() {
+        let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+        wait_tx(h, format!("{command}\n").as_bytes());
+        h.inject_rx_processed(raw.as_bytes());
+        advance_until(
+            h,
+            Duration::from_millis(200),
+            &format!("{label}: liveness command {index}"),
+            |h| is_done(h, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("done"), "{label}: {result:?}");
+        assert_eq!(result["stdout"], PyValue::from(stdout), "{label}: {result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(false), "{label}: {result:?}");
+        if index == 0 {
+            assert!(
+                h.rx.snapshot_from(0).prompt_evidence.is_none(),
+                "{label}: 無 echo 的相容完成不得自行學習 prompt evidence"
+            );
+        } else {
+            assert!(
+                h.rx.snapshot_from(0).prompt_evidence.is_some(),
+                "{label}: 完整 echo 前綴與尾端同行 prompt 應重建 evidence"
+            );
+        }
+    }
+    assert_eq!(
+        wal_tx_bytes_since(h, tx_count),
+        b"printf R2_NO_ECHO\nprintf R2_ECHO_ONE\nprintf R2_ECHO_TWO\n",
+        "{label}: liveness 恢復不得增加救援或重送 TX"
+    );
+}
+
+#[test]
+fn i294_r2_clear_without_evidence_completes_then_reestablishes_from_echo() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.rx.clear();
+    i294_r2_run_liveness_sequence(&h, "clear");
+}
+
+#[test]
+fn i294_r2_rejected_ready_evidence_recovers_no_echo_then_echo_sequence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile);
+    h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+    let h = h.attach();
+    h.wait_for("混合來源 READY probe TX", |rig| {
+        rig.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload.starts_with(b"echo __READY__"))
+    });
+    let probe = h
+        .wal_tx_payloads()
+        .into_iter()
+        .find(|payload| payload.starts_with(b"echo __READY__"))
+        .expect("mixed READY probe");
+    let probe = String::from_utf8(probe).expect("READY probe UTF-8");
+    let nonce = probe
+        .split("__READY__")
+        .nth(1)
+        .expect("READY nonce")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    h.inject_rx_reader_processed(
+        format!("\r\n__READY__{nonce}\r\nAsyncPath# ").as_bytes(),
+    );
+    h.wait_for("混合來源仍可完成登入", |rig| {
+        rig.get_state()["state"].as_str() == Some("READY")
+    });
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "probe 後不同 prompt 必須拒絕 READY evidence"
+    );
+    i294_r2_run_liveness_sequence(&h, "READY rejected");
+}
+
+fn i294_r2_run_router_arrow_matrix(prompt_regex: &str, prompt: &str) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new(&profile).ready_with_prompt(prompt.as_bytes());
+    let tx_count = h.wal_tx_payloads().len();
+
+    let ready = h.submit_with("printf R2_READY", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_READY\n");
+    h.inject_rx_processed(
+        format!("printf R2_READY\r\nREADY{prompt}").as_bytes(),
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "READY arrow evidence completion",
+        |h| is_done(h, &ready),
+    );
+    let result = h.wait_done(&ready);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("READY"), "{result:?}");
+
+    h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\n");
+    let echo = h.submit_with("printf R2_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_ECHO\n");
+    h.inject_rx_processed(
+        format!("{prompt}printf R2_ECHO\r\nECHO\r\n{prompt}").as_bytes(),
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "echo arrow evidence completion",
+        |h| is_done(h, &echo),
+    );
+    let result = h.wait_done(&echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ECHO"), "{result:?}");
+
+    let no_echo = h.submit_with("printf R2_NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_NO_ECHO\n");
+    h.inject_rx_processed(format!("NO ECHO\r\n{prompt}").as_bytes());
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "no-echo arrow completion",
+        |h| is_done(h, &no_echo),
+    );
+    let result = h.wait_done(&no_echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("NO ECHO"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf R2_READY\nprintf R2_ECHO\nprintf R2_NO_ECHO\n"
+    );
+}
+
+#[test]
+fn i294_r2_exact_spaced_and_compact_router_arrow_matrix() {
+    i294_r2_run_router_arrow_matrix(r"(?m)^router =>[ \t]*$", "router => ");
+    i294_r2_run_router_arrow_matrix(r"(?m)^router=>[ \t]*$", "router=> ");
+}
+
+#[test]
+fn i294_r2_path_arrow_output_never_completes_or_becomes_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^.*=>[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready_with_prompt(b"router => ");
+    h.rx.clear();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf R2_PATH", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R2_PATH\n");
+    h.inject_rx_processed(b"printf R2_PATH\r\nPath => ");
+    let (checks, end) = h.rx.snapshot_wait_progress_for_test();
+    h.clock.advance(Duration::from_millis(51));
+    assert!(
+        h.rx
+            .wait_for_snapshot_wait_progress_for_test(checks, end, Duration::from_secs(5)),
+        "Path => 片段後 evaluator 應已跨過 poll 間隔"
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "Path => 命令輸出不得提前完成"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "Path => ambiguity timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert!(
+        h.rx.snapshot_from(0).prompt_evidence.is_none(),
+        "Path => 命令輸出不得成為 prompt evidence"
+    );
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R2_PATH\n");
+}
+
+fn i294_r3_advance_until_done(h: &ActorRig, id: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let result = h.command_get(id);
+        if result
+            .get("done_at")
+            .is_some_and(|value| !value.is_null())
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "推進逾時：{what}：{result:?}"
+        );
+        h.clock.advance(Duration::from_millis(200));
+        h.send_control(ControlEvent::Tick);
+        std::thread::sleep(Duration::from_millis(3));
+    }
+}
+
+fn i294_r3_no_evidence_rig(kind: &str) -> ActorRig {
+    if kind == "READY rejected" {
+        let profile = SHELL_PROFILE.replace(
+            "(?m)^root@t:.*# ",
+            r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+        );
+        let h = ActorRig::new(&profile);
+        h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+        let h = h.attach();
+        h.wait_for("R3 混合來源 READY probe TX", |rig| {
+            rig.wal_tx_payloads()
+                .iter()
+                .any(|payload| payload.starts_with(b"echo __READY__"))
+        });
+        let probe = h
+            .wal_tx_payloads()
+            .into_iter()
+            .find(|payload| payload.starts_with(b"echo __READY__"))
+            .expect("R3 mixed READY probe");
+        let probe = String::from_utf8(probe).expect("R3 READY probe UTF-8");
+        let nonce = probe
+            .split("__READY__")
+            .nth(1)
+            .expect("R3 READY nonce")
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect::<String>();
+        h.inject_rx_reader_processed(
+            format!("\r\n__READY__{nonce}\r\nAsyncPath# ").as_bytes(),
+        );
+        h.wait_for("R3 混合來源仍可完成登入", |rig| {
+            rig.get_state()["state"].as_str() == Some("READY")
+        });
+        return h;
+    }
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^root@t:[^\r\n]*# [ \t]*"),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 R3 evidence barrier: {other}"),
+    }
+    h
+}
+
+#[test]
+fn i294_r3_bare_echo_crosses_tx_boundary_after_each_evidence_barrier() {
+    for kind in ["clear", "READY rejected", "profile", "takeover"] {
+        let h = i294_r3_no_evidence_rig(kind);
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "{kind}: barrier 釋放前必須沒有 evidence"
+        );
+        h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+        let tx_count = h.wal_tx_payloads().len();
+        let mut expected_tx = Vec::new();
+        for index in 0..3 {
+            let command = format!("printf R3_BARE_{index}");
+            let stdout = format!("BARE {index}");
+            expected_tx.extend_from_slice(format!("{command}\n").as_bytes());
+            let id = h.submit_with(&command, |request| request.timeout_s = 0.2);
+            wait_tx(&h, format!("{command}\n").as_bytes());
+            h.inject_rx_processed(
+                format!("{command}\r\n{stdout}\r\nroot@t:/# ").as_bytes(),
+            );
+            i294_r3_advance_until_done(&h, &id, &format!("{kind}: bare echo {index}"));
+            let result = h.wait_done(&id);
+            assert_eq!(result["status"], PyValue::from("done"), "{kind}: {result:?}");
+            assert_eq!(
+                result["stdout"],
+                PyValue::from(stdout),
+                "{kind}: bare echo {index}: {result:?}"
+            );
+            assert_eq!(result["partial"], PyValue::Bool(false), "{kind}: {result:?}");
+            assert_eq!(
+                h.rx.prompt_evidence_literal_for_test().as_deref(),
+                Some("root@t:/# "),
+                "{kind}: 第一筆互證後應保持同一 evidence"
+            );
+        }
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            expected_tx,
+            "{kind}: bare echo liveness 不得重送或送救援 TX"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_cross_boundary_prefix_yields_to_human_path() {
+    for kind in ["clear", "READY rejected", "profile", "takeover"] {
+        let h = i294_r3_no_evidence_rig(kind);
+        h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf R3_HUMAN_PREFIX", |request| {
+            request.timeout_s = 0.2
+        });
+        wait_tx(&h, b"printf R3_HUMAN_PREFIX\n");
+        h.rx
+            .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        h.inject_rx_processed(
+            b"printf R3_HUMAN_PREFIX\r\nHUMAN PREFIX\r\nroot@t:/# ",
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "{kind}: TX 前前綴不得繞過 human 訊號"
+        );
+        advance_until(
+            &h,
+            Duration::from_millis(200),
+            &format!("{kind}: human prefix timeout"),
+            |rig| is_done(rig, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{kind}: {result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{kind}: {result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{kind}: {result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{kind}: {result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_HUMAN_PREFIX\n",
+            "{kind}: human 路徑不得送救援或重送 TX"
+        );
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "{kind}: human 路徑不得由跨 TX 前綴學習 evidence"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_contiguous_prompt_prefix_must_not_replace_evidence_with_suffix() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        assert_eq!(
+            h.rx.prompt_evidence_literal_for_test().as_deref(),
+            Some("root@t:/# ")
+        );
+        let tx_count = h.wal_tx_payloads().len();
+        let command = "printf R3_CONTIGUOUS";
+        let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_CONTIGUOUS\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(
+            b"root@t:/# root@t:/new# printf R3_CONTIGUOUS\r\nOUT\r\nroot@t:/new# ",
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "連續 prompt 的完整前綴不同於尾端，不得用 suffix 互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 contiguous prompt timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(
+            h.rx.prompt_evidence_literal_for_test().as_deref(),
+            Some("root@t:/# "),
+            "完整前綴不互證時不得學習後段 suffix"
+        );
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_CONTIGUOUS\n",
+            "互證失敗不得增加救援或重送 TX"
+        );
+    }
+}
+
+fn i294_r3_assert_barrier_does_not_revive_evidence(kind: &str, human_tx_seen: bool) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^root@(?:t|new):/#[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_prompt_evidence_before_write_hook_for_test(Some(Arc::new(move |snapshot| {
+            entered_tx
+                .send(snapshot.clone())
+                .expect("R3 prompt evidence barrier snapshot");
+            release_rx.recv().expect("R3 release evidence barrier");
+        })));
+
+    h.inject_rx_reader_processed(b"\r\n");
+    let first = h.submit_with("cd /new", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_reader_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let stale = entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("R3 evaluator 已辨識新 prompt evidence");
+    assert!(stale.prompt_evidence.is_some(), "R3 READY 應先提供舊 evidence");
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^other@host:.*# "),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 R3 evidence barrier: {other}"),
+    }
+    h.advance(Duration::from_millis(201));
+    release_tx.send(()).expect("R3 release evidence writeback");
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "R3 stale completion recheck",
+        |rig| is_done(rig, &first),
+    );
+    let _ = h.wait_done(&first);
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test(),
+        None,
+        "{kind}: barrier 後被攔截的 root@new:/# 不得寫回 evidence"
+    );
+
+    let tx_count = h.wal_tx_payloads().len();
+    let second = h.submit_with("printf R3_STALE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R3_STALE\n");
+    if human_tx_seen {
+        h.rx
+            .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+    }
+    h.inject_rx_processed(b"printf R3_STALE\r\nSTAL Eroot@new:/# ");
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "{kind}: stale root@new:/# 不得完成後續命令：human={human_tx_seen}"
+    );
+    i294_r3_advance_until_done(&h, &second, "R3 stale evidence follow-up timeout");
+    let result = h.wait_done(&second);
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "{kind}: 後續歧義不得重新學習 root@new:/#"
+    );
+    if human_tx_seen {
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_STALE\n"
+        );
+    } else {
+        match result["status"].as_str() {
+            Some("done") => {
+                assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+                assert_eq!(
+                    wal_tx_bytes_since(&h, tx_count),
+                    b"printf R3_STALE\n\x03"
+                );
+            }
+            Some("error") => {
+                assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+                assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+                assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+                let tx = wal_tx_bytes_since(&h, tx_count);
+                assert!(
+                    tx.strip_prefix(b"printf R3_STALE\n").is_some_and(|rescue| {
+                        rescue
+                            .iter()
+                            .all(|byte| matches!(*byte, b'\x03' | b'\x04' | b'\n'))
+                    }),
+                    "{kind}: timeout 只可沿既有 recovery 傳救援鍵，不得重送命令：{tx:?}"
+                );
+            }
+            other => panic!("stale evidence 後續命令得到非預期狀態：{other:?}: {result:?}"),
+        }
+    }
+}
+
+#[test]
+fn i294_r3_barriers_never_revive_stale_evidence_with_human_or_without_human() {
+    for kind in ["clear", "profile", "takeover"] {
+        for human_tx_seen in [false, true] {
+            i294_r3_assert_barrier_does_not_revive_evidence(kind, human_tx_seen);
+        }
+    }
+}
+
+#[test]
+fn i294_r3_long_prefix_with_different_tail_never_completes_or_learns() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.rx.clear();
+        let prefix = format!("root@t:/{}# ", "x".repeat(2_000));
+        h.inject_rx_reader_processed(format!("\r\n{prefix}").as_bytes());
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf R3_LONG", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_LONG\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(b"printf R3_LONG\r\nOUT\r\nroot@t:/different# ");
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "長前綴與不同尾端不得互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 long prefix timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert!(
+            h.rx.prompt_evidence_literal_for_test().is_none(),
+            "長前綴與不同尾端不得學成 evidence"
+        );
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf R3_LONG\n"
+        );
+    }
+}
+
+#[test]
+fn i294_r3_trimmed_echo_prefix_line_start_never_mutually_confirms() {
+    for human_tx_seen in [false, true] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.rx.clear();
+        let prefix = format!("root@t:/{}# ", "x".repeat(131_060));
+        h.inject_rx_reader_processed(format!("\r\n{prefix}").as_bytes());
+        let id = h.submit_with("printf R3_TRIM", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"printf R3_TRIM\n");
+        if human_tx_seen {
+            h.rx
+                .record_human_tx_for_test(b"echo R3_HUMAN\n", &*h.clock);
+        }
+        h.inject_rx_processed(b"printf R3_TRIM\r\nOUT\r\nroot@t:/different# ");
+        assert!(
+            h.rx.snapshot_from(0).trimmed_before_from,
+            "R3 測試必須確實修剪跨 TX 前綴所在行首"
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "前綴行首被修剪後不得互證：human={human_tx_seen}"
+        );
+        i294_r3_advance_until_done(&h, &id, "R3 trimmed prefix timeout");
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert!(h.rx.prompt_evidence_literal_for_test().is_none());
+    }
+}
+
+#[test]
+fn i294_r4_cross_tx_prefix_waits_for_real_human_effect_guard() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r4-real-human-effect");
+    h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+
+    let human_starts = h.rx.human_submit_start_count_for_test();
+    let human_generation = h.rx.human_tx_state().generation;
+    let (pump_paused_tx, pump_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+            pump_paused_tx
+                .send(())
+                .expect("R4 human job 到達 writer 前屏障");
+            release_pump_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("R4 測試釋放 human pump");
+        })));
+    console.push_input(b"echo R4_HUMAN\n");
+    pump_paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("真實 HumanTx effect 已建立 guard");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(
+        h.rx.human_submit_start_count_for_test(),
+        human_starts,
+        "HumanTx 尚未成功入 writer，不得增加 submit 計數"
+    );
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        human_generation,
+        "HumanTx 尚未登錄，不得推進 TX generation"
+    );
+    assert!(
+        !h.rx.snapshot_from(0).tx_submit_pending,
+        "writer 前屏障只覆蓋 HumanTx guard 與 pump channel"
+    );
+
+    let command = "printf R4_GUARDED";
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx
+                .send(())
+                .expect("R4 command completion waiter 已開始");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("R4 command 已進入 completion wait");
+
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    h.inject_rx_reader_processed(
+        format!("{command}\r\nGUARDED\r\nroot@t:/# ").as_bytes(),
+    );
+    let evaluated = h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    );
+    let snapshot = h.rx.snapshot_from(0);
+    assert!(
+        evaluated,
+        "跨 TX bare echo 必須在 human guard 仍在途時重新評估: in_flight={}, submit_pending={}, revision={}",
+        snapshot.human_in_flight,
+        snapshot.tx_submit_pending,
+        snapshot.revision,
+    );
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "human guard 在途時不得以跨 TX 前綴完成 agent 命令"
+    );
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "human guard 在途的跨 TX 前綴不得寫回 evidence"
+    );
+
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "R4 human 交錯後原命令 timeout",
+        |h| is_done(h, &id),
+    );
+    let first = h.wait_done(&id);
+    assert_eq!(first["status"], PyValue::from("error"), "{first:?}");
+    assert_eq!(first["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{first:?}");
+    assert_eq!(first["partial"], PyValue::Bool(true), "{first:?}");
+    assert_eq!(first["recovery_action"], PyValue::from("NONE"), "{first:?}");
+    assert!(h.rx.prompt_evidence_literal_for_test().is_none());
+
+    release_pump_tx.send(()).expect("釋放真實 HumanTx job");
+    h.wait_for("R4 HumanTx writer report 與 guard 結算", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+            && rig.rx.human_tx_state().generation > human_generation
+    });
+    wait_tx(&h, b"echo R4_HUMAN\n");
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+    h.wait_for("R4 human pending 已由 TX 後 prompt 結案", |rig| {
+        !rig.rx.human_tx_state().pending_human
+    });
+
+    let next = h.submit_ok("printf R4_AFTER");
+    wait_tx(&h, b"printf R4_AFTER\n");
+    h.inject_rx_processed(
+        b"printf R4_AFTER\r\nAFTER\r\nroot@t:/# ",
+    );
+    let next_result = h.wait_done(&next);
+    assert_eq!(next_result["status"], PyValue::from("done"), "{next_result:?}");
+    assert_eq!(next_result["stdout"], PyValue::from("AFTER"));
+    assert_eq!(next_result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test().as_deref(),
+        Some("root@t:/# ")
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf R4_GUARDED\necho R4_HUMAN\nprintf R4_AFTER\n",
+        "guard 釋放後 liveness 恢復不得增加或重送 TX"
+    );
+}
+
+#[test]
+fn i294_r1_ready_evidence_rejects_probe_echo_old_prompt_and_async_output() {
+    for response in ["probe-echo", "old-prompt", "async-output"] {
+        for fragmented in [false, true] {
+            i294_r1_run_ready_evidence_case(response, fragmented);
+        }
+    }
+}
+
+#[test]
+fn i294_r1_no_echo_known_prompt_requires_true_last_line_start() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf INLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf INLINE\n");
+
+    h.inject_rx_processed(b"abc");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無 echo 的 stdout 片段不能完成"
+    );
+    h.inject_rx_processed(b"root@t:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無 echo 的同行已知 prompt suffix 不得當作行首 prompt"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "no-echo inline prompt timeout",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf INLINE\n");
+
+    let line_start = h.submit_ok("printf LINE");
+    wait_tx(&h, b"printf LINE\n");
+    h.inject_rx_processed(b"line output\r\nroot");
+    assert_eq!(h.command_get(&line_start)["status"], PyValue::from("running"));
+    h.inject_rx_processed(b"@t:/# ");
+    let result = h.wait_done(&line_start);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("line output"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_r1_timeout_candidate_matrix_preserves_no_candidate_recovery() {
+    for silence_entry in [false, true] {
+        for echo_found in [false, true] {
+            let label = format!("candidate/no-candidate silence={silence_entry} echo={echo_found}");
+            let h = ActorRig::new(SHELL_PROFILE).ready();
+            h.dev
+                .on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+            let tx_count = h.wal_tx_payloads().len();
+            let command = format!("printf R1_{silence_entry}_{echo_found}");
+            let id = h.submit_with(&command, |request| {
+                request.timeout_s = 0.2;
+                if silence_entry {
+                    request.expected_duration_s = Some(1.0);
+                }
+            });
+            wait_tx(&h, format!("{command}\n").as_bytes());
+            let mut raw = if echo_found {
+                format!("{command}\r\nno candidate\r\n").into_bytes()
+            } else {
+                b"no candidate\r\n".to_vec()
+            };
+            h.inject_rx_processed(&raw);
+            advance_until(
+                &h,
+                Duration::from_millis(100),
+                &format!("{label} recovery"),
+                |h| is_done(h, &id),
+            );
+            let result = h.wait_done(&id);
+            assert_eq!(result["status"], PyValue::from("done"), "{label}: {result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{label}: {result:?}");
+            assert_eq!(result["partial"], PyValue::Bool(true), "{label}: {result:?}");
+            let expected_tx = format!("{command}\n").into_bytes();
+            raw = expected_tx;
+            raw.push(0x03);
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                raw,
+                "{label}: 無候選必須保留基線救援 TX"
+            );
+        }
+    }
+
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    for silence_entry in [false, true] {
+        let h = ActorRig::new(&profile).ready();
+        let tx_count = h.wal_tx_payloads().len();
+        let command = format!("printf R1_CANDIDATE_{silence_entry}");
+        let id = h.submit_with(&command, |request| {
+            request.timeout_s = 0.2;
+            if silence_entry {
+                request.expected_duration_s = Some(1.0);
+            }
+        });
+        wait_tx(&h, format!("{command}\n").as_bytes());
+        h.inject_rx_processed(
+            format!("{command}\r\ncandidate root@new:/# ")
+                .as_bytes(),
+        );
+        assert_eq!(
+            h.command_get(&id)["status"],
+            PyValue::from("running"),
+            "歧義候選不得在尾端提前完成"
+        );
+        advance_until(
+            &h,
+            Duration::from_millis(100),
+            "歧義候選 timeout",
+            |h| is_done(h, &id),
+        );
+        let result = h.wait_done(&id);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            format!("{command}\n").as_bytes(),
+            "有歧義候選的 timeout 不送救援 TX"
+        );
+    }
+}
+
+fn i294_r1_prompt_evidence_barrier(kind: &str) {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^root@(?:t|new):/#[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.dev
+        .on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_prompt_evidence_before_write_hook_for_test(Some(Arc::new(move |snapshot| {
+            entered_tx
+                .send(snapshot.clone())
+                .expect("prompt evidence barrier snapshot");
+            release_rx.recv().expect("release prompt evidence barrier");
+        })));
+
+    h.inject_rx_reader_processed(b"\r\n");
+    let id = h.submit_with("cd /new", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_reader_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let stale = entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已辨識新 prompt evidence");
+    assert!(stale.prompt_evidence.is_some(), "READY 應已提供舊 evidence");
+    match kind {
+        "clear" => h.rx.clear(),
+        "profile" => h
+            .rx
+            .set_human_prompt_regex_for_test(r"(?m)^other@host:.*# "),
+        "takeover" => h.rx.activate_epoch_for_test(9),
+        other => panic!("未知 prompt evidence barrier: {other}"),
+    }
+    h.advance(Duration::from_millis(201));
+    release_tx.send(()).expect("release evidence writeback");
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "stale completion recheck",
+        |h| is_done(h, &id),
+    );
+    let first = h.wait_done(&id);
+    assert!(
+        first["status"].as_str() != Some("done")
+            || first["recovery_action"].as_str() == Some("CTRL_C"),
+        "{kind}: 舊 snapshot 不得在 barrier 後直接完成：{first:?}"
+    );
+    assert_eq!(
+        h.rx.prompt_evidence_literal_for_test(),
+        None,
+        "{kind}: barrier 後不得寫回被攔截的新 evidence"
+    );
+
+    h.inject_rx_reader_processed(b"\r\n");
+    let tx_count = h.wal_tx_payloads().len();
+    let second = h.submit_with("printf AFTER_BARRIER", |request| {
+        request.timeout_s = 0.2
+    });
+    wait_tx(&h, b"printf AFTER_BARRIER\n");
+    h.inject_rx_processed(
+        b"printf AFTER_BARRIER\r\nAFTER\r\nroot@new:/# ",
+    );
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "{kind}: stale evidence 不得復活並完成後續命令"
+    );
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "stale evidence 後續命令",
+        |h| is_done(h, &second),
+    );
+    let result = h.wait_done(&second);
+    assert_eq!(result["status"], PyValue::from("error"), "{kind}: {result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{kind}: {result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{kind}: {result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{kind}: {result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf AFTER_BARRIER\n");
+    assert!(
+        h.rx.prompt_evidence_literal_for_test().is_none(),
+        "{kind}: 後續命令不得讓 stale evidence 復活"
+    );
+}
+
+#[test]
+fn i294_r1_prompt_evidence_writeback_clear_profile_and_takeover_barriers() {
+    for kind in ["clear", "profile", "takeover"] {
+        i294_r1_prompt_evidence_barrier(kind);
+    }
+}
+
+#[test]
+fn i294_r1_exact_router_arrow_prompt_supports_ready_echo_and_no_echo() {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", r"(?m)^router=>[ \t]*$");
+    let h = ActorRig::new(&profile).ready_with_prompt(b"router=> ");
+
+    let ready = h.submit_with("printf READY", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf READY\n");
+    h.inject_rx_processed(b"printf READY\r\nREADY\r\nrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router READY evidence",
+        |h| is_done(h, &ready),
+    );
+    let result = h.wait_done(&ready);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("READY"));
+
+    h.rx.clear();
+    h.inject_rx_reader_processed(b"\r\n");
+    let echo = h.submit_with("printf ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf ECHO\n");
+    h.inject_rx_processed(b"router=> printf ECHO\r\nECHO\r\nrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router complete echo evidence",
+        |h| is_done(h, &echo),
+    );
+    let result = h.wait_done(&echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ECHO"));
+
+    let no_echo = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    h.inject_rx_processed(b"NO ECHO\r\nrouter=> ");
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "router no-echo evidence",
+        |h| is_done(h, &no_echo),
+    );
+    let result = h.wait_done(&no_echo);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("NO ECHO"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_r1_path_arrow_output_cannot_become_echo_prefix_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^.*=>[ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready_with_prompt(b"Path => ");
+    h.rx.clear();
+    let id = h.submit_with("printf PATH", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf PATH\n");
+    h.inject_rx_processed(b"printf PATH\r\nPath => ");
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "Path arrow output ambiguity",
+        |h| is_done(h, &id),
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+}
+
+fn i271_r1_run_shipped_prefix_inline(prompt_regex: &str, prompt: &str) {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", prompt_regex);
+    let h = ActorRig::new(&profile).ready_with_prompt(prompt.as_bytes());
+
+    let plain = h.submit_with("printf abc", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(format!("printf abc\r\nabc{prompt}").as_bytes());
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "prefix printf abc",
+        |h| is_done(h, &plain),
+    );
+    let result = h.wait_done(&plain);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("abc"));
+
+    let nul = h.submit_with("cat model", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"cat model\n");
+    let mut raw = b"cat model\r\nmodel\0".to_vec();
+    raw.extend_from_slice(prompt.as_bytes());
+    h.inject_rx_processed(&raw);
+    advance_until(
+        &h,
+        Duration::from_millis(50),
+        "prefix NUL stdout",
+        |h| is_done(h, &nul),
+    );
+    let result = h.wait_done(&nul);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("model\0"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_r1_shipped_prefix_profiles_preserve_inline_stdout_and_nul() {
+    i271_r1_run_shipped_prefix_inline(
+        r"(?m)^root@prplOS:.*# ",
+        "root@prplOS:~# ",
+    );
+    i271_r1_run_shipped_prefix_inline(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+    );
+}
+
+#[test]
+fn i271_no_newline_stdout_and_nul_are_exact() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+
+    let plain = h.submit_ok("printf abc");
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabcroot@t:/# ");
+    let plain_result = h.wait_done(&plain);
+    assert_eq!(plain_result["stdout"], PyValue::from("abc"));
+    assert_eq!(plain_result["partial"], PyValue::Bool(false));
+
+    let nul = h.submit_ok("cat /proc/device-tree/model");
+    wait_tx(&h, b"cat /proc/device-tree/model\n");
+    h.inject_rx_processed(
+        b"cat /proc/device-tree/model\r\nmodel\0root@t:/# ",
+    );
+    let nul_result = h.wait_done(&nul);
+    assert_eq!(nul_result["stdout"], PyValue::from("model\0"));
+    assert_eq!(nul_result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_trimmed_no_echo_completion_is_partial() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_ok("printf TRIM");
+    wait_tx(&h, b"printf TRIM\n");
+
+    let filler = "x".repeat(131_200);
+    h.inject_rx_processed(format!("{filler}TAIL\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.ends_with("TAIL")),
+        "修剪後仍須保留 snapshot 內的可用輸出：{result:?}"
+    );
+}
+
+#[test]
+fn i271_unknown_prompt_keeps_output_partial() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf UNKNOWN", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf UNKNOWN\n");
+
+    h.inject_rx_processed(b"printf UNKNOWN\r\nUNKNOWNroot@new:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "未知 prompt 不得從任意 regex match 學習"
+    );
+    advance_until(&h, Duration::from_millis(200), "unknown prompt timeout", |h| {
+        is_done(h, &id)
+    });
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("UNKNOWN")),
+        "未知 prompt 不得丟掉可用 stdout：{result:?}"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf UNKNOWN\n",
+        "prompt 身分歧義不得自動送救援鍵"
+    );
+}
+
+#[test]
+fn i271_short_prompt_does_not_cut_inline_stdout() {
+    let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", r"(?m)^#[ \t]*$");
+    let h = ActorRig::new(&profile).ready_with_prompt(b"# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf abc", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabc# ");
+    advance_until(&h, Duration::from_millis(200), "short prompt ambiguity", |h| {
+        is_done(h, &id)
+    });
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("abc")),
+        "短 prompt 同行候選不得刪掉 stdout：{result:?}"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"printf abc\n",
+        "短 prompt 歧義不得送 Ctrl-C／Ctrl-D"
+    );
+
+    let line_prompt = h.submit_ok("printf ok");
+    wait_tx(&h, b"printf ok\n");
+    h.inject_rx_processed(b"printf ok\r\nok\r\n# ");
+    let result = h.wait_done(&line_prompt);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("ok"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_complete_echo_prefix_updates_changed_prompt_evidence() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.inject_rx_reader_processed(b"\r\n");
+    let cd = h.submit_ok("cd /new");
+    wait_tx(&h, b"cd /new\n");
+    h.inject_rx_processed(b"root@new:/# cd /new\r\nroot@new:/# ");
+    let cd_result = h.wait_done(&cd);
+    assert_eq!(cd_result["status"], PyValue::from("done"));
+    assert_eq!(cd_result["stdout"], PyValue::from(""));
+    assert_eq!(cd_result["partial"], PyValue::Bool(false));
+
+    let inline = h.submit_ok("printf abc");
+    wait_tx(&h, b"printf abc\n");
+    h.inject_rx_processed(b"printf abc\r\nabcroot@new:/# ");
+    let result = h.wait_done(&inline);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("abc"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i271_clear_invalidates_prompt_evidence_until_clean_echo_prefix() {
+    let profile = SHELL_PROFILE.replace(
+        "(?m)^root@t:.*# ",
+        r"(?m)^(?:[ \t]*|.*[^>#\s])[>#][ \t]*$",
+    );
+    let h = ActorRig::new(&profile).ready();
+    h.rx.clear();
+
+    let uncertain = h.submit_with("printf before", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf before\n");
+    h.inject_rx_processed(b"printf before\r\nbefore root@t:/# ");
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "cleared prompt evidence ambiguity",
+        |h| is_done(h, &uncertain),
+    );
+    let result = h.wait_done(&uncertain);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert!(
+        result["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("before")),
+        "清除證據後不得假設舊 prompt：{result:?}"
+    );
+
+    h.inject_rx_reader_processed(b"\r\n");
+    let relearn = h.submit_ok("printf after");
+    wait_tx(&h, b"printf after\n");
+    h.inject_rx_processed(
+        b"root@t:/# printf after\r\nafter\r\nroot@t:/# ",
+    );
+    let result = h.wait_done(&relearn);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("after"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_human_prompt_before_agent_echo_does_not_complete() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let id = h.submit_ok("echo AGENT");
+    wait_tx(&h, b"echo AGENT\n");
+    h.inject_rx_processed(b"root@t:/# ");
+    let before_agent_echo = h.command_get(&id);
+    assert_eq!(
+        before_agent_echo["status"],
+        PyValue::from("running"),
+        "human 的舊 prompt 不得完成 agent 命令：{before_agent_echo:?}"
+    );
+
+    h.inject_rx_processed(b"echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("AGENT"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "完成判定不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho AGENT\n".to_vec(),
+        "只送原本的人類行與 agent 命令"
+    );
+}
+
+#[test]
+fn i294_unrelated_busybox_wrap_marker_does_not_join_plain_crlf_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-unrelated-busybox-wrap");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let command = format!("/tmp/{}", "x".repeat(60));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    // BusyBox 折行標記屬於前面的雜訊行；ANSI 與 backspace 清理後仍不得把證據移到候選 echo。
+    let unrelated = format!(
+        "root@t:/# \r\nnoiseX\x08\x1b[31m\r\r\n\x1b[0m{}\r\n{}\r\nroot@t:/# ",
+        &command[..40],
+        &command[40..]
+    );
+    let checks = h.rx.snapshot_wait_progress_for_test().0;
+    let expected_end = h
+        .rx
+        .snapshot_len()
+        .saturating_add(unrelated.chars().count() as u64);
+    h.inject_rx_reader_processed(unrelated.as_bytes());
+    h.wait_for("BusyBox 無關標記的 evaluator 判定", |rig| {
+        let status = rig.command_get(&id)["status"].clone();
+        let (_, checked_end) = rig.rx.snapshot_wait_progress_for_test();
+        status != "running"
+            || (rig.rx.snapshot_wait_progress_for_test().0 > checks && checked_end >= expected_end)
+    });
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無關的 BusyBox 標記不得拼接普通 CRLF；未完成 human TX 後的舊 prompt 也不能完成命令"
+    );
+
+    h.inject_rx_processed(format!("{command}\r\nOK\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OK"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("echo HUMAN\n{tx}").as_bytes());
+}
+
+#[test]
+fn i294_unrelated_readline_wrap_marker_does_not_join_plain_space_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-unrelated-readline-wrap");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let command = format!("/tmp/{}", "x".repeat(60));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    // readline 標記只在前面的雜訊行；候選 echo 中的普通空白不是折行插入點。
+    let unrelated = format!(
+        "root@t:/# \r\nnoise \r\n{} {}\r\nroot@t:/# ",
+        &command[..40],
+        &command[40..]
+    );
+    let checks = h.rx.snapshot_wait_progress_for_test().0;
+    let expected_end = h
+        .rx
+        .snapshot_len()
+        .saturating_add(unrelated.chars().count() as u64);
+    h.inject_rx_reader_processed(unrelated.as_bytes());
+    h.wait_for("readline 無關標記的 evaluator 判定", |rig| {
+        let status = rig.command_get(&id)["status"].clone();
+        let (_, checked_end) = rig.rx.snapshot_wait_progress_for_test();
+        status != "running"
+            || (rig.rx.snapshot_wait_progress_for_test().0 > checks && checked_end >= expected_end)
+    });
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "無關的 readline 標記不得授權候選 echo 的普通空白；human 舊 prompt 也不能完成命令"
+    );
+
+    h.inject_rx_processed(format!("{command}\r\nOK\r\nroot@t:/# ").as_bytes());
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OK"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("echo HUMAN\n{tx}").as_bytes());
+}
+
+#[test]
+fn i294_human_reply_arriving_inside_submit_does_not_poison_next_no_echo_command() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human-submit-race");
+    let before_generation = h.rx.human_tx_state().generation;
+    let reply = b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ".to_vec();
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    let called = Arc::new(AtomicBool::new(false));
+    let called_hook = Arc::clone(&called);
+    let (arrived_tx, arrived_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if called_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let expected = rx.total_bytes().saturating_add(reply.len() as u64);
+        dev.push_rx(&reply);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+        arrived_tx.send(()).expect("測試仍等待 submit 交錯點");
+        resume_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("測試應釋放仍在 OS submit 閉包內的 writer");
+    }));
+
+    console.push_input(b"echo HUMAN\n");
+    arrived_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human TX 已寫入，但 submit 尚未回傳");
+    assert!(
+        h.rx.text_from(0).ends_with("echo HUMAN\r\nHUMAN\r\nroot@t:/# "),
+        "完整 human echo、輸出與 prompt 已由 reader 收到"
+    );
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        before_generation,
+        "TX observation 尚未提交，writer 仍停在 submit 閉包內"
+    );
+    resume_tx.send(()).expect("writer hook 尚在等待釋放");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.wait_for("human TX observation 已提交", |rig| {
+        rig.rx.human_tx_state().generation > before_generation
+    });
+    h.inject_rx_reader_processed(b"\r\nroot@t:/# ");
+    h.wait_for("write 後的新 prompt 結清 human pending", |rig| {
+        !rig.rx.human_tx_state().pending_human
+    });
+
+    let tx_count = h.wal_tx_payloads().len();
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let id = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    h.inject_rx_processed(b"NO_ECHO\r\nroot@t:/# ");
+    h.wait_for("無 echo prompt 完成線性化", |rig| {
+        rig.command_get(&id).get("status") != Some(&PyValue::from("running"))
+    });
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("NO_ECHO"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_ECHO\n");
+}
+
+#[test]
+fn i294_incomplete_human_reply_still_makes_no_echo_command_partial() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-human-incomplete-reply");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let id = h.submit_with("printf AGENT", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    h.inject_rx_processed(b"AGENT\r\nroot@t:/# ");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "human 回應尚無 prompt 時，不可由無 echo agent prompt 降階完成"
+    );
+
+    h.advance(Duration::from_millis(200));
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"));
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(result["stdout"], PyValue::from("AGENT"));
+    assert_eq!(result["partial"], PyValue::Bool(true));
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo HUMAN\nprintf AGENT\n");
+}
+
+#[test]
+fn i294_shipped_prefix_prompts_handle_split_and_co_packed_rx() {
+    run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", false);
+    run_i294_shipped_prefix_case(r"(?m)^root@prplOS:.*# ", "root@prplOS:~# ", true);
+    run_i294_shipped_prefix_case(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+        false,
+    );
+    run_i294_shipped_prefix_case(
+        r"(?m)^root@Speedport Smart 4 Typ [AB]:[^\r\n#]*#[ \t]*",
+        "root@Speedport Smart 4 Typ A:~# ",
+        true,
+    );
+}
+
+#[test]
+fn i294_completion_snapshot_ignores_later_rx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let (matched_tx, matched_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |snapshot| {
+        matched_tx
+            .send(snapshot.clone())
+            .expect("測試仍等待 completion snapshot");
+        resume_rx
+            .recv()
+            .expect("測試釋放 completion snapshot waiter");
+    })));
+
+    let id = h.submit_ok("echo SNAPSHOT");
+    wait_tx(&h, b"echo SNAPSHOT\n");
+    h.dev
+        .push_rx(b"echo SNAPSHOT\r\nSNAPSHOT\r\nroot@t:/# ");
+    let accepted = matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 應接受原始 completion snapshot");
+    assert!(accepted.text.ends_with("SNAPSHOT\r\nroot@t:/# "));
+
+    h.inject_rx_reader_processed(b"\r\nLATE_RX");
+    resume_tx
+        .send(())
+        .expect("completion snapshot waiter 應仍在暫停");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("SNAPSHOT"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo SNAPSHOT\n".to_vec(),
+        "接受 snapshot 後抵達的 RX 不得改變 stdout 或增加 TX"
+    );
+}
+
+#[test]
+fn i294_r8_completion_decided_before_deadline_remains_done() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (matched_tx, matched_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |snapshot| {
+        matched_tx
+            .send(snapshot.clone())
+            .expect("test waits for pre-deadline completion decision");
+        resume_rx
+            .recv()
+            .expect("test releases pre-deadline completion decision");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo PRE_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo PRE_DEADLINE\n");
+    h.inject_rx_reader_processed(b"echo PRE_DEADLINE\r\nPRE_DEADLINE\r\nroot@t:/# ");
+    let accepted = matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已在 deadline 前判定完成");
+    assert!(accepted.text.ends_with("PRE_DEADLINE\r\nroot@t:/# "));
+    assert!(h.clock.mono_ns() < 200_000_000, "FakeClock 仍在 deadline 前");
+    h.advance(Duration::from_millis(201));
+    resume_tx.send(()).expect("釋放 pre-deadline completion barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("PRE_DEADLINE"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo PRE_DEADLINE\n".to_vec());
+}
+
+#[test]
+fn i294_late_echo_and_prompt_after_deadline_do_not_complete() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            deadline_tx.send(()).expect("test waits for deadline barrier");
+            resume_rx.recv().expect("test releases deadline barrier");
+        })));
+
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    let id = h.submit_with("echo LATE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo LATE\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+
+    h.advance(Duration::from_millis(201));
+    deadline_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("waiter must reach the configured deadline before late RX");
+    h.inject_rx_reader_processed(b"echo LATE\r\nLATE\r\nroot@t:/# ");
+    h.rx
+        .record_human_tx_for_test(b"late human TX", &*h.clock);
+    resume_tx.send(()).expect("deadline waiter remains paused");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "截止後、timeout 決策前才開始的 human submit 保守走 human timeout：{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(""), "截止後 RX 不回填 partial snapshot：{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo LATE\n".to_vec());
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT"),
+        "截止後、決策前開始的 submit 必須走 timeout partial：{recovered:?}"
+    );
+}
+
+#[test]
+fn i294_r7_absolute_deadline_is_not_restarted_before_snapshot_wait() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        entered_tx.send(()).expect("test waits for inner wait entry");
+        resume_rx.recv().expect("test releases inner wait entry");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo OUTER_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo OUTER_DEADLINE\n");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("外層 deadline 已計算，等待器尚未起算");
+
+    h.advance(Duration::from_millis(201));
+    h.inject_rx_reader_processed(b"echo OUTER_DEADLINE\r\nOUTER_DEADLINE\r\nroot@t:/# ");
+    resume_tx.send(()).expect("釋放等待器入口 barrier");
+
+    // 以救援 TX 的 WAL 作同步點，讓救援等待本身也透過 FakeClock 到期；late prompt 不得被當成
+    // 命令完成或救援回 prompt 的證據。
+    for key in h.timeout_recovery_keys() {
+        wait_tx(&h, key.payload());
+        h.advance(Duration::from_secs(2));
+    }
+    let result = h.wait_done(&id);
+    assert_ne!(result["status"], PyValue::from("done"), "外層期限後的 echo 不得完成：{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        expected_timeout_tx(&h, b"echo OUTER_DEADLINE\n")
+    );
+}
+
+#[test]
+fn i294_r7_deadline_settlement_includes_pre_deadline_human_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |_| {
+            evaluated_tx.send(()).expect("test waits for evaluator barrier");
+            resume_rx.recv().expect("test releases evaluator barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf NO_ECHO", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"printf NO_ECHO\n");
+    evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已釋鎖並檢查舊 snapshot");
+
+    h.clock.advance(Duration::from_millis(500));
+    h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+    h.clock.advance(Duration::from_millis(500));
+    resume_tx.send(()).expect("釋放 evaluator barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_ECHO\n".to_vec());
+}
+
+#[test]
+fn i294_r7_deadline_settlement_includes_pre_deadline_rx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |_| {
+            evaluated_tx.send(()).expect("test waits for evaluator barrier");
+            resume_rx.recv().expect("test releases evaluator barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("echo DEADLINE_RX", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"echo DEADLINE_RX\n");
+    evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("evaluator 已釋鎖並檢查舊 snapshot");
+
+    h.clock.advance(Duration::from_millis(500));
+    h.inject_rx_reader_processed(b"echo DEADLINE_RX\r\nDEADLINE_RX\r\nroot@t:/# ");
+    h.clock.advance(Duration::from_millis(501));
+    h.inject_rx_reader_processed(&vec![b'z'; 140_000]);
+    resume_tx.send(()).expect("釋放 evaluator barrier");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "期限後不得事後採用 RX 完成判定；只有 Ctrl-C 找回 prompt 才回成功：{result:?}");
+    let baseline_stdout = format!(
+        "{}^C",
+        "z".repeat(sw_core::resources::RX_WINDOW_MAX_CHARS - b"^C\r\nroot@t:/# ".len())
+    );
+    assert_eq!(
+        result["stdout"],
+        PyValue::from(baseline_stdout),
+        "無 human TX 時 timeout stdout 必須採用完整 recovery 結果，與 9af187ca 基線相同：{result:?}"
+    );
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "無 human TX 時保留基線救援：{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo DEADLINE_RX\n\x03".to_vec(),
+        "期限內尚未判定完成且無 human TX 時維持基線 Ctrl-C 救援"
+    );
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "期限前 RX 不得事後改判正常完成：{recovered:?}"
+    );
+}
+
+#[test]
+fn i294_r8_expired_before_first_wait_returns_timeout_partial() {
+    for (human_state, echo_found) in [
+        ("none", true),
+        ("none", false),
+        ("registered", true),
+        ("registered", false),
+        ("pending", true),
+        ("pending", false),
+    ] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            entered_tx.send(()).expect("test waits before first snapshot wait");
+            resume_rx.recv().expect("test releases first snapshot wait");
+        })));
+
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("echo FIRST_WAIT", |request| request.timeout_s = 0.2);
+        wait_tx(&h, b"echo FIRST_WAIT\n");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("已進入首次 snapshot wait 前的 barrier");
+        match human_state {
+            "registered" => h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock),
+            "pending" => h.rx.set_tx_submit_pending_for_test(true),
+            "none" => {}
+            _ => unreachable!("unknown human state"),
+        }
+        let raw = if echo_found {
+            b"echo FIRST_WAIT\r\nFIRST_WAIT\r\nroot@t:/# ".as_slice()
+        } else {
+            b"partial output\r\nroot@t:/# ".as_slice()
+        };
+        h.inject_rx_reader_processed(raw);
+        h.advance(Duration::from_millis(201));
+        resume_tx.send(()).expect("釋放首次 snapshot wait");
+
+        let result = h.wait_done(&id);
+        if human_state == "pending" {
+            h.rx.set_tx_submit_pending_for_test(false);
+        }
+        assert_eq!(result["partial"], PyValue::Bool(true), "state={human_state}, echo={echo_found}: {result:?}");
+        if human_state == "none" {
+            assert_eq!(result["status"], PyValue::from("done"), "期限後只可由 recovery 找回 prompt：{result:?}");
+            assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+            assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n\x03".to_vec());
+            let recovered = h.request(SessionRequest::ResultTail {
+                cmd_id: id,
+                from_chunk: 0,
+                limit: 10,
+            });
+            assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+            assert_eq!(recovered["error_code"], PyValue::from("PROMPT_TIMEOUT_RECOVERED"), "{recovered:?}");
+        } else {
+            assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+            assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+            assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+            assert_eq!(result["stdout"], PyValue::from(if echo_found { "FIRST_WAIT" } else { "partial output" }), "{result:?}");
+            assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+            assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo FIRST_WAIT\n".to_vec());
+        }
+    }
+}
+
+#[test]
+fn i294_r8_timeout_after_deadline_snapshot_keeps_partial_and_baseline_recovery() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            deadline_tx.send(()).expect("test waits for operation deadline snapshot");
+            resume_rx.recv().expect("test releases deadline settlement");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf NO_OUTPUT", |request| request.timeout_s = 0.2);
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    wait_tx(&h, b"printf NO_OUTPUT\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+    h.advance(Duration::from_millis(201));
+    deadline_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("等待器已取得逾時 snapshot");
+    resume_tx.send(()).expect("釋放逾時結算");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf NO_OUTPUT\n\x03".to_vec());
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "只有救援鍵找回 prompt 才回報基線 recovery code：{recovered:?}"
+    );
+}
+
+#[test]
+fn i294_r8_tx_submit_pending_at_settlement_suppresses_recovery() {
+    for pending_before_deadline in [true, false] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        h.rx
+            .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+                deadline_tx.send(()).expect("operation deadline settlement reached");
+                resume_rx.recv().expect("test releases deadline settlement");
+            })));
+
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_with("printf HUMAN_PENDING", |request| request.timeout_s = 0.2);
+        let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+        wait_tx(&h, b"printf HUMAN_PENDING\n");
+        assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+            checks,
+            h.rx.snapshot_len(),
+            Duration::from_secs(5),
+        ));
+        if pending_before_deadline {
+            h.rx.set_tx_submit_pending_for_test(true);
+        }
+        h.advance(Duration::from_millis(201));
+        deadline_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("deadline snapshot 已建立；第一輪在途、第二輪在截止後啟動");
+        if !pending_before_deadline {
+            h.rx.set_tx_submit_pending_for_test(true);
+        }
+        resume_tx.send(()).expect("釋放 deadline settlement");
+
+        let result = h.wait_done(&id);
+        h.rx.set_tx_submit_pending_for_test(false);
+        assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+        assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+        assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+        assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+        assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+        assert_eq!(
+            wal_tx_bytes_since(&h, tx_count),
+            b"printf HUMAN_PENDING\n".to_vec(),
+            "結算時有在途 human submit 必須抑制所有救援 TX；pending_before_deadline={pending_before_deadline}"
+        );
+    }
+}
+
+fn i294_r9_run_silence_timeout_with_human(pending_submit: bool, echo_found: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+
+    let (first_wait_tx, first_wait_rx) = crossbeam_channel::bounded(1);
+    let (release_first_wait_tx, release_first_wait_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            first_wait_tx.send(()).expect("等待第一個靜默 chunk");
+            release_first_wait_rx.recv().expect("釋放第一個靜默 chunk");
+        })));
+    let (first_timeout_tx, first_timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_first_timeout_tx, release_first_timeout_rx) = crossbeam_channel::bounded(1);
+    let (second_timeout_tx, second_timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_second_timeout_tx, release_second_timeout_rx) = crossbeam_channel::bounded(1);
+    let timeout_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let timeout_count_hook = Arc::clone(&timeout_count);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            match timeout_count_hook.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
+                0 => {
+                    first_timeout_tx.send(()).expect("等待第一個靜默 chunk 到期");
+                    release_first_timeout_rx
+                        .recv()
+                        .expect("釋放第一個靜默 chunk 到期點");
+                }
+                1 => {
+                    second_timeout_tx.send(()).expect("等待第二個靜默 chunk 到期");
+                    release_second_timeout_rx
+                        .recv()
+                        .expect("釋放第二個靜默 chunk 到期點");
+                }
+                _ => {}
+            }
+        })));
+
+    let command = "printf R9_SILENCE";
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    first_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("命令已到第一個 snapshot wait barrier");
+    wait_tx(&h, b"printf R9_SILENCE\n");
+
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+
+    let rx_before = h.rx.total_bytes();
+    let partial = if echo_found {
+        b"printf R9_SILENCE\r\npartial output\r\n".as_slice()
+    } else {
+        b"partial output\r\n".as_slice()
+    };
+    h.dev.push_rx(partial);
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        rx_before + partial.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_first_wait_tx
+        .send(())
+        .expect("釋放第一個 snapshot wait");
+
+    h.clock.advance(Duration::from_secs(30));
+    h.send_control(ControlEvent::Tick);
+    let _ = h.get_state();
+    first_timeout_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個靜默 chunk 已到期；operation deadline 仍在 90 秒後");
+    assert!(h.clock.mono_ns() < 120_000_000_000);
+
+    let (second_wait_tx, second_wait_rx) = crossbeam_channel::bounded(1);
+    let (release_second_wait_tx, release_second_wait_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            second_wait_tx.send(()).expect("等待第二個靜默 chunk");
+            release_second_wait_rx.recv().expect("釋放第二個靜默 chunk");
+        })));
+    release_first_timeout_tx
+        .send(())
+        .expect("釋放第一個靜默 chunk 結算");
+    second_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RX 改變後重新開始第二個靜默 chunk");
+    release_second_wait_tx
+        .send(())
+        .expect("釋放第二個靜默 chunk");
+    h.clock.advance(Duration::from_secs(30));
+    h.send_control(ControlEvent::Tick);
+    let _ = h.get_state();
+    second_timeout_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第二個靜默 chunk 已到期；operation deadline 尚未到期");
+    release_second_timeout_tx
+        .send(())
+        .expect("釋放第二個靜默 chunk 結算");
+
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    let expected_stdout = if echo_found {
+        "printf R9_SILENCE\npartial output"
+    } else {
+        "partial output\n"
+    };
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_SILENCE\n");
+}
+
+#[test]
+fn i294_r9_silence_timeout_full_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(false, true);
+}
+
+#[test]
+fn i294_r9_silence_timeout_full_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(true, true);
+}
+
+#[test]
+fn i294_r9_silence_timeout_without_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(false, false);
+}
+
+#[test]
+fn i294_r9_silence_timeout_without_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_silence_timeout_with_human(true, false);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R10SubmitRacePoint {
+    BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+    SnapshotContainsPendingThenSubmitCompletes,
+    SubmitStartsAfterCutoffBeforeSettlement,
+}
+
+fn i294_r10_advance_clock(h: &ActorRig, duration: Duration) {
+    let mut left = duration;
+    while left > Duration::ZERO {
+        let step = left.min(Duration::from_secs(1));
+        left -= step;
+        h.clock.advance(step);
+        h.send_control(ControlEvent::Tick);
+    }
+}
+
+fn i294_r10_begin_human_submit_after_write(
+    h: &ActorRig,
+) -> (
+    u64,
+    crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    crossbeam_channel::Sender<()>,
+    sw_core::uart_bridge::HumanInFlightGuard,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let generation_before = h.rx.human_tx_state().generation;
+    let (accepted_tx, accepted_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let called = Arc::new(AtomicBool::new(false));
+    let called_hook = Arc::clone(&called);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if called_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        accepted_tx.send(()).expect("等待 human OS submit barrier");
+        release_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放已由 fake OS 接受的 human submit");
+    }));
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(h, 9_294_100);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: b"echo HUMAN\n".to_vec(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = h
+        .rx
+        .submit_human_job_for_test(&tx, job)
+        .expect("human job 已排入 TX writer");
+    accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human line 已由 fake OS 接受、observer 尚未登錄");
+    assert_eq!(
+        h.rx.human_tx_state().generation,
+        generation_before,
+        "OS accept barrier 尚未返回，human observer 尚未登錄"
+    );
+    assert!(h.rx.snapshot_from(0).tx_submit_pending);
+    (generation_before, report_rx, release_tx, guard)
+}
+
+fn i294_r10_human_line_permit(h: &ActorRig, op_id: u64) -> sw_core::tx_writer::TxPermit {
+    let (epoch, owner_gen, fsm_gen) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+        )
+    });
+    sw_core::tx_writer::TxPermit {
+        op_id: OpId(op_id),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        class: sw_core::tx_writer::TxClass::HumanLine,
+        source: "human:r10-test".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: None,
+        replay_hold: None,
+        probe_id: None,
+    }
+}
+
+fn i294_r10_release_human_submit(
+    h: &ActorRig,
+    generation_before: u64,
+    report_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    release: crossbeam_channel::Sender<()>,
+    guard: sw_core::uart_bridge::HumanInFlightGuard,
+) {
+    release.send(()).expect("human OS submit barrier 尚在等待");
+    h.wait_for("human observer 登錄並清除 submit pending", |rig| {
+        rig.rx.human_tx_state().generation > generation_before
+            && !rig.rx.snapshot_from(0).tx_submit_pending
+    });
+    report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanLine TxWriter report 已完成");
+    drop(guard);
+    wait_tx(h, b"echo HUMAN\n");
+}
+
+fn i294_r10_run_silence_submit_race(
+    point: I294R10SubmitRacePoint,
+    echo_found: bool,
+) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R10_RACE";
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n").into_bytes()
+    } else {
+        b"partial output\r\n".to_vec()
+    };
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        let expected = rx.total_bytes().saturating_add(response.len() as u64);
+        dev.push_rx(&response);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+    }));
+
+    let (timeout_tx, timeout_rx) = crossbeam_channel::bounded(1);
+    let (release_timeout_tx, release_timeout_rx) = crossbeam_channel::bounded(1);
+    let timeout_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        timeout_tx.send(()).expect("等待 timeout snapshot barrier");
+        release_timeout_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放 timeout snapshot barrier");
+    });
+    match point {
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot => h
+            .rx
+            .set_snapshot_wait_before_deadline_snapshot_hook_for_test(Some(timeout_hook)),
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes
+        | I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement => h
+            .rx
+            .set_snapshot_wait_deadline_hook_for_test(Some(timeout_hook)),
+    }
+
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx
+            .send(())
+            .expect("completion wait deadline 已建立");
+    })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    wait_tx(&h, b"printf R10_RACE\n");
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已建立 quiet cutoff 的 snapshot wait");
+    let command_started_at = h.clock.mono_ns();
+
+    match point {
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot => {
+            let (before, _accepted_rx, release, guard) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_advance_clock(&h, Duration::from_secs(29));
+            assert!(
+                h.clock.mono_ns() < command_started_at + 30_000_000_000,
+                "submit 開始仍早於 30 秒靜默 cutoff"
+            );
+            i294_r10_advance_clock(&h, Duration::from_secs(2));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("quiet cutoff 已到，snapshot 建立前暫停");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
+        }
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes => {
+            let (before, _accepted_rx, release, guard) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_advance_clock(&h, Duration::from_secs(31));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout snapshot 已在 submit pending 時建立");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
+        }
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement => {
+            i294_r10_advance_clock(&h, Duration::from_secs(31));
+            timeout_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("無 human 的 timeout snapshot 已建立，settlement 暫停");
+            assert!(h.clock.mono_ns() < command_started_at + 120_000_000_000);
+            let (before, _accepted_rx, release, guard) =
+                i294_r10_begin_human_submit_after_write(&h);
+            i294_r10_release_human_submit(&h, before, _accepted_rx, release, guard);
+        }
+    }
+
+    release_timeout_tx
+        .send(())
+        .expect("timeout snapshot barrier 尚在等待");
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        "printf R10_RACE\npartial output"
+    } else {
+        "partial output\n"
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    let mut expected_tx = format!("{command}\n").into_bytes();
+    expected_tx.extend_from_slice(b"echo HUMAN\n");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        expected_tx,
+        "human 交錯 timeout 必須是零救援 TX；point={point:?}, echo_found={echo_found}"
+    );
+}
+
+#[test]
+fn i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_submit_before_cutoff_observed_after_cutoff_before_snapshot_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::BeforeCutoffObserverAfterCutoffBeforeSnapshot,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_snapshot_pending_then_submit_completes_before_settlement_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_snapshot_pending_then_submit_completes_before_settlement_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SnapshotContainsPendingThenSubmitCompletes,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_submit_starts_after_cutoff_before_decision_with_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement,
+        true,
+    );
+}
+
+#[test]
+fn i294_r10_submit_starts_after_cutoff_before_decision_without_echo() {
+    i294_r10_run_silence_submit_race(
+        I294R10SubmitRacePoint::SubmitStartsAfterCutoffBeforeSettlement,
+        false,
+    );
+}
+
+#[test]
+fn i294_r10_no_human_decision_serializes_first_rescue_key_before_new_submit() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R10_RESCUE_ORDER";
+    let response = format!("{command}\r\npartial output\r\n").into_bytes();
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        let expected = rx.total_bytes().saturating_add(response.len() as u64);
+        dev.push_rx(&response);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+    }));
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx.send(()).expect("completion wait 已開始");
+    })));
+    let (decision_tx, decision_rx) = crossbeam_channel::bounded(1);
+    let (release_decision_tx, release_decision_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_decision_hook_for_test(Some(Arc::new(move || {
+            decision_tx.send(()).expect("timeout 已判定無 human");
+            release_decision_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 timeout rescue decision barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| {
+        request.timeout_s = 30.0;
+        request.expected_duration_s = Some(120.0);
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command quiet deadline 已建立");
+    let (enqueue_order_tx, enqueue_order_rx) = crossbeam_channel::unbounded();
+    h.tx_handle().set_enqueue_hook_for_test(Some(Arc::new(move |class, op_id| {
+        enqueue_order_tx
+            .send((class, op_id))
+            .expect("記錄 writer enqueue 次序");
+    })));
+    i294_r10_advance_clock(&h, Duration::from_secs(31));
+    decision_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("無 human timeout 已完成救援決策，第一鍵尚未送出");
+
+    let gate_available_at_decision = h.rx.timeout_rescue_gate_available_for_test();
+    let submit_count_before = h.rx.human_submit_start_count_for_test();
+    let tx_start = h.dev.tx_len();
+    let (human_accepted_tx, human_accepted_rx) = crossbeam_channel::bounded(1);
+    let (release_human_tx, release_human_rx) = crossbeam_channel::bounded(1);
+    let human_hook_dev = h.dev.clone();
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if human_hook_dev.tx_since(tx_start).ends_with(b"echo HUMAN\n") {
+            human_accepted_tx
+                .send(())
+                .expect("等待 human OS submit barrier");
+            release_human_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 human OS submit barrier");
+        }
+    }));
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_101);
+    let submit_rx = Arc::clone(&h.rx);
+    let (enqueued_tx, enqueued_rx) = crossbeam_channel::bounded(1);
+    let (human_done_tx, human_done_rx) = crossbeam_channel::bounded(1);
+    let human_submit = std::thread::spawn(move || {
+        let (reply, report_rx) = crossbeam_channel::bounded(1);
+        let job = sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"echo HUMAN\n".to_vec(),
+            reply,
+            aggregate: None,
+        };
+        let (_, guard) = submit_rx
+            .submit_human_job_for_test(&tx, job)
+            .expect("human submit 已排入 TX writer");
+        enqueued_tx.send(()).expect("回報 human job 已排入 writer");
+        report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("HumanLine writer report");
+        drop(guard);
+        human_done_tx.send(()).expect("回報 human TX 完成");
+    });
+
+    h.wait_for("human submit 抵達 timeout rescue gate", |rig| {
+        rig.rx.human_submit_attempts_for_test() > 0
+    });
+    let submit_count_while_decision_paused = h.rx.human_submit_start_count_for_test();
+    if gate_available_at_decision {
+        enqueued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("未持有 rescue gate 時 human job 先排入 writer");
+        human_accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("未持有 rescue gate 時 human bytes 先到 OS");
+        release_human_tx
+            .send(())
+            .expect("釋放先送出的 human TX");
+        human_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("先送出的 human TX 已結算");
+    }
+    release_decision_tx
+        .send(())
+        .expect("timeout decision barrier 尚在等待");
+    if !gate_available_at_decision {
+        enqueued_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("rescue key 排隊後 human job 才可進 writer");
+        human_accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一個救援鍵後 human bytes 才到 OS");
+        release_human_tx
+            .send(())
+            .expect("釋放 rescue key 後的 human TX");
+        human_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("rescue key 後的 human TX 已結算");
+    }
+    human_submit.join().expect("human submit worker 正常結束");
+    let enqueue_order = [
+        enqueue_order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一個救援鍵已進 writer queue"),
+        enqueue_order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("後到 HumanLine 已進 writer queue"),
+    ];
+    assert_eq!(
+        enqueue_order.map(|(class, _)| class),
+        [
+            sw_core::tx_writer::TxClass::SystemRecoverKey,
+            sw_core::tx_writer::TxClass::HumanLine,
+        ],
+        "timeout 讀取完成且無 human 後，第一個救援鍵必須先進 writer queue"
+    );
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert!(
+        !gate_available_at_decision,
+        "timeout 無 human 判定至第一救援鍵入列期間必須持有同一 human submit gate"
+    );
+    assert_eq!(
+        submit_count_while_decision_paused,
+        submit_count_before,
+        "decision 與第一救援鍵互斥期間，新 human submit 尚未開始"
+    );
+    let mut expected_tx = format!("{command}\n").into_bytes();
+    expected_tx.extend_from_slice(b"\x03echo HUMAN\n");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), expected_tx);
+}
+
+#[test]
+fn i294_r20_empty_recovery_releases_timeout_rescue_guard_and_allows_later_human_submit() {
+    let profile = shell_profile_with_two_recovery_keys().replace("[CTRL_C, CTRL_D]", "[]");
+    let h = ActorRig::new_with_hub(&profile).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("cat", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"cat\n");
+
+    i294_r10_advance_clock(&h, Duration::from_secs(2));
+    let result = h.wait_done(&id);
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(state_of(&h), "ATTACHED");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\n",
+        "空 timeout_recovery_keys 必須走 recovery 且不得送救援鍵"
+    );
+    h.wait_for("空救援鍵清單釋放 timeout rescue guard", |rig| {
+        rig.rx.timeout_rescue_gate_available_for_test()
+    });
+
+    let console = h.attach_pty_console("i294-r20-empty-recovery-human");
+    console.push_input(b"echo AFTER_EMPTY\n");
+    wait_tx(&h, b"echo AFTER_EMPTY\n");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\necho AFTER_EMPTY\n",
+        "空清單 recovery 收尾後 human submit 必須能送達"
+    );
+}
+
+#[test]
+fn i294_r20_non_ctrl_c_first_key_releases_timeout_rescue_guard_at_enqueue() {
+    let profile = shell_profile_with_two_recovery_keys().replace("[CTRL_C, CTRL_D]", "[CTRL_D, CTRL_C]");
+    let h = ActorRig::new(&profile).ready();
+    h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
+    let tx_start = h.dev.tx_len();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("cat", |request| request.timeout_s = 1.0);
+    wait_tx(&h, b"cat\n");
+
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    let (enqueue_tx, enqueue_rx) = crossbeam_channel::unbounded();
+    h.tx_handle().set_enqueue_hook_for_test(Some(Arc::new(move |class, op_id| {
+        enqueue_tx.send((class, op_id)).expect("記錄 rescue 與 human enqueue 次序");
+    })));
+    i294_r10_advance_clock(&h, Duration::from_secs(2));
+    h.dev.wait_blocked();
+
+    assert_eq!(
+        h.dev.tx_since(tx_start),
+        b"cat\n\x04",
+        "設定順序的第一鍵必須是 CTRL_D，且 writer 尚在此鍵的 report 等待中"
+    );
+    assert!(!is_done(&h, &id), "第一鍵 writer 尚未回報，OpRunner 不得已收尾");
+    assert!(
+        h.rx.timeout_rescue_gate_available_for_test(),
+        "CTRL_D 入列後、writer report 尚未返回時就必須釋放 rescue guard"
+    );
+    assert_eq!(
+        enqueue_rx.recv_timeout(Duration::from_secs(5)).expect("第一救援鍵入列").0,
+        sw_core::tx_writer::TxClass::SystemRecoverKey
+    );
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_201);
+    let submit_rx = Arc::clone(&h.rx);
+    let (human_enqueued_tx, human_enqueued_rx) = crossbeam_channel::bounded(1);
+    let (human_done_tx, human_done_rx) = crossbeam_channel::bounded(1);
+    let human_submit = std::thread::spawn(move || {
+        let (reply, report_rx) = crossbeam_channel::bounded(1);
+        let job = sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"echo AFTER_FIRST_KEY\n".to_vec(),
+            reply,
+            aggregate: None,
+        };
+        let (_, guard) = submit_rx
+            .submit_human_job_for_test(&tx, job)
+            .expect("rescue guard 釋放後 human submit 應能入列");
+        human_enqueued_tx.send(()).expect("human line 已入列");
+        let report = report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("HumanLine writer report");
+        drop(guard);
+        human_done_tx.send(report).expect("human line writer 結果已回報");
+    });
+    human_enqueued_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CTRL_D 已入列且 writer report 暫停時 human submit 仍可入列");
+    assert_eq!(
+        enqueue_rx.recv_timeout(Duration::from_secs(5)).expect("human line 入列").0,
+        sw_core::tx_writer::TxClass::HumanLine
+    );
+
+    h.dev.release_block();
+    let human_report = human_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human line 已由 writer 收尾");
+    assert!(matches!(
+        human_report.result.outcome,
+        sw_pal::TxOutcome::Completed(n) if n == b"echo AFTER_FIRST_KEY\n".len()
+    ));
+    human_submit.join().expect("human submit worker 正常結束");
+    let result = h.wait_done(&id);
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_D"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat\n\x04echo AFTER_FIRST_KEY\n",
+        "非 CTRL_C 首鍵後 human bytes 緊接入列，不得多送 CTRL_C"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R11HumanState {
+    QueuedAtDecision,
+    RegisteredBeforeDecision,
+    FenceRejectedBeforeReport,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R11TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+struct I294R11HumanSubmission {
+    completed_rx: crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+fn i294_r11_permit(
+    h: &ActorRig,
+    op_id: u64,
+    class: sw_core::tx_writer::TxClass,
+) -> sw_core::tx_writer::TxPermit {
+    let (epoch, owner_gen, fsm_gen, input_epoch) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+            state.input_epoch,
+        )
+    });
+    sw_core::tx_writer::TxPermit {
+        op_id: OpId(op_id),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        class,
+        source: "human:r11-test".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: matches!(class, sw_core::tx_writer::TxClass::HumanRaw | sw_core::tx_writer::TxClass::HumanReplay)
+            .then_some(input_epoch),
+        replay_hold: None,
+        probe_id: None,
+    }
+}
+
+fn i294_r15_enqueue_writer_job(
+    h: &ActorRig,
+    op_id: u64,
+    payload: &[u8],
+) -> crossbeam_channel::Receiver<sw_core::tx_writer::TxReport> {
+    let mut permit = i294_r11_permit(h, op_id, sw_core::tx_writer::TxClass::LeaseOwner);
+    permit.log = false;
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .jobs
+        .send(sw_core::tx_writer::TxJob {
+            permit,
+            payload: payload.to_vec(),
+            reply,
+            aggregate: None,
+        })
+        .expect("測試 writer job 已入列");
+    report_rx
+}
+
+fn i294_r15_fill_writer_queue(h: &ActorRig, first_op_id: u64) {
+    let tx = h.tx_handle();
+    let capacity = tx.jobs.capacity().expect("writer queue 為有界 channel");
+    for index in 0..capacity {
+        let mut permit = i294_r11_permit(
+            h,
+            first_op_id + index as u64,
+            sw_core::tx_writer::TxClass::LeaseOwner,
+        );
+        permit.log = false;
+        let (reply, _report_rx) = crossbeam_channel::bounded(1);
+        tx.jobs
+            .try_send(sw_core::tx_writer::TxJob {
+                permit,
+                payload: b"FILL".to_vec(),
+                reply,
+                aggregate: None,
+            })
+            .expect("writer queue 尚有容量時可塞入 filler");
+    }
+    assert_eq!(tx.jobs.len(), capacity, "writer queue 已確實滿載");
+}
+
+struct I294R15ReleaseWriterOnDrop(sw_pal::fakes::serial::FakeDevice);
+
+impl Drop for I294R15ReleaseWriterOnDrop {
+    fn drop(&mut self) {
+        self.0.release_block();
+    }
+}
+
+#[test]
+fn i294_r15_pump_yields_timeout_decision_while_writer_queue_is_full() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r15-pump-full");
+    let tx_count = h.wal_tx_payloads().len();
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let blocker = i294_r15_enqueue_writer_job(&h, 9_294_150, b"BLOCK");
+    h.dev.wait_blocked();
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    i294_r15_fill_writer_queue(&h, 9_294_200);
+
+    let (pump_take_tx, pump_take_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_after_take_hook_for_test(Some(Arc::new(move || {
+            pump_take_tx.send(()).expect("human pump 已取出 job");
+        })));
+    let (capacity_wait_tx, capacity_wait_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .set_capacity_wait_hook_for_test(Some(Arc::new(move || {
+            capacity_wait_tx.send(()).expect("pump 已在 rescue gate 外等待 writer 容量");
+        })));
+    console.push_input(b"P");
+    pump_take_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pump 已取出 human job");
+    capacity_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("滿載 enqueue 已讓出 rescue gate 並等待容量");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "effect guard 在 pump 等容量期間仍在途");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "未成功 enqueue 不記 submit 起點");
+
+    let decision_rx = Arc::clone(&h.rx);
+    let (decision_tx, decision_done_rx) = crossbeam_channel::bounded(1);
+    let decision = std::thread::spawn(move || {
+        decision_tx
+            .send(decision_rx.timeout_rescue_human_seen_for_test(0, 0))
+            .expect("timeout 訊號讀取結果已回傳");
+    });
+    assert!(
+        decision_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer 尚未釋放時 timeout 已讀完訊號"),
+        "pump 的實際 HumanTx guard 使結果走 human tuple"
+    );
+    assert_eq!(h.dev.tx_since(0).iter().filter(|byte| **byte == 3 || **byte == 4).count(), 0);
+    decision.join().expect("timeout decision thread 正常結束");
+
+    h.dev.release_block();
+    blocker
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer blocker 已收斂");
+    h.wait_for("pump job 在容量恢復後送出", |rig| wal_tx_has(rig, b"P"));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count)
+            .iter()
+            .filter(|byte| **byte == 3 || **byte == 4)
+            .count(),
+        0,
+        "滿載 pump 案例不得送出救援鍵"
+    );
+}
+
+fn i294_r15_human_line_full_queue_case(timeout_entry: I294R11TimeoutEntry) {
+    use sw_core::session_core::OpGrant;
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let command = "printf R15_HUMAN_LINE";
+    let response = format!("{command}\r\npartial output\r\n").into_bytes();
+    h.dev.on_tx_reply(format!("{command}\n").as_bytes(), &response);
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        wait_started_tx.send(()).expect("command completion wait 已開始");
+    })));
+    let (decision_read_tx, decision_read_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+        decision_read_tx
+            .send(())
+            .expect("timeout 已完成四項訊號讀取");
+    })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R11TimeoutEntry::Silence => {
+            request.timeout_s = 30.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R11TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已進入 timeout 等待");
+
+    h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let blocker = i294_r15_enqueue_writer_job(&h, 9_294_300, b"BLOCK");
+    h.dev.wait_blocked();
+    let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+    i294_r15_fill_writer_queue(&h, 9_294_400);
+
+    let ctx = h.op_ctx_for_test();
+    let (epoch, owner_gen, fsm_gen) = h.fence.with(|state| {
+        (
+            state.active_epoch.expect("ActorRig bridge 已開啟"),
+            state.owner_gen,
+            state.fsm_gen,
+        )
+    });
+    let grant = OpGrant {
+        op_id: OpId(9_294_399),
+        epoch,
+        owner_gen,
+        fsm_gen,
+        cmd_id: None,
+    };
+    let (capacity_wait_tx, capacity_wait_rx) = crossbeam_channel::bounded(1);
+    h.tx_handle()
+        .set_capacity_wait_hook_for_test(Some(Arc::new(move || {
+            capacity_wait_tx.send(()).expect("HumanLine 已讓出 gate 等 writer 容量");
+        })));
+    let human = std::thread::spawn(move || {
+        sw_core::op_runner::send_human_line_for_test(&ctx, &grant, b"echo HUMAN_LINE\n")
+    });
+    capacity_wait_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanLine 已在 writer 滿載時讓出 rescue gate");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "HumanLine guard 在容量等待期間仍在途");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), 0, "滿載時尚未記錄成功 enqueue");
+
+    match timeout_entry {
+        I294R11TimeoutEntry::Silence => h.clock.advance(Duration::from_secs(31)),
+        I294R11TimeoutEntry::OperationDeadline => h.clock.advance(Duration::from_millis(201)),
+    }
+    decision_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer 尚未釋放時 timeout 已讀完四項訊號");
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "timeout 讀取完成至 writer 釋放前沒有救援 TX"
+    );
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "HumanLine 仍在容量等待中");
+
+    h.dev.release_block();
+    blocker
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer blocker 已收斂");
+    let report = human
+        .join()
+        .expect("HumanLine sender 正常結束");
+    assert!(report.reject.is_none(), "HumanLine 在容量恢復後獲 writer 處理");
+    assert!(
+        wal_tx_bytes_since(&h, tx_count).ends_with(b"echo HUMAN_LINE\n"),
+        "HumanLine 實際入列並保留 WAL：{:?}",
+        wal_tx_bytes_since(&h, tx_count)
+    );
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 後釋放 HumanLine guard");
+}
+
+#[test]
+fn i294_r15_human_line_full_queue_timeout_entries_finish_before_writer_release() {
+    i294_r15_human_line_full_queue_case(I294R11TimeoutEntry::Silence);
+    i294_r15_human_line_full_queue_case(I294R11TimeoutEntry::OperationDeadline);
+}
+
+fn i294_r11_enqueue_human(
+    h: &ActorRig,
+    class: sw_core::tx_writer::TxClass,
+    reply_capacity: usize,
+    hold_until_report: bool,
+) -> I294R11HumanSubmission {
+    let tx = h.tx_handle();
+    let permit = i294_r11_permit(h, 9_294_110, class);
+    let (reply, report_rx) = crossbeam_channel::bounded(reply_capacity);
+    let report_waiter = report_rx.clone();
+    let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+    let (queued_tx, queued_rx) = crossbeam_channel::bounded(1);
+    let rx = Arc::clone(&h.rx);
+    let join = std::thread::spawn(move || {
+        let (_, guard) = rx
+            .submit_human_job_for_test(
+                &tx,
+                sw_core::tx_writer::TxJob {
+                    permit,
+                    payload: b"echo HUMAN\n".to_vec(),
+                    reply,
+                    aggregate: None,
+                },
+            )
+            .expect("human job 已排入 TX writer");
+        queued_tx.send(()).expect("回報 human job 已排入 writer");
+        let report = if hold_until_report {
+            Some(
+                report_waiter
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("Human TX writer report"),
+            )
+        } else {
+            None
+        };
+        drop(guard);
+        if let Some(report) = report {
+            completed_tx.send(report).expect("回報 Human TX 結算");
+        }
+    });
+    queued_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human submit 已開始並排入 writer");
+    I294R11HumanSubmission {
+        completed_rx,
+        join: Some(join),
+    }
+}
+
+fn i294_r11_enqueue_blocker(
+    h: &ActorRig,
+    op_id: u64,
+) -> crossbeam_channel::Receiver<sw_core::tx_writer::TxReport> {
+    let tx = h.tx_handle();
+    let permit = i294_r11_permit(h, op_id, sw_core::tx_writer::TxClass::LeaseOwner);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    tx.jobs
+        .send(sw_core::tx_writer::TxJob {
+            permit,
+            payload: b"\n".to_vec(),
+            reply,
+            aggregate: None,
+        })
+        .expect("writer blocker 已排入 TX queue");
+    report_rx
+}
+
+fn i294_r11_run_timeout_case(
+    human_state: I294R11HumanState,
+    timeout_entry: I294R11TimeoutEntry,
+    echo_found: bool,
+) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R11_HUMAN";
+    let tx_count = h.wal_tx_payloads().len();
+    let writes_before = h.dev.write_calls();
+    let mut steps = vec![FakeWriteStep::BlockForever, FakeWriteStep::Accept(usize::MAX)];
+    if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        steps.push(FakeWriteStep::BlockForever);
+    }
+    h.dev.script_write(steps);
+    let initial_blocker_report = i294_r11_enqueue_blocker(&h, 9_294_109);
+    h.dev.wait_blocked();
+
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n")
+    } else {
+        "partial output\r\n".to_string()
+    };
+    let rx_before_command = h.rx.total_bytes();
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+    let (command_write_tx, command_write_rx) = crossbeam_channel::bounded(1);
+    let (release_command_tx, release_command_rx) = crossbeam_channel::bounded(1);
+    let command_hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let command_hook_called_once = Arc::clone(&command_hook_called);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if command_hook_called_once.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        command_write_tx
+            .send(())
+            .expect("command OS submit 已完成");
+        release_command_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("測試釋放 command OS submit barrier");
+    }));
+
+    let (wait_entered_tx, wait_entered_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_entered_tx.send(()).expect("completion waiter 已開始");
+        })));
+    let (timeout_read_tx, timeout_read_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+        timeout_read_tx
+            .send(())
+            .expect("timeout 已完成四項 human 訊號讀取");
+    })));
+
+    let (report_paused_tx, report_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        h.rx
+            .set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+                report_paused_tx
+                    .send(())
+                    .expect("human rejection report 到達 barrier");
+                release_report_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("測試釋放 human rejection report");
+            })));
+    }
+
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R11TimeoutEntry::Silence => {
+            request.timeout_s = 30.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R11TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    h.wait_for("command job 已排在 writer 前方", |rig| {
+        rig.tx_handle().jobs.len() == 1
+    });
+
+    let blocker_report_rx = if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        Some(i294_r11_enqueue_blocker(&h, 9_294_113))
+    } else {
+        None
+    };
+    let human_class = if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        sw_core::tx_writer::TxClass::HumanRaw
+    } else {
+        sw_core::tx_writer::TxClass::HumanLine
+    };
+    let hold_until_report = true;
+    let report_capacity = if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        0
+    } else {
+        1
+    };
+    let human = i294_r11_enqueue_human(&h, human_class, report_capacity, hold_until_report);
+    let submitted_count = h.rx.human_submit_start_count_for_test();
+    assert_eq!(submitted_count, 1, "human submit 在 command OS submit 前開始");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1, "writer report 前 human job 保持在途");
+
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        let permit = i294_r11_permit(
+            &h,
+            9_294_112,
+            sw_core::tx_writer::TxClass::HumanRaw,
+        );
+        assert_eq!(
+            h.tx_handle().fence_verdict(&permit),
+            Err(sw_core::tx_writer::FenceReject::HumanAdmissionClosed),
+            "actor foreground 已關閉 HumanRaw admission；排隊 permit 會由 writer fence 拒絕"
+        );
+    }
+
+    h.dev.release_block();
+    initial_blocker_report
+        .recv_timeout(Duration::from_secs(5))
+        .expect("初始 writer barrier 已收斂");
+    command_write_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command 已到 OS submit 後置 barrier");
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        rx_before_command + response.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_command_tx
+        .send(())
+        .expect("釋放 command OS submit barrier");
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    if matches!(human_state, I294R11HumanState::QueuedAtDecision) {
+        h.dev.wait_blocked();
+        assert_eq!(
+            h.dev.write_calls(),
+            writes_before + 3,
+            "writer 正停在 command 後的 blocker，human job 仍留在佇列"
+        );
+    }
+    if matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        let report = human
+            .completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human TX 已完成 observer 登錄與 writer report");
+        assert_eq!(report.result.outcome, sw_pal::TxOutcome::Completed(b"echo HUMAN\n".len()));
+        assert!(report.reject.is_none());
+        assert!(h.rx.human_tx_state().generation > 0);
+        assert!(!h.rx.snapshot_from(0).tx_submit_pending);
+        assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 回來後 guard 已釋放");
+    }
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        report_paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer 已拒絕 human permit，report 尚未回傳 submitter");
+        assert_eq!(h.rx.human_tx_state().generation, 0);
+        assert!(!h.rx.snapshot_from(0).tx_submit_pending);
+        assert_eq!(h.rx.human_in_flight_for_test(), 1, "拒絕 report 尚未回傳時仍在途");
+    }
+
+    wait_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("命令 TX 後 completion waiter 已建立");
+    match timeout_entry {
+        I294R11TimeoutEntry::Silence => i294_r10_advance_clock(&h, Duration::from_secs(31)),
+        I294R11TimeoutEntry::OperationDeadline => {
+            i294_r10_advance_clock(&h, Duration::from_millis(201))
+        }
+    }
+
+    timeout_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 已完成四項訊號讀取，human report 尚未釋放");
+    if !matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        assert_eq!(h.rx.human_in_flight_for_test(), 1, "timeout 決策時 human report 尚未回來");
+    }
+
+    if let Some(blocker_report) = blocker_report_rx.as_ref() {
+        h.dev.release_block();
+        blocker_report
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer blocker 已收斂");
+    }
+    if matches!(human_state, I294R11HumanState::FenceRejectedBeforeReport) {
+        release_report_tx
+            .send(())
+            .expect("釋放 fence rejection report barrier");
+        h.rx.set_human_tx_report_hook_for_test(None);
+    }
+    if !matches!(human_state, I294R11HumanState::RegisteredBeforeDecision) {
+        let report = human
+            .completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human writer report 已回來且 in-flight guard 已釋放");
+        match human_state {
+            I294R11HumanState::FenceRejectedBeforeReport => assert_eq!(
+                report.reject,
+                Some(sw_core::tx_writer::FenceReject::HumanAdmissionClosed)
+            ),
+            I294R11HumanState::QueuedAtDecision => {
+                assert!(report.reject.is_none());
+                assert_eq!(
+                    report.result.outcome,
+                    sw_pal::TxOutcome::Completed(b"echo HUMAN\n".len())
+                );
+            }
+            I294R11HumanState::RegisteredBeforeDecision => unreachable!(),
+        }
+        assert_eq!(h.rx.human_in_flight_for_test(), 0, "writer report 回來後 in-flight 清零");
+    }
+    if let Some(join) = human.join {
+        join.join().expect("human submit worker 正常結束");
+    }
+
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        format!("{command}\npartial output")
+    } else {
+        "partial output\n".to_string()
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+
+    let tx_bytes = wal_tx_bytes_since(&h, tx_count);
+    assert!(!tx_bytes.contains(&0x03) && !tx_bytes.contains(&0x04), "timeout human route has zero rescue TX: {tx_bytes:?}");
+}
+
+fn i294_r11_run_matrix(human_state: I294R11HumanState) {
+    for timeout_entry in [
+        I294R11TimeoutEntry::Silence,
+        I294R11TimeoutEntry::OperationDeadline,
+    ] {
+        for echo_found in [true, false] {
+            i294_r11_run_timeout_case(human_state, timeout_entry, echo_found);
+        }
+    }
+}
+
+#[test]
+fn i294_r11_human_job_queued_before_command_submit_suppresses_rescue() {
+    i294_r11_run_matrix(I294R11HumanState::QueuedAtDecision);
+}
+
+#[test]
+fn i294_r11_human_tx_registered_before_timeout_decision_suppresses_rescue() {
+    i294_r11_run_matrix(I294R11HumanState::RegisteredBeforeDecision);
+}
+
+#[test]
+fn i294_r11_fence_rejected_human_job_before_report_suppresses_rescue() {
+    i294_r11_run_matrix(I294R11HumanState::FenceRejectedBeforeReport);
+}
+
+#[derive(Clone, Copy)]
+enum I294R12PumpPause {
+    BeforeTake,
+    AfterTake,
+}
+
+#[derive(Clone, Copy)]
+enum I294R12TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+fn i294_r12_run_pump_timeout_case(
+    pump_pause: I294R12PumpPause,
+    timeout_entry: I294R12TimeoutEntry,
+    echo_found: bool,
+) {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (pump_paused_tx, pump_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    let pause = Arc::new(move || {
+        pump_paused_tx
+            .send(())
+            .expect("human pump 到達指定 pause point");
+        let _ = release_pump_rx.recv_timeout(Duration::from_secs(10));
+    });
+    match pump_pause {
+        I294R12PumpPause::BeforeTake => {
+            h.rx.set_human_pump_before_take_hook_for_test(Some(pause));
+        }
+        I294R12PumpPause::AfterTake => {
+            h.rx.set_human_pump_after_take_hook_for_test(Some(pause));
+        }
+    }
+
+    let console = h.attach_pty_console("i294-r12-pump");
+    let submitted_before = h.rx.human_pump_submissions_for_test();
+    console.push_input(b"echo HUMAN\n");
+    pump_paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pump 到達受控 pause point");
+    h.wait_for("human job 已排入 pump channel", |rig| {
+        rig.rx.human_pump_submissions_for_test() > submitted_before
+    });
+    let in_flight_at_pause = h.rx.human_in_flight_for_test();
+
+    let command = "printf R12_PUMP_HUMAN";
+    let response = if echo_found {
+        format!("{command}\r\npartial output\r\n")
+    } else {
+        "partial output\r\n".to_string()
+    };
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| match timeout_entry {
+        I294R12TimeoutEntry::Silence => {
+            request.timeout_s = 2.0;
+            request.expected_duration_s = Some(120.0);
+        }
+        I294R12TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+    });
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("operation deadline 已建立，現在才推進假時鐘");
+    match timeout_entry {
+        I294R12TimeoutEntry::Silence => h.advance(Duration::from_secs(3)),
+        I294R12TimeoutEntry::OperationDeadline => h.advance(Duration::from_millis(201)),
+    }
+
+    let result = h.wait_done(&id);
+    let expected_stdout = if echo_found {
+        format!("{command}\npartial output")
+    } else {
+        "partial output\n".to_string()
+    };
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(expected_stdout), "{result:?}");
+    assert_eq!(
+        in_flight_at_pause, 1,
+        "actor lane 已產生 HumanTx effect 且 job 位於 pump channel／pump local 時，guard 必須已可見"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "human job 在途時 timeout 不可送救援 TX"
+    );
+
+    release_pump_tx.send(()).expect("釋放 human pump");
+    h.rx.set_human_pump_before_take_hook_for_test(None);
+    h.rx.set_human_pump_after_take_hook_for_test(None);
+    h.wait_for("human writer report 收尾後 guard 清零", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+    });
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "pump report 後不可洩漏 guard");
+}
+
+fn i294_r12_run_pump_timeout_matrix(pump_pause: I294R12PumpPause) {
+    for timeout_entry in [
+        I294R12TimeoutEntry::Silence,
+        I294R12TimeoutEntry::OperationDeadline,
+    ] {
+        for echo_found in [true, false] {
+            i294_r12_run_pump_timeout_case(pump_pause, timeout_entry, echo_found);
+        }
+    }
+}
+
+#[test]
+fn i294_r12_human_job_guarded_before_pump_take_suppresses_rescue() {
+    i294_r12_run_pump_timeout_matrix(I294R12PumpPause::BeforeTake);
+}
+
+#[test]
+fn i294_r12_human_job_guarded_after_pump_take_suppresses_rescue() {
+    i294_r12_run_pump_timeout_matrix(I294R12PumpPause::AfterTake);
+}
+
+#[test]
+fn i294_r13_actor_transition_effect_barrier_holds_unstarted_guard() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r14-actor-barrier");
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
+                .send(())
+                .expect("actor transition 已完成、guard 尚未登記");
+            release_dispatch_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放 dispatch/guard 屏障");
+        })));
+    let (pump_entered_tx, pump_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+            pump_entered_tx.send(()).expect("human pump 已啟動");
+            release_pump_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放 human pump");
+        })));
+
+    console.push_input(b"echo HUMAN\n");
+    dispatch_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 在 transition 完成、guard 登記前進入屏障");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+    release_dispatch_tx
+        .send(())
+        .expect("actor dispatch 仍停在實際 guard 登記前");
+    pump_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HumanTx effect 已交給受控 pump");
+    assert_eq!(h.rx.human_in_flight_for_test(), 1);
+    assert_eq!(
+        h.rx.human_submit_start_count_for_test(),
+        starts_before,
+        "guard 登記不提前增加 writer enqueue 計數"
+    );
+
+    release_pump_tx.send(()).expect("human pump 仍在受控屏障");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.wait_for("HumanTx report 後 guard 清理", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+    });
+    assert_eq!(
+        h.rx.human_submit_start_count_for_test(),
+        starts_before + 1,
+        "writer enqueue 成功後才記錄 submit 起點"
+    );
+}
+
+#[test]
+fn i294_r13_transition_to_effect_barrier_guards_both_timeout_entries() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R14_NO_HUMAN";
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), b"partial output\r\n");
+    let tx_count = h.wal_tx_payloads().len();
+    let starts_before = h.rx.human_submit_start_count_for_test();
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx.send(()).expect("command completion waiter 已開始");
+        })));
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 completion waiter 已進入");
+    h.wait_for("命令已收到無 prompt 的部分輸出", |rig| {
+        rig.rx.text_from(0).contains("partial output")
+    });
+
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
+                .send(())
+                .expect("actor 已進入實際 dispatch 區段");
+            release_dispatch_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("測試釋放不含 HumanTx 的 dispatch");
+        })));
+    h.send_control(ControlEvent::Tick);
+    dispatch_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Tick transition 已完成、guard 登記前停在同一屏障");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+    let (attempt_tx, attempt_rx) = crossbeam_channel::bounded(1);
+    let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+            attempt_tx.send(()).expect("no-human timeout 已嘗試線性化判讀");
+        })));
+    h.rx
+        .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+            read_tx.send(()).expect("no-human timeout 已讀取四項訊號");
+        })));
+    h.clock.advance(Duration::from_millis(201));
+    attempt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 已嘗試進入線性化判讀");
+    assert!(read_rx.try_recv().is_err(), "dispatch 未結束前不得讀取 timeout 訊號");
+    assert!(!is_done(&h, &id), "dispatch 屏障期間 command 尚未完成");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0, "無 HumanTx 的 dispatch 不改變在途數");
+    assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n").as_bytes());
+
+    release_dispatch_tx
+        .send(())
+        .expect("no-human dispatch 仍停在 guard 登記屏障");
+    read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dispatch 完成後 timeout 讀取四項訊號");
+    assert_eq!(h.rx.human_in_flight_for_test(), 0);
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n\x03").as_bytes());
+}
+
+fn i294_r13_wait_without_actor_rpc(
+    h: &ActorRig,
+    what: &str,
+    mut condition: impl FnMut(&ActorRig) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if condition(h) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "等待逾時：{what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn i294_r13_actor_effect_barrier_covers_timeout_entries_and_echo_states() {
+    use sw_core::arbiter::{CommandRegistry, QueuedCommand};
+    use sw_core::op_runner::{OpCtx, OpRunner, OpSpec};
+    use sw_core::session_core::OpGrant;
+    use sw_core::wal::{WalConfig, WalWriter};
+    use sw_pal::fakes::wal_fs::FakeWalFs;
+    use std::path::PathBuf;
+
+    for (case_index, timeout_entry) in [
+        I294R12TimeoutEntry::Silence,
+        I294R12TimeoutEntry::OperationDeadline,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for echo_found in [true, false] {
+            let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+            let command = "printf R14_EFFECT";
+            let response = if echo_found {
+                format!("{command}\r\npartial output\r\n")
+            } else {
+                "partial output\r\n".to_string()
+            };
+            h.dev
+                .on_tx_reply(format!("{command}\n").as_bytes(), response.as_bytes());
+            let console = h.attach_pty_console("i294-r13-real-effect-barrier");
+            let starts_before = h.rx.human_submit_start_count_for_test();
+            let tx_count = h.wal_tx_payloads().len();
+            let (effect_entered_tx, effect_entered_rx) = crossbeam_channel::bounded(1);
+            let (release_effect_tx, release_effect_rx) = crossbeam_channel::bounded(1);
+            h.rx
+                .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+                    effect_entered_tx
+                        .send(())
+                        .expect("actor transition 已完成，尚未登記實際 HumanTx guard");
+                    release_effect_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("測試釋放 actor dispatch/guard 屏障");
+                })));
+            console.push_input(b"echo HUMAN\n");
+            effect_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("actor transition 完成、guard 尚未登記");
+            assert_eq!(h.rx.human_in_flight_for_test(), 0);
+            assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+
+            let (pump_entered_tx, pump_entered_rx) = crossbeam_channel::bounded(1);
+            let (release_pump_tx, release_pump_rx) = crossbeam_channel::bounded(1);
+            h.rx
+                .set_human_pump_before_take_hook_for_test(Some(Arc::new(move || {
+                    pump_entered_tx.send(()).expect("human pump 已啟動");
+                    release_pump_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("測試釋放 human pump queue 屏障");
+                })));
+
+            let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+            h.rx
+                .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+                    wait_started_tx
+                        .send(())
+                        .expect("獨立 OpRunner 已開始 command completion wait");
+                })));
+            let op_wal = Arc::new(WalWriter::open(
+                WalConfig {
+                    dir: PathBuf::from(format!("/fake/i294-r13-op-{case_index}-{echo_found}")),
+                    rotate_bytes: 67_108_864,
+                },
+                FakeWalFs::new(),
+                h.clock.clone(),
+            ));
+            let (op_tx, op_rx) = crossbeam_channel::bounded(1);
+            let runner = OpRunner::spawn(OpCtx {
+                com: "COM0".into(),
+                sid: String::new(),
+                profile: profile_of(SHELL_PROFILE),
+                rx: h.rx.clone(),
+                tx: h.tx_handle(),
+                wal: op_wal,
+                clock: h.clock.clone(),
+                control: op_tx,
+                rng: Arc::new(|buf: &mut [u8]| {
+                    for (index, byte) in buf.iter_mut().enumerate() {
+                        *byte = index as u8;
+                    }
+                }),
+                registry: CommandRegistry::new(),
+            });
+            let cmd_id = format!("i294-r13-direct-{case_index}-{echo_found}");
+            let mut request = agent_submit(command);
+            match timeout_entry {
+                I294R12TimeoutEntry::Silence => {
+                    request.timeout_s = 2.0;
+                    request.expected_duration_s = Some(120.0);
+                }
+                I294R12TimeoutEntry::OperationDeadline => request.timeout_s = 0.2,
+            }
+            let (epoch, owner_gen, fsm_gen) = h.fence.with(|state| {
+                (
+                    state.active_epoch.expect("ActorRig 已 READY"),
+                    state.owner_gen,
+                    state.fsm_gen,
+                )
+            });
+            runner.run(
+                OpGrant {
+                    op_id: OpId(0x294_1300 + (case_index * 2 + usize::from(!echo_found)) as u64),
+                    epoch,
+                    owner_gen,
+                    fsm_gen,
+                    cmd_id: Some(cmd_id.clone()),
+                },
+                OpSpec::Command(QueuedCommand {
+                    sort_key: (0, 0),
+                    cmd_id,
+                    req: request,
+                }),
+            );
+            i294_r13_wait_without_actor_rpc(&h, "獨立 OpRunner command TX", |rig| {
+                wal_tx_has(rig, format!("{command}\n").as_bytes())
+            });
+            wait_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("OpRunner 已進入 completion wait");
+            i294_r13_wait_without_actor_rpc(&h, "OpRunner 已收到無 prompt 的部分輸出", |rig| {
+                rig.rx.text_from(0).contains("partial output")
+            });
+
+            let (decision_attempt_tx, decision_attempt_rx) = crossbeam_channel::bounded(1);
+            let (decision_read_tx, decision_read_rx) = crossbeam_channel::bounded(1);
+            let (gate_event_tx, gate_event_rx) = crossbeam_channel::unbounded();
+            h.rx.set_actor_dispatch_gate_hook_for_test(Some(Arc::new(move |event| {
+                let _ = gate_event_tx.send(event);
+            })));
+            h.rx
+                .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+                    decision_attempt_tx
+                        .send(())
+                        .expect("timeout 已嘗試進入線性化判讀");
+                })));
+            let tuple_rx = Arc::clone(&h.rx);
+            h.rx
+                .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+                    let snapshot = tuple_rx.snapshot_from(0);
+                    decision_read_tx
+                        .send((
+                            snapshot.human_submit_start_count,
+                            tuple_rx.human_in_flight_for_test(),
+                            snapshot.tx_submit_pending,
+                            snapshot.human_tx_state.generation,
+                        ))
+                        .expect("timeout 已讀完完整 human 訊號 tuple");
+                })));
+            match timeout_entry {
+                I294R12TimeoutEntry::Silence => h.clock.advance(Duration::from_secs(3)),
+                I294R12TimeoutEntry::OperationDeadline => {
+                    h.clock.advance(Duration::from_millis(201))
+                }
+            }
+            decision_attempt_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout 已嘗試在 actor dispatch 中間讀訊號");
+            let gate_event = gate_event_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout 等待中的 gate event");
+            assert_eq!(
+                gate_event,
+                sw_core::uart_bridge::ActorDispatchGateEvent::DecisionWaiting
+            );
+            assert!(decision_read_rx.try_recv().is_err(), "dispatch 屏障期間不得讀取訊號");
+            assert!(op_rx.try_recv().is_err(), "dispatch 屏障期間 timeout 尚未完成");
+            assert_eq!(h.rx.human_in_flight_for_test(), 0, "guard 尚未登記");
+            assert_eq!(h.rx.human_submit_start_count_for_test(), starts_before);
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                format!("{command}\n").as_bytes(),
+                "dispatch barrier 期間不得有 human 或救援 TX"
+            );
+
+            release_effect_tx
+                .send(())
+                .expect("actor dispatch 仍停在 guard 登記屏障");
+            pump_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("human effect 已交給受控 pump");
+            let human_tuple = decision_read_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("dispatch 結束後 timeout 讀取完整 human 訊號 tuple");
+            assert_eq!(human_tuple, (starts_before, 1, false, 0));
+            let finished = op_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("OpRunner 已回報 timeout 結果");
+            if let ControlEvent::OpFinished { outcome, .. } = finished {
+                if let OpOutcome::CompletionUncertain { stdout } = outcome {
+                    let expected_stdout = if echo_found {
+                        format!("{command}\npartial output")
+                    } else {
+                        "partial output\n".to_string()
+                    };
+                    assert_eq!(stdout, expected_stdout);
+                } else {
+                    panic!("實際 Effect::HumanTx guard 下應回 CompletionUncertain");
+                }
+            } else {
+                panic!("OpRunner 應回報 OpFinished");
+            }
+
+            release_pump_tx
+                .send(())
+                .expect("human pump 仍停在 queue 屏障");
+            wait_tx(&h, b"echo HUMAN\n");
+            h.wait_for("HumanTx report 後 transition guard 清理", |rig| {
+                rig.rx.human_in_flight_for_test() == 0
+            });
+            assert_eq!(
+                h.rx.human_submit_start_count_for_test(),
+                starts_before + 1,
+                "只在 writer enqueue 成功後建立 submit 歷史"
+            );
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                format!("{command}\necho HUMAN\n").as_bytes(),
+                "兩種 timeout 入口與 echo 狀態都不得送救援 TX"
+            );
+        }
+    }
+}
+
+#[test]
+fn i294_r14_timeout_decision_is_not_starved_by_queued_actor_dispatches() {
+    use sw_core::uart_bridge::ActorDispatchGateEvent;
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let command = "printf R14_STARVATION";
+    h.dev
+        .on_tx_reply(format!("{command}\n").as_bytes(), b"partial output\r\n");
+    let (wait_started_tx, wait_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            wait_started_tx.send(()).expect("completion waiter 已開始");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(command, |request| request.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    wait_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout worker 已進入 completion wait");
+
+    let (gate_event_tx, gate_event_rx) = crossbeam_channel::unbounded();
+    h.rx
+        .set_actor_dispatch_gate_hook_for_test(Some(Arc::new(move |event| {
+            let _ = gate_event_tx.send(event);
+        })));
+    let (dispatch_entered_tx, dispatch_entered_rx) = crossbeam_channel::bounded(1);
+    let (release_dispatch_tx, release_dispatch_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_dispatch_before_guard_registration_hook_for_test(Some(Arc::new(move || {
+            dispatch_entered_tx
+                .send(())
+                .expect("actor 已進入受控的無 HumanTx dispatch");
+            release_dispatch_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 actor dispatch");
+        })));
+    h.send_control(ControlEvent::Tick);
+    dispatch_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個 actor dispatch 已停在 hook");
+    assert_eq!(
+        gate_event_rx.recv_timeout(Duration::from_secs(5)),
+        Ok(ActorDispatchGateEvent::ActorEntered)
+    );
+    for _ in 0..32 {
+        h.send_control(ControlEvent::Tick);
+    }
+
+    let (attempt_tx, attempt_rx) = crossbeam_channel::bounded(1);
+    let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_timeout_rescue_attempt_hook_for_test(Some(Arc::new(move || {
+            attempt_tx.send(()).expect("timeout 已開始線性化判讀");
+        })));
+    h.rx
+        .set_timeout_rescue_read_hook_for_test(Some(Arc::new(move || {
+            read_tx.send(()).expect("timeout 已完成訊號判讀");
+        })));
+    h.clock.advance(Duration::from_millis(201));
+    attempt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout 入口已觸發");
+    let decision_waiting = gate_event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout waiter gate event");
+    assert_eq!(
+        decision_waiting,
+        ActorDispatchGateEvent::DecisionWaiting,
+        "timeout waiter 先登記，避免 actor 連續 dispatch 插隊"
+    );
+    assert!(read_rx.try_recv().is_err(), "dispatch 區段未結束前不讀 timeout 訊號");
+
+    release_dispatch_tx
+        .send(())
+        .expect("actor dispatch 仍停在受控區段");
+    read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("決策只等候一次進行中的 dispatch 後完成讀取");
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::Null, "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("CTRL_C"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), format!("{command}\n\x03").as_bytes());
+
+    let (decision_waits, actor_waits) = h.rx.actor_dispatch_gate_waits_for_test();
+    assert!(decision_waits <= 1, "decision 最多等候一次 dispatch：{decision_waits}");
+    assert!(actor_waits <= 1, "actor 最多等候一次訊號讀取區段：{actor_waits}");
+
+    let mut observed = vec![decision_waiting];
+    while let Ok(event) = gate_event_rx.try_recv() {
+        observed.push(event);
+    }
+    let waiting = observed
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionWaiting)
+        .expect("有 timeout waiter event");
+    let exited = observed[waiting + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::ActorExited)
+        .map(|index| waiting + 1 + index)
+        .expect("受控 actor dispatch 已結束");
+    let entered = observed[exited + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionEntered)
+        .map(|index| exited + 1 + index)
+        .expect("決策在線性化區段取得 gate");
+    let left = observed[entered + 1..]
+        .iter()
+        .position(|event| *event == ActorDispatchGateEvent::DecisionExited)
+        .map(|index| entered + 1 + index)
+        .expect("訊號讀取完成後釋放 gate");
+    assert!(
+        !observed[exited + 1..entered].contains(&ActorDispatchGateEvent::ActorEntered),
+        "queued actor dispatch 不得插入決策的訊號讀取區段：{observed:?}"
+    );
+    assert!(
+        observed[left + 1..].contains(&ActorDispatchGateEvent::ActorEntered),
+        "timeout 線性化完成後 actor 可繼續處理佇列"
+    );
+}
+
+fn i294_r14_wait_for_actor_data(h: &ActorRig, previous: u64, what: &str) {
+    let probe = h.actor_probe();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.data_items() <= previous {
+        assert!(Instant::now() < deadline, "等待 actor 處理資料事件逾時：{what}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn i294_r14_actor_guards_self_test_op_finished_human_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r14-self-test");
+    h.dev.clear_replies();
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 0.5,
+        strict_human_lock: false,
+    });
+    h.wait_for("self-test probe TX", |rig| {
+        rig.wal_tx_payloads().iter().any(|payload| {
+            String::from_utf8_lossy(payload).contains("__READY__")
+        })
+    });
+
+    let previous = h.actor_probe().data_items();
+    console.push_input(b"Q");
+    i294_r14_wait_for_actor_data(&h, previous, "self-test suspend 期間的 human 輸入");
+    h.clock.advance(Duration::from_secs(5));
+    let _reply = self_test
+        .recv_timeout(Duration::from_secs(5))
+        .expect("self-test probe 應經 OpFinished 收尾");
+    h.wait_for("OpFinished 回放的 human byte", |rig| wal_tx_has(rig, b"Q"));
+    assert!(wal_tx_has(&h, b"Q"), "self-test 收尾應恰好送出緩衝的 human byte");
+}
+
+fn i294_r14_open_agent_lease_with_deferred_human(
+    h: &ActorRig,
+    console_id: &str,
+) -> sw_pal::fakes::console::FakeConsoleRef {
+    let console = h.attach_pty_console(console_id);
+    let opened = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14".into(),
+        timeout_s: 1.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)), "{opened:?}");
+    console
+}
+
+fn i294_r14_buffer_human_until_actor_accepts(h: &ActorRig, console: &sw_pal::fakes::console::FakeConsoleRef) {
+    let previous = h.actor_probe().data_items();
+    console.push_input(b"Q");
+    i294_r14_wait_for_actor_data(h, previous, "agent lease 期間的 deferred human 輸入");
+}
+
+#[test]
+fn i294_r14_actor_guards_interactive_open_lazy_lease_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = i294_r14_open_agent_lease_with_deferred_human(&h, "i294-r14-open");
+    i294_r14_buffer_human_until_actor_accepts(&h, &console);
+    h.clock.advance(Duration::from_millis(900));
+    let pause = h.pause_before_event("Request");
+    let refresh = h.request_async(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14-next".into(),
+        timeout_s: 30.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("InteractiveOpen 已取出；停在 transition 前");
+    h.clock.advance(Duration::from_millis(600));
+    pause.resume.send(()).expect("釋放 InteractiveOpen transition");
+    let _reply = refresh.recv_timeout(Duration::from_secs(5));
+    h.wait_for("InteractiveOpen 惰性刷新回放的 human byte", |rig| wal_tx_has(rig, b"Q"));
+    assert!(wal_tx_has(&h, b"Q"), "InteractiveOpen refresh 應送出 deferred human byte");
+}
+
+#[test]
+fn i294_r14_actor_guards_submit_execute_time_lease_replay() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r14-submit");
+    let opened = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:i294-r14-submit".into(),
+        timeout_s: 1.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)), "{opened:?}");
+    i294_r14_buffer_human_until_actor_accepts(&h, &console);
+    h.clock.advance(Duration::from_millis(900));
+
+    h.dev.on_tx_reply(b"echo R14_SUBMIT\n", b"echo R14_SUBMIT\r\nR14_SUBMIT\r\nroot@t:/# ");
+    let pause = h.pause_before_event("Request");
+    let response = h.request_async(SessionRequest::Submit(agent_submit("echo R14_SUBMIT")));
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("一般 Submit 已取出；停在 transition 前");
+    h.clock.advance(Duration::from_millis(600));
+    pause.resume.send(()).expect("釋放 Submit transition");
+    let _reply = response.recv_timeout(Duration::from_secs(5));
+    h.wait_for("Submit execute-time lease refresh 回放的 human byte", |rig| {
+        wal_tx_has(rig, b"Q")
+    });
+    assert!(wal_tx_has(&h, b"Q"), "一般 Submit refresh 應送出 deferred human byte");
+}
+
+fn i294_r9_run_deadline_timeout_full_echo_with_human(pending_submit: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf R9_DEADLINE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R9_DEADLINE\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+    let raw = b"printf R9_DEADLINE\r\npartial output\r\n";
+    if pending_submit {
+        let before = h.rx.total_bytes();
+        h.dev.push_rx(raw);
+        assert!(h.rx.wait_for_reader_bytes_for_test(
+            before + raw.len() as u64,
+            Duration::from_secs(5),
+        ));
+    } else {
+        h.inject_rx_processed(raw);
+    }
+    h.advance(Duration::from_millis(201));
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("printf R9_DEADLINE\npartial output"), "{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_DEADLINE\n");
+}
+
+#[test]
+fn i294_r9_deadline_timeout_full_echo_with_human_tx_suppresses_recovery() {
+    i294_r9_run_deadline_timeout_full_echo_with_human(false);
+}
+
+#[test]
+fn i294_r9_deadline_timeout_full_echo_with_pending_submit_suppresses_recovery() {
+    i294_r9_run_deadline_timeout_full_echo_with_human(true);
+}
+
+fn i294_r9_assert_stale_no_echo_completion_rechecked(pending_submit: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (enter_tx, enter_rx) = crossbeam_channel::bounded(1);
+    let (release_enter_tx, release_enter_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            enter_tx.send(()).expect("等待第一次 snapshot");
+            release_enter_rx.recv().expect("釋放第一次 snapshot");
+        })));
+    let (evaluated_tx, evaluated_rx) = crossbeam_channel::bounded(1);
+    let (release_evaluated_tx, release_evaluated_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_evaluated_hook_for_test(Some(Arc::new(move |snapshot| {
+            evaluated_tx
+                .send(snapshot.clone())
+                .expect("等待 evaluator 返回 Complete 的 snapshot");
+            release_evaluated_rx
+                .recv()
+                .expect("釋放成功判定線性化 barrier");
+        })));
+
+    let tx_count = h.wal_tx_payloads().len();
+    let initial_rx = h.rx.total_bytes();
+    let id = h.submit_with("printf R9_STALE", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"printf R9_STALE\n");
+    enter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("等待器已進入 snapshot barrier");
+    let prompt = b"root@t:/# ";
+    h.dev.push_rx(prompt);
+    assert!(h.rx.wait_for_reader_bytes_for_test(
+        initial_rx + prompt.len() as u64,
+        Duration::from_secs(5),
+    ));
+    release_enter_tx.send(()).expect("釋放 snapshot 建立");
+    let stale = evaluated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("舊 snapshot 已由無 echo 相容路徑判定 Complete");
+    assert_eq!(stale.text, "root@t:/# ");
+
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(true);
+    } else {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        assert!(h.rx.human_tx_state().generation > 0);
+    }
+    h.advance(Duration::from_millis(201));
+    release_evaluated_tx
+        .send(())
+        .expect("釋放 evaluator 與 RX 鎖之間的 barrier");
+
+    let result = h.wait_done(&id);
+    if pending_submit {
+        h.rx.set_tx_submit_pending_for_test(false);
+    }
+    assert_eq!(result["status"], PyValue::from("error"), "{result:?}");
+    assert_eq!(result["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(true), "{result:?}");
+    assert_eq!(result["recovery_action"], PyValue::from("NONE"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from(""), "逾時 stdout 必須取自重新結算的 snapshot：{result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf R9_STALE\n");
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+}
+
+#[test]
+fn i294_r9_stale_no_echo_completion_rechecked_after_human_tx() {
+    i294_r9_assert_stale_no_echo_completion_rechecked(false);
+}
+
+#[test]
+fn i294_r9_stale_no_echo_completion_rechecked_after_pending_submit() {
+    i294_r9_assert_stale_no_echo_completion_rechecked(true);
+}
+
+fn i294_r7_assert_long_prompt_prefix_echo(human_tx: bool) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let id = h.submit_with("echo x", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo x\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+
+    if human_tx {
+        h.rx.record_human_tx_for_test(b"echo HUMAN\n", &*h.clock);
+        h.inject_rx_reader_processed(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
+    }
+
+    let changed_prompt = format!("root@t:/{}# ", "e".repeat(2_000));
+    let raw = format!("\r\n{changed_prompt}echo x\r\nx\r\n{changed_prompt}");
+    h.inject_rx_processed(raw.as_bytes());
+    h.advance(Duration::from_millis(200));
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "human_tx={human_tx}: {result:?}");
+    assert_eq!(result["stdout"], PyValue::from("x"), "human_tx={human_tx}: {result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "human_tx={human_tx}: {result:?}");
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"echo x\n".to_vec(), "不得額外 TX 或重送");
+}
+
+#[test]
+fn i294_r7_long_prompt_prefix_echo_completes_without_human_tx() {
+    i294_r7_assert_long_prompt_prefix_echo(false);
+}
+
+#[test]
+fn i294_r7_long_prompt_prefix_echo_completes_with_human_tx() {
+    i294_r7_assert_long_prompt_prefix_echo(true);
+}
+
+#[test]
+fn i294_completion_before_deadline_still_completes() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (checks, _) = h.rx.snapshot_wait_progress_for_test();
+    let id = h.submit_with("echo ON_TIME", |request| request.timeout_s = 0.2);
+    wait_tx(&h, b"echo ON_TIME\n");
+    assert!(h.rx.wait_for_snapshot_wait_progress_for_test(
+        checks,
+        h.rx.snapshot_len(),
+        Duration::from_secs(5),
+    ));
+    h.inject_rx_processed(b"echo ON_TIME\r\nON_TIME\r\nroot@t:/# ");
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"), "{result:?}");
+    assert_eq!(result["stdout"], PyValue::from("ON_TIME"), "{result:?}");
+    assert_eq!(result["partial"], PyValue::Bool(false), "{result:?}");
+}
+
+#[test]
+fn i294_deferred_human_prompt_between_queued_commands_does_not_complete_next() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-deferred-order");
+    let tx_count = h.wal_tx_payloads().len();
+
+    // A 以 producer marker 收尾，不在 B 的命令邊界前留下 shell prompt；
+    // 讓延後 human line 的 RX prompt 明確落在 B TX 之後，驗證該 human TX 證據。
+    let first = h.submit_with("echo FIRST", |r| {
+        r.completion_regex = Some("(?m)^FIRST\\r?$".into())
+    });
+    wait_tx(&h, b"echo FIRST\n");
+    let second = h.submit_ok("echo SECOND");
+    console.push_input(b"echo HUMAN\n");
+    assert_eq!(h.command_get(&first)["status"], PyValue::from("running"));
+
+    h.inject_rx_reader_processed(b"echo FIRST\r\nFIRST\r\n");
+    let first_result = h.wait_done(&first);
+    assert_eq!(first_result["stdout"], PyValue::from("FIRST"));
+    wait_tx(&h, b"echo HUMAN\n");
+
+    wait_tx(&h, b"echo SECOND\n");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo FIRST\necho HUMAN\necho SECOND\n".to_vec(),
+        "A 完成後 human TX 與命令 B TX 的邊界都已建立"
+    );
+    h.inject_rx_processed(b"echo HUMAN\r\nHUMAN\r\nroot@t:/# ");
+    h.inject_rx_processed(b"root@t:/# ");
+    assert_eq!(
+        h.command_get(&second)["status"],
+        PyValue::from("running"),
+        "deferred human 的 prompt 在第二筆 command echo 前不得完成"
+    );
+
+    h.inject_rx_processed(b"echo SECOND\r\nSECOND\r\nroot@t:/# ");
+    let second_result = h.wait_done(&second);
+    assert_eq!(second_result["status"], PyValue::from("done"));
+    assert_eq!(second_result["stdout"], PyValue::from("SECOND"));
+    assert_eq!(second_result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo FIRST\necho HUMAN\necho SECOND\n".to_vec(),
+        "deferred 回放與兩筆 agent 命令依既有仲裁送出，不增加 TX"
+    );
+}
+
+#[test]
+fn i294_background_uses_command_echo_boundary() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-background-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    h.inject_rx(b"echo HUMAN\r\nHUMAN\r\n");
+
+    let id = h.submit_with("echo BACKGROUND", |r| r.mode = "background".into());
+    wait_tx(&h, b"echo BACKGROUND\n");
+    h.inject_rx(b"root@t:/# ");
+    let before_echo = h.command_get(&id);
+    assert_eq!(
+        before_echo["status"],
+        PyValue::from("running"),
+        "背景命令同樣不得由命令前的 prompt 完成：{before_echo:?}"
+    );
+
+    h.inject_rx(b"echo BACKGROUND\r\nBACKGROUND\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["execution_mode"], PyValue::from("background"));
+    let tail = h.request(SessionRequest::ResultTail {
+        cmd_id: id,
+        from_chunk: 0,
+        limit: 200,
+    });
+    assert_eq!(tail["status"], PyValue::from("active"));
+    let PyValue::List(chunks) = tail["chunks"].clone() else {
+        panic!("capture 應為 list")
+    };
+    let joined: String = chunks.iter().filter_map(PyValue::as_str).collect();
+    assert!(joined.contains("BACKGROUND"), "背景輸出應擷取：{joined:?}");
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\necho BACKGROUND\n".to_vec(),
+        "背景完成判定不增加 TX"
+    );
+}
+
+#[test]
+fn i294_no_echo_without_pending_human_tx_uses_tail_prompt() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"printf x\n");
+    h.inject_rx(b"x\r\nroot@t:/# ");
+
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("x"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf x\n".to_vec());
+}
+
+#[test]
+fn i294_prompt_before_command_tx_is_outside_no_echo_window() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    assert!(h.dev.wait_paused(Duration::from_secs(2)), "命令應停在 OS submit 前");
+    h.inject_rx(b"root@t:/# ");
+    h.dev.release_pause();
+    wait_tx(&h, b"printf x\n");
+    assert_eq!(
+        h.command_get(&id)["status"],
+        PyValue::from("running"),
+        "command TX 前到達的舊 prompt 不得觸發無 echo 降階"
+    );
+
+    h.inject_rx(b"x\r\nroot@t:/# ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("x"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"printf x\n".to_vec());
+}
+
+#[test]
+fn i294_no_echo_with_pending_human_tx_returns_partial_without_recovery_tx() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-no-echo-human");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let id = h.submit_with("printf x", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"printf x\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    h.inject_rx(b"root@t:/# ");
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    h.advance(Duration::from_millis(200));
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["partial"], PyValue::Bool(true));
+    assert_eq!(rec["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "歧義結算不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo HUMAN\nprintf x\n".to_vec(),
+        "無 echo 歧義不額外送救援鍵或重送"
+    );
+}
+
+#[test]
+fn i294_raw_half_line_does_not_anchor_agent_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-half-line");
+    let tx_count = h.wal_tx_payloads().len();
+    console.push_input(b"e");
+    wait_tx(&h, b"e");
+
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let id = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"cho AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    h.advance(Duration::from_millis(200));
+
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["partial"], PyValue::Bool(true));
+    assert!(rec["stdout"].as_str().is_some_and(|stdout| stdout.contains("AGENT")));
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert!(
+        !h.wal_tx_payloads().iter().any(|payload| payload == b"\x03" || payload == b"\x04"),
+        "歧義結算不得送救援鍵"
+    );
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo AGENT\n".to_vec(),
+        "half-line 歧義不額外送救援鍵或重送"
+    );
+}
+
+#[test]
+fn i294_raw_half_line_does_not_poison_next_agent_echo() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-half-line-next");
+    console.push_input(b"e");
+    wait_tx(&h, b"e");
+
+    let (deadline_started_tx, deadline_started_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            deadline_started_tx
+                .send(())
+                .expect("completion waiter 已建立 operation deadline");
+        })));
+    let first = h.submit_with("cho AGENT", |r| r.timeout_s = 0.2);
+    wait_tx(&h, b"cho AGENT\n");
+    deadline_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("推進假時鐘前 operation deadline 已建立");
+    h.inject_rx(b"root@t:/# echo AGENT\r\nAGENT\r\nroot@t:/# ");
+    h.advance(Duration::from_millis(200));
+    let first_result = h.wait_done(&first);
+    assert_eq!(first_result["partial"], PyValue::Bool(true));
+
+    let second = h.submit_ok("echo NEXT");
+    wait_tx(&h, b"echo NEXT\n");
+    h.inject_rx(b"echo NEXT\r\nNEXT\r\nroot@t:/# ");
+    let second_result = h.wait_done(&second);
+    assert_eq!(second_result["status"], PyValue::from("done"));
+    assert_eq!(second_result["stdout"], PyValue::from("NEXT"));
+    assert_eq!(second_result["partial"], PyValue::Bool(false));
+}
+
+#[test]
+fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-wrapped-echo-human");
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+    let tx_count = h.wal_tx_payloads().len();
+    let command = format!("echo {} {}", "x".repeat(50), "y".repeat(40));
+    let id = h.submit_ok(&command);
+    let tx = format!("{command}\n");
+    wait_tx(&h, tx.as_bytes());
+
+    let incomplete = format!(
+        "noiseX\x08\r\nroot@t:/# {}\x1b[31m\r\r\n\x1b[0mroot@t:/# ",
+        &command[..65]
+    );
+    // 第一段只有折行命令前綴，後面刻意有舊 prompt。human TX 使無 echo 降階保持歧義；
+    // 若把折行前綴誤認為完整 echo，這個 prompt 會讓命令提早 done，下面 running 斷言會失敗。
+    h.inject_rx_processed(incomplete.as_bytes());
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    let first = format!(
+        "\r\nroot@t:/# {}\x1b[31m\r\r\n\x1b[0m",
+        &command[..65]
+    );
+    h.inject_rx_processed(first.as_bytes());
+    assert_eq!(h.command_get(&id)["status"], PyValue::from("running"));
+
+    let tail = format!("{}\r\nWRAPPED\r\nroot@t:/# ", &command[65..]);
+    h.inject_rx_processed(tail.as_bytes());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("WRAPPED"));
+    assert_eq!(rec["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        tx.as_bytes().to_vec(),
+        "折行 echo 判定不重送命令"
+    );
+}
+
+#[test]
+fn i294_busybox_wrap_after_command_space_keeps_actor_completion_anchored() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-wrap-command-space");
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
+    let cut = 5 + 40 + 1;
+    let tx_count = h.wal_tx_payloads().len();
+    let (completion_matched_tx, completion_matched_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_match_hook_for_test(Some(Arc::new(move |_| {
+        completion_matched_tx
+            .send(())
+            .expect("completion evaluator 已判定完整 echo 與 prompt");
+    })));
+    let id = h.submit_with(&command, |r| r.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+    let raw = format!(
+        "{}\r\r\n{}\r\nOUT\r\nroot@t:/# ",
+        &command[..cut],
+        &command[cut..]
+    );
+    h.inject_rx_processed(raw.as_bytes());
+    completion_matched_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("operation deadline 已建立，且完成判定先於假時鐘推進");
+    h.advance(Duration::from_millis(200));
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OUT"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "折行 echo 不增加或重送 TX"
+    );
+}
+
+#[test]
+fn i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_count = h.wal_tx_payloads().len();
+    let command = "cat /tmp/job";
+    let id = h.submit_ok(command);
+    wait_tx(&h, b"cat /tmp/job\n");
+
+    h.inject_rx_processed(
+        b"cat /tmp/job\r\ncat /tmp/job\r\nnext\r\nroot@t:/# ",
+    );
+
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("next"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"cat /tmp/job\n".to_vec(),
+        "文件化的重複 echo 相容處理不增加或重送 TX"
+    );
+}
+
+#[test]
 fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
     let slow = h.submit_with("sleep 20", |r| r.timeout_s = 1.0);
     let queued = h.submit_ok("echo later");
     wait_tx(&h, b"sleep 20\n");
@@ -192,8 +4899,30 @@ fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
             PyValue::Null,
             PyValue::from("CTRL_C")
         )
-    ); // ok:true 的碼不入紀錄
+    ); // 命令紀錄沿用基線成功終態；recovery code 保存在結果 capture。
     assert_eq!(rec["partial"], PyValue::Bool(true));
+    let recovered = h.request(SessionRequest::ResultTail {
+        cmd_id: slow,
+        from_chunk: 0,
+        limit: 10,
+    });
+    assert_eq!(recovered["ok"], PyValue::Bool(true), "{recovered:?}");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED"),
+        "救援成功的錯誤碼必須與基線相同：{recovered:?}"
+    );
+    let tx: Vec<u8> = h
+        .wal_tx_payloads()
+        .into_iter()
+        .skip(tx_count)
+        .flatten()
+        .collect();
+    assert_eq!(tx, b"sleep 20\n\x03".to_vec(), "TX 序列為原命令再加成功救援的 Ctrl-C");
+    println!(
+        "i294-r8b baseline tuple: status={:?}, error_code={:?}, partial={:?}, recovery_action={:?}, tx={tx:?}",
+        rec["status"], recovered["error_code"], rec["partial"], rec["recovery_action"]
+    );
     assert_eq!(
         h.command_get(&queued)["error_code"],
         PyValue::from("FLUSHED_BY_RECOVERY")
@@ -290,11 +5019,13 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
         PyValue::from(c.source),
         "{label}：紀錄 source：{rec:?}"
     );
-    assert_eq!(
-        rec["error_code"],
-        PyValue::Null,
-        "{label}：ok:true 的結算不入錯誤碼：{rec:?}"
-    );
+    if matches!(c.expect, Wp61Expect::Rescue { .. }) {
+        assert_eq!(
+            rec["error_code"],
+            PyValue::Null,
+            "{label}：成功救援的命令紀錄沿用基線不記 error_code：{rec:?}"
+        );
+    }
     assert_eq!(rec["partial"], PyValue::Bool(true), "{label}：{rec:?}");
     assert_eq!(
         state_of(&h),
@@ -303,6 +5034,11 @@ fn wp61_runner_timeout_case(c: &Wp61Case) {
     );
     match c.expect {
         Wp61Expect::Promote { owner } => {
+            assert_eq!(
+                rec["error_code"],
+                PyValue::Null,
+                "{label}：trusted human 升格仍為成功結算：{rec:?}"
+            );
             assert_eq!(
                 uart, b"sleep 20\n",
                 "{label}：UART TX 只有命令本身，零 CTRL_C／CTRL_D"
@@ -557,6 +5293,8 @@ fn ctrl_d_after_ctrl_c_fails() {
     });
     let rec = h.command_get(&id);
     assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["error_code"], PyValue::Null);
+    assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_D"));
     assert!(wal_tx_has(&h, b"\x03") && wal_tx_has(&h, b"\x04"));
     assert_eq!(state_of(&h), "READY");
@@ -564,7 +5302,9 @@ fn ctrl_d_after_ctrl_c_fails() {
 
 #[test]
 fn both_keys_fail_prompt_timeout_to_attached() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
+    let tx_count = h.wal_tx_payloads().len();
     let id = h.submit_with("cat", |r| r.timeout_s = 1.0);
     let queued = h.submit_ok("echo later");
     wait_tx(&h, b"cat\n");
@@ -572,9 +5312,11 @@ fn both_keys_fail_prompt_timeout_to_attached() {
         is_done(h, &id)
     });
     let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("error"));
     assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
     assert_eq!(rec["partial"], PyValue::Bool(true));
     assert_eq!(rec["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"cat\n\x03\x04".to_vec());
     let s = h.get_state();
     assert_eq!(s["state"], PyValue::from("ATTACHED"));
     assert_eq!(s["last_error"], PyValue::from("PROMPT_TIMEOUT"));
@@ -659,6 +5401,211 @@ fn echo_line_removed_repeatedly() {
     h.dev.on_tx_reply(b"ls\n", b"ls\r\nls\r\na b\r\nroot@t:/# ");
     let id = h.submit_ok("ls");
     assert_eq!(h.wait_done(&id)["stdout"], PyValue::from("a b"));
+}
+
+/// 9af187ca 的 producer 擷取器原樣保存在測試內，供 producer 路徑差分使用。
+/// 此 oracle 刻意保留整份 raw 的 BusyBox/readline 標記判斷；i294 evaluator 不得改變 producer 語意。
+fn producer_oracle_9af187ca(
+    raw: &str,
+    command: &str,
+    prompt_regex: &sw_proto::pyre::PyRegex,
+    completion: Option<&sw_proto::pyre::PyRegex>,
+) -> String {
+    #[derive(Clone, Copy)]
+    struct WrapEvidence {
+        newline: bool,
+        space: bool,
+    }
+
+    fn char_prefix(text: &str, chars: usize) -> String {
+        text.chars().take(chars).collect()
+    }
+
+    fn last_match_start(re: &sw_proto::pyre::PyRegex, text: &str) -> Option<usize> {
+        let total = text.chars().count();
+        let mut pos = 0;
+        let mut last = None;
+        while pos <= total {
+            let Some(m) = re.search_from(text, pos) else {
+                break;
+            };
+            last = Some(m.start);
+            pos = if m.end > m.start { m.end } else { m.end + 1 };
+        }
+        last
+    }
+
+    fn match_wrapped_echo(
+        text: &[char],
+        start: usize,
+        command: &[char],
+        wraps: WrapEvidence,
+    ) -> Option<usize> {
+        let (mut i, mut j) = (start, 0usize);
+        let mut last_wrap: Option<usize> = None;
+        while j < command.len() {
+            let ch = *text.get(i)?;
+            if ch == command[j] {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            let allowed = (ch == '\n' && wraps.newline) || (ch == ' ' && wraps.space);
+            if j == 0 || !allowed {
+                return None;
+            }
+            let column = last_wrap.map_or(start + j, |w| j - w);
+            if column < 20 {
+                return None;
+            }
+            last_wrap = Some(j);
+            i += 1;
+        }
+        Some(i)
+    }
+
+    fn strip_wrapped_command_echo(
+        lines: &[String],
+        command: &str,
+        wraps: WrapEvidence,
+    ) -> Option<usize> {
+        if command.is_empty() || lines.is_empty() {
+            return None;
+        }
+        let cmd: Vec<char> = command.chars().collect();
+        let window = &lines[..lines.len().min(cmd.len() / 20 + 2)];
+        let text: Vec<char> = window.join("\n").chars().collect();
+        for start in 0..lines[0].chars().count() {
+            if let Some(end) = match_wrapped_echo(&text, start, &cmd, wraps) {
+                if end == text.len() || text[end] == '\n' {
+                    return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
+                }
+            }
+        }
+        None
+    }
+
+    let cleaned = clean_text(raw);
+    let prompt_start = last_match_start(prompt_regex, &cleaned);
+    let completion_end = completion
+        .and_then(|re| re.search(raw))
+        .map(|m| clean_text(&char_prefix(raw, m.end)).chars().count());
+    let mut text = cleaned;
+    if let Some(start) = prompt_start {
+        let cut = match completion {
+            None => true,
+            Some(_) => completion_end.is_some_and(|end| start >= end),
+        };
+        if cut {
+            text = char_prefix(&text, start);
+        }
+    }
+    let mut lines: Vec<String> = splitlines(text.trim_start_matches('\n'))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if !command.is_empty() {
+        let stripped = py_strip(command);
+        let mut removed = false;
+        while lines
+            .first()
+            .is_some_and(|line| py_strip(line).ends_with(stripped))
+        {
+            lines.remove(0);
+            removed = true;
+        }
+        if !removed {
+            let wraps = WrapEvidence {
+                newline: raw.contains("\r\r\n"),
+                space: raw.contains(" \r"),
+            };
+            if wraps.newline || wraps.space {
+                if let Some(n) = strip_wrapped_command_echo(&lines, stripped, wraps) {
+                    lines.drain(..n);
+                }
+            }
+        }
+    }
+    lines.join("\n").trim_matches('\n').to_string()
+}
+
+#[test]
+fn i294_producer_stdout_matches_base_9af187ca_oracle() {
+    let prompt = compile("(?m)^root@t:.*# ", PyFlags(0)).expect("prompt regex");
+    let marker = compile("(?m)^DONE\\r?$", PyFlags(0)).expect("completion marker regex");
+
+    // R5-01 固定反例：輸出行的 ` \\r\\n` 不得切換 producer 的重複 echo 剝除策略。
+    let raw = "ls\r\nls\r\na b \r\nDONE\r\n";
+    assert_eq!(
+        producer_oracle_9af187ca(raw, "ls", &prompt, Some(&marker)),
+        "a b \nDONE"
+    );
+    assert_eq!(
+        extract_command_stdout(raw, "ls", &prompt, Some(&marker)),
+        "a b \nDONE"
+    );
+
+    // 有界 producer 輸入空間：重複 echo、兩種終端折行、無關行尾空白、ANSI／backspace、
+    // completion marker 與 prompt 的相對位置都逐一對照 9af187ca oracle。
+    let long = wrap_cmd96();
+    let mut cases = Vec::<(String, String)>::new();
+    for command in ["ls".to_string(), long.clone()] {
+        for repeats in [1usize, 2] {
+            for output in [
+                "OUT\r\n",
+                "a b \r\n",
+                "\x1b[31mA\x08B\x07\x1b[0m\r\n",
+            ] {
+                for tail in [
+                    "DONE\r\nroot@t:/# ",
+                    "root@t:/# \r\nDONE\r\n",
+                    "DONE\r\n",
+                ] {
+                    let echo = format!("{command}\r\n").repeat(repeats);
+                    cases.push((format!("{echo}{output}{tail}"), command.clone()));
+                }
+            }
+        }
+    }
+    let mixed_command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
+    let mixed_echo = format!(
+        "{}\r\r\n{} \r{}\r\n",
+        &mixed_command[..25],
+        &mixed_command[25..60],
+        &mixed_command[60..]
+    );
+    cases.push((
+        format!("{mixed_echo}\x1b[32mOUT\x1b[0m\r\nDONE\r\nroot@t:/# "),
+        mixed_command,
+    ));
+    let mut prefixed_prompt_case = format!(
+        "root@t:/# old\r\n\x1b[33m{long}\x1b[0mX\x08\r\nOUT\r\nDONE\r\nroot@t:/# "
+    );
+    cases.push((prefixed_prompt_case.clone(), long.clone()));
+    prefixed_prompt_case.push_str("AFTER-MARKER\r\n");
+    cases.push((prefixed_prompt_case, long));
+
+    for (raw, command) in cases {
+        let completion = Some(&marker);
+        assert_eq!(
+            extract_command_stdout(&raw, &command, &prompt, completion),
+            producer_oracle_9af187ca(&raw, &command, &prompt, completion),
+            "producer output differs from 9af187ca for command={command:?}, raw={raw:?}"
+        );
+    }
+
+    // 確認完成標記實際經一般 producer 呼叫路徑時也維持基線結果。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"ls\n", b"ls\r\nls\r\na b \r\nDONE\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with("ls", |request| {
+        request.completion_regex = Some("(?m)^DONE\\r?$".into())
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"));
+    assert_eq!(rec["stdout"], PyValue::from("a b \nDONE"));
+    assert_eq!(wal_tx_bytes_since(&h, tx_count), b"ls\n");
 }
 
 #[test]
@@ -1956,6 +6903,7 @@ fn wp53_route_without_flag_keeps_timeout_recovery() {
     });
     let rec = h.command_get(&id);
     assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
     assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
     assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
@@ -4395,6 +9343,85 @@ fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
     assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..55], &c[56..]));
 }
 
+#[test]
+fn wrapped_echo_whitespace_boundary_matrix() {
+    let prompt = WRAP_PROMPT;
+    let check = |raw: String, command: &str, expected: String| {
+        let profile = SHELL_PROFILE.replace("(?m)^root@t:.*# ", WRAP_PROMPT_RE);
+        let h = ActorRig::new_with_hub(&profile).ready_with_prompt(prompt.as_bytes());
+        let tx = format!("{command}\n");
+        h.dev.on_tx_reply(tx.as_bytes(), raw.as_bytes());
+        let tx_count = h.wal_tx_payloads().len();
+        let id = h.submit_ok(command);
+        let record = h.wait_done(&id);
+        assert_eq!(record["status"], PyValue::from("done"));
+        assert_eq!(
+            record["stdout"],
+            PyValue::from(expected),
+            "command={command:?} raw={raw:?}"
+        );
+        assert_eq!(wal_tx_bytes_since(&h, tx_count), tx.as_bytes());
+    };
+
+    // R4-01：命令原有空白緊接 BusyBox 折行；該空白既像 readline 標記，也必須保留為命令字元。
+    let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
+    let cut = 5 + 40 + 1;
+    check(
+        format!("{}\r\r\n{}\r\nOUT\r\n{prompt}", &command[..cut], &command[cut..]),
+        &command,
+        "OUT".into(),
+    );
+
+    // readline 插入空白位於命令空白前後，以及連續兩個命令空白之間。
+    let command = format!("echo {} {}", "x".repeat(74), "y".repeat(20));
+    for cut in [5 + 74, 5 + 74 + 1] {
+        let echo = readline_wrapped(&command, &[cut]);
+        check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+    }
+    let command = format!("echo {}  {}", "x".repeat(40), "y".repeat(40));
+    let echo = readline_wrapped(&command, &[5 + 40 + 1]);
+    check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+
+    // 同一 echo 內多次折行並混用 BusyBox 與 readline 標記。
+    let command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
+    let echo = format!(
+        "{}\r\r\n{} \r{}",
+        &command[..25],
+        &command[25..60],
+        &command[60..]
+    );
+    check(
+        format!("{echo}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{}\n{} {}\nOUT", &command[..25], &command[25..60], &command[60..]),
+    );
+
+    // 折行標記不得出現在第一個命令字元之前，亦不得出現在命令完成後。
+    let command = format!("echo {}", "z".repeat(40));
+    check(
+        format!(" \r{command}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!(" {command}\nOUT"),
+    );
+    check(
+        format!("\r\r\n{command}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{command}\nOUT"),
+    );
+    check(
+        format!("{command} \r\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{command} \nOUT"),
+    );
+
+    // BusyBox 的換行緊接完整命令，可作為 echo 的行尾。
+    check(
+        format!("{command}\r\r\nOUT\r\n{prompt}"),
+        &command,
+        "OUT".into(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WP5-2 第 5 項：`expect_reboot`／`trusted_human` 經佇列送進 `OpSpec::Command`，且不繞過 gate
 // ---------------------------------------------------------------------------
@@ -5012,6 +10039,1922 @@ fn wp73_reboot_clears_rx_for_console_unlock_avoids_stale_prompt_evidence() {
     assert!(
         tx.contains("secret123"),
         "reboot 後的 unlock 流程必須送出 unlock 密鑰，不得誤用舊 root prompt 當作解鎖證據；實際 TX: {tx:?}"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I1R16TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+impl I1R16TimeoutEntry {
+    fn configure(self, request: &mut sw_core::arbiter::SubmitReq) {
+        match self {
+            Self::Silence => {
+                request.timeout_s = 30.0;
+                request.expected_duration_s = Some(120.0);
+            }
+            Self::OperationDeadline => request.timeout_s = 0.2,
+        }
+    }
+
+    fn advance(self, manager: &ManagerRig) {
+        match self {
+            Self::Silence => manager.clock.advance(Duration::from_secs(31)),
+            Self::OperationDeadline => manager.clock.advance(Duration::from_millis(201)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum I294R17TimeoutEntry {
+    Silence,
+    OperationDeadline,
+}
+
+impl I294R17TimeoutEntry {
+    fn configure(self, request: &mut sw_core::arbiter::SubmitReq) {
+        match self {
+            Self::Silence => {
+                request.timeout_s = 30.0;
+                request.expected_duration_s = Some(120.0);
+            }
+            Self::OperationDeadline => request.timeout_s = 0.2,
+        }
+    }
+
+    fn advance_actor(self, rig: &ActorRig) {
+        match self {
+            Self::Silence => i294_r10_advance_clock(rig, Duration::from_secs(31)),
+            Self::OperationDeadline => i294_r10_advance_clock(rig, Duration::from_millis(201)),
+        }
+    }
+}
+
+fn i294_r17_submit_no_echo_actor(
+    h: &ActorRig,
+    command: &str,
+    timeout_entry: I294R17TimeoutEntry,
+) -> String {
+    let (wait_entered_tx, wait_entered_rx) = crossbeam_channel::bounded(1);
+    h.rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+        let _ = wait_entered_tx.send(());
+    })));
+    let id = h.submit_with(command, |request| timeout_entry.configure(request));
+    wait_tx(h, format!("{command}\n").as_bytes());
+    wait_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("agent command completion waiter 已開始");
+    id
+}
+
+fn i294_r17_push_actor_rx_and_wait(h: &ActorRig, bytes: &[u8]) {
+    let (checks_before, _) = h.rx.snapshot_wait_progress_for_test();
+    let end = h
+        .rx
+        .snapshot_len()
+        .saturating_add(String::from_utf8_lossy(bytes).chars().count() as u64);
+    h.inject_rx_reader_processed(bytes);
+    assert!(
+        h.rx.wait_for_snapshot_wait_progress_for_test(checks_before, end, Duration::from_secs(5)),
+        "completion evaluator 已檢查 RX"
+    );
+}
+
+fn i294_r17_assert_timeout_partial(record: &PyDict) {
+    assert_eq!(record.get("status"), Some(&PyValue::from("error")), "{record:?}");
+    assert_eq!(record.get("error_code"), Some(&PyValue::from("PROMPT_TIMEOUT")), "{record:?}");
+    assert_eq!(record.get("partial"), Some(&PyValue::Bool(true)), "{record:?}");
+    assert_eq!(record.get("recovery_action"), Some(&PyValue::from("NONE")), "{record:?}");
+}
+
+fn i1_r16_manager_tx_payloads(manager: &ManagerRig) -> Vec<Vec<u8>> {
+    manager
+        .wal_rows()
+        .into_iter()
+        .filter(|row| row.get("dir").and_then(PyValue::as_str) == Some("TX"))
+        .map(|row| b64(&row))
+        .collect()
+}
+
+fn i294_r17_manager_human_tx_payloads(manager: &ManagerRig) -> Vec<Vec<u8>> {
+    manager
+        .wal_rows()
+        .into_iter()
+        .filter(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("TX")
+                && row
+                    .get("source")
+                    .and_then(PyValue::as_str)
+                    .is_some_and(|source| source.starts_with("human:"))
+        })
+        .map(|row| b64(&row))
+        .collect()
+}
+
+fn i1_r16_reconnect_after_old_human(
+    prompt_returned: bool,
+) -> (
+    ManagerRig,
+    Arc<sw_core::uart_bridge::RxShared>,
+    sw_pal::fakes::serial::FakeDevice,
+) {
+    let manager = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let (old_rx, _, _, old_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 bridge snapshot");
+    old_rx.record_human_tx_for_test(b"echo R16_OLD\n", &*manager.clock);
+
+    if prompt_returned {
+        let reply = b"echo R16_OLD\r\nR16_OLD\r\nroot@t:/# ";
+        let expected = old_rx.total_bytes().saturating_add(reply.len() as u64);
+        manager.dev.push_rx(reply);
+        assert!(
+            old_rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)),
+            "舊 epoch human prompt 已經由 reader 收到"
+        );
+    }
+
+    manager.retarget_by_id(DEVICE_BY_ID, "/dev/ttyNEW-R16");
+    manager.wait_state("COM0", "READY");
+    let (new_rx, _, _, new_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("新 bridge snapshot");
+    assert!(!Arc::ptr_eq(&old_rx, &new_rx), "重接流程建立新 RX epoch");
+    assert_ne!(old_epoch, new_epoch, "重接流程前進 bridge epoch");
+    assert!(
+        Arc::ptr_eq(&old_rx.actor_dispatch_gate(), &new_rx.actor_dispatch_gate()),
+        "同一 session 的兩個 bridge 共用 session gate"
+    );
+    let new_device = manager.device("/dev/ttyNEW-R16");
+    (manager, new_rx, new_device)
+}
+
+fn i1_r16_submit_manager_command(
+    manager: &ManagerRig,
+    command: &str,
+    timeout_entry: I1R16TimeoutEntry,
+) -> String {
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let mut request = agent_submit(command);
+    timeout_entry.configure(&mut request);
+    let response = manager
+        .mgr
+        .route(&sid, SessionRequest::Submit(request), Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("command.submit: {}", error.message));
+    response
+        .get("cmd_id")
+        .and_then(PyValue::as_str)
+        .expect("command.submit 回傳 cmd_id")
+        .to_string()
+}
+
+fn i1_r16_push_rx_and_wait(
+    rx: &sw_core::uart_bridge::RxShared,
+    device: &sw_pal::fakes::serial::FakeDevice,
+    data: &[u8],
+    checks_before: u64,
+) {
+    let expected_bytes = rx.total_bytes().saturating_add(data.len() as u64);
+    let expected_end = rx
+        .snapshot_len()
+        .saturating_add(String::from_utf8_lossy(data).chars().count() as u64);
+    device.push_rx(data);
+    assert!(
+        rx.wait_for_reader_bytes_for_test(expected_bytes, Duration::from_secs(5)),
+        "RX reader 已追加指定 bytes"
+    );
+    assert!(
+        rx.wait_for_snapshot_wait_progress_for_test(
+            checks_before,
+            expected_end,
+            Duration::from_secs(5)
+        ),
+        "completion evaluator 已檢查本次 RX snapshot"
+    );
+}
+
+fn i1_r16_wait_for_command_tx(manager: &ManagerRig, command: &str) {
+    let payload = format!("{command}\n").into_bytes();
+    wait_until("i294 R16 command TX", || {
+        i1_r16_manager_tx_payloads(manager)
+            .iter()
+            .any(|written| written == &payload)
+    });
+}
+
+fn i1_r16_finish_if_running(
+    manager: &ManagerRig,
+    rx: &sw_core::uart_bridge::RxShared,
+    cmd_id: &str,
+    timeout_entry: I1R16TimeoutEntry,
+) -> PyDict {
+    let current = manager.reg.get(cmd_id).expect("command record");
+    let mut is_terminal = current
+        .get("done_at")
+        .is_some_and(|done| !done.is_null());
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    while !is_terminal {
+        timeout_entry.advance(manager);
+        // RX snapshot wait 以 50 ms 實時切片重看 FakeClock；留出一個切片讓 waiter 收斂，
+        // silence 入口若先觀察到命令窗口 RX，下一輪仍需再越過一個 silence interval。
+        std::thread::sleep(Duration::from_millis(80));
+        let record = manager.reg.get(cmd_id).expect("command record");
+        is_terminal = record.get("done_at").is_some_and(|done| !done.is_null());
+        assert!(
+            is_terminal || Instant::now() < wait_deadline,
+            "i294 R16 command terminal wait expired: {record:?}, state={:?}, rx_tail={:?}, clock_ns={}, progress={:?}",
+            manager.session("COM0").get("state"),
+            rx_tail(manager),
+            manager.clock.mono_ns(),
+            rx.snapshot_wait_progress_for_test()
+        );
+    }
+    manager.reg.get(cmd_id).expect("terminal command record")
+}
+
+fn rx_tail(manager: &ManagerRig) -> Option<String> {
+    let sid = manager.mgr.resolve("COM0")?;
+    let (rx, _, _, _) = manager.mgr.actor_snapshot_for_test(&sid)?;
+    Some(rx.tail(80))
+}
+
+fn i1_r16_close_manager(manager: ManagerRig) {
+    let _ = manager.mgr.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn i294_r16_epoch_human_counter_domain_matrix() {
+    let mut mismatches = Vec::new();
+
+    for timeout_entry in [
+        I1R16TimeoutEntry::Silence,
+        I1R16TimeoutEntry::OperationDeadline,
+    ] {
+        // 舊 epoch human 已收到 prompt；新 epoch 無 human TX。無 echo 的新命令仍須正常完成。
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(true);
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_SETTLED_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"SETTLED_RESULT\r\nroot@t:/# ",
+            checks_before,
+        );
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("done"))
+            || record.get("stdout") != Some(&PyValue::from("SETTLED_RESULT"))
+            || record.get("partial") != Some(&PyValue::Bool(false))
+        {
+            mismatches.push(format!(
+                "settled old epoch／{timeout_entry:?}: status={:?}, stdout={:?}, partial={:?}",
+                record.get("status"),
+                record.get("stdout"),
+                record.get("partial")
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("settled old epoch／{timeout_entry:?}: unexpected TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+
+        // 新 epoch 已有完成的人類 prompt；command TX 後的 human TX 仍使無 echo prompt 保持歧義。
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(true);
+        rx.record_human_tx_for_test(b"echo R16_BASELINE\n", &*manager.clock);
+        let baseline_prompt = b"echo R16_BASELINE\r\nR16_BASELINE\r\nroot@t:/# ";
+        let expected = rx.total_bytes().saturating_add(baseline_prompt.len() as u64);
+        device.push_rx(baseline_prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_INTERLEAVED_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        rx.record_human_tx_for_test(b"echo R16_WINDOW\n", &*manager.clock);
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"echo R16_WINDOW\r\nR16_WINDOW\r\nroot@t:/# ",
+            checks_before,
+        );
+        let after_prompt = manager.reg.get(&cmd_id).expect("command record");
+        if after_prompt.get("status") != Some(&PyValue::from("running")) {
+            mismatches.push(format!(
+                "window human／{timeout_entry:?}: command left running at human prompt: {after_prompt:?}"
+            ));
+        }
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("error"))
+            || record.get("error_code") != Some(&PyValue::from("PROMPT_TIMEOUT"))
+            || record.get("partial") != Some(&PyValue::Bool(true))
+            || record.get("recovery_action") != Some(&PyValue::from("NONE"))
+        {
+            mismatches.push(format!(
+                "window human／{timeout_entry:?}: expected timeout partial, got {record:?}"
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("window human／{timeout_entry:?}: rescue or retry TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+    }
+
+    assert!(mismatches.is_empty(), "R16 計數域回歸：\n{}", mismatches.join("\n"));
+}
+
+#[test]
+fn i294_r16_unsettled_human_remains_pending_after_reconnect() {
+    let mut mismatches = Vec::new();
+    for timeout_entry in [
+        I1R16TimeoutEntry::Silence,
+        I1R16TimeoutEntry::OperationDeadline,
+    ] {
+        let (manager, rx, device) = i1_r16_reconnect_after_old_human(false);
+        // 新 epoch human TX 後的結尾 prompt 位於最新邊界之後，應結清接管時尚未結案的 human。
+        rx.record_human_tx_for_test(b"echo R16_NEW_EPOCH\n", &*manager.clock);
+        let new_epoch_prompt = b"echo R16_NEW_EPOCH\r\nR16_NEW_EPOCH\r\nroot@t:/# ";
+        let expected = rx.total_bytes().saturating_add(new_epoch_prompt.len() as u64);
+        device.push_rx(new_epoch_prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        let command = format!("printf R16_PENDING_{timeout_entry:?}");
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        rx.set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+            let _ = started_tx.send(());
+        })));
+        let cmd_id = i1_r16_submit_manager_command(&manager, &command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, &command);
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command completion waiter 已開始");
+        let (checks_before, _) = rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"PENDING_RESULT\r\nroot@t:/# ",
+            checks_before,
+        );
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        if record.get("status") != Some(&PyValue::from("done"))
+            || record.get("stdout") != Some(&PyValue::from("PENDING_RESULT"))
+            || record.get("partial") != Some(&PyValue::Bool(false))
+        {
+            mismatches.push(format!(
+                "new epoch human prompt／{timeout_entry:?}: expected normal completion, got {record:?}"
+            ));
+        }
+        let tx = i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .collect::<Vec<_>>();
+        if tx != [format!("{command}\n").into_bytes()] {
+            mismatches.push(format!("pending old human／{timeout_entry:?}: rescue or retry TX {tx:?}"));
+        }
+        i1_r16_close_manager(manager);
+    }
+    assert!(mismatches.is_empty(), "未結案 human 接管規則：\n{}", mismatches.join("\n"));
+}
+
+#[test]
+fn i294_r17_human_prompt_must_follow_tx_boundary() {
+    for (suffix_name, suffix) in [
+        ("BEL", b"\x07".as_slice()),
+        ("ANSI", b"\x1b[?25h".as_slice()),
+    ] {
+        for timeout_entry in [
+            I294R17TimeoutEntry::Silence,
+            I294R17TimeoutEntry::OperationDeadline,
+        ] {
+            let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+            let console = h.attach_pty_console(&format!("i294-r17-{suffix_name}-{timeout_entry:?}"));
+            let (timeout_seen_tx, timeout_seen_rx) = crossbeam_channel::bounded(1);
+            let (release_timeout_tx, release_timeout_rx) = crossbeam_channel::bounded(1);
+            let timeout_hook_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let timeout_hook_once = Arc::clone(&timeout_hook_called);
+            h.rx.set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+                if !timeout_hook_once.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    timeout_seen_tx.send(()).expect("completion timeout 已到期");
+                    release_timeout_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("釋放 completion timeout barrier");
+                }
+            })));
+            let tx_count = h.wal_tx_payloads().len();
+            h.inject_rx_reader_processed(b"root@t:/# ");
+
+            console.push_input(b"echo R17_HUMAN\n");
+            wait_tx(&h, b"echo R17_HUMAN\n");
+            h.wait_for("human writer report 收斂", |rig| {
+                rig.rx.human_in_flight_for_test() == 0
+                    && rig.rx.human_tx_state().generation > 0
+            });
+
+            let before_suffix = h.rx.total_bytes();
+            h.dev.push_rx(suffix);
+            assert!(h.rx.wait_for_reader_bytes_for_test(
+                before_suffix + suffix.len() as u64,
+                Duration::from_secs(5),
+            ));
+
+            let id = i294_r17_submit_no_echo_actor(
+                &h,
+                "printf R17_AGENT",
+                timeout_entry,
+            );
+            i294_r17_push_actor_rx_and_wait(&h, b"R17_HUMAN\r\nroot@t:/# ");
+            let before_timeout = h.command_get(&id);
+            assert_eq!(
+                before_timeout.get("status"),
+                Some(&PyValue::from("running")),
+                "{suffix_name} 舊 prompt 不得讓無 echo agent 命令提前完成：{before_timeout:?}"
+            );
+
+            timeout_entry.advance_actor(&h);
+            timeout_seen_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("指定 timeout 入口已到期");
+            let second_wait = if timeout_entry == I294R17TimeoutEntry::Silence {
+                let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+                h.rx
+                    .set_snapshot_wait_enter_hook_for_test(Some(Arc::new(move || {
+                        entered_tx.send(()).expect("RX 活動後重新開始靜默窗口");
+                    })));
+                Some(entered_rx)
+            } else {
+                None
+            };
+            release_timeout_tx
+                .send(())
+                .expect("釋放指定 timeout 入口");
+            if let Some(second_wait) = second_wait {
+                second_wait
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("RX 活動後已開始新的靜默窗口");
+                timeout_entry.advance_actor(&h);
+            }
+            let record = h.wait_done(&id);
+            i294_r17_assert_timeout_partial(&record);
+            assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+            assert_eq!(
+                wal_tx_bytes_since(&h, tx_count),
+                b"echo R17_HUMAN\nprintf R17_AGENT\n",
+                "{suffix_name}/{timeout_entry:?}: no rescue or retry TX"
+            );
+        }
+    }
+}
+
+#[test]
+fn i294_r18_prompt_received_before_human_os_write_return_is_before_boundary() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-write-boundary");
+    let rx = Arc::clone(&h.rx);
+    let dev = h.dev.clone();
+    let first_submit = Arc::new(AtomicBool::new(false));
+    let first_submit_hook = Arc::clone(&first_submit);
+    let (prompt_seen_tx, prompt_seen_rx) = crossbeam_channel::bounded(1);
+    h.dev.on_os_submit(Box::new(move || {
+        if first_submit_hook.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let prompt = b"root@t:/# ";
+        let expected = rx.total_bytes().saturating_add(prompt.len() as u64);
+        dev.push_rx(prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+        prompt_seen_tx.send(()).expect("OS write 前 prompt 已由 reader 收到");
+    }));
+
+    console.push_input(b"echo R18_WRITE_BOUNDARY\n");
+    prompt_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("human writer 在 OS write 之前收到完整 prompt");
+    wait_tx(&h, b"echo R18_WRITE_BOUNDARY\n");
+    h.wait_for("human writer report 與 guard 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().generation > 0
+    });
+
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "write 返回前已追加的 prompt 必須位於 post-write watermark 之前，不能結案"
+    );
+}
+
+#[test]
+fn i294_r18_split_prompt_settles_only_after_complete_post_boundary_line() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-split-prompt");
+    console.push_input(b"echo R18_SPLIT\n");
+    wait_tx(&h, b"echo R18_SPLIT\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+
+    h.inject_rx_reader_processed(b"\r\nroot@t:/");
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "分包 prompt 尚未形成完整尾端行時保持 pending"
+    );
+    h.inject_rx_reader_processed(b"# ");
+    assert!(
+        !h.rx.human_tx_state().pending_human,
+        "清理後完整 prompt 位於邊界之後時應結案"
+    );
+}
+
+#[test]
+fn i294_r18_prompt_line_start_before_tx_boundary_does_not_settle() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-cross-boundary-line");
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_CROSS_BOUNDARY\n");
+    wait_tx(&h, b"echo R18_CROSS_BOUNDARY\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+    h.inject_rx_reader_processed(b"root@t:/# ");
+
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "完整清理視窗的最後一行起點在 TX 邊界之前，不得用切片開頭當行首"
+    );
+}
+
+#[test]
+fn i294_r18_trimmed_line_start_does_not_settle() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-r18-trimmed-line-start");
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_TRIMMED\n");
+    wait_tx(&h, b"echo R18_TRIMMED\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+
+    let mut redraw = vec![b'x'; 131_072];
+    redraw.extend(std::iter::repeat_n(b'\x08', 131_072));
+    redraw.extend_from_slice(b"root@t:/# ");
+    h.inject_rx_reader_processed(&redraw);
+    assert!(h.rx.snapshot_from(0).trimmed_before_from, "RX window 確實已修剪");
+    assert!(
+        h.rx.human_tx_state().pending_human,
+        "行首被修剪且無法證明位於邊界之後時保持 pending"
+    );
+}
+
+fn i294_r18_cross_boundary_timeout(timeout_entry: I294R17TimeoutEntry) {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console(&format!("i294-r18-cross-timeout-{timeout_entry:?}"));
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let tx_count = h.wal_tx_payloads().len();
+    h.inject_rx_reader_processed(b"x");
+    console.push_input(b"echo R18_TIMEOUT_HUMAN\n");
+    wait_tx(&h, b"echo R18_TIMEOUT_HUMAN\n");
+    h.wait_for("human writer report 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+    });
+    h.inject_rx_reader_processed(b"root@t:/# ");
+
+    let (timeout_seen_tx, timeout_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_timeout_tx, release_timeout_rx) = crossbeam_channel::bounded(1);
+    h.rx
+        .set_snapshot_wait_deadline_hook_for_test(Some(Arc::new(move || {
+            timeout_seen_tx.send(()).expect("指定 timeout 入口已到期");
+            release_timeout_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 timeout barrier");
+        })));
+    let id = i294_r17_submit_no_echo_actor(&h, "printf R18_NO_ECHO", timeout_entry);
+    timeout_entry.advance_actor(&h);
+    timeout_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("指定 timeout 入口抵達受控 barrier");
+    release_timeout_tx.send(()).expect("釋放 timeout barrier");
+    let record = h.wait_done(&id);
+    i294_r17_assert_timeout_partial(&record);
+    assert_eq!(h.get_state()["state"], PyValue::from("READY"));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        b"echo R18_TIMEOUT_HUMAN\nprintf R18_NO_ECHO\n",
+        "human／agent 真實路徑不得重送或送救援 TX"
+    );
+}
+
+#[test]
+fn i294_r18_cross_boundary_prompt_silence_timeout_has_no_rescue_tx() {
+    i294_r18_cross_boundary_timeout(I294R17TimeoutEntry::Silence);
+}
+
+#[test]
+fn i294_r18_cross_boundary_prompt_operation_deadline_has_no_rescue_tx() {
+    i294_r18_cross_boundary_timeout(I294R17TimeoutEntry::OperationDeadline);
+}
+
+#[test]
+fn i294_r18_late_old_writer_accepted_prompt_uses_active_epoch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let old_rx = Arc::clone(&h.rx);
+    let old_epoch = old_rx.watermark().0;
+    let new_epoch = old_epoch.saturating_add(1);
+    let new_rx = sw_core::uart_bridge::RxShared::new_with_actor_dispatch_gate(
+        131_072,
+        h.clock.mono_ns(),
+        old_rx.actor_dispatch_gate(),
+    );
+    let (write_seen_tx, write_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_write_tx, release_write_rx) = crossbeam_channel::bounded(1);
+    let once = Arc::new(AtomicBool::new(false));
+    let once_hook = Arc::clone(&once);
+    h.dev.on_os_submit_after_write(Box::new(move || {
+        if once_hook.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        write_seen_tx.send(()).expect("old human bytes 已寫入 OS");
+        release_write_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 observer 登錄前的 old writer barrier");
+    }));
+
+    let (report_seen_tx, report_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    old_rx.set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+        report_seen_tx.send(()).expect("old human report barrier");
+        release_report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 old writer report barrier");
+    })));
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_180);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: b"echo R18_LATE_OLD\n".to_vec(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = old_rx
+        .submit_human_job_for_test(&tx, job)
+        .expect("真實 TxWriter 接受 human job 入列");
+    write_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old OS write 已完成但 observer 尚未登錄");
+
+    new_rx.activate_epoch_for_test(new_epoch);
+    new_rx.append(b"root@t:/# ", h.clock.mono_ns(), new_epoch, 1);
+    release_write_tx.send(()).expect("釋放 old OS write closure");
+    report_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old writer 結果已形成，report 尚未釋放");
+    assert!(
+        new_rx.human_tx_state().pending_human,
+        "guard/report 未收斂前，新 epoch prompt 不得提前結案"
+    );
+    release_report_tx.send(()).expect("釋放 old writer report");
+    report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old human writer report 已交付");
+    drop(guard);
+
+    assert!(
+        !new_rx.human_tx_state().pending_human,
+        "old writer 的成功 submit 登錄到 active epoch offset 0 後，已有新 epoch prompt 應可結案"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R18WriterOutcome {
+    Accepted,
+    Pending,
+    WouldBlock,
+    NotSubmitted,
+}
+
+fn i294_r18_run_writer_handoff_case(
+    outcome: I294R18WriterOutcome,
+    had_pending: bool,
+    prompt_before_guard_release: bool,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let old_rx = Arc::clone(&h.rx);
+    let old_epoch = old_rx.watermark().0;
+    let new_epoch = old_epoch.saturating_add(1);
+    let new_rx = sw_core::uart_bridge::RxShared::new_with_actor_dispatch_gate(
+        131_072,
+        h.clock.mono_ns(),
+        old_rx.actor_dispatch_gate(),
+    );
+    if had_pending {
+        old_rx.record_human_tx_for_test(b"echo R18_PRIOR\n", &*h.clock);
+        if !old_rx.human_tx_state().pending_human {
+            return Err("前置條件：接管前 human pending 未建立".into());
+        }
+    }
+
+    let (report_seen_tx, report_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_report_tx, release_report_rx) = crossbeam_channel::bounded(1);
+    old_rx.set_human_tx_report_hook_for_test(Some(Arc::new(move || {
+        report_seen_tx.send(()).expect("human writer report 屏障");
+        release_report_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("釋放 human writer report 屏障");
+    })));
+
+    let (submit_seen_tx, submit_seen_rx) = crossbeam_channel::bounded(1);
+    let (release_submit_tx, release_submit_rx) = crossbeam_channel::bounded(1);
+    let tx_start = h.dev.tx_len();
+    match outcome {
+        I294R18WriterOutcome::Accepted => {
+            let once = Arc::new(AtomicBool::new(false));
+            let once_hook = Arc::clone(&once);
+            h.dev.on_os_submit_after_write(Box::new(move || {
+                if once_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                submit_seen_tx.send(()).expect("Accepted OS write 屏障");
+                release_submit_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("釋放 Accepted OS write 屏障");
+            }));
+        }
+        I294R18WriterOutcome::Pending => {
+            h.dev.script_write(vec![FakeWriteStep::Unknown {
+                confirmed: 0,
+                error: PalError::cancelled(),
+            }]);
+            let once = Arc::new(AtomicBool::new(false));
+            let once_hook = Arc::clone(&once);
+            h.dev.on_os_submit(Box::new(move || {
+                if once_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                submit_seen_tx.send(()).expect("Pending OS submit 屏障");
+                release_submit_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("釋放 Pending OS submit 屏障");
+            }));
+        }
+        I294R18WriterOutcome::WouldBlock => {
+            h.dev.script_write(vec![FakeWriteStep::WouldBlockThenPause]);
+        }
+        I294R18WriterOutcome::NotSubmitted => {
+            h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+        }
+    }
+
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(&h, 9_294_181);
+    let payload = b"echo R18_HANDOFF\n".to_vec();
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: payload.clone(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = old_rx
+        .submit_human_job_for_test(&tx, job)
+        .ok_or_else(|| "真實 human writer 未接受測試 job 入列".to_string())?;
+
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        if !h.dev.wait_paused(Duration::from_secs(5)) {
+            return Err(format!("{outcome:?} writer 未到控制屏障"));
+        }
+    } else if submit_seen_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        return Err(format!("{outcome:?} writer 未到提交屏障"));
+    }
+
+    new_rx.activate_epoch_for_test(new_epoch);
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        h.fence.with(|state| state.active_epoch = Some(new_epoch));
+    }
+    let prompt = b"\r\nroot@t:/# ";
+    if prompt_before_guard_release {
+        new_rx.append(prompt, h.clock.mono_ns(), new_epoch, 1);
+    }
+
+    if matches!(outcome, I294R18WriterOutcome::WouldBlock | I294R18WriterOutcome::NotSubmitted) {
+        h.dev.release_pause();
+    } else {
+        release_submit_tx
+            .send(())
+            .map_err(|_| format!("釋放 {outcome:?} submit 屏障失敗"))?;
+    }
+    if report_seen_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        return Err(format!("{outcome:?} writer report 未抵達受控屏障"));
+    }
+
+    let report_pending = new_rx.human_tx_state().pending_human;
+    let expect_pending_at_report = had_pending
+        || matches!(outcome, I294R18WriterOutcome::Accepted | I294R18WriterOutcome::Pending);
+    if report_pending != expect_pending_at_report {
+        return Err(format!(
+            "{outcome:?}, prior_pending={had_pending}, prompt_before={prompt_before_guard_release}: report 前 pending={report_pending}, 預期={expect_pending_at_report}"
+        ));
+    }
+
+    release_report_tx
+        .send(())
+        .map_err(|_| "釋放 writer report 失敗".to_string())?;
+    let report = report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "真實 human writer report 未交付".to_string())?;
+    drop(guard);
+
+    match outcome {
+        I294R18WriterOutcome::Accepted => {
+            if report.result.outcome != sw_pal::TxOutcome::Completed(payload.len())
+                || report.reject.is_some()
+            {
+                return Err(format!("Accepted writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::Pending => {
+            if report.result.outcome != (sw_pal::TxOutcome::Unknown { confirmed: 0 })
+                || report.reject.is_some()
+            {
+                return Err(format!("Pending writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::NotSubmitted => {
+            if report.reject.is_none()
+                || !matches!(report.result.outcome, sw_pal::TxOutcome::NotSubmitted)
+            {
+                return Err(format!("NotSubmitted writer 回報不符：{report:?}"));
+            }
+        }
+        I294R18WriterOutcome::WouldBlock => {
+            if report.reject.is_none()
+                || !matches!(report.result.outcome, sw_pal::TxOutcome::NotSubmitted)
+            {
+                return Err(format!("WouldBlock 後的舊 epoch retry 應由 fence 拒絕：{report:?}"));
+            }
+        }
+    }
+
+    if prompt_before_guard_release {
+        if new_rx.human_tx_state().pending_human {
+            return Err(format!(
+                "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: prompt 在 guard 釋放前到達，結案未收斂"
+            ));
+        }
+    } else if expect_pending_at_report {
+        if !new_rx.human_tx_state().pending_human {
+            return Err(format!(
+                "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: prompt 尚未到達就提前結案"
+            ));
+        }
+        new_rx.append(prompt, h.clock.mono_ns(), new_epoch, 1);
+    }
+
+    if new_rx.human_tx_state().pending_human {
+        return Err(format!(
+            "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: 新 epoch prompt 後仍 pending"
+        ));
+    }
+    let expected_tx = match outcome {
+        I294R18WriterOutcome::Accepted => payload.as_slice(),
+        I294R18WriterOutcome::Pending
+        | I294R18WriterOutcome::WouldBlock
+        | I294R18WriterOutcome::NotSubmitted => &[],
+    };
+    if h.dev.tx_since(tx_start) != expected_tx {
+        return Err(format!(
+            "{outcome:?} prior_pending={had_pending}, prompt_before_guard_release={prompt_before_guard_release}: 發生重送或非預期 TX：{:?}",
+            h.dev.tx_since(tx_start)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn i294_r18_real_human_writer_handoff_result_matrix() {
+    let mut failures = Vec::new();
+    for outcome in [
+        I294R18WriterOutcome::Accepted,
+        I294R18WriterOutcome::Pending,
+        I294R18WriterOutcome::WouldBlock,
+        I294R18WriterOutcome::NotSubmitted,
+    ] {
+        for had_pending in [false, true] {
+            for prompt_before_guard_release in [false, true] {
+                if let Err(error) = i294_r18_run_writer_handoff_case(
+                    outcome,
+                    had_pending,
+                    prompt_before_guard_release,
+                ) {
+                    failures.push(error);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "R18 真實 human writer 接管矩陣：\n{}", failures.join("\n"));
+}
+
+#[test]
+fn i294_r18_real_writer_reconnect_unblocks_consecutive_no_echo_commands() {
+    let (manager, factory) = i294_r17_dynamic_manager();
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let (old_rx, _, _, old_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 bridge snapshot");
+    let old_epoch = old_epoch.expect("舊 bridge active epoch");
+    let console = i294_r17_manager_console(&manager, &factory);
+    console.push_input(b"echo R18_REAL_HUMAN\n");
+    wait_until("真實 human writer TX 已寫入 WAL", || {
+        i294_r17_manager_human_tx_payloads(&manager)
+            .iter()
+            .any(|payload| payload == b"echo R18_REAL_HUMAN\n")
+    });
+    wait_until("真實 human writer report 收斂且 pending", || {
+        old_rx.human_in_flight_for_test() == 0 && old_rx.human_tx_state().pending_human
+    });
+
+    let (new_rx, new_device) =
+        i294_r17_switch_manager_to_prpl(&manager, "/dev/ttyNEW-R18-REAL-WRITER");
+    assert_ne!(old_epoch, new_rx.watermark().0, "正式 reconnect 建立新 RX epoch");
+    assert!(
+        !new_rx.human_tx_state().pending_human,
+        "新 epoch READY prompt 應結清真實 writer 登記的舊 human TX"
+    );
+    assert_eq!(
+        i294_r17_manager_human_tx_payloads(&manager),
+        [b"echo R18_REAL_HUMAN\n".to_vec()],
+        "接管不重送 human TX"
+    );
+
+    let tx_before_commands = i1_r16_manager_tx_payloads(&manager).len();
+    for index in 0..3 {
+        let command = format!("printf R18_NO_ECHO_{index}");
+        let cmd_id = i1_r16_submit_manager_command(
+            &manager,
+            &command,
+            I1R16TimeoutEntry::OperationDeadline,
+        );
+        i1_r16_wait_for_command_tx(&manager, &command);
+        let (checks_before, _) = new_rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &new_rx,
+            &new_device,
+            format!("R18_NO_ECHO_{index}\r\nroot@prpl:/# ").as_bytes(),
+            checks_before,
+        );
+        wait_until("reconnect 後 no-echo 命令完成", || {
+            manager
+                .reg
+                .get(&cmd_id)
+                .and_then(|record| record.get("status").and_then(PyValue::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("done")
+        });
+        let record = manager.reg.get(&cmd_id).expect("no-echo command record");
+        assert_eq!(record.get("status"), Some(&PyValue::from("done")), "{record:?}");
+        assert_eq!(
+            record.get("stdout"),
+            Some(&PyValue::from(format!("R18_NO_ECHO_{index}"))),
+            "{record:?}"
+        );
+        assert_eq!(record.get("partial"), Some(&PyValue::Bool(false)), "{record:?}");
+    }
+    let command_tx = i1_r16_manager_tx_payloads(&manager)
+        .into_iter()
+        .skip(tx_before_commands)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command_tx,
+        (0..3)
+            .map(|index| format!("printf R18_NO_ECHO_{index}\n").into_bytes())
+            .collect::<Vec<_>>(),
+        "連續 no-echo 命令只送原命令，沒有重送或救援 TX"
+    );
+}
+
+fn i294_r17_dynamic_manager() -> (ManagerRig, sw_pal::fakes::console::FakeConsoleFactory) {
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_detected
+        .insert(DEVICE_BY_ID.to_string(), "t".to_string());
+    let console = sw_pal::fakes::console::FakeConsoleFactory::new(sw_pal::ConsoleKind::TcpTelnet);
+    let manager = ManagerRig::with_console(
+        &manager_yaml(&[]),
+        loaded,
+        None,
+        Arc::new(console.clone()),
+    );
+    manager.devices(&[DEVICE_BY_ID]);
+    manager.mgr.prepare_dynamic_rank(&manager.device_keys());
+    let device = manager.device(&manager.real_of(DEVICE_BY_ID));
+    i294_r17_install_manager_ready_replies(&device, b"root@t:/# ");
+    manager.mgr.update_devices(&manager.snapshot());
+    manager.mgr.bootstrap_attach();
+    manager.wait_state("COM0", "READY");
+    (manager, console)
+}
+
+fn i294_r17_switch_manager_to_prpl(
+    manager: &ManagerRig,
+    new_real: &str,
+) -> (Arc<sw_core::uart_bridge::RxShared>, sw_pal::fakes::serial::FakeDevice) {
+    manager.mgr.update_devices(&[]);
+    manager.wait_state("COM0", "DETACHED");
+    let pin = manager.mgr.pin("COM0", "prpl-template").expect("profile pin");
+    assert_eq!(pin.get("ok"), Some(&PyValue::Bool(true)), "{pin:?}");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    manager
+        .mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            entered_tx.send(()).expect("profile bridge open 已暫停");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放 profile bridge open");
+        }));
+    manager.retarget_by_id_no_wait(DEVICE_BY_ID, new_real);
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("profile bridge open barrier");
+    let device = manager.device(new_real);
+    device.clear_replies();
+    i294_r17_install_manager_ready_replies(&device, b"root@prpl:/# ");
+    release_tx.send(()).expect("釋放 profile bridge open");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while manager.state_of("COM0").as_deref() != Some("READY") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        manager.state_of("COM0").as_deref(),
+        Some("READY"),
+        "profile attach 診斷：session={:?}, warnings={:?}, events={:?}, tx={:?}, wal={:?}",
+        manager.session("COM0"),
+        manager.warnings(),
+        manager.events(),
+        device.tx_since(0),
+        manager.wal_rows(),
+    );
+    let sid = manager.mgr.resolve("COM0").expect("rematerialized COM0");
+    assert!(sid.starts_with("prpl-template:"), "profile 已重新物化：{sid}");
+    let (rx, _, _, _) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("現行 profile RX snapshot");
+    (rx, device)
+}
+
+fn i294_r17_manager_console(
+    manager: &ManagerRig,
+    factory: &sw_pal::fakes::console::FakeConsoleFactory,
+) -> sw_pal::fakes::console::FakeConsoleRef {
+    let console = factory.connect();
+    wait_until("TCP human console 已接入", || {
+        manager
+            .session("COM0")
+            .get("console_count")
+            .and_then(PyValue::as_i64)
+            == Some(1)
+    });
+    console
+}
+
+#[test]
+fn i294_r17_profile_switch_new_prompt_settles_old_human() {
+    let (manager, factory) = i294_r17_dynamic_manager();
+    let sid = manager.mgr.resolve("COM0").expect("舊 profile session");
+    let (old_rx, _, _, _) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 profile RX snapshot");
+    let console = i294_r17_manager_console(&manager, &factory);
+    let human_tx_count = i294_r17_manager_human_tx_payloads(&manager).len();
+    console.push_input(b"echo R17_OLD_PROFILE_HUMAN\n");
+    wait_until("舊 profile human TX 記錄", || {
+        i294_r17_manager_human_tx_payloads(&manager)
+            .iter()
+            .any(|payload| payload == b"echo R17_OLD_PROFILE_HUMAN\n")
+    });
+    wait_until("舊 profile human writer 收斂且 pending", || {
+        old_rx.human_in_flight_for_test() == 0 && old_rx.human_tx_state().pending_human
+    });
+
+    let (new_rx, _) = i294_r17_switch_manager_to_prpl(&manager, "/dev/ttyNEW-R17-PROFILE-SETTLE");
+    assert_ne!(old_rx.watermark().0, new_rx.watermark().0, "profile 重接建立新 RX epoch");
+    assert!(
+        !new_rx.human_tx_state().pending_human,
+        "新 profile 的 READY 結尾 prompt 位於接管邊界之後，應結清舊 human"
+    );
+    let human_tx = i294_r17_manager_human_tx_payloads(&manager);
+    assert_eq!(human_tx.len(), human_tx_count + 1, "profile 接管不重送 human TX");
+    assert_eq!(
+        human_tx.last(),
+        Some(&b"echo R17_OLD_PROFILE_HUMAN\n".to_vec()),
+        "profile 接管只保留原始 human TX"
+    );
+    assert!(
+        !i1_r16_manager_tx_payloads(&manager)
+            .iter()
+            .any(|payload| payload.iter().any(|byte| matches!(*byte, 3 | 4))),
+        "profile 接管不得送出救援按鍵"
+    );
+}
+
+#[test]
+fn i294_r17_profile_switch_rejects_old_regex_prompt_for_both_timeouts() {
+    for timeout_entry in [
+        I1R16TimeoutEntry::Silence,
+        I1R16TimeoutEntry::OperationDeadline,
+    ] {
+        let (manager, factory) = i294_r17_dynamic_manager();
+        let (rx, device) = i294_r17_switch_manager_to_prpl(
+            &manager,
+            &format!("/dev/ttyNEW-R17-PROFILE-OLD-{timeout_entry:?}"),
+        );
+        let console = i294_r17_manager_console(&manager, &factory);
+        let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+        console.push_input(b"echo R17_NEW_PROFILE_HUMAN\n");
+        i1_r16_wait_for_command_tx(&manager, "echo R17_NEW_PROFILE_HUMAN");
+        wait_until("新 profile human pending", || {
+            rx.human_in_flight_for_test() == 0 && rx.human_tx_state().pending_human
+        });
+
+        let old_prompt = b"\r\nroot@t:/# ";
+        let before_old_prompt = rx.total_bytes();
+        device.push_rx(old_prompt);
+        assert!(rx.wait_for_reader_bytes_for_test(
+            before_old_prompt + old_prompt.len() as u64,
+            Duration::from_secs(5),
+        ));
+        assert!(
+            rx.human_tx_state().pending_human,
+            "舊 regex 命中但不是現行 profile prompt，不得結案"
+        );
+
+        let command = "printf R17_OLD_PROMPT";
+        let cmd_id = i1_r16_submit_manager_command(&manager, command, timeout_entry);
+        i1_r16_wait_for_command_tx(&manager, command);
+        let checks_before = rx.snapshot_wait_progress_for_test().0;
+        i1_r16_push_rx_and_wait(
+            &rx,
+            &device,
+            b"R17_HUMAN\r\nroot@prpl:/# ",
+            checks_before,
+        );
+        let record = manager.reg.get(&cmd_id).expect("command record");
+        assert_eq!(
+            record.get("status"),
+            Some(&PyValue::from("running")),
+            "舊 profile prompt 不得解除 human pending 並讓無 echo 命令提前結束：{record:?}"
+        );
+        timeout_entry.advance(&manager);
+        let record = i1_r16_finish_if_running(&manager, &rx, &cmd_id, timeout_entry);
+        i294_r17_assert_timeout_partial(&record);
+        assert_eq!(
+            i1_r16_manager_tx_payloads(&manager)
+                .into_iter()
+                .skip(tx_count)
+                .flatten()
+                .collect::<Vec<_>>(),
+            b"echo R17_NEW_PROFILE_HUMAN\nprintf R17_OLD_PROMPT\n",
+            "{timeout_entry:?}: 不增加救援 TX 或重送"
+        );
+    }
+}
+
+fn i294_r17_install_manager_ready_replies(
+    device: &sw_pal::fakes::serial::FakeDevice,
+    prompt: &[u8],
+) {
+    let prompt = prompt.to_vec();
+    let probe_prompt = prompt.clone();
+    device.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect::<String>();
+            if let Some(marker_nonce) = text
+                .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                .and_then(|(_, rest)| rest.split('\'').next())
+            {
+                let expected = format!(
+                    "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                );
+                if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                    let mut response = format!("__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\n")
+                        .into_bytes();
+                    response.extend_from_slice(&prompt);
+                    return response;
+                }
+            }
+            let mut response = format!("__READY__{token}\r\n").into_bytes();
+            response.extend_from_slice(&prompt);
+            response
+        }),
+    );
+    device.on_tx_reply(b"\n", &probe_prompt);
+}
+
+#[test]
+fn i294_r17_reconnect_waits_for_old_guard_then_unblocks_commands() {
+    let manager = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = manager.mgr.resolve("COM0").expect("COM0 session");
+    let (old_rx, _, _, old_epoch) = manager
+        .mgr
+        .actor_snapshot_for_test(&sid)
+        .expect("舊 bridge snapshot");
+    old_rx.record_human_tx_for_test(b"echo R17_OLD\n", &*manager.clock);
+    let in_flight = old_rx.begin_human_tx_effect();
+
+    let (open_paused_tx, open_paused_rx) = crossbeam_channel::bounded(1);
+    let (release_open_tx, release_open_rx) = crossbeam_channel::bounded(1);
+    manager
+        .mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            open_paused_tx.send(()).expect("新 bridge open 已暫停");
+            release_open_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("釋放新 bridge open");
+        }));
+    manager.retarget_by_id_no_wait(DEVICE_BY_ID, "/dev/ttyNEW-R17");
+    open_paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("新 bridge 開啟前 barrier");
+    let new_device = manager.device("/dev/ttyNEW-R17");
+    new_device.clear_replies();
+    release_open_tx.send(()).expect("釋放新 bridge open");
+
+    wait_until("R17 新 bridge open", || {
+        manager.events().iter().any(|event| event == "open:/dev/ttyNEW-R17")
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (new_rx, new_epoch) = loop {
+        if let Some((rx, _, _, epoch)) = manager.mgr.actor_snapshot_for_test(&sid) {
+            if !Arc::ptr_eq(&rx, &old_rx) && epoch != old_epoch {
+                break (rx, epoch);
+            }
+        }
+        assert!(Instant::now() < deadline, "新 RX epoch 接管逾時");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_ne!(old_epoch, new_epoch);
+    assert!(new_rx.human_tx_state().pending_human, "新 epoch prompt 前仍保留舊 pending");
+
+    i294_r17_install_manager_ready_replies(&new_device, b"root@t:/# ");
+    manager.wait_state("COM0", "READY");
+    assert!(
+        new_rx.human_tx_state().pending_human,
+        "舊 human guard 未回報前，新 epoch 的 READY prompt 不得解除 pending"
+    );
+    drop(in_flight); // 測試此舊 writer job 確認未寫出；之後可安全以新 epoch prompt 收斂。
+    wait_until("舊 human guard 收斂後 pending 清除", || {
+        !new_rx.human_tx_state().pending_human
+    });
+
+    let tx_count = i1_r16_manager_tx_payloads(&manager).len();
+    let mut expected_tx = Vec::new();
+    for index in 0..3 {
+        let command = format!("printf R17_RECONNECTED_{index}");
+        let cmd_id = i1_r16_submit_manager_command(
+            &manager,
+            &command,
+            I1R16TimeoutEntry::OperationDeadline,
+        );
+        i1_r16_wait_for_command_tx(&manager, &command);
+        let (checks_before, _) = new_rx.snapshot_wait_progress_for_test();
+        i1_r16_push_rx_and_wait(
+            &new_rx,
+            &new_device,
+            format!("R17_RECONNECTED_{index}\r\nroot@t:/# ").as_bytes(),
+            checks_before,
+        );
+        let record = i1_r16_finish_if_running(
+            &manager,
+            &new_rx,
+            &cmd_id,
+            I1R16TimeoutEntry::OperationDeadline,
+        );
+        assert_eq!(record.get("status"), Some(&PyValue::from("done")), "{record:?}");
+        assert_eq!(
+            record.get("stdout"),
+            Some(&PyValue::from(format!("R17_RECONNECTED_{index}"))),
+            "{record:?}"
+        );
+        assert_eq!(record.get("partial"), Some(&PyValue::Bool(false)), "{record:?}");
+        expected_tx.extend_from_slice(format!("{command}\n").as_bytes());
+    }
+    assert_eq!(
+        i1_r16_manager_tx_payloads(&manager)
+            .into_iter()
+            .skip(tx_count)
+            .flatten()
+            .collect::<Vec<_>>(),
+        expected_tx,
+        "重接同步後連續命令不增加救援或重送 TX"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum I294R19PendingShape {
+    PromptBeforeWriteReturn,
+    NonNewlineKey,
+    NoEchoHumanCommand,
+    TrimmedWindowAtBoundary,
+}
+
+fn i294_r19_prime_pending(
+    h: &ActorRig,
+    console: &sw_pal::fakes::console::FakeConsoleRef,
+    shape: I294R19PendingShape,
+) -> bool {
+    match shape {
+        I294R19PendingShape::PromptBeforeWriteReturn => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let rx = Arc::clone(&h.rx);
+            let dev = h.dev.clone();
+            let first_submit = Arc::new(AtomicBool::new(false));
+            let first_submit_hook = Arc::clone(&first_submit);
+            let (prompt_tx, prompt_rx) = crossbeam_channel::bounded(1);
+            h.dev.on_os_submit(Box::new(move || {
+                if first_submit_hook.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let prompt = b"root@t:/# ";
+                let expected = rx.total_bytes().saturating_add(prompt.len() as u64);
+                dev.push_rx(prompt);
+                assert!(rx.wait_for_reader_bytes_for_test(expected, Duration::from_secs(5)));
+                prompt_tx.send(()).expect("human write 返回前 prompt 已抵達");
+            }));
+            console.push_input(b"echo R19_PREWRITE\n");
+            prompt_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("human writer 的 OS write 返回前收到 prompt");
+            wait_tx(h, b"echo R19_PREWRITE\n");
+        }
+        I294R19PendingShape::NonNewlineKey => {
+            console.push_input(b"\x0c");
+            wait_tx(h, b"\x0c");
+        }
+        I294R19PendingShape::NoEchoHumanCommand => {
+            h.inject_rx_reader_processed(b"x");
+            console.push_input(b"true\n");
+            wait_tx(h, b"true\n");
+            h.wait_for("human writer report 收斂", |rig| {
+                rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+            });
+            // 無 echo、無換行：prompt 接在既有行尾，行首仍位於 human 邊界之前。
+            h.inject_rx_reader_processed(b"root@t:/# ");
+        }
+        I294R19PendingShape::TrimmedWindowAtBoundary => {
+            h.inject_rx_reader_processed(b"x");
+            console.push_input(b"true\n");
+            wait_tx(h, b"true\n");
+            h.wait_for("human writer report 收斂", |rig| {
+                rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+            });
+
+            let boundary = h.rx.human_tx_state().rx_offset;
+            const WINDOW_CHARS: usize = 131_072;
+            let prompt = b"root@t:/# ";
+            let mut redraw = vec![b'\x07'; WINDOW_CHARS - prompt.len()];
+            redraw.extend_from_slice(prompt);
+            let split = redraw.len() / 2;
+            h.inject_rx_reader_processed(&redraw[..split]);
+            h.inject_rx_reader_processed(&redraw[split..]);
+            let snapshot = h.rx.snapshot_from(0);
+            assert_eq!(snapshot.base, boundary, "修剪點應恰等於 human 邊界");
+            assert_eq!(snapshot.text.chars().count(), WINDOW_CHARS);
+        }
+    }
+    h.wait_for("human writer report 與 guard 收斂", |rig| {
+        rig.rx.human_in_flight_for_test() == 0
+    });
+    h.rx.human_tx_state().pending_human
+}
+
+fn i294_r19_assert_timeout_partial(record: &PyDict) -> bool {
+    record.get("status") == Some(&PyValue::from("error"))
+        && record.get("error_code") == Some(&PyValue::from("PROMPT_TIMEOUT"))
+        && record.get("partial") == Some(&PyValue::Bool(true))
+        && record.get("recovery_action") == Some(&PyValue::from("NONE"))
+}
+
+fn i294_r19_assert_no_echo_done(record: &PyDict) -> bool {
+    record.get("status") == Some(&PyValue::from("done"))
+        && record.get("error_code").is_none_or(PyValue::is_null)
+        && record.get("partial") == Some(&PyValue::Bool(false))
+        && record.get("stdout") == Some(&PyValue::from(""))
+}
+
+fn i294_r19_submit_human_writer_job(
+    h: &ActorRig,
+    op_id: u64,
+    payload: &[u8],
+) -> (
+    crossbeam_channel::Receiver<sw_core::tx_writer::TxReport>,
+    sw_core::uart_bridge::HumanInFlightGuard,
+) {
+    let tx = h.tx_handle();
+    let permit = i294_r10_human_line_permit(h, op_id);
+    let (reply, report_rx) = crossbeam_channel::bounded(1);
+    let job = sw_core::tx_writer::TxJob {
+        permit,
+        payload: payload.to_vec(),
+        reply,
+        aggregate: None,
+    };
+    let (_, guard) = h
+        .rx
+        .submit_human_job_for_test(&tx, job)
+        .expect("human job 已排入真實 TxWriter");
+    (report_rx, guard)
+}
+
+fn i294_r19_advance_prompt_timeout_if_still_running(
+    h: &ActorRig,
+    id: &str,
+    _timeout_entry: I294R17TimeoutEntry,
+) {
+    h.wait_for("prompt completion 已通過 stale recheck", |rig| {
+        rig.command_get(id).get("status") != Some(&PyValue::from("running"))
+    });
+}
+
+fn i294_r19_run_three_no_echo_commands(
+    h: &ActorRig,
+    timeout_entry: I294R17TimeoutEntry,
+    label: &str,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    let tx_count = h.wal_tx_payloads().len();
+    let first_id = i294_r17_submit_no_echo_actor(h, "true", timeout_entry);
+    timeout_entry.advance_actor(h);
+    let first = h.wait_done(&first_id);
+    if !i294_r19_assert_timeout_partial(&first) {
+        mismatches.push(format!(
+            "{label}/{timeout_entry:?}: 第一筆應走 human timeout partial，實際 {first:?}"
+        ));
+    }
+
+    for index in 1..=2 {
+        let command = format!("true # R19_{index}");
+        let id = i294_r17_submit_no_echo_actor(h, &command, timeout_entry);
+        i294_r17_push_actor_rx_and_wait(h, b"root@t:/# ");
+        // 舊程式若仍保留 pending，該 prompt 只會留作 timeout 的 partial 證據。
+        i294_r19_advance_prompt_timeout_if_still_running(h, &id, timeout_entry);
+        let record = h.wait_done(&id);
+        if !i294_r19_assert_no_echo_done(&record) {
+            mismatches.push(format!(
+                "{label}/{timeout_entry:?}: 第 {index} 筆應與基線相同地正常完成，實際 {record:?}"
+            ));
+        }
+    }
+
+    let expected_tx = b"true\ntrue # R19_1\ntrue # R19_2\n";
+    let actual_tx = wal_tx_bytes_since(h, tx_count);
+    if actual_tx != expected_tx {
+        mismatches.push(format!(
+            "{label}/{timeout_entry:?}: 必須只有三筆原始 agent TX，實際 {actual_tx:?}"
+        ));
+    }
+    let tx_count_after = h.wal_tx_payloads().len().saturating_sub(tx_count);
+    if tx_count_after != 3 {
+        mismatches.push(format!(
+            "{label}/{timeout_entry:?}: TX 記錄應為 3 筆、不得增加救援或重送，實際 {tx_count_after} 筆"
+        ));
+    }
+    mismatches
+}
+
+#[test]
+fn i294_r19_trimmed_window_head_never_counts_as_a_real_line_start() {
+    const WINDOW_CHARS: usize = 131_072;
+    let mut failures = Vec::new();
+
+    for (case, pre_boundary, trim_kind) in [
+        ("less", 65_536usize, 0usize),
+        ("equal", 1usize, 1usize),
+        ("greater", 1usize, 2usize),
+    ] {
+        let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+        let console = h.attach_pty_console(&format!("i294-r19-trim-{case}"));
+        if case == "less" {
+            h.inject_rx_reader_processed(b"\r\n");
+            h.inject_rx_reader_processed(&vec![b'\x07'; pre_boundary]);
+        } else {
+            // 視窗原先有一個尚未換行的 x；boundary 前一行首不在 human TX 之後。
+            h.inject_rx_reader_processed(b"x");
+        }
+        console.push_input(b"true\n");
+        wait_tx(&h, b"true\n");
+        h.wait_for("human writer report 收斂", |rig| {
+            rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+        });
+        let boundary = h.rx.human_tx_state().rx_offset;
+        let target_trim = match trim_kind {
+            0 => 1usize,
+            1 => boundary as usize,
+            _ => boundary as usize + 1,
+        };
+        let post_len = WINDOW_CHARS + target_trim - boundary as usize;
+        let prompt = b"root@t:/# ";
+        let mut post_boundary = vec![b'\x07'; post_len.saturating_sub(prompt.len())];
+        post_boundary.extend_from_slice(prompt);
+        let split = post_boundary.len() / 2;
+        h.inject_rx_reader_processed(&post_boundary[..split]);
+        h.inject_rx_reader_processed(&post_boundary[split..]);
+
+        let snapshot = h.rx.snapshot_from(0);
+        let expected_trim = target_trim as u64;
+        if snapshot.base != expected_trim {
+            failures.push(format!(
+                "{case}: 修剪點預期 {expected_trim}，實際 {}（boundary={boundary}）",
+                snapshot.base
+            ));
+        }
+        if !h.rx.human_tx_state().pending_human {
+            failures.push(format!(
+                "{case}: trimmed={} 與 boundary={} 時不得把已修剪的視窗開頭當作真實行首",
+                snapshot.base, boundary
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "R19-01 修剪行首反例：\n{}", failures.join("\n"));
+}
+
+#[test]
+fn i294_r19_stale_pending_timeout_consumes_after_one_partial() {
+    let mut mismatches = Vec::new();
+    for shape in [
+        I294R19PendingShape::PromptBeforeWriteReturn,
+        I294R19PendingShape::NonNewlineKey,
+        I294R19PendingShape::NoEchoHumanCommand,
+        I294R19PendingShape::TrimmedWindowAtBoundary,
+    ] {
+        for timeout_entry in [
+            I294R17TimeoutEntry::Silence,
+            I294R17TimeoutEntry::OperationDeadline,
+        ] {
+            let label = format!("{shape:?}");
+            let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+            h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+            let console = h.attach_pty_console(&format!("i294-r19-{label}-{timeout_entry:?}"));
+            let pending_before = i294_r19_prime_pending(&h, &console, shape);
+            if !pending_before {
+                mismatches.push(format!("{label}/{timeout_entry:?}: 準備後 pending 已被錯誤結案"));
+            }
+            mismatches.extend(i294_r19_run_three_no_echo_commands(&h, timeout_entry, &label));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "R19-02 有界收斂（四種來源、兩個 timeout 入口）：\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn i294_r19_pending_timeout_keeps_new_human_submit_until_next_timeout() {
+    let mut failures = Vec::new();
+    for timeout_entry in [
+        I294R17TimeoutEntry::Silence,
+        I294R17TimeoutEntry::OperationDeadline,
+    ] {
+        let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let console = h.attach_pty_console(&format!("i294-r19-new-submit-{timeout_entry:?}"));
+        console.push_input(b"\x0c");
+        wait_tx(&h, b"\x0c");
+        h.wait_for("初始 human guard 收斂", |rig| {
+            rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+        });
+        let tx_count = h.wal_tx_payloads().len();
+
+        let first_id = i294_r17_submit_no_echo_actor(&h, "true", timeout_entry);
+        let start_count = h.rx.human_submit_start_count_for_test();
+        let (human_report_rx, human_guard) =
+            i294_r19_submit_human_writer_job(&h, 9_294_190, b"echo R19_NEW_HUMAN\n");
+        human_report_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一筆命令期間 human writer 完成");
+        drop(human_guard);
+        h.wait_for("新 human submit 完成", |rig| {
+            rig.rx.human_in_flight_for_test() == 0
+                && rig.rx.human_submit_start_count_for_test() > start_count
+        });
+        timeout_entry.advance_actor(&h);
+        let first = h.wait_done(&first_id);
+        if !i294_r19_assert_timeout_partial(&first) || !h.rx.human_tx_state().pending_human {
+            failures.push(format!(
+                "{timeout_entry:?}: 第一筆 timeout 前的新 human submit 必須保留 pending，record={first:?}"
+            ));
+        }
+
+        let second_id = i294_r17_submit_no_echo_actor(&h, "true # R19_SECOND", timeout_entry);
+        timeout_entry.advance_actor(&h);
+        let second = h.wait_done(&second_id);
+        if !i294_r19_assert_timeout_partial(&second) || h.rx.human_tx_state().pending_human {
+            failures.push(format!(
+                "{timeout_entry:?}: 第二筆仍走 human partial，並在無新 human 動作後 timeout 消耗 pending，record={second:?}"
+            ));
+        }
+        let third_id = i294_r17_submit_no_echo_actor(&h, "true # R19_THIRD", timeout_entry);
+        i294_r17_push_actor_rx_and_wait(&h, b"root@t:/# ");
+        h.wait_for("第三筆 prompt 完成線性化", |rig| {
+            rig.command_get(&third_id).get("status") != Some(&PyValue::from("running"))
+        });
+        let third = h.wait_done(&third_id);
+        if !i294_r19_assert_no_echo_done(&third) {
+            failures.push(format!("{timeout_entry:?}: 第三筆應正常完成，record={third:?}"));
+        }
+        let expected_tx = b"true\necho R19_NEW_HUMAN\ntrue # R19_SECOND\ntrue # R19_THIRD\n";
+        let actual_tx = wal_tx_bytes_since(&h, tx_count);
+        if actual_tx != expected_tx {
+            failures.push(format!("{timeout_entry:?}: 有額外救援／重送 TX：{actual_tx:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "R19-02 新 human submit 反向情境：\n{}", failures.join("\n"));
+}
+
+#[test]
+fn i294_r19_pending_timeout_keeps_inflight_human_writer() {
+    let mut failures = Vec::new();
+    for timeout_entry in [
+        I294R17TimeoutEntry::Silence,
+        I294R17TimeoutEntry::OperationDeadline,
+    ] {
+        let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+        let console = h.attach_pty_console(&format!("i294-r19-inflight-{timeout_entry:?}"));
+        console.push_input(b"\x0c");
+        wait_tx(&h, b"\x0c");
+        h.wait_for("初始 human guard 收斂", |rig| {
+            rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+        });
+        let tx_count = h.wal_tx_payloads().len();
+        let first_id = i294_r17_submit_no_echo_actor(&h, "true", timeout_entry);
+
+        let starts_before = h.rx.human_submit_start_count_for_test();
+        let tx = h.tx_handle();
+        let permit = i294_r10_human_line_permit(&h, 9_294_191);
+        let (capacity_wait_tx, capacity_wait_rx) = crossbeam_channel::bounded(1);
+        tx.set_capacity_wait_hook_for_test(Some(Arc::new(move || {
+            let _ = capacity_wait_tx.send(());
+        })));
+        h.dev.script_write(vec![FakeWriteStep::BlockForever]);
+        let blocker = i294_r15_enqueue_writer_job(&h, 9_294_500, b"BLOCK");
+        h.dev.wait_blocked();
+        let _release_on_drop = I294R15ReleaseWriterOnDrop(h.dev.clone());
+        i294_r15_fill_writer_queue(&h, 9_294_600);
+        let submit_rx = Arc::clone(&h.rx);
+        let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+        let human_submit = std::thread::spawn(move || {
+            let (reply, report_rx) = crossbeam_channel::bounded(1);
+            let job = sw_core::tx_writer::TxJob {
+                permit,
+                payload: b"echo R19_BLOCKED\n".to_vec(),
+                reply,
+                aggregate: None,
+            };
+            let (_, guard) = submit_rx
+                .submit_human_job_for_test(&tx, job)
+                .expect("human job writer queue 恢復後入列");
+            let _ = submitted_tx.send((report_rx, guard));
+        });
+        capacity_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human writer 在 queue barrier 等待容量");
+        assert_eq!(h.rx.human_in_flight_for_test(), 1, "writer barrier 期間 guard 仍在途");
+        assert_eq!(
+            h.rx.human_submit_start_count_for_test(),
+            starts_before,
+            "尚未入 writer queue 時沒有新 submit 起點"
+        );
+
+        timeout_entry.advance_actor(&h);
+        let first = h.wait_done(&first_id);
+        if !i294_r19_assert_timeout_partial(&first) || !h.rx.human_tx_state().pending_human {
+            failures.push(format!(
+                "{timeout_entry:?}: 在途 human writer 期間不得 timeout 消耗 pending，record={first:?}"
+            ));
+        }
+        h.dev.release_block();
+        blocker
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer blocker 已收斂");
+        let (human_report_rx, human_guard) = submitted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human writer queue 已恢復並入列");
+        human_report_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("human writer barrier 後完成");
+        human_submit.join().expect("human submit worker 正常結束");
+        drop(human_guard);
+        wait_tx(&h, b"echo R19_BLOCKED\n");
+        h.wait_for("human writer report 收斂", |rig| {
+            rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+        });
+
+        let second_id = i294_r17_submit_no_echo_actor(&h, "true # R19_SECOND", timeout_entry);
+        timeout_entry.advance_actor(&h);
+        let second = h.wait_done(&second_id);
+        if !i294_r19_assert_timeout_partial(&second) || h.rx.human_tx_state().pending_human {
+            failures.push(format!("{timeout_entry:?}: writer 收斂後下一個 timeout 應消耗 pending，record={second:?}"));
+        }
+        let third_id = i294_r17_submit_no_echo_actor(&h, "true # R19_THIRD", timeout_entry);
+        i294_r17_push_actor_rx_and_wait(&h, b"root@t:/# ");
+        i294_r19_advance_prompt_timeout_if_still_running(&h, &third_id, timeout_entry);
+        let third = h.wait_done(&third_id);
+        if !i294_r19_assert_no_echo_done(&third) {
+            failures.push(format!("{timeout_entry:?}: 第三筆應正常完成，record={third:?}"));
+        }
+        let expected_tx = b"true\necho R19_BLOCKED\ntrue # R19_SECOND\ntrue # R19_THIRD\n";
+        let actual_tx = wal_tx_bytes_since(&h, tx_count);
+        if actual_tx != expected_tx {
+            failures.push(format!("{timeout_entry:?}: 有額外救援／重送 TX：{actual_tx:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "R19-02 在途 writer 反向情境：\n{}", failures.join("\n"));
+}
+
+#[test]
+fn i294_r19_timeout_submit_interleavings_preserve_pending() {
+    let mut failures = Vec::new();
+    for timeout_entry in [
+        I294R17TimeoutEntry::Silence,
+        I294R17TimeoutEntry::OperationDeadline,
+    ] {
+        for submit_before_decision in [true, false] {
+            let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+            h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+            let label = if submit_before_decision { "before" } else { "after" };
+            let console = h.attach_pty_console(&format!("i294-r19-interleave-{label}-{timeout_entry:?}"));
+            console.push_input(b"\x0c");
+            wait_tx(&h, b"\x0c");
+            h.wait_for("初始 human guard 收斂", |rig| {
+                rig.rx.human_in_flight_for_test() == 0 && rig.rx.human_tx_state().pending_human
+            });
+            let tx_count = h.wal_tx_payloads().len();
+            let first_id = i294_r17_submit_no_echo_actor(&h, "true", timeout_entry);
+            let (decision_seen_tx, decision_seen_rx) = crossbeam_channel::bounded(1);
+            let (release_decision_tx, release_decision_rx) = crossbeam_channel::bounded(1);
+            let hook = Arc::new(move || {
+                let _ = decision_seen_tx.send(());
+                let _ = release_decision_rx.recv_timeout(Duration::from_secs(30));
+            });
+            if submit_before_decision {
+                h.rx.set_timeout_rescue_attempt_hook_for_test(Some(hook));
+            } else {
+                h.rx.set_human_timeout_decision_hook_for_test(Some(hook));
+            }
+            timeout_entry.advance_actor(&h);
+            decision_seen_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("timeout 決定抵達受控線性化交錯點");
+
+            if !submit_before_decision && h.rx.human_tx_state().pending_human {
+                failures.push(format!(
+                    "{timeout_entry:?}/{label}: timeout 決定臨界區應先消耗穩定的舊 pending"
+                ));
+            }
+            if !submit_before_decision
+                && h.rx.last_human_state_event_kind_for_test()
+                    != Some(sw_core::uart_bridge::HumanStateEventKind::TimeoutConsumed)
+            {
+                failures.push(format!(
+                    "{timeout_entry:?}/{label}: timeout 消耗必須記為獨立 human state event"
+                ));
+            }
+            let starts_before = h.rx.human_submit_start_count_for_test();
+            let rx = Arc::clone(&h.rx);
+            let tx = h.tx_handle();
+            let permit = i294_r10_human_line_permit(&h, 9_294_192);
+            let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+            let human_submit = std::thread::spawn(move || {
+                let (reply, report_rx) = crossbeam_channel::bounded(1);
+                let job = sw_core::tx_writer::TxJob {
+                    permit,
+                    payload: b"echo R19_RACE\n".to_vec(),
+                    reply,
+                    aggregate: None,
+                };
+                let result = rx
+                    .submit_human_job_for_test(&tx, job)
+                    .expect("timeout 交錯 human job 入列");
+                let _ = submitted_tx.send((report_rx, result.1));
+            });
+            let mut queued_before_release = if submit_before_decision {
+                None
+            } else {
+                match submitted_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(submitted) => Some(submitted),
+                    Err(_) => {
+                        failures.push(format!(
+                            "{timeout_entry:?}/{label}: 決策後的新 human submit 應可在 timeout hook 釋放前入列"
+                        ));
+                        None
+                    }
+                }
+            };
+            if submit_before_decision {
+                let (human_report_rx, human_guard) = submitted_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("決策前交錯 human writer 入列");
+                human_report_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("決策前交錯 human writer 完成");
+                drop(human_guard);
+            }
+            release_decision_tx.send(()).expect("釋放 timeout 決定");
+            if !submit_before_decision {
+                let (human_report_rx, human_guard) = match queued_before_release.take() {
+                    Some(submitted) => submitted,
+                    None => submitted_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("決策後 timeout hook 釋放後 human writer 入列"),
+                };
+                human_report_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("timeout 交錯 human writer 完成");
+                drop(human_guard);
+            }
+            human_submit.join().expect("timeout 交錯 human submit worker 正常結束");
+            h.wait_for("交錯 human writer report 收斂", |rig| {
+                rig.rx.human_in_flight_for_test() == 0
+                    && rig.rx.human_submit_start_count_for_test() > starts_before
+                    && rig.rx.human_tx_state().pending_human
+            });
+            let first = h.wait_done(&first_id);
+            if !i294_r19_assert_timeout_partial(&first) || !h.rx.human_tx_state().pending_human {
+                failures.push(format!(
+                    "{timeout_entry:?}/{label}: 交錯 submit 不得遺失，第一筆= {first:?}"
+                ));
+            }
+
+            let second_id = i294_r17_submit_no_echo_actor(&h, "true # R19_SECOND", timeout_entry);
+            timeout_entry.advance_actor(&h);
+            let second = h.wait_done(&second_id);
+            if !i294_r19_assert_timeout_partial(&second) || h.rx.human_tx_state().pending_human {
+                failures.push(format!("{timeout_entry:?}/{label}: 第二筆應消耗穩定 pending，record={second:?}"));
+            }
+            let third_id = i294_r17_submit_no_echo_actor(&h, "true # R19_THIRD", timeout_entry);
+            i294_r17_push_actor_rx_and_wait(&h, b"root@t:/# ");
+            i294_r19_advance_prompt_timeout_if_still_running(&h, &third_id, timeout_entry);
+            let third = h.wait_done(&third_id);
+            if !i294_r19_assert_no_echo_done(&third) {
+                failures.push(format!("{timeout_entry:?}/{label}: 第三筆應正常完成，record={third:?}"));
+            }
+            let expected_tx = b"true\necho R19_RACE\ntrue # R19_SECOND\ntrue # R19_THIRD\n";
+            let actual_tx = wal_tx_bytes_since(&h, tx_count);
+            if actual_tx != expected_tx {
+                failures.push(format!("{timeout_entry:?}/{label}: 有額外救援／重送 TX：{actual_tx:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "R19-02 submit／timeout 決定交錯：\n{}",
+        failures.join("\n")
     );
 }
 
