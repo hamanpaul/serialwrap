@@ -19,6 +19,14 @@ jobs:
           # 架構證據綁定歷史 revision，測試需讀取原始 Git blob。
           fetch-depth: 0
           persist-credentials: false
+      - name: Stage 3 證據索引逐提交只增檢查（R9-01／R10-01）
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 -m tools.stage3.evidence_index --repo .
+          --check-pr-history "$BASE_REF" "$HEAD_REF"
       - uses: actions/setup-python@v5
         with:
           # 釘 CPython 3.12.3：Stage 1A argparse 相容層的方言基準（arch §7.2、plan §0.7）。
