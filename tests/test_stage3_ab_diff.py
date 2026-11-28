@@ -1692,6 +1692,126 @@ def test_call_count_difference_has_one_entry_per_missing_call(tmp_path: Path):
                for item in count_differences)
 
 
+def test_difference_verification_tracks_run_identity_and_observation_hash(tmp_path: Path):
+    case_id = "verified-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [_call(["daemon", "status"], {"ok": True, "state": "baseline"})]
+    calls_b = [_call(["daemon", "status"], {"ok": True, "state": "candidate"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", calls=calls_b)
+
+    verified = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in verified["differences"] if item["kind"] == "value")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"] and difference["source_refs"]["b"]
+
+    manifest_path = b_dir / case_id / "bridge" / "1" / "manifest.json"
+    manifest = fakes.read_json(manifest_path)
+    manifest["evidence"]["cli_log"]["sha256"] = "0" * 64
+    fakes.write_json(manifest_path, manifest)
+
+    unverified = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in unverified["differences"] if item["kind"] == "value")
+    assert difference["verified"] is False
+    assert unverified["integrity"]["b"] is False
+
+
+def test_call_count_difference_verifies_only_present_observation_source(tmp_path: Path):
+    case_id = "verified-call-count-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [
+        _call(["session", "list"], {"ok": True}),
+        _call(["daemon", "status"], {"ok": True, "state": "extra"}),
+    ]
+    calls_b = [_call(["session", "list"], {"ok": True})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", calls=calls_b)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "call_count")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"]
+    assert difference["source_refs"]["b"] is None
+
+
+def test_independent_cli_difference_stays_verified_with_unverified_invariant(tmp_path: Path):
+    case_id = "independent-difference-unverified-invariant"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls_a = [_call(["daemon", "status"], {"ok": True, "state": "baseline"})]
+    calls_b = [_call(["daemon", "status"], {"ok": True, "state": "candidate"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls_a)
+    fakes.write_run(
+        b_dir,
+        case_id,
+        side="b",
+        calls=calls_b,
+        invariants=[{"id": None, "result": "FAIL"}],
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "value")
+    assert difference["verified"] is True
+    assert result["unverified_failures"]
+    assert result["integrity"]["b"] is False
+
+
+def test_bridge_comparison_verdict_difference_uses_comparison_identity(tmp_path: Path):
+    case_id = "comparison-verdict-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls, verdict="FAIL")
+    fakes.write_run(b_dir, case_id, side="b", calls=calls, verdict="PASS")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["a"].endswith("comparison.json")
+    assert difference["source_refs"]["b"].endswith("comparison.json")
+
+
+def test_comparison_identity_mismatch_unverifies_verdict_difference(tmp_path: Path):
+    case_id = "comparison-verdict-identity-mismatch"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", calls=calls, verdict="PASS")
+    b_run = fakes.write_run(b_dir, case_id, side="b", calls=calls, verdict="FAIL")
+    comparison = fakes.read_json(b_run / "comparison.json")
+    comparison["case_id"] = "different-case"
+    fakes.write_json(b_run / "comparison.json", comparison)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is False
+
+
+def test_nonbridge_verdict_difference_uses_verified_l1_result_row(tmp_path: Path):
+    case_id = "nonbridge-verdict-difference"
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    calls = [_call(["daemon", "status"], {"ok": True, "state": "same"})]
+    fakes.write_run(a_dir, case_id, side="a", runner="contract-blackbox", calls=calls)
+    fakes.write_run(
+        b_dir, case_id, side="b", runner="contract-blackbox", calls=calls, verdict="FAIL"
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(item for item in result["differences"] if item["kind"] == "verdict")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["b"].endswith("source/l1-results.json#results[0]")
+
+
 @pytest.mark.parametrize("flag", ["--endpoint", "--socket", "--bench"])
 def test_logical_argv_ignores_cli_path_and_instance_endpoint(tmp_path: Path, flag: str):
     case_id = f"argv-instance-only-{flag[2:]}"
@@ -1990,3 +2110,196 @@ def test_case_change_missing_from_registered_breaks_integrity(tmp_path: Path):
                           case_changes={case_id: "BC-99"})
     assert registered_ok["integrity"] == {"a": True, "b": True}
     assert registered_ok["ok"] is True
+
+
+def _r3_update_observation(run_dir: Path, index: int, **updates):
+    envelope_path = run_dir / "runner-observation.json"
+    envelope = fakes.read_json(envelope_path)
+    envelope["cli_observations"][index].update(updates)
+    fakes.write_json(envelope_path, envelope)
+
+
+def _r3_run_pair(tmp_path: Path, *, runner: str, calls_a, calls_b):
+    case_id = f"r3-raw-{runner}"
+    a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+    fakes.write_run(a_dir, case_id, side="a", runner=runner, calls=calls_a)
+    fakes.write_run(b_dir, case_id, side="b", runner=runner, calls=calls_b)
+    return case_id, a_dir, b_dir
+
+
+def test_r3_nonbridge_raw_difference_survives_matching_summary(tmp_path: Path):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner="contract-blackbox",
+        calls_a=[_call(["daemon", "status"], {"state": "same"})],
+        calls_b=[_call(["daemon", "status"], {"state": "different"})],
+    )
+    b_run = b_dir / case_id / "contract-blackbox" / "1"
+    a_raw = json.loads((a_dir / case_id / "contract-blackbox" / "1" / "source/cli-observations.ndjson").read_bytes().splitlines()[0])
+    _r3_update_observation(b_run, 0, stdout=a_raw["stdout"])
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(row for row in result["differences"] if row["kind"] == "value")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["b"].endswith("source/cli-observations.ndjson#L1")
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "source observation mismatch")
+
+
+def test_r3_nonbridge_raw_equality_ignores_different_summary(tmp_path: Path):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner="contract-blackbox",
+        calls_a=[_call(["daemon", "status"], {"state": "same"})],
+        calls_b=[_call(["daemon", "status"], {"state": "same"})],
+    )
+    b_run = b_dir / case_id / "contract-blackbox" / "1"
+    _r3_update_observation(
+        b_run, 0,
+        stdout=json.dumps({"state": "summary-only"}, separators=(",", ":")),
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "source observation mismatch")
+
+
+@pytest.mark.parametrize("field", ["argv", "rc", "stdout"])
+def test_r3_nonbridge_each_summary_field_is_diagnostic_only(tmp_path: Path, field: str):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner="contract-blackbox",
+        calls_a=[_call(["daemon", "status"], {"state": "same"})],
+        calls_b=[_call(["daemon", "status"], {"state": "same"})],
+    )
+    b_run = b_dir / case_id / "contract-blackbox" / "1"
+    mismatch = {
+        "argv": ["session", "list"],
+        "rc": 17,
+        "stdout": json.dumps({"state": "summary-only"}, separators=(",", ":")),
+    }[field]
+    _r3_update_observation(b_run, 0, **{field: mismatch})
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    assert result["differences"] == []
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", f"cli_observations[0].{field}")
+
+
+def test_r3_nonbridge_summary_row_index_does_not_select_comparison_data(tmp_path: Path):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner="contract-blackbox",
+        calls_a=[_call(["daemon", "status"], {"state": "same"}), _call(["session", "list"], {"ok": True})],
+        calls_b=[_call(["daemon", "status"], {"state": "different"}), _call(["session", "list"], {"ok": True})],
+    )
+    b_run = b_dir / case_id / "contract-blackbox" / "1"
+    envelope_path = b_run / "runner-observation.json"
+    envelope = fakes.read_json(envelope_path)
+    envelope["cli_observations"][0]["source_ref"] = (
+        f"{case_id}/contract-blackbox/1/source/cli-observations.ndjson#L2"
+    )
+    fakes.write_json(envelope_path, envelope)
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(row for row in result["differences"] if row["kind"] == "value")
+    assert difference["verified"] is True
+    assert difference["source_refs"]["b"].endswith("source/cli-observations.ndjson#L1")
+    assert result["integrity"]["b"] is False
+    assert _has_problem(result, "b", "source observation index mismatch")
+
+
+@pytest.mark.parametrize("runner", ["bridge", "contract-blackbox"])
+@pytest.mark.parametrize("damage", ["truncated", "missing", "bad-line", "hash"])
+@pytest.mark.parametrize("damage_side", ["a", "b"])
+def test_r3_call_count_requires_both_complete_cli_sources(
+    tmp_path: Path, runner: str, damage: str, damage_side: str,
+):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner=runner,
+        calls_a=[_call(["daemon", "status"], {"state": "same"})],
+        calls_b=[
+            _call(["daemon", "status"], {"state": "same"}),
+            _call(["session", "list"], {"ok": True}),
+        ],
+    )
+    damaged_report = a_dir if damage_side == "a" else b_dir
+    damaged_run = damaged_report / case_id / runner / "1"
+    relative = "cli.ndjson" if runner == "bridge" else "source/cli-observations.ndjson"
+    cli_path = damaged_run / relative
+    raw = cli_path.read_bytes()
+    if damage == "truncated":
+        cli_path.write_bytes(raw[:-1])
+    elif damage == "missing":
+        cli_path.unlink()
+    elif damage == "bad-line":
+        rows = raw.splitlines(keepends=True)
+        cli_path.write_bytes(b"{bad-json}\n" + b"".join(rows[1:]))
+    else:
+        cli_path.write_bytes(raw[:-1] + b" \n")
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    call_count = [row for row in result["differences"] if row["kind"] == "call_count"]
+    assert call_count
+    assert all(row["verified"] is False for row in call_count)
+    assert result["integrity"][damage_side] is False
+
+
+@pytest.mark.parametrize("runner", ["bridge", "contract-blackbox"])
+def test_r3_call_count_is_verified_when_both_raw_sets_are_complete(tmp_path: Path, runner: str):
+    case_id, a_dir, b_dir = _r3_run_pair(
+        tmp_path,
+        runner=runner,
+        calls_a=[_call(["daemon", "status"], {"state": "same"})],
+        calls_b=[
+            _call(["daemon", "status"], {"state": "same"}),
+            _call(["session", "list"], {"ok": True}),
+        ],
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    call_count = next(row for row in result["differences"] if row["kind"] == "call_count")
+    assert call_count["verified"] is True
+
+
+@pytest.mark.parametrize("runner", ["bridge", "contract-blackbox"])
+@pytest.mark.parametrize("kind", ["value", "rc", "argv", "call_count"])
+def test_r3_cli_artifact_sha_mismatch_unverifies_cli_differences(
+    tmp_path: Path, runner: str, kind: str,
+):
+    case_id = f"r3-cli-sha-mismatch-{runner}-{kind}"
+    a_dir, b_dir = tmp_path / "a", tmp_path / "b"
+    base = _call(["daemon", "status"], {"state": "same"})
+    calls_a = [base]
+    calls_b = [base]
+    if kind == "value":
+        calls_b = [_call(["daemon", "status"], {"state": "different"})]
+    elif kind == "rc":
+        calls_b = [_call(["daemon", "status"], {"state": "same"}, rc=1)]
+    elif kind == "argv":
+        calls_b = [_call(["session", "list"], {"state": "same"})]
+    else:
+        calls_b = [base, _call(["session", "list"], {"ok": True})]
+    fakes.write_run(
+        a_dir, case_id, side="a", runner=runner,
+        calls=calls_a,
+    )
+    fakes.write_run(
+        b_dir, case_id, side="b", runner=runner,
+        calls=calls_b,
+        artifact_overrides={"cli": {"sha256": "f" * 64}},
+    )
+
+    result = _diff(a_dir, b_dir, {case_id})
+
+    difference = next(row for row in result["differences"] if row["kind"] == kind)
+    assert difference["verified"] is False
+    assert result["integrity"]["b"] is False

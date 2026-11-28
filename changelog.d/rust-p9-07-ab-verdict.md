@@ -1,0 +1,6 @@
+---
+type: fix
+scope: stage3
+---
+第 3 輪修正：`absolute_only` 差異一律不建立產品 FAIL；僅沿用 T7B 已核實的 B 側 FAIL 記錄，狀態不足、未知或缺案則記完整性問題並進入 comparator INFRA。歷史 gate 的產品 FAIL 僅取已驗證 candidate 的 engine FAIL 或非 evidence、非 safety 的明確 check FAIL；evidence check 非 PASS 會記具體側別完整性原因，頂層彙總 FAIL 本身不作產品失敗來源。`combine` 先處理產品／安全 FAIL、suite INFRA 與 integrity，再判定完整 gate 的 BLOCKED／證據不足分支。
+修正 A/B 判定的失敗優先與來源驗證：L1.5 依差異實際引用的來源逐筆核實 `verified`；CLI 差異核對原始觀測 hash，bridge verdict 核對 comparison／manifest 身分與 artifact 身分，非 bridge verdict 核對已映射的原始 L1 結果列。同 case 的其他未核實線索不會遮蔽獨立有效差異。已核實且未豁免的差異保留為產品 FAIL，公開 `collect_product_failures` 供報告消費端取得結構化失敗與正確側別來源；未核實差異仍保留 INFRA 診斷。A FAIL／B PASS 的 verdict 差異依基線規則回報 `BASELINE_INVALID`。L2 與非長跑 L3 在已成立的產品／安全 FAIL 後檢查 suite `INFRA_ERROR`，一般 suite `FAIL` 不推導逐案結果。XFAIL 僅在兩側都有有效且可比較結果時因差異列入 needs_review。L2 的 TestPilot 結果沒有逐案安全欄位，因此安全違規保持空清單，不從 `cases.yaml` 的 `invariants` 覆蓋項推論；歷史 L3 只採用 P2 gate `checks` 中明確的 `group: safety`、`result: FAIL`，並保留兩側來源。歷史 gate 依 P2 `release-gate.v1` 檢查必要欄位及每筆 check 的 `group`、`id`、`result` 列舉，核對 `release_gate_result` 是否符合 P2 對 checks 的彙總；evidence check 僅接受 PASS，另接受 baseline 模式 P2 定義的不適用值。先驗證 A `baseline`／B `candidate` mode，再收集對應側的失敗。L2 產品失敗 `source_ref` 指向相對側 `report_dir` 的 TestPilot／realhw `report.json#/results/<index>`，額外 evidence 引用另列於 `evidence_refs`。L3 一般逐案比較仍走 required case 與 sentinel 規則，不讀取長跑 gate；`case_changes` 展開所有 scope（包括 rust_only）。

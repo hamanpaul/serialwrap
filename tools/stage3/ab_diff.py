@@ -88,6 +88,7 @@ class _Call:
     response: Any = None
     response_valid: bool = False
     source_ref: str = ""
+    source_verified: bool = False
 
 
 @dataclass
@@ -109,6 +110,12 @@ class _Run:
     identity_verified: bool = False
     case_identity_verified: bool = False
     verified_sources: set[str] = field(default_factory=set)
+    declared_sources: set[str] = field(default_factory=set)
+    invalid_ndjson_sources: set[str] = field(default_factory=set)
+    invalid_ndjson_lines: dict[str, set[int]] = field(default_factory=dict)
+    verified_cli_lines: set[str] = field(default_factory=set)
+    cli_collection_verified: bool = False
+    verified_l1_result_indices: set[int] = field(default_factory=set)
     failure_ref: str = ""
     failure_reason: str = ""
     failure_verified: bool = False
@@ -279,26 +286,44 @@ def _bridge_artifacts(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 def _read_ndjson(path: Path, run: _Run, relative: str) -> list[tuple[int, dict[str, Any]]]:
     if not path.is_file():
+        run.invalid_ndjson_sources.add(relative)
         return []
     try:
         raw = _read_bytes(path)
     except OSError:
         _add_problem(run.problems, f"unreadable source file: {relative}")
+        run.invalid_ndjson_sources.add(relative)
         return []
     rows: list[tuple[int, dict[str, Any]]] = []
-    for line_number, raw_line in enumerate(raw.split(b"\n"), start=1):
+    raw_lines = raw.split(b"\n")
+    for line_number, raw_line in enumerate(raw_lines, start=1):
         if not raw_line.strip():
+            if line_number != len(raw_lines) or not raw.endswith(b"\n"):
+                _add_problem(run.problems, f"empty NDJSON row: {relative}#L{line_number}")
+                run.invalid_ndjson_sources.add(relative)
+                run.invalid_ndjson_lines.setdefault(relative, set()).add(line_number)
             continue
         try:
             value = json.loads(raw_line.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError, RecursionError):
             _add_problem(run.problems, f"invalid JSON: {relative}#L{line_number}")
+            run.invalid_ndjson_sources.add(relative)
+            run.invalid_ndjson_lines.setdefault(relative, set()).add(line_number)
             continue
         if not isinstance(value, dict):
             _add_problem(run.problems, f"invalid JSON object: {relative}#L{line_number}")
+            run.invalid_ndjson_sources.add(relative)
+            run.invalid_ndjson_lines.setdefault(relative, set()).add(line_number)
             continue
         rows.append((line_number, value))
     return rows
+
+
+def _ndjson_line_count(raw: bytes) -> int:
+    """回傳原始 NDJSON 的實體列數，保留損毀列所佔的位置。"""
+    if not raw:
+        return 0
+    return len(raw.split(b"\n")) - (1 if raw.endswith(b"\n") else 0)
 
 
 def _parse_stdout(run: _Run, stdout: Any, relative_ref: str) -> tuple[Any, bool]:
@@ -313,24 +338,57 @@ def _parse_stdout(run: _Run, stdout: Any, relative_ref: str) -> tuple[Any, bool]
 
 def _parse_bridge_calls(run: _Run) -> None:
     relative = "cli.ndjson"
-    rows = _read_ndjson(run.path / relative, run, relative)
-    for line_number, row in rows:
+    cli_path = run.path / relative
+    rows = _read_ndjson(cli_path, run, relative)
+    try:
+        raw_bytes = _read_bytes(cli_path)
+    except OSError:
+        raw_bytes = b""
+    line_count = _ndjson_line_count(raw_bytes)
+    rows_by_line = dict(rows)
+    complete = (
+        cli_path.is_file()
+        and relative in run.verified_sources
+        and relative not in run.invalid_ndjson_sources
+        and bool(raw_bytes)
+        and raw_bytes.endswith(b"\n")
+        and line_count == len(rows)
+        and bool(rows)
+    )
+    for line_number in range(1, line_count + 1):
         ref = run.ref(relative, f"#L{line_number}")
+        row = rows_by_line.get(line_number)
+        if row is None:
+            run.calls.append(_Call(
+                argv=[], rc=None, stdout=None, response_valid=False,
+                source_ref=ref, source_verified=False,
+            ))
+            continue
         argv = row.get("argv")
         rc = row.get("rc")
         stdout = row.get("stdout")
         argv_valid = isinstance(argv, list) and all(isinstance(token, str) for token in argv)
-        if not argv_valid or not argv or not _has_logical_command(argv):
+        argv_valid = argv_valid and bool(argv) and _has_logical_command(argv)
+        if not argv_valid:
             _add_problem(
                 run.problems,
                 f"missing required observation: cli_observations[{len(run.calls)}].argv ({ref})",
             )
-        if not isinstance(rc, int) or isinstance(rc, bool):
+        rc_valid = isinstance(rc, int) and not isinstance(rc, bool)
+        if not rc_valid:
             _add_problem(run.problems, f"missing required observation: cli_observations[{len(run.calls)}].rc")
             rc = None
-        if not isinstance(stdout, str):
+        stdout_valid = isinstance(stdout, str)
+        if not stdout_valid:
             _add_problem(run.problems, f"missing required observation: cli_observations[{len(run.calls)}].stdout")
         response, response_valid = _parse_stdout(run, stdout, ref)
+        line_verified = (
+            relative in run.verified_sources
+            and line_number not in run.invalid_ndjson_lines.get(relative, set())
+            and argv_valid and rc_valid and stdout_valid
+        )
+        if line_verified:
+            run.verified_cli_lines.add(ref)
         run.calls.append(_Call(
             argv=list(argv) if argv_valid else [],
             rc=rc,
@@ -338,9 +396,11 @@ def _parse_bridge_calls(run: _Run) -> None:
             response=response,
             response_valid=response_valid,
             source_ref=ref,
+            source_verified=line_verified,
         ))
-    if not run.calls:
+    if not rows:
         _add_problem(run.problems, "missing required observation: cli.ndjson")
+    run.cli_collection_verified = complete and all(call.source_verified for call in run.calls)
     run.instance_roots = _instance_roots(run)
 
 
@@ -382,6 +442,7 @@ def _manifest_evidence(manifest: Mapping[str, Any], run: _Run) -> None:
         if relative is None:
             _add_problem(run.problems, f"invalid manifest path: evidence.{key}.path")
             continue
+        run.declared_sources.add(relative)
         candidate = run.path / Path(*PurePosixPath(relative).parts)
         if not candidate.is_file():
             _add_problem(run.problems, f"missing source file: {relative}")
@@ -653,78 +714,153 @@ def _source_ref_path(report_root: Path, source_ref: str) -> tuple[Path | None, i
 
 
 def _validate_cli_source_line(
-    run: _Run, source_ref: Any, index: int, observation: Mapping[str, Any], raw_rows: Mapping[int, dict[str, Any]],
-) -> str:
-    fallback = run.ref("source/cli-observations.ndjson")
+    run: _Run,
+    source_ref: Any,
+    index: int,
+    expected_line: int,
+    raw_rows: Mapping[int, dict[str, Any]],
+) -> None:
+    """只核對 envelope 引用，不以讀取視圖選擇比較列。"""
     if not isinstance(source_ref, str):
         _add_problem(run.problems, f"missing required observation: cli_observations[{index}].source_ref")
-        return fallback
+        return
     source_path, line_number = _source_ref_path(run.report_root, source_ref)
     if source_path is None:
         _add_problem(run.problems, f"invalid source_ref: cli_observations[{index}].source_ref")
-        return fallback
+        return
     if line_number is None:
         _add_problem(run.problems, f"invalid source_ref: cli_observations[{index}].source_ref")
-        return fallback
+        return
     try:
         relative = source_path.relative_to(run.path).as_posix()
     except ValueError:
         _add_problem(run.problems, f"invalid source_ref: cli_observations[{index}].source_ref")
-        return fallback
+        return
     if relative != "source/cli-observations.ndjson":
         _add_problem(run.problems, f"invalid source_ref: cli_observations[{index}].source_ref")
-        return fallback
+        return
     row = raw_rows.get(line_number)
     if row is None:
         _add_problem(run.problems, f"invalid source_ref: cli_observations[{index}].source_ref")
-        return fallback
-    if row.get("call_index") != index:
+        return
+    if line_number != expected_line or row.get("call_index") != index:
         _add_problem(run.problems, f"source observation index mismatch: {relative}#L{line_number}")
-    for field_name in ("argv", "rc", "stdout"):
-        if field_name in observation and row.get(field_name) != observation[field_name]:
-            _add_problem(run.problems, f"source observation mismatch: cli_observations[{index}].{field_name}")
-    return run.ref(relative, f"#L{line_number}")
 
 
 def _parse_runner_calls(run: _Run, envelope: Mapping[str, Any]) -> None:
     observations = envelope.get("cli_observations")
     raw_relative = "source/cli-observations.ndjson"
-    raw_rows_list = _read_ndjson(run.path / raw_relative, run, raw_relative)
+    raw_path = run.path / raw_relative
+    raw_rows_list = _read_ndjson(raw_path, run, raw_relative)
     raw_rows = {line: row for line, row in raw_rows_list}
+    try:
+        raw_bytes = _read_bytes(raw_path)
+    except OSError:
+        raw_bytes = b""
+    raw_line_count = _ndjson_line_count(raw_bytes)
     if not isinstance(observations, list):
         _add_problem(run.problems, "missing required observation: cli_observations")
-        return
+        observations = []
     if not observations:
         _add_problem(run.problems, "missing required observation: cli_observations[0]")
-    if len(observations) != len(raw_rows_list):
+    if len(observations) != raw_line_count:
         _add_problem(run.problems, "source observation count mismatch: source/cli-observations.ndjson")
     for index, observation in enumerate(observations):
         if not isinstance(observation, Mapping):
             _add_problem(run.problems, f"missing required observation: cli_observations[{index}]")
             continue
-        argv = observation.get("argv")
-        rc = observation.get("rc")
-        stdout = observation.get("stdout")
-        argv_valid = isinstance(argv, list) and all(isinstance(token, str) for token in argv)
-        if not argv_valid or not argv or not _has_logical_command(argv):
-            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].argv")
-        if not isinstance(rc, int) or isinstance(rc, bool):
-            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].rc")
-            rc = None
-        if not isinstance(stdout, str):
-            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].stdout")
-        source_ref = _validate_cli_source_line(
-            run, observation.get("source_ref"), index, observation, raw_rows,
+        expected_raw = raw_rows.get(index + 1)
+        if expected_raw is None:
+            _add_problem(run.problems, f"source observation missing: {raw_relative}#L{index + 1}")
+            continue
+        for field_name in ("argv", "rc", "stdout"):
+            if field_name in observation and expected_raw.get(field_name) != observation[field_name]:
+                _add_problem(run.problems, f"source observation mismatch: cli_observations[{index}].{field_name}")
+        self_argv = observation.get("argv")
+        self_rc = observation.get("rc")
+        self_stdout = observation.get("stdout")
+        self_argv_valid = (
+            isinstance(self_argv, list)
+            and all(isinstance(token, str) for token in self_argv)
+            and bool(self_argv)
+            and _has_logical_command(self_argv)
         )
-        response, response_valid = _parse_stdout(run, stdout, source_ref or f"{raw_relative}#L{index + 1}")
+        if not self_argv_valid:
+            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].argv")
+        if not isinstance(self_rc, int) or isinstance(self_rc, bool):
+            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].rc")
+        if not isinstance(self_stdout, str):
+            _add_problem(run.problems, f"missing required observation: cli_observations[{index}].stdout")
+
+    for line_number in range(1, raw_line_count + 1):
+        index = line_number - 1
+        source_ref = run.ref(raw_relative, f"#L{line_number}")
+        observation = observations[index] if index < len(observations) else None
+        row = raw_rows.get(line_number)
+        if row is None:
+            run.calls.append(_Call(
+                argv=[], rc=None, stdout=None, response_valid=False,
+                source_ref=source_ref, source_verified=False,
+            ))
+            continue
+        if isinstance(observation, Mapping):
+            _validate_cli_source_line(
+                run,
+                observation.get("source_ref"),
+                index,
+                index + 1,
+                raw_rows,
+            )
+        argv = row.get("argv")
+        rc = row.get("rc")
+        stdout = row.get("stdout")
+        call_index = row.get("call_index")
+        argv_valid = isinstance(argv, list) and all(isinstance(token, str) for token in argv)
+        argv_valid = argv_valid and bool(argv) and _has_logical_command(argv)
+        rc_valid = isinstance(rc, int) and not isinstance(rc, bool)
+        stdout_valid = isinstance(stdout, str)
+        index_valid = call_index == line_number - 1 and not isinstance(call_index, bool)
+        if not index_valid:
+            _add_problem(run.problems, f"source observation index mismatch: {raw_relative}#L{line_number}")
+        if not argv_valid:
+            _add_problem(run.problems, f"missing required observation: source cli_observations[{index}].argv")
+        if not rc_valid:
+            _add_problem(run.problems, f"missing required observation: source cli_observations[{index}].rc")
+        if not stdout_valid:
+            _add_problem(run.problems, f"missing required observation: source cli_observations[{index}].stdout")
+        if not isinstance(observation, Mapping):
+            _add_problem(run.problems, f"missing required observation: cli_observations[{index}]")
+        elif observation.get("source_ref") != source_ref:
+            _add_problem(run.problems, f"source observation index mismatch: {raw_relative}#L{line_number}")
+        row_verified = (
+            raw_relative in run.verified_sources
+            and line_number not in run.invalid_ndjson_lines.get(raw_relative, set())
+            and index_valid and argv_valid and rc_valid and stdout_valid
+        )
+        if row_verified:
+            run.verified_cli_lines.add(source_ref)
+        response, response_valid = _parse_stdout(run, stdout, source_ref)
         run.calls.append(_Call(
             argv=list(argv) if argv_valid else [],
-            rc=rc,
+            rc=rc if rc_valid else None,
             stdout=stdout if isinstance(stdout, str) else None,
             response=response,
             response_valid=response_valid,
             source_ref=source_ref,
+            source_verified=row_verified,
         ))
+    raw_indices = [row.get("call_index") for _line, row in raw_rows_list]
+    run.cli_collection_verified = (
+        raw_path.is_file()
+        and raw_relative in run.verified_sources
+        and raw_relative not in run.invalid_ndjson_sources
+        and bool(raw_bytes)
+        and raw_bytes.endswith(b"\n")
+        and raw_line_count == len(raw_rows_list)
+        and raw_indices == list(range(len(raw_rows_list)))
+        and bool(raw_rows_list)
+        and all(call.source_verified for call in run.calls)
+    )
     run.instance_roots = _instance_roots(run)
 
 
@@ -895,6 +1031,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
 
     mapped_indices: set[int] = set()
     verified_mapped_indices: set[int] = set()
+    mapped_outcomes: dict[int, str] = {}
     executed_outcomes: list[str] = []
     for map_index, mapping in enumerate(rows):
         if not isinstance(mapping, Mapping):
@@ -938,6 +1075,7 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
             _add_problem(run.problems, f"required case result not executed: {outcome}")
             continue
         verified_mapped_indices.add(result_index)
+        mapped_outcomes[result_index] = outcome
         executed_outcomes.append(outcome)
 
     mapped_failed_indices: set[int] = set()
@@ -977,6 +1115,21 @@ def _load_runner_case_results(run: _Run, envelope: Mapping[str, Any]) -> None:
             _add_problem(run.problems, "runner result mismatch: verdict")
         run.verdict = raw_verdict
     run.case_identity_verified = bool(case_identity_ok and case_map_ok)
+    if (
+        run.identity_verified
+        and run.case_identity_verified
+        and run.l1_report_valid
+        and "source/l1-results.json" in run.verified_sources
+    ):
+        run.verified_l1_result_indices = set(verified_mapped_indices)
+        if run.verdict in {"PASS", "FAIL"}:
+            wanted_outcome = "failed" if run.verdict == "FAIL" else "passed"
+            result_index = next(
+                (index for index, outcome in mapped_outcomes.items() if outcome == wanted_outcome),
+                None,
+            )
+            if result_index is not None:
+                run.verdict_ref = run.ref("source/l1-results.json", f"#results[{result_index}]")
 
     if envelope.get("verdict") == "FAIL" and not (
         case_identity_ok and case_map_ok and mapped_failed_indices
@@ -1652,13 +1805,67 @@ def _difference(
     source_a: str | None,
     source_b: str | None,
 ) -> dict[str, Any]:
+    if kind == "verdict":
+        source_a_verified = _verdict_source_verified(run_a, source_a)
+        source_b_verified = _verdict_source_verified(run_b, source_b)
+        cli_pair_verified = True
+    else:
+        cli_a = _nested(run_a.artifacts, "cli", "sha256")
+        cli_b = _nested(run_b.artifacts, "cli", "sha256")
+        cli_pair_verified = _valid_sha256(cli_a) and _valid_sha256(cli_b) and cli_a == cli_b
+        if kind == "call_count":
+            source_a_verified = run_a.cli_collection_verified
+            source_b_verified = run_b.cli_collection_verified
+        else:
+            source_a_verified = _call_source_verified(run_a, source_a)
+            source_b_verified = _call_source_verified(run_b, source_b)
     return {
         "case": case_id,
         "path": path,
         "kind": kind,
         "registered_change": case_changes.get(case_id),
         "source_refs": {"a": source_a, "b": source_b},
+        "verified": (
+            run_a.identity_verified
+            and run_a.case_identity_verified
+            and run_b.identity_verified
+            and run_b.case_identity_verified
+            and source_a_verified
+            and source_b_verified
+            and cli_pair_verified
+        ),
     }
+
+
+def _call_source_verified(run: _Run, source_ref: str | None) -> bool:
+    """確認差分引用的 CLI 觀測來源已由該 run 的原始 hash 清單核實。"""
+    if not isinstance(source_ref, str) or not source_ref:
+        return False
+    return source_ref in run.verified_cli_lines
+
+
+def _verdict_source_verified(run: _Run, source_ref: str | None) -> bool:
+    """核對 verdict 差異實際引用的 comparison 或原始 L1 結果列。"""
+    if not isinstance(source_ref, str) or not source_ref:
+        return False
+    expected_prefix = run.path.relative_to(run.report_root).as_posix() + "/"
+    if not source_ref.startswith(expected_prefix):
+        return False
+    relative = source_ref[len(expected_prefix):]
+    if run.runner == "bridge":
+        return (
+            relative == "comparison.json"
+            and (
+                "comparison.json" not in run.declared_sources
+                or "comparison.json" in run.verified_sources
+            )
+        )
+    match = re.fullmatch(r"source/l1-results\.json#results\[([0-9]+)\]", relative)
+    return bool(
+        match
+        and int(match.group(1)) in run.verified_l1_result_indices
+        and "source/l1-results.json" in run.verified_sources
+    )
 
 
 def _compare_run_pair(
@@ -1781,6 +1988,9 @@ def diff_l15(
             if not runs_by_case.get(case_id):
                 _add_problem(problems[side], f"missing required case: {case_id}")
 
+    baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
+        {"a": runs_a, "b": runs_b}, required_case_ids,
+    )
     differences: list[dict[str, Any]] = []
     cli_pairing: list[dict[str, Any]] = []
     for case_id in sorted(set(runs_a) | set(runs_b)):
@@ -1804,11 +2014,12 @@ def diff_l15(
             if cli_match is False:
                 _add_problem(problems["b"], "artifact identity mismatch: artifacts.cli.sha256")
                 _add_problem(run_b.problems, "artifact identity mismatch: artifacts.cli.sha256")
-            differences.extend(_compare_run_pair(run_a, run_b, rules=rules, case_changes=case_changes))
-
-    baseline_failures, product_failures, unverified_failures, safety_violations = _collect_failures_and_safety(
-        {"a": runs_a, "b": runs_b}, required_case_ids,
-    )
+            differences.extend(_compare_run_pair(
+                run_a,
+                run_b,
+                rules=rules,
+                case_changes=case_changes,
+            ))
 
     for side, runs_by_case in (("a", runs_a), ("b", runs_b)):
         for case_runs in runs_by_case.values():
