@@ -486,7 +486,7 @@ def test_fail_is_sticky_for_same_artifact(tmp_path):
     assert _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")[0] == "FAIL"
 
 
-def test_both_platform_item_needs_both_targets_and_entries(tmp_path):
+def test_both_platform_item_needs_both_targets_and_entries(tmp_path, monkeypatch):
     api = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = api.load_exit_catalog()
@@ -498,6 +498,8 @@ def test_both_platform_item_needs_both_targets_and_entries(tmp_path):
     assert _platform_detail(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED", "linux")[0] == "SATISFIED"
     assert _platform_detail(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED", "windows")[0] == "MISSING"
     assert _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")[0] == "STALE"
+    _enable_verified_raw_report_test_seam(monkeypatch)
+    assert _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")[0] == "MISSING"
     api.add_entry(
         idx,
         fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="windows"),
@@ -507,7 +509,7 @@ def test_both_platform_item_needs_both_targets_and_entries(tmp_path):
         _platform_detail(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED", platform)[0] == "SATISFIED"
         for platform in ("linux", "windows")
     )
-    assert _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")[0] == "STALE"
+    assert _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")[0] == "SATISFIED"
 
 
 def test_contract_change_makes_pass_stale(tmp_path, monkeypatch):
@@ -1351,6 +1353,34 @@ def test_stage_status_lists_satisfying_entries(tmp_path, monkeypatch):
         "raw report binding unverifiable" in reason
         for reason in result["items"]["S3-ROLLBACK-LINUX"]["reasons"]
     )
+    _enable_verified_raw_report_test_seam(monkeypatch)
+    verified = evidence_index.stage_status(
+        evidence_index.load_index(idx), "3", catalog=cat, evidence_root=_evidence_root(tmp_path), cases={}
+    )
+    assert verified["items"]["S3-ROLLBACK-LINUX"]["status"] == "SATISFIED"
+    assert verified["items"]["S3-ROLLBACK-LINUX"]["satisfying_entries"] == [entry.entry_id]
+
+
+def test_stage_status_lists_both_platform_satisfying_entries(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
+    _enable_verified_raw_report_test_seam(monkeypatch)
+    evidence_index = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    cat = evidence_index.load_exit_catalog()
+    linux_entry = fakes_evidence.entry(
+        tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="linux"
+    )
+    windows_entry = fakes_evidence.entry(
+        tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="windows"
+    )
+    evidence_index.add_entry(idx, linux_entry, catalog=cat)
+    evidence_index.add_entry(idx, windows_entry, catalog=cat)
+    result = evidence_index.stage_status(
+        evidence_index.load_index(idx), "3", catalog=cat, evidence_root=_evidence_root(tmp_path), cases={}
+    )
+    item = result["items"]["S3-INCIDENTS-CLOSED"]
+    assert item["status"] == "SATISFIED"
+    assert item["satisfying_entries"] == [linux_entry.entry_id, windows_entry.entry_id]
 
 
 def test_set_target_per_platform_appends_history(tmp_path):
@@ -2088,11 +2118,17 @@ def test_od09_and_legacy_round_exceptions(tmp_path, monkeypatch):
     catalog = evidence_index.load_exit_catalog()
     frozen_path = Path(__file__).resolve().parents[1] / "realhw" / "acceptance" / "longrun_acceptance.yaml"
     frozen_before = frozen_path.read_bytes()
-    entries = []
-    for platform in ("linux", "windows"):
-        current = fakes_evidence.entry(tmp_path, "S3-OD09-ALL-FROZEN", "PASS", platform=platform)
-        evidence_index.add_entry(idx, current, catalog=catalog)
-        entries.append(current)
+    linux_current = fakes_evidence.entry(
+        tmp_path, "S3-OD09-ALL-FROZEN", "PASS", platform="linux"
+    )
+    evidence_index.add_entry(idx, linux_current, catalog=catalog)
+    assert _status(idx, tmp_path, catalog, "S3-OD09-ALL-FROZEN")[0] != "SATISFIED"
+    windows_current = fakes_evidence.entry(
+        tmp_path, "S3-OD09-ALL-FROZEN", "PASS", platform="windows"
+    )
+    evidence_index.add_entry(idx, windows_current, catalog=catalog)
+    entries = [linux_current, windows_current]
+    assert _status(idx, tmp_path, catalog, "S3-OD09-ALL-FROZEN")[0] == "SATISFIED"
     round_id = evidence_index.begin_candidate_round(
         idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
     )
