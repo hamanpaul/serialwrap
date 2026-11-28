@@ -84,6 +84,12 @@ BO_P9_19_AFFECTED_KINDS = frozenset({
 # memory_only 測試可在模組載入後注入固定 revision bytes；正式呼叫預設走 Git。
 DEFAULT_SOURCE_READER: Callable[[str, str], bytes | None] | None = None
 
+# T1 candidate_context 尚未提供原始報告引用欄位前，原始報告綁定無法在正式路徑驗證。
+# 此 hook 僅是測試 seam：供測試隔離身分檢查，正式程式路徑不得設定為已驗證；預設必須 fail closed。
+_RAW_REPORT_BINDING_TEST_VERIFIER: Callable[
+    [Mapping[str, Any], ExitItem, str, Sequence[str]], bool
+] | None = None
+
 
 @dataclass(frozen=True)
 class FrozenFile:
@@ -1795,6 +1801,22 @@ def _platform_status(
     return "MISSING", [f"no passing evidence for {item.item_id}"], []
 
 
+def _raw_report_binding_verified_for_test(
+    index: Mapping[str, Any],
+    item: ExitItem,
+    platform: str,
+    satisfying_entries: Sequence[str],
+) -> bool:
+    """只供測試 seam 使用；沒有注入驗證器時，一律視為原始報告綁定不可驗證。"""
+    verifier = _RAW_REPORT_BINDING_TEST_VERIFIER
+    if verifier is None:
+        return False
+    try:
+        return bool(verifier(index, item, platform, tuple(satisfying_entries)))
+    except Exception:
+        return False
+
+
 def _item_status_full(
     index: Mapping[str, Any],
     item: ExitItem,
@@ -1827,24 +1849,32 @@ def _item_status_full(
         if status == "FAIL":
             return "FAIL", [f"{platform}: {reason}" for reason in reasons], []
     if item.stage == "3" and item.evidence_kind != "od09-freeze":
-        # T1 candidate_context 尚無原始報告引用欄位，無法證明附件屬於該次執行。
-        # 此限制同樣套用到 reference；stage_status 仍只用 required 項判定完成性。
-        reasons = ["raw report binding unverifiable"]
-        reasons.extend(
-            f"{platform}: {reason}"
-            for platform, _, platform_reasons, _ in results
-            for reason in platform_reasons
-        )
-        if _bop919_pending(item):
-            pending = f"BO-P9-19 pending: no owner-approved public verification for {item.evidence_kind}"
-            if not any("BO-P9-19 pending" in reason for reason in reasons):
-                reasons.append(pending)
-        return "STALE", reasons, []
+        # 只有原本可滿足的平台結果才因缺少原始報告綁定降為 STALE；缺證、雜湊錯誤與既有 STALE 保持原狀。
+        verified_results: list[tuple[str, str, list[str], list[str]]] = []
+        for platform, status, reasons, satisfying in results:
+            if status == "SATISFIED" and not _raw_report_binding_verified_for_test(
+                index, item, platform, satisfying
+            ):
+                status = "STALE"
+                reasons = ["raw report binding unverifiable", *reasons]
+            verified_results.append((platform, status, reasons, satisfying))
+        results = verified_results
     if all(status == "SATISFIED" for _, status, _, _ in results):
         return "SATISFIED", [], [entry for _, _, _, entries in results for entry in entries]
     priority = {"HASH_MISMATCH": 5, "STALE": 4, "NO_TARGET": 3, "MISSING": 2, "SATISFIED": 1}
     status = max((row[1] for row in results), key=lambda value: priority.get(value, 0))
-    reasons = [f"{platform}: {reason}" for platform, _, entries, _ in results for reason in entries]
+    raw_binding_unverifiable = any(
+        reason == "raw report binding unverifiable"
+        for _, _, platform_reasons, _ in results
+        for reason in platform_reasons
+    )
+    reasons = ["raw report binding unverifiable"] if raw_binding_unverifiable else []
+    reasons.extend(
+        f"{platform}: {reason}"
+        for platform, _, platform_reasons, _ in results
+        for reason in platform_reasons
+        if reason != "raw report binding unverifiable"
+    )
     return status, reasons, []
 
 

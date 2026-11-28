@@ -81,6 +81,16 @@ def _platform_detail(idx: Path, root: Path, cat: dict, item_id: str, platform: s
     )
 
 
+def _enable_verified_raw_report_test_seam(monkeypatch) -> None:
+    """測試用 seam：讓身分檢查可在有效對照中獨立驗證。"""
+    monkeypatch.setattr(
+        evidence_index,
+        "_RAW_REPORT_BINDING_TEST_VERIFIER",
+        lambda _index, _item, _platform, _entry_ids: True,
+        raising=False,
+    )
+
+
 def _empty_index(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     path = root / "index.json"
@@ -500,7 +510,9 @@ def test_both_platform_item_needs_both_targets_and_entries(tmp_path):
     assert _status(idx, tmp_path, cat, "S3-INCIDENTS-CLOSED")[0] == "STALE"
 
 
-def test_contract_change_makes_pass_stale(tmp_path):
+def test_contract_change_makes_pass_stale(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
+    _enable_verified_raw_report_test_seam(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="d" * 40)
     cat = evidence_index.load_exit_catalog()
@@ -515,7 +527,21 @@ def test_contract_change_makes_pass_stale(tmp_path):
         ),
         catalog=cat,
     )
-    assert _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")[0] == "STALE"
+    data = evidence_index.load_index(idx)
+    target_revision = data["stage_targets"]["3"]["linux"]["contract_revision"]
+    row = next(row for row in data["entries"] if row["item_id"] == "S3-ROLLBACK-LINUX")
+    row["contract_revision"] = target_revision
+    assert evidence_index.item_status(
+        data,
+        cat["S3-ROLLBACK-LINUX"],
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+        catalog=cat,
+    )[0] == "SATISFIED"
+    row["contract_revision"] = "c" * 40
+    status, reasons = _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")
+    assert status == "STALE"
+    assert any("stale contract_revision" in reason for reason in reasons)
 
 
 def test_newer_canary_report_revokes_earlier_pass(tmp_path):
@@ -545,7 +571,7 @@ def test_newer_canary_report_revokes_earlier_pass(tmp_path):
     )
     evidence_index.add_entry(idx, new, catalog=cat)
     status, reasons = _status(idx, tmp_path, cat, "S3-CANARY-LINUX")
-    assert status == "STALE"
+    assert status == "MISSING"
     assert any(
         reason.startswith(f"linux: superseded: latest canary report {new.entry_id} is INSUFFICIENT")
         and old.entry_id in reason
@@ -554,7 +580,7 @@ def test_newer_canary_report_revokes_earlier_pass(tmp_path):
     st = evidence_index.stage_status(
         evidence_index.load_index(idx), "3", catalog=cat, evidence_root=_evidence_root(tmp_path), cases={}
     )
-    assert st["items"]["S3-CANARY-LINUX"]["status"] == "STALE"
+    assert st["items"]["S3-CANARY-LINUX"]["status"] == "MISSING"
     assert st["items"]["S3-CANARY-LINUX"]["satisfying_entries"] == []
     assert st["result"] == "BLOCKED"
     closed = fakes_evidence.entry(
@@ -843,11 +869,13 @@ def test_skip_is_not_pass(tmp_path):
     )
     assert _platform_detail(idx, tmp_path, cat, "S3-ROLLBACK-LINUX", "linux")[0] == "MISSING"
     status, reasons = _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")
-    assert status == "STALE"
-    assert any("raw report binding unverifiable" in reason for reason in reasons)
+    assert status == "MISSING"
+    assert any("result SKIP is not sufficient" in reason for reason in reasons)
 
 
-def test_tool_revision_change_stale(tmp_path):
+def test_tool_revision_change_stale(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
+    _enable_verified_raw_report_test_seam(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = evidence_index.load_exit_catalog()
@@ -858,10 +886,26 @@ def test_tool_revision_change_stale(tmp_path):
         ),
         catalog=cat,
     )
-    assert _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")[0] == "STALE"
+    data = evidence_index.load_index(idx)
+    target_revision = data["stage_targets"]["3"]["linux"]["tool_revision"]
+    row = next(row for row in data["entries"] if row["item_id"] == "S3-ROLLBACK-LINUX")
+    row["tool_revision"] = target_revision
+    assert evidence_index.item_status(
+        data,
+        cat["S3-ROLLBACK-LINUX"],
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+        catalog=cat,
+    )[0] == "SATISFIED"
+    row["tool_revision"] = "z" * 40
+    status, reasons = _status(idx, tmp_path, cat, "S3-ROLLBACK-LINUX")
+    assert status == "STALE"
+    assert any("stale tool_revision" in reason for reason in reasons)
 
 
-def test_case_list_change_stale(tmp_path):
+def test_case_list_change_stale(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
+    _enable_verified_raw_report_test_seam(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = evidence_index.load_exit_catalog()
@@ -876,7 +920,21 @@ def test_case_list_change_stale(tmp_path):
         ),
         catalog=cat,
     )
-    assert _status(idx, tmp_path, cat, "S3-L2-FULL-AB-LINUX")[0] == "STALE"
+    data = evidence_index.load_index(idx)
+    target_case_list = data["stage_targets"]["3"]["linux"]["case_list_sha256"]
+    row = next(row for row in data["entries"] if row["item_id"] == "S3-L2-FULL-AB-LINUX")
+    row["case_list_sha256"] = target_case_list
+    assert evidence_index.item_status(
+        data,
+        cat["S3-L2-FULL-AB-LINUX"],
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+        catalog=cat,
+    )[0] == "SATISFIED"
+    row["case_list_sha256"] = "9" * 64
+    status, reasons = _status(idx, tmp_path, cat, "S3-L2-FULL-AB-LINUX")
+    assert status == "STALE"
+    assert any("stale case_list_sha256" in reason for reason in reasons)
 
 
 def test_xfail_requires_unexpired_sentinel(tmp_path, monkeypatch):
@@ -904,6 +962,26 @@ def test_xfail_requires_unexpired_sentinel(tmp_path, monkeypatch):
     )
     assert _platform_detail(future_idx, future_root, cat, "S3-ROLLBACK-LINUX", "linux", future_cases)[0] == "SATISFIED"
     assert _status(future_idx, future_root, cat, "S3-ROLLBACK-LINUX", future_cases)[0] == "STALE"
+    _enable_verified_raw_report_test_seam(monkeypatch)
+    future_index = evidence_index.load_index(future_idx)
+    assert evidence_index.item_status(
+        future_index,
+        cat["S3-ROLLBACK-LINUX"],
+        evidence_root=_evidence_root(future_root),
+        cases=future_cases,
+        catalog=cat,
+    )[0] == "SATISFIED"
+    invalid_expected_cases = deepcopy(future_cases)
+    invalid_expected_cases["fixture-xfail"]["expected"] = "PASS"
+    invalid_status, invalid_reasons = evidence_index.item_status(
+        future_index,
+        cat["S3-ROLLBACK-LINUX"],
+        evidence_root=_evidence_root(future_root),
+        cases=invalid_expected_cases,
+        catalog=cat,
+    )
+    assert invalid_status == "MISSING"
+    assert any("result XFAIL is not sufficient" in reason for reason in invalid_reasons)
 
     expired_root = tmp_path / "expired"
     expired_idx = fakes_evidence.evidence_index(expired_root, stage="3", contract="c" * 40)
@@ -925,7 +1003,11 @@ def test_xfail_requires_unexpired_sentinel(tmp_path, monkeypatch):
         }
     }
     assert _platform_detail(expired_idx, expired_root, cat, "S3-ROLLBACK-LINUX", "linux", expired_cases)[0] == "MISSING"
-    assert _status(expired_idx, expired_root, cat, "S3-ROLLBACK-LINUX", expired_cases)[0] == "STALE"
+    expired_status, expired_reasons = _status(
+        expired_idx, expired_root, cat, "S3-ROLLBACK-LINUX", expired_cases
+    )
+    assert expired_status == "MISSING"
+    assert any("result XFAIL is not sufficient" in reason for reason in expired_reasons)
 
     pass_expected_root = tmp_path / "pass-expected"
     pass_expected_idx = fakes_evidence.evidence_index(
@@ -948,16 +1030,24 @@ def test_xfail_requires_unexpired_sentinel(tmp_path, monkeypatch):
             "sentinel": {"issue": "#1", "signature": "fixture", "expires": fakes.ts(11, 0)},
         }
     }
-    assert (
-        _status(
-            pass_expected_idx,
-            pass_expected_root,
-            cat,
-            "S3-ROLLBACK-LINUX",
-            pass_expected_cases,
-        )[0]
-        == "STALE"
+    valid_pass_expected_cases = deepcopy(pass_expected_cases)
+    valid_pass_expected_cases["f4-background-result-tail-consistent"]["expected"] = "XFAIL"
+    assert evidence_index.item_status(
+        evidence_index.load_index(pass_expected_idx),
+        cat["S3-ROLLBACK-LINUX"],
+        evidence_root=_evidence_root(pass_expected_root),
+        cases=valid_pass_expected_cases,
+        catalog=cat,
+    )[0] == "SATISFIED"
+    pass_expected_status, pass_expected_reasons = _status(
+        pass_expected_idx,
+        pass_expected_root,
+        cat,
+        "S3-ROLLBACK-LINUX",
+        pass_expected_cases,
     )
+    assert pass_expected_status == "MISSING"
+    assert any("result XFAIL is not sufficient" in reason for reason in pass_expected_reasons)
 
 
 def test_hash_mismatch_detected(tmp_path):
@@ -972,7 +1062,9 @@ def test_hash_mismatch_detected(tmp_path):
     changed_path = _evidence_root(changed_root) / changed.files[0].path
     changed_path.write_bytes(b"tampered\n")
     assert _platform_detail(changed_idx, changed_root, cat, "S3-ROLLBACK-LINUX", "linux")[0] == "HASH_MISMATCH"
-    assert _status(changed_idx, changed_root, cat, "S3-ROLLBACK-LINUX")[0] == "STALE"
+    changed_status, changed_reasons = _status(changed_idx, changed_root, cat, "S3-ROLLBACK-LINUX")
+    assert changed_status == "HASH_MISMATCH"
+    assert any("file hash mismatch" in reason for reason in changed_reasons)
 
     deleted_root = tmp_path / "deleted"
     deleted_idx = fakes_evidence.evidence_index(deleted_root, stage="3", contract="c" * 40)
@@ -982,7 +1074,22 @@ def test_hash_mismatch_detected(tmp_path):
     evidence_index.add_entry(deleted_idx, deleted, catalog=cat)
     (_evidence_root(deleted_root) / deleted.files[0].path).unlink()
     assert _platform_detail(deleted_idx, deleted_root, cat, "S3-ROLLBACK-LINUX", "linux")[0] == "HASH_MISMATCH"
-    assert _status(deleted_idx, deleted_root, cat, "S3-ROLLBACK-LINUX")[0] == "STALE"
+    deleted_status, deleted_reasons = _status(deleted_idx, deleted_root, cat, "S3-ROLLBACK-LINUX")
+    assert deleted_status == "HASH_MISMATCH"
+    assert any("file missing" in reason for reason in deleted_reasons)
+
+
+def test_public_status_preserves_required_cases_hash_mismatch(tmp_path):
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    target = api.load_index(idx)["stage_targets"]["3"]["linux"]
+    frozen_lock = _evidence_root(tmp_path) / target["required_cases_lock"]["path"]
+    frozen_lock.write_bytes(frozen_lock.read_bytes() + b"tampered")
+
+    status, reasons = _status(idx, tmp_path, catalog, "S3-ROLLBACK-LINUX")
+    assert status == "HASH_MISMATCH"
+    assert any("frozen required cases lock attachment hash mismatch" in reason for reason in reasons)
 
 
 def test_reuse_by_runtime_digest(tmp_path, monkeypatch):
@@ -1387,9 +1494,21 @@ def test_missing_l1_lock_makes_l1_item_missing(tmp_path):
         cases={},
         l1_lock={"schema_version": 1, "sets": {}},
     )
-    assert status == "STALE"
-    assert "raw report binding unverifiable" in reasons
-    assert "linux: no frozen l1 set: s3_release_contract" in reasons
+    assert status == "MISSING"
+    assert reasons == ["linux: no frozen l1 set: s3_release_contract"]
+
+
+def test_public_status_preserves_no_target(tmp_path):
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    data = api.load_index(idx)
+    del data["stage_targets"]["3"]["linux"]
+    _write_json(idx, data)
+
+    status, reasons = _status(idx, tmp_path, catalog, "S3-ROLLBACK-LINUX")
+    assert status == "NO_TARGET"
+    assert reasons == ["linux: no target"]
 
 
 def test_index_file_stable_format(tmp_path):
@@ -1614,7 +1733,7 @@ def test_default_missing_canary_does_not_block_required_stage(tmp_path, monkeypa
         evidence_root=_evidence_root(tmp_path),
         cases={},
     )
-    assert all(result["items"][item_id]["status"] == "STALE" for item_id in reference_ids)
+    assert all(result["items"][item_id]["status"] == "MISSING" for item_id in reference_ids)
     assert all(result["items"][item_id]["satisfying_entries"] == [] for item_id in reference_ids)
     assert result["result"] == "PASS"
 
@@ -1640,8 +1759,8 @@ def test_owner_required_canary_blocks_without_evidence(tmp_path):
         evidence_root=_evidence_root(tmp_path),
         cases={},
     )
-    assert result["items"][canary]["status"] == "STALE"
-    assert any("raw report binding unverifiable" in reason for reason in result["items"][canary]["reasons"])
+    assert result["items"][canary]["status"] == "MISSING"
+    assert any("no evidence entries" in reason for reason in result["items"][canary]["reasons"])
     assert result["result"] == "BLOCKED"
 
 
@@ -1940,9 +2059,10 @@ def test_round_id_and_archive_are_entry_identity(tmp_path, monkeypatch):
     evidence_index.add_entry(idx, new, catalog=catalog)
     assert _platform_detail(idx, tmp_path, catalog, "S3-ROLLBACK-WINDOWS", "windows")[0] == "SATISFIED"
     assert _status(idx, tmp_path, catalog, "S3-ROLLBACK-WINDOWS")[0] == "STALE"
+    _enable_verified_raw_report_test_seam(monkeypatch)
+    assert _status(idx, tmp_path, catalog, "S3-ROLLBACK-WINDOWS")[0] == "SATISFIED"
 
     data = evidence_index.load_index(idx)
-    new_row = next(row for row in data["entries"] if row["entry_id"] == new.entry_id)
     for field, invalid_value in (
         ("candidate_round_id", "0" * 32),
         ("archive_sha256", "f" * 64),
@@ -1950,13 +2070,15 @@ def test_round_id_and_archive_are_entry_identity(tmp_path, monkeypatch):
         corrupted = json.loads(json.dumps(data))
         row = next(row for row in corrupted["entries"] if row["entry_id"] == new.entry_id)
         row[field] = invalid_value
-        status, _ = evidence_index.item_status(
+        status, reasons = evidence_index.item_status(
             corrupted,
             catalog["S3-ROLLBACK-WINDOWS"],
             evidence_root=_evidence_root(tmp_path),
             cases={},
+            catalog=catalog,
         )
         assert status == "STALE"
+        assert any(f"stale {field}" in reason for reason in reasons)
 
 
 def test_od09_and_legacy_round_exceptions(tmp_path, monkeypatch):
@@ -2543,7 +2665,7 @@ def test_hash_only_or_redacted_crc_cannot_satisfy_a8(tmp_path, payload):
         evidence_root=evidence_root,
         cases={},
     )
-    assert status == "STALE"
+    assert status == "MISSING"
     assert any("BO-P9-19" in reason for reason in reasons)
 
 
@@ -2844,16 +2966,16 @@ def test_formal_fail_requires_next_candidate_round(tmp_path):
 
 
 def test_bop919_blocks_any_stub_for_affected_required_kind(tmp_path):
-    """原始報告無可驗證綁定時維持 STALE，並保留 BO-P9-19 原因。"""
+    """BO-P9-19 尚未核定時，公開證據維持 MISSING。"""
     api = _evidence_api()
     catalog = api.load_exit_catalog()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     item_id = "S3-ROLLBACK-LINUX"
     api.add_entry(idx, fakes_evidence.entry(tmp_path, item_id, "PASS", platform="linux"), catalog=catalog)
     status, reasons = _status(idx, tmp_path, catalog, item_id)
-    assert status == "STALE"
+    assert status == "MISSING"
     assert any("BO-P9-19 pending" in reason for reason in reasons)
-    assert any("raw report binding unverifiable" in reason for reason in reasons)
+    assert not any("raw report binding unverifiable" in reason for reason in reasons)
 
 
 @pytest.mark.parametrize(
@@ -2870,7 +2992,7 @@ def test_bop919_blocks_any_stub_for_affected_required_kind(tmp_path):
     ids=("nested-summary-ab-kind", "other-attachment-format-realhw-kind", "arbitrary-drill-stub"),
 )
 def test_bop919_blocks_nested_summaries_formats_and_other_required_kinds(tmp_path, item_id, suffix, payload):
-    """巢狀摘要、非 JSON 附件與其他受影響必要 kind 均保持 STALE。"""
+    """巢狀摘要、非 JSON 附件與其他受影響必要 kind 均保持 MISSING。"""
     api = _evidence_api()
     catalog = api.load_exit_catalog()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
@@ -2894,9 +3016,9 @@ def test_bop919_blocks_nested_summaries_formats_and_other_required_kinds(tmp_pat
     )
     api.add_entry(idx, entry, catalog=catalog)
     status, reasons = _status(idx, tmp_path, catalog, item_id)
-    assert status == "STALE"
+    assert status == "MISSING"
     assert any("BO-P9-19 pending" in reason for reason in reasons)
-    assert any("raw report binding unverifiable" in reason for reason in reasons)
+    assert not any("raw report binding unverifiable" in reason for reason in reasons)
 
 
 def test_bop919_blocks_canary_kind_when_owner_marks_it_required(tmp_path):
@@ -2915,9 +3037,9 @@ def test_bop919_blocks_canary_kind_when_owner_marks_it_required(tmp_path):
     if "catalog" in inspect.signature(api.item_status).parameters:
         status_args["catalog"] = {**catalog, item_id: required_item}
     status, reasons = api.item_status(api.load_index(idx), required_item, **status_args)
-    assert status == "STALE"
+    assert status == "MISSING"
     assert any("BO-P9-19 pending" in reason for reason in reasons)
-    assert any("raw report binding unverifiable" in reason for reason in reasons)
+    assert not any("raw report binding unverifiable" in reason for reason in reasons)
 
 
 def test_stage3_target_rejects_non_archive_without_mutating_index(tmp_path):
@@ -3541,3 +3663,24 @@ def test_memory_only_stage3_fixture_never_starts_git(tmp_path, monkeypatch):
     monkeypatch.setattr(evidence_index, "_git_seed_reader", forbidden)
     fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
 
+
+def test_both_platform_mixed_status_preserves_missing_reason(tmp_path):
+    """兩平台結果混合時，公開狀態保留優先結果與另一平台的缺證原因。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    api.add_entry(
+        idx,
+        fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "PASS", platform="linux"),
+        catalog=catalog,
+    )
+    api.add_entry(
+        idx,
+        fakes_evidence.entry(tmp_path, "S3-INCIDENTS-CLOSED", "SKIP", platform="windows"),
+        catalog=catalog,
+    )
+
+    status, reasons = _status(idx, tmp_path, catalog, "S3-INCIDENTS-CLOSED")
+    assert status == "STALE"
+    assert "raw report binding unverifiable" in reasons
+    assert any("windows: latest canary report " in reason and " is SKIP" in reason for reason in reasons)
