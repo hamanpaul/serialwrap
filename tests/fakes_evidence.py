@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -59,18 +60,20 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def read_seed_revision(revision: str, repo_path: str) -> bytes | None:
-    """從指定 Git revision 取回測試所需的原始 seed blob。"""
-    import subprocess
+_SEED_REVISION = "59d8c7f1eb7de1ae2a90cefd6df21ce945d695d2"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SEED_ATTACHMENT_ROOT = _REPO_ROOT / "docs" / "rust-refactor" / "evidence" / "denominators"
+_SEED_SOURCE_BYTES = {
+    "tests/acceptance/cases.yaml": (_SEED_ATTACHMENT_ROOT / "cases.yaml").read_bytes(),
+    "tests/acceptance/cases.lock.json": (_SEED_ATTACHMENT_ROOT / "cases.lock.json").read_bytes(),
+}
 
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{repo_path}"],
-        cwd=Path(__file__).resolve().parents[1],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    return result.stdout if result.returncode == 0 else None
+
+def read_seed_revision(revision: str, repo_path: str) -> bytes | None:
+    """回傳測試預先快照的 seed 位元組，不啟動 Git 或其他子程序。"""
+    if revision != _SEED_REVISION:
+        return None
+    return _SEED_SOURCE_BYTES.get(repo_path)
 
 
 def _payload_sha256(value: Any) -> str:
@@ -135,6 +138,23 @@ def _write_legacy_scope(root: Path, index_path: Path, catalog: dict[str, Any]) -
             },
         }
     )
+    second_legacy_scope = {"case_ids": ["fixture:second-legacy-source-obligation"]}
+    obligations.append(
+        {
+            "key": "legacy:fixture-second-source-obligation",
+            "stage": "legacy",
+            "platform": "windows",
+            "item_id": "LEGACY-FIXTURE-SECOND-SOURCE-OBLIGATION",
+            "source_refs": ["fixture:legacy-source-inventory"],
+            "required_scope": second_legacy_scope,
+            "required_scope_sha256": _payload_sha256(second_legacy_scope),
+            "safety_invariant": False,
+            "allowed_evidence": {
+                "kinds": ["manual-procedure"],
+                "case_ids": second_legacy_scope["case_ids"],
+            },
+        }
+    )
 
     source_ids = sorted(
         {source_ref for obligation in obligations for source_ref in obligation["source_refs"]}
@@ -143,7 +163,22 @@ def _write_legacy_scope(root: Path, index_path: Path, catalog: dict[str, Any]) -
     source_hashes: list[dict[str, str]] = []
     for number, source_id in enumerate(source_ids):
         source_path = evidence_root / "legacy-sources" / f"source-{number:03d}.json"
-        _write_json(source_path, {"fixture_source_id": source_id})
+        if source_id == "fixture:legacy-source-inventory":
+            snapshot_doc = {
+                "obligations": [
+                    {
+                        "key": row["key"],
+                        "platform": row["platform"],
+                        "case_ids": row["required_scope"]["case_ids"],
+                        "evidence_kinds": row["allowed_evidence"]["kinds"],
+                    }
+                    for row in obligations
+                    if row["stage"] == "legacy"
+                ]
+            }
+        else:
+            snapshot_doc = {"fixture_source_id": source_id}
+        _write_json(source_path, snapshot_doc)
         source_sha256 = _file_sha256(source_path)
         sources.append(
             {
@@ -198,37 +233,35 @@ def _write_legacy_scope(root: Path, index_path: Path, catalog: dict[str, Any]) -
 
 
 def _copy_denominator_inputs(root: Path) -> None:
-    """保存指定 Git revision 的公開 seed 與目前分母鎖快照。"""
-    import subprocess
-
-    from tools.stage3 import required_cases
-
-    repo_root = Path(__file__).resolve().parents[1]
+    """保存指定 revision 的固定 seed bytes 與目前分母驗證輸入。"""
+    repo_root = _REPO_ROOT
     evidence_root = _evidence_root(root)
     sources = [
-        (repo_root / "tests" / "acceptance" / "stage3_required_cases.lock.json", "stage3-required-cases.lock.json"),
         (repo_root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json", "denominators/source-manifest.json"),
     ]
     for repo_path, relative in (
         ("tests/acceptance/cases.yaml", "denominators/cases.yaml"),
         ("tests/acceptance/cases.lock.json", "denominators/cases.lock.json"),
     ):
-        result = subprocess.run(
-            ["git", "show", f"{required_cases.SEED_REVISION}:{repo_path}"],
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if result.returncode:
-            raise RuntimeError(f"無法讀取指定 seed {repo_path}: {result.stderr.decode('utf-8', errors='replace')}")
+        data = read_seed_revision(_SEED_REVISION, repo_path)
+        if data is None:
+            raise RuntimeError(f"測試 seed bytes 缺少指定來源：{repo_path}")
         target = evidence_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(result.stdout)
+        target.write_bytes(data)
     for source, relative in sources:
         target = evidence_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
+    acceptance = root / "tests" / "acceptance"
+    acceptance.mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "cases.yaml",
+        "cases.lock.json",
+        "stage3_required_cases.lock.json",
+        "stage_exits.json",
+    ):
+        (acceptance / relative).write_bytes((repo_root / "tests" / "acceptance" / relative).read_bytes())
 
 
 def _entry_id(entry: Any) -> str:
@@ -252,6 +285,7 @@ def evidence_index(
     tool: str = "t" * 40,
     case_list: str = "0" * 64,
     platforms: Iterable[str] = ("linux", "windows"),
+    source_reader=None,
 ) -> Path:
     """建立 index、公開 evidence root、清冊 fixture 與逐平台 target。"""
     api = _evidence_api()
@@ -314,6 +348,8 @@ def evidence_index(
                     "candidate_round_id": round_id,
                 }
             )
+            if "source_reader" in inspect.signature(api.set_target).parameters:
+                kwargs["source_reader"] = source_reader or read_seed_revision
         api.set_target(index_path, **kwargs)
     return index_path
 
@@ -357,6 +393,20 @@ def entry(
                 sha256=_file_sha256(report),
             ),
         )
+
+    if item is not None and item.stage == "3" and item.item_id != "S3-OD09-ALL-FROZEN" and files:
+        context = api.run_context(
+            index,
+            platform=platform,
+            run_id=f"fixture-{n}-{platform}",
+        )
+        context_path = evidence_root / "contexts" / f"{item_id}-{platform}-{n}.json"
+        _write_json(context_path, context)
+        context_file = _ab_manifest_api().FrozenFile(
+            path=context_path.relative_to(evidence_root).as_posix(),
+            sha256=_file_sha256(context_path),
+        )
+        files = tuple(files) + (context_file,)
 
     evidence_kind = item.evidence_kind if item is not None else "manual-procedure"
     is_l3 = item is not None and item.layer == "L3"

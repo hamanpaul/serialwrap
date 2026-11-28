@@ -11,13 +11,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import posixpath
 import re
+import stat
 import subprocess
 import sys
+import tarfile
+import time
 import uuid
+import zipfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from tools.stage3.jsonio import (
     atomic_write_text,
@@ -63,6 +70,19 @@ _RESTRICTED_FIELDS = frozenset({
     "candidate_round_id", "context_id", "private_source_sha256", "failure_summary",
     "verified_by", "verified_at",
 })
+
+# BO-P9-19：依 plan 10 §0.2「BLOCKED-OWNER 總表」BO-P9-19 與 §0.4「公開證據契約」
+# 的原始資料非公開、公開衍生資料須可獨立核驗、hash 不可代替來源核驗及受限來源 FAIL
+# 規則，Stage 0～3 必要執行 kind 均未獲公開替代驗證核定；kind 清單依 stage_exits.json
+# 的完整 enum 明列。canary-report 只有被目錄指定為 required 才受阻；od09-freeze 是靜態
+# 凍結核對，不是執行來源。未知 kind 依同一 fail-closed 契約處理。
+BO_P9_19_AFFECTED_KINDS = frozenset({
+    "junit", "bridge-selftest", "functest-report", "regression-report", "realhw-report",
+    "gate-report", "manual-procedure", "drill-report", "ab-report", "canary-report",
+})
+
+# memory_only 測試可在模組載入後注入固定 revision bytes；正式呼叫預設走 Git。
+DEFAULT_SOURCE_READER: Callable[[str, str], bytes | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -393,6 +413,42 @@ def _write_index(path: Path, index: Mapping[str, Any]) -> None:
     atomic_write_text(Path(path), dumps_report(dict(index)))
 
 
+@contextmanager
+def _index_write_lock(index_path: Path) -> Iterator[None]:
+    """以索引同目錄的 OS 檔案鎖序列化所有讀取後修改入口。"""
+    path = Path(index_path)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def check_index_append_only(base_index: Mapping[str, Any], head_index: Mapping[str, Any]) -> list[str]:
     """檢查 base 的每筆 entry 在 head 仍以相同 ID 與完整 JSON 存在。
 
@@ -620,6 +676,12 @@ def _stage3_target_errors(index: Mapping[str, Any]) -> list[str]:
 
 
 def begin_candidate_round(index_path: Path, *, rc_tag: str, set_by: str, now: str) -> str:
+    """在共用索引鎖內重讀、驗證並切換共同候選輪次。"""
+    with _index_write_lock(index_path):
+        return _begin_candidate_round_locked(index_path, rc_tag=rc_tag, set_by=set_by, now=now)
+
+
+def _begin_candidate_round_locked(index_path: Path, *, rc_tag: str, set_by: str, now: str) -> str:
     """建立新的共同 RC 輪次並立即切換目前輪次；舊紀錄全部保留。"""
     match = _RC_TAG.fullmatch(rc_tag) if isinstance(rc_tag, str) else None
     if match is None or not isinstance(set_by, str) or not set_by:
@@ -639,6 +701,20 @@ def begin_candidate_round(index_path: Path, *, rc_tag: str, set_by: str, now: st
     ]
     if numbers and requested_number < max(numbers):
         raise _invalid("rc_tag must not move backwards")
+    targets = index.get("stage_targets", {}).get("3", {})
+    current_failures = [
+        row
+        for row in index.get("entries", [])
+        if isinstance(row, dict)
+        and row.get("result") == "FAIL"
+        and isinstance(targets, dict)
+        and isinstance(targets.get(row.get("platform")), dict)
+        and row.get("artifact_id") == targets[row["platform"]].get("artifact_id")
+    ]
+    if current_failures:
+        expected_number = max(numbers, default=0) + 1
+        if requested_number != expected_number:
+            raise _invalid(f"正式 FAIL 後必須升至 v1.0.0-rc.{expected_number}")
     candidate_round_id = uuid.uuid4().hex
     while _candidate_round(index, candidate_round_id) is not None:
         candidate_round_id = uuid.uuid4().hex
@@ -693,10 +769,17 @@ def _index_evidence_root(index_path: Path) -> Path:
     return resolved.parent / "docs" / "rust-refactor" / "evidence"
 
 
-def _git_seed_reader(revision: str, repo_path: str) -> bytes | None:
+def _index_repo_root(evidence_root: Path) -> Path:
+    root = Path(evidence_root).resolve()
+    if root.name == "evidence" and root.parent.name == "rust-refactor" and root.parent.parent.name == "docs":
+        return root.parents[2]
+    return REPO_ROOT
+
+
+def _git_seed_reader(revision: str, repo_path: str, *, repo_root: Path = REPO_ROOT) -> bytes | None:
     result = subprocess.run(
         ["git", "show", f"{revision}:{repo_path}"],
-        cwd=REPO_ROOT,
+        cwd=Path(repo_root),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -707,26 +790,47 @@ def _git_seed_reader(revision: str, repo_path: str) -> bytes | None:
     return result.stdout
 
 
-def _prepare_required_cases(evidence_root: Path) -> tuple[dict[str, str], str]:
+def _selected_source_reader(
+    repo_root: Path,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
+) -> Callable[[str, str], bytes | None]:
+    if source_reader is not None:
+        return source_reader
+    if DEFAULT_SOURCE_READER is not None:
+        return DEFAULT_SOURCE_READER
+    return lambda revision, path: _git_seed_reader(revision, path, repo_root=repo_root)
+
+
+def _prepare_required_cases(
+    evidence_root: Path,
+    *,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
+) -> tuple[dict[str, str], str]:
     """重驗 T1 分母與 seed，並在公開 evidence root 保存原始位元組快照。"""
     from tools.stage3 import required_cases
 
-    errors = required_cases.validate_current_lock(REPO_ROOT)
+    repo_root = _index_repo_root(evidence_root)
+    reader = _selected_source_reader(repo_root, source_reader)
+    lock_path = repo_root / "tests/acceptance/stage3_required_cases.lock.json"
+    manifest_path = repo_root / "docs/rust-refactor/evidence/denominators/source-manifest.json"
+    errors = required_cases.validate_current_lock(repo_root, source_reader=reader)
     if errors:
         raise _invalid("required cases lock is invalid: " + "; ".join(errors))
-    lock_bytes = REQUIRED_CASES_LOCK_PATH.read_bytes()
-    manifest_bytes = (REPO_ROOT / "docs/rust-refactor/evidence/denominators/source-manifest.json").read_bytes()
+    lock_bytes = lock_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+    digest = _sha256_bytes(lock_bytes)
+    lock_relative = f"stage3-required-cases.lock.{digest}.json"
     seed_sources = (
         (required_cases.SEED_REVISION, "tests/acceptance/cases.yaml", "denominators/cases.yaml"),
         (required_cases.SEED_REVISION, "tests/acceptance/cases.lock.json", "denominators/cases.lock.json"),
     )
     attachments = [
         (Path("docs/rust-refactor/evidence/denominators/source-manifest.json"), "denominators/source-manifest.json", manifest_bytes),
-        (REQUIRED_CASES_LOCK_PATH, "stage3-required-cases.lock.json", lock_bytes),
+        (lock_path, lock_relative, lock_bytes),
     ]
     for revision, repo_path, relative in seed_sources:
         try:
-            data = _git_seed_reader(revision, repo_path)
+            data = reader(revision, repo_path)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise _invalid(f"cannot retrieve designated public seed {repo_path}: {exc}") from exc
         if data is None:
@@ -735,24 +839,199 @@ def _prepare_required_cases(evidence_root: Path) -> tuple[dict[str, str], str]:
     for source, relative, data in attachments:
         destination = evidence_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.resolve(strict=False).relative_to(evidence_root.resolve())
+        except ValueError as exc:
+            raise _invalid(f"frozen required case attachment escapes evidence root: {relative}") from exc
+        if destination.is_symlink():
+            raise _invalid(f"frozen required case attachment must not be a symlink: {relative}")
         if destination.exists():
+            if not destination.is_file():
+                raise _invalid(f"frozen required case attachment is not a regular file: {relative}")
             if destination.read_bytes() != data:
                 raise _invalid(f"frozen required case attachment changed: {relative}")
         else:
-            destination.write_bytes(data)
+            try:
+                with destination.open("xb") as stream:
+                    stream.write(data)
+            except FileExistsError:
+                if destination.is_symlink() or not destination.is_file() or destination.read_bytes() != data:
+                    raise _invalid(f"frozen required case attachment changed: {relative}")
     manifest = _decode_json(manifest_bytes, "required case source manifest")
     seed_errors = required_cases.verify_seed_sources(
         manifest,
         evidence_root=evidence_root,
-        source_reader=_git_seed_reader,
+        source_reader=reader,
     )
     if seed_errors:
         raise _invalid("required case seed is invalid: " + "; ".join(seed_errors))
-    digest = _sha256_bytes(lock_bytes)
-    return {"path": "stage3-required-cases.lock.json", "sha256": digest}, digest
+    return {"path": lock_relative, "sha256": digest}, digest
 
 
-def set_target(
+def _archive_path(name: str) -> tuple[str, ...]:
+    if not isinstance(name, str) or not name or "\\" in name or name.startswith("/"):
+        raise _invalid(f"release archive contains an unsafe member path: {name!r}")
+    if re.match(r"^[A-Za-z]:", name):
+        raise _invalid(f"release archive contains an absolute member path: {name!r}")
+    normalized = name[:-1] if name.endswith("/") else name
+    if any(part in ("", ".", "..") for part in normalized.split("/")):
+        raise _invalid(f"release archive contains an unsafe member path: {name!r}")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise _invalid(f"release archive contains an unsafe member path: {name!r}")
+    return parts
+
+
+def _stream_digest(stream: Any) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := stream.read(1024 * 1024):
+        size += len(chunk)
+        digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _validate_release_archive(archive: Path, bundle: Path, manifest: Mapping[str, Any], platform: str) -> str:
+    """依 T2 `rc_archive` 版型安全解析，逐檔驗 archive 與已驗證 bundle 一致。"""
+    archive_path = Path(archive)
+    bundle_path = Path(bundle)
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise _invalid("release archive must be a regular file")
+    try:
+        version = manifest["bundle_version"]
+        target = str(manifest["target"]).casefold()
+    except (KeyError, TypeError) as exc:
+        raise _invalid("release manifest lacks archive version or target") from exc
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]*", version):
+        raise _invalid("release manifest bundle_version is unsafe for an archive path")
+    target_platform = "windows" if "windows" in target or "win32" in target else "linux" if "linux" in target else None
+    if target_platform != platform:
+        raise _invalid("archive platform does not match bundle platform")
+    outer = f"serialwrap-{version}-{platform}-x86_64"
+    version_root = f"{outer}/versions/{version}"
+
+    expected_files: dict[str, tuple[str, int]] = {}
+    expected_dirs: set[str] = set()
+    for path in bundle_path.rglob("*"):
+        rel = path.relative_to(bundle_path).as_posix()
+        if path.is_symlink():
+            raise _invalid(f"bundle version tree contains symlink: {rel}")
+        if path.is_dir():
+            expected_dirs.add(f"{version_root}/{rel}")
+        elif path.is_file():
+            expected_files[f"{version_root}/{rel}"] = (sha256_file(path), path.stat().st_size)
+        else:
+            raise _invalid(f"bundle version tree contains a non-regular member: {rel}")
+
+    expected_dirs.update({outer, f"{outer}/versions", version_root, f"{outer}/bin"})
+    cli_name = "serialwrap.exe" if platform == "windows" else "serialwrap"
+    daemon_name = "serialwrapd.exe" if platform == "windows" else "serialwrapd"
+    aliases = {
+        f"{outer}/bin/{cli_name}": (f"bin/{cli_name}", platform == "linux"),
+        f"{outer}/bin/{daemon_name}": (f"bin/{daemon_name}", platform == "linux"),
+    }
+    archive_files: dict[str, tuple[str, int]] = {}
+    archive_dirs: set[str] = set()
+    archive_links: dict[str, str] = {}
+    seen: set[str] = set()
+
+    def record(name: str, kind: str, payload: Any = None) -> None:
+        parts = _archive_path(name)
+        normalized = "/".join(parts)
+        if normalized in seen:
+            raise _invalid(f"release archive contains duplicate member: {normalized}")
+        seen.add(normalized)
+        if parts[0] != outer:
+            raise _invalid("release archive must contain exactly one expected version root")
+        if kind == "dir":
+            archive_dirs.add(normalized)
+        elif kind == "file":
+            archive_files[normalized] = payload
+        elif kind == "symlink":
+            archive_links[normalized] = str(payload)
+        else:
+            raise _invalid(f"release archive contains an unsupported member type: {normalized}")
+
+    try:
+        if platform == "linux":
+            with tarfile.open(archive_path, mode="r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.isdir():
+                        record(member.name, "dir")
+                    elif member.isfile():
+                        source = tar.extractfile(member)
+                        if source is None:
+                            raise _invalid(f"release archive member cannot be read: {member.name}")
+                        with source:
+                            record(member.name, "file", _stream_digest(source))
+                    elif member.issym():
+                        record(member.name, "symlink", member.linkname)
+                    else:
+                        raise _invalid(f"release archive contains a device or unsupported member: {member.name}")
+        else:
+            if not zipfile.is_zipfile(archive_path):
+                raise _invalid("Windows release archive must be a ZIP file")
+            with zipfile.ZipFile(archive_path) as zipped:
+                for member in zipped.infolist():
+                    mode = member.external_attr >> 16
+                    member_type = stat.S_IFMT(mode)
+                    if member.is_dir() or member_type == stat.S_IFDIR:
+                        record(member.filename, "dir")
+                    elif member_type in (0, stat.S_IFREG):
+                        with zipped.open(member, "r") as source:
+                            record(member.filename, "file", _stream_digest(source))
+                    else:
+                        raise _invalid(f"ZIP contains a symlink, device, or unsupported member: {member.filename}")
+    except HarnessError:
+        raise
+    except (OSError, EOFError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
+        raise _invalid(f"release archive is invalid or has the wrong platform format: {exc}") from exc
+
+    roots = {name.split("/", 1)[0] for name in seen}
+    if roots != {outer}:
+        raise _invalid("release archive must contain exactly one version root")
+    archive_version_roots = {
+        "/".join(parts[:3])
+        for name in seen
+        if (parts := tuple(name.split("/")))[:2] == (outer, "versions") and len(parts) >= 3
+    }
+    if archive_version_roots != {version_root}:
+        raise _invalid("release archive must contain exactly one matching version root")
+
+    actual_version_files = {name: value for name, value in archive_files.items() if name.startswith(version_root + "/")}
+    actual_version_dirs = {name for name in archive_dirs if name.startswith(version_root + "/")}
+    if actual_version_files != expected_files or actual_version_dirs != expected_dirs - {outer, f"{outer}/versions", version_root, f"{outer}/bin"}:
+        raise HarnessError("HARNESS_ARTIFACT_MISMATCH", "archive version tree file set differs from bundle")
+
+    allowed_files = set(expected_files) | (set(aliases) if platform == "windows" else set())
+    allowed_dirs = expected_dirs
+    if set(archive_files) != allowed_files or archive_dirs != allowed_dirs:
+        raise HarnessError("HARNESS_ARTIFACT_MISMATCH", "archive members differ from the release bundle layout")
+    if platform == "linux":
+        if set(archive_links) != set(aliases):
+            raise HarnessError("HARNESS_ARTIFACT_MISMATCH", "Linux archive aliases differ from the release bundle layout")
+        for alias, (bundle_rel, _is_link) in aliases.items():
+            expected_link = f"../versions/{version}/{bundle_rel}"
+            if archive_links[alias] != expected_link:
+                raise _invalid(f"archive symlink escapes or differs from its version root: {alias}")
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(alias), archive_links[alias]))
+            if not resolved.startswith(outer + "/"):
+                raise _invalid(f"archive symlink escapes its version root: {alias}")
+    elif archive_links:
+        raise _invalid("Windows release archive may not contain symlinks")
+
+    for name, expected in expected_files.items():
+        if archive_files.get(name) != expected:
+            raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"archive member content differs from bundle: {name}")
+    if platform == "windows":
+        for alias, (bundle_rel, _is_link) in aliases.items():
+            bundle_file = bundle_path / Path(*PurePosixPath(bundle_rel).parts)
+            if archive_files.get(alias) != (sha256_file(bundle_file), bundle_file.stat().st_size):
+                raise HarnessError("HARNESS_ARTIFACT_MISMATCH", f"archive entry content differs from bundle: {alias}")
+    return sha256_file(archive_path)
+
+
+def _set_target_locked(
     index_path: Path,
     *,
     stage: str,
@@ -766,6 +1045,7 @@ def set_target(
     bundle_dir: Path | None = None,
     archive: Path | None = None,
     candidate_round_id: str | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> None:
     """凍結一個 stage/platform target，保留完整 target 歷史。"""
     if stage not in STAGES or platform not in PLATFORMS:
@@ -826,7 +1106,10 @@ def set_target(
         if isinstance(existing_target, dict) and existing_target.get("candidate_round_id") == candidate_round_id:
             raise _invalid(f"{platform} target is already frozen for this candidate round")
         evidence_root = _index_evidence_root(index_path)
-        lock_pointer, required_cases_sha256 = _prepare_required_cases(evidence_root)
+        lock_pointer, required_cases_sha256 = _prepare_required_cases(
+            evidence_root,
+            source_reader=source_reader,
+        )
         scope_errors = validate_legacy_scope(
             index,
             catalog=load_exit_catalog(),
@@ -838,14 +1121,22 @@ def set_target(
         if not _pointer_valid(scope_pointer):
             raise _invalid("stage 3 target requires a frozen legacy obligation scope")
         legacy_scope_sha256 = scope_pointer["sha256"]
-        try:
-            archive_sha256 = sha256_file(Path(archive))
-        except OSError as exc:
-            raise _invalid(f"cannot read release archive: {exc}") from exc
+        archive_sha256 = _validate_release_archive(Path(archive), bundle_path, manifest_doc, platform)
 
     history = index["target_history"]
     for previous in history:
         previous_target = previous.get("target", previous)
+        if (
+            stage == "3"
+            and previous.get("stage") == stage
+            and previous.get("platform") == platform
+            and previous_target.get("rc_tag") == rc_tag
+            and previous_target.get("artifact_id") != artifact_id
+        ):
+            raise HarnessError(
+                "HARNESS_ARTIFACT_MISMATCH",
+                f"RC tag already identifies a different artifact: {platform} {rc_tag}",
+            )
         if (
             previous.get("stage") == stage
             and previous.get("platform") == platform
@@ -858,6 +1149,17 @@ def set_target(
                 "HARNESS_ARTIFACT_MISMATCH",
                 f"bundle tree changed under same manifest: {platform}",
             )
+    if stage == "3" and any(
+        isinstance(row, dict)
+        and row.get("platform") == platform
+        and row.get("result") == "FAIL"
+        and row.get("artifact_id") == artifact_id
+        for row in index.get("entries", [])
+    ):
+        raise HarnessError(
+            "HARNESS_ARTIFACT_MISMATCH",
+            f"a formal FAIL requires a different Stage 3 artifact: {platform}",
+        )
 
     target: dict[str, Any] = {
         "artifact_id": artifact_id,
@@ -882,7 +1184,42 @@ def set_target(
     _write_index(index_path, index)
 
 
-def add_entry(
+def set_target(
+    index_path: Path,
+    *,
+    stage: str,
+    platform: str,
+    release_manifest: Path,
+    contract_revision: str,
+    tool_revision: str,
+    case_list_sha256: str,
+    set_by: str,
+    now: str,
+    bundle_dir: Path | None = None,
+    archive: Path | None = None,
+    candidate_round_id: str | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
+) -> None:
+    """於同一索引鎖內完成 target 的讀取、驗證、凍結與寫入。"""
+    with _index_write_lock(index_path):
+        _set_target_locked(
+            index_path,
+            stage=stage,
+            platform=platform,
+            release_manifest=release_manifest,
+            contract_revision=contract_revision,
+            tool_revision=tool_revision,
+            case_list_sha256=case_list_sha256,
+            set_by=set_by,
+            now=now,
+            bundle_dir=bundle_dir,
+            archive=archive,
+            candidate_round_id=candidate_round_id,
+            source_reader=source_reader,
+        )
+
+
+def _add_entry_locked(
     index_path: Path,
     entry: EvidenceEntry | RestrictedFailEntry,
     *,
@@ -940,6 +1277,17 @@ def add_entry(
     _write_index(index_path, index)
 
 
+def add_entry(
+    index_path: Path,
+    entry: EvidenceEntry | RestrictedFailEntry,
+    *,
+    catalog: Mapping[str, ExitItem],
+) -> None:
+    """在共用索引鎖內重讀、驗證並追加一筆 evidence entry。"""
+    with _index_write_lock(index_path):
+        _add_entry_locked(index_path, entry, catalog=catalog)
+
+
 def _entry_file_path(evidence_root: Path, file_row: Mapping[str, Any]) -> Path | None:
     rel = file_row.get("path")
     if not isinstance(rel, str) or not rel:
@@ -985,30 +1333,67 @@ def _files_status(entry: Mapping[str, Any], evidence_root: Path) -> tuple[bool, 
     return True, None
 
 
-def _a8_substitute_pending(item_id: str, entry: Mapping[str, Any], evidence_root: Path) -> bool:
-    """在 BO-P9-19 未裁決前，不把 hash-only／遮罩 CRC 報告算成公開正向證據。"""
-    if item_id not in {"S3-L3-P0P1-REMOTE-LINUX", "S3-L3-P0P1-REMOTE-WINDOWS"}:
+def _bop919_pending(item: ExitItem) -> bool:
+    """依 plan 10 §0.2 BO-P9-19 與 §0.4「公開證據契約」（R7-01、R8-01、R10-01）判定。
+
+    原始執行資料不公開且公開正向替代尚未核定前，必要執行來源不可 SATISFIED；
+    kind 清單含 junit、bridge-selftest、functest-report、regression-report、realhw-report、
+    gate-report、manual-procedure、drill-report、ab-report、canary-report。未知 kind 同樣
+    阻擋；只有靜態 od09-freeze 不依賴受限執行來源，選配 reference 缺證不新增必要項。
+    """
+    if item.release_requirement != "required" or item.evidence_kind == "od09-freeze":
         return False
-    files = entry.get("files")
-    if not isinstance(files, list):
-        return False
-    for file_row in files:
-        if not isinstance(file_row, dict):
+    if item.evidence_kind in BO_P9_19_AFFECTED_KINDS:
+        return True
+    # 目前只有既有 OD-09 凍結核對是非執行來源例外；未知 kind 不得假設安全。
+    return True
+
+
+def _stage3_context_errors(
+    item: ExitItem,
+    entry: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    evidence_root: Path,
+) -> list[str]:
+    if item.stage != "3" or item.item_id == "S3-OD09-ALL-FROZEN":
+        return []
+    from tools.stage3.candidate_context import load_run_context_bytes
+
+    rows = entry.get("files")
+    if not isinstance(rows, list):
+        return ["candidate context is missing from entry files"]
+    contexts: list[tuple[Mapping[str, Any], str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
             continue
-        path = _entry_file_path(evidence_root, file_row)
+        path = _entry_file_path(evidence_root, row)
         if path is None:
             continue
         try:
-            data = json.loads(path.read_bytes().decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            context = load_run_context_bytes(path.read_bytes())
+        except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and (
-            "private_source_sha256" in data
-            or "redacted_crc32" in data
-            or data.get("payload") == "[redacted]"
-        ):
-            return True
-    return False
+        contexts.append((context, str(row.get("path", ""))))
+    if len(contexts) != 1:
+        return ["candidate context must appear exactly once in entry files"]
+    context, _context_path = contexts[0]
+    expected = {
+        "candidate_round_id": entry.get("candidate_round_id"),
+        "archive_sha256": entry.get("archive_sha256"),
+        "artifact_id": entry.get("artifact_id"),
+        "required_cases_sha256": entry.get("required_cases_sha256"),
+        "platform": entry.get("platform"),
+    }
+    round_row = target.get("rc_tag")
+    if isinstance(round_row, str) and context.get("rc_tag") != round_row:
+        return ["candidate context differs: rc_tag"]
+    expected.update({key: target.get(key) for key in expected if key != "platform"})
+    expected["platform"] = target.get("platform", entry.get("platform"))
+    for key, value in expected.items():
+        if context.get(key) != value:
+            return [f"candidate context differs: {key}"]
+    return []
 
 
 def _load_l1_lock(l1_lock: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -1054,6 +1439,80 @@ def _xfail_valid(entry: Mapping[str, Any], cases: Mapping[str, dict]) -> bool:
     return True
 
 
+def _required_cases_validation(
+    target: Mapping[str, Any],
+    *,
+    evidence_root: Path,
+    required_lock: Path | None,
+    source_reader: Callable[[str, str], bytes | None] | None,
+) -> tuple[str, str] | None:
+    """重驗 target 快照、指定 seed、T1 只增鎖與 family 治理。"""
+    from tools.stage3 import required_cases
+
+    evidence_root = Path(evidence_root)
+    repo_root = _index_repo_root(evidence_root)
+    reader = _selected_source_reader(repo_root, source_reader)
+    current_lock_path = Path(required_lock) if required_lock is not None else repo_root / "tests/acceptance/stage3_required_cases.lock.json"
+    if not current_lock_path.is_file():
+        return "MISSING", "current required cases lock is missing"
+    try:
+        current_lock_bytes = current_lock_path.read_bytes()
+    except OSError:
+        return "MISSING", "current required cases lock cannot be read"
+    current_sha = _sha256_bytes(current_lock_bytes)
+
+    pointer = target.get("required_cases_lock")
+    if not _pointer_valid(pointer):
+        return "HASH_MISMATCH", "target required cases lock pointer is invalid"
+    frozen_path = _entry_file_path(evidence_root, pointer)
+    if frozen_path is None:
+        return "HASH_MISMATCH", "frozen required cases lock is missing or unsafe"
+    try:
+        frozen_bytes = frozen_path.read_bytes()
+    except OSError:
+        return "HASH_MISMATCH", "frozen required cases lock is missing"
+    if _sha256_bytes(frozen_bytes) != pointer["sha256"]:
+        return "HASH_MISMATCH", "frozen required cases lock attachment hash mismatch"
+    if target.get("required_cases_sha256") != pointer["sha256"]:
+        return "HASH_MISMATCH", "target required cases SHA differs from its frozen lock attachment"
+
+    manifest_path = evidence_root / "denominators" / "source-manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = _decode_json(manifest_bytes, "required case source manifest")
+    except (OSError, HarnessError) as exc:
+        return "HASH_MISMATCH", f"required case source manifest is unavailable: {exc}"
+    seed_errors = required_cases.verify_seed_sources(
+        manifest,
+        evidence_root=evidence_root,
+        source_reader=reader,
+    )
+    if seed_errors:
+        return "HASH_MISMATCH", "required case seed validation failed: " + "; ".join(seed_errors)
+
+    lock_repo_path = (repo_root / "tests/acceptance/stage3_required_cases.lock.json").resolve()
+    def read_current(path: Path) -> bytes:
+        if Path(path).resolve() == lock_repo_path and current_lock_path.resolve() != lock_repo_path:
+            return current_lock_bytes
+        return Path(path).read_bytes()
+
+    governance_errors = required_cases.validate_current_lock(
+        repo_root,
+        source_reader=reader,
+        read_bytes=read_current,
+    )
+    if governance_errors:
+        joined = "; ".join(governance_errors)
+        if target.get("required_cases_sha256") != current_sha:
+            return "STALE", "required cases changed after target freeze; current governance failed: " + joined
+        if any(token in joined.lower() for token in ("sha", "附件", "source", "seed", "來源")):
+            return "HASH_MISMATCH", "required case source validation failed: " + joined
+        return "STALE", "required cases governance failed: " + joined
+    if target.get("required_cases_sha256") != current_sha:
+        return "STALE", "required cases changed after target freeze"
+    return None
+
+
 def _reuse_ok(
     entry: Mapping[str, Any],
     by_id: Mapping[str, Mapping[str, Any]],
@@ -1063,6 +1522,7 @@ def _reuse_ok(
     catalog: Mapping[str, ExitItem],
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
     visiting: frozenset[str] = frozenset(),
 ) -> tuple[bool, str | None]:
     source_id = entry.get("reuse_of")
@@ -1080,6 +1540,21 @@ def _reuse_ok(
     source_platform = source.get("platform")
     if source_item is None or not isinstance(source_platform, str):
         return False, "reused entry item or platform invalid"
+    target_item = catalog.get(str(entry.get("item_id", "")))
+    if target_item is None:
+        return False, "reuse target item invalid"
+    if source_platform != entry.get("platform"):
+        return False, "reuse platform differs"
+    if source_item.evidence_kind != target_item.evidence_kind:
+        return False, "reuse evidence kind differs"
+    if source_item.required_case_set != target_item.required_case_set:
+        return False, "reuse required case set differs"
+    if source_item.required_l1_set != target_item.required_l1_set:
+        return False, "reuse L1 set differs"
+    if target_item.platform not in (entry.get("platform"), "both"):
+        return False, "reuse target platform does not match its item"
+    if source_item.platform not in (source_platform, "both"):
+        return False, "reuse source platform does not match its item"
     files_ok, _ = _files_status(source, evidence_root)
     if not files_ok:
         return False, "reused entry files invalid"
@@ -1096,6 +1571,16 @@ def _reuse_ok(
         if left != right:
             identity_error = f"reuse identity differs: {field}"
             break
+    report_scope_fields = (
+        "required_cases_sha256", "l1_set_sha256", "ledger_through", "ledger_records",
+    )
+    if identity_error is None:
+        for field in report_scope_fields:
+            if entry.get(field) != source.get(field):
+                identity_error = f"reuse report scope differs: {field}"
+                break
+    if identity_error is not None:
+        return False, identity_error
     source_l1 = _load_l1_lock(l1_lock) if source_item.required_l1_set is not None else None
     source_status, source_reasons, satisfying = _platform_status(
         index,
@@ -1105,16 +1590,13 @@ def _reuse_ok(
         cases=cases,
         l1_lock=source_l1,
         catalog=catalog,
+        source_reader=source_reader,
         reuse_chain=visiting | {str(source_id), str(current_id)},
     )
     if source_status != "SATISFIED" or str(source_id) not in satisfying:
         if any("reuse cycle" in reason for reason in source_reasons):
             return False, "reuse cycle"
-        if identity_error is not None:
-            return False, identity_error
         return False, "reused entry not PASS"
-    if identity_error is not None:
-        return False, identity_error
     return True, None
 
 
@@ -1140,16 +1622,31 @@ def _platform_status(
     l1_lock: Mapping[str, Any] | None,
     catalog: Mapping[str, ExitItem],
     required_lock: Path | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
     reuse_chain: frozenset[str] = frozenset(),
 ) -> tuple[str, list[str], list[str]]:
     stage_rows = index.get("stage_targets", {}).get(item.stage, {})
     target = stage_rows.get(platform) if isinstance(stage_rows, dict) else None
-    if not isinstance(target, dict):
-        return "NO_TARGET", ["no target"], []
     entries = [
         row for row in index.get("entries", [])
         if isinstance(row, dict) and row.get("item_id") == item.item_id and row.get("platform") == platform
     ]
+    if not isinstance(target, dict):
+        historical_artifacts = {
+            row.get("artifact_id")
+            for row in index.get("target_history", [])
+            if isinstance(row, Mapping)
+            and row.get("stage") == item.stage
+            and row.get("platform") == platform
+            and isinstance(row.get("artifact_id"), str)
+        }
+        failures = [
+            row for row in entries
+            if row.get("result") == "FAIL" and row.get("artifact_id") in historical_artifacts
+        ]
+        if failures:
+            return "FAIL", [f"FAIL: {row.get('entry_id')}" for row in failures], []
+        return "NO_TARGET", ["no target"], []
     # 正式 FAIL 對目前 artifact 黏著；先於輪次、目錄角色與一般 entry 新鮮度檢查。
     failures = [
         row for row in entries
@@ -1170,43 +1667,30 @@ def _platform_status(
             target_errors.append("target is not in the current candidate round")
 
     required_lock_doc: Mapping[str, Any] | None = None
-    required_lock_hash: str | None = None
-    lock_hash_error: str | None = None
     if item.stage == "3":
-        current_lock_path = Path(required_lock) if required_lock is not None else REQUIRED_CASES_LOCK_PATH
+        governance = _required_cases_validation(
+            target,
+            evidence_root=evidence_root,
+            required_lock=required_lock,
+            source_reader=source_reader,
+        )
+        if governance is not None:
+            status, reason = governance
+            return status, [reason], []
+        repo_root = _index_repo_root(evidence_root)
+        current_lock_path = Path(required_lock) if required_lock is not None else repo_root / "tests/acceptance/stage3_required_cases.lock.json"
         try:
             current_lock_bytes = current_lock_path.read_bytes()
-            required_lock_hash = _sha256_bytes(current_lock_bytes)
             loaded_lock = json.loads(current_lock_bytes.decode("utf-8"))
             if isinstance(loaded_lock, dict):
                 required_lock_doc = loaded_lock
-            else:
-                lock_hash_error = "current required cases lock is not an object"
-        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
-            lock_hash_error = f"cannot read current required cases lock: {exc}"
-        pointer = target.get("required_cases_lock")
-        if not _pointer_valid(pointer):
-            lock_hash_error = "target required cases lock pointer is invalid"
-        else:
-            frozen_path = _entry_file_path(evidence_root, pointer)
-            if frozen_path is None:
-                lock_hash_error = "frozen required cases lock is missing or unsafe"
-            else:
-                try:
-                    frozen_bytes = frozen_path.read_bytes()
-                    if _sha256_bytes(frozen_bytes) != pointer["sha256"]:
-                        lock_hash_error = "frozen required cases lock hash mismatch"
-                except OSError:
-                    lock_hash_error = "frozen required cases lock is missing"
-        if target.get("required_cases_sha256") != required_lock_hash:
-            target_errors.append("required cases changed after target freeze")
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            required_lock_doc = None
         if required_lock_doc is not None and item.required_case_set is not None:
             try:
                 required_lock_doc["exits"][item.item_id][platform]
             except (KeyError, TypeError):
                 target_errors.append(f"required cases lock lacks {item.item_id}/{platform}")
-        if lock_hash_error:
-            return "HASH_MISMATCH", [lock_hash_error], []
 
     current_l1 = _l1_set_sha256(l1_lock or {}, item.required_l1_set, platform) if item.required_l1_set else None
     if item.required_l1_set is not None and current_l1 is None:
@@ -1232,6 +1716,10 @@ def _platform_status(
                 reasons.append(f"stale archive_sha256: {entry_id}")
             if entry.get("required_cases_sha256") != target.get("required_cases_sha256"):
                 reasons.append(f"stale required_cases_sha256: {entry_id}")
+            if item.release_requirement == "required" and entry.get("reuse_of") is not None:
+                reasons.append(f"Stage 3 required evidence cannot use reuse_of: {entry_id}")
+            if entry.get("result") in {"PASS", "XFAIL"}:
+                reasons.extend(_stage3_context_errors(item, entry, target, evidence_root=evidence_root))
         if target.get("bundle_tree_sha256") is not None and (
             entry.get("bundle_tree_sha256") is None
             or entry.get("runtime_tree_sha256") is None
@@ -1273,15 +1761,12 @@ def _platform_status(
     by_id = {str(row.get("entry_id")): row for row in index.get("entries", []) if isinstance(row, dict)}
     stale_reuse: list[str] = []
     hash_mismatch: list[str] = []
-    a8_pending: list[str] = []
+    bop919_pending: list[str] = []
     satisfying: list[str] = []
     for row in successful:
         files_ok, file_reason = _files_status(row, evidence_root)
         if not files_ok:
             hash_mismatch.append(f"{file_reason}: {row.get('entry_id')}")
-            continue
-        if _a8_substitute_pending(item.item_id, row, evidence_root):
-            a8_pending.append(f"BO-P9-19: public substitute verification is not owner-approved: {row.get('entry_id')}")
             continue
         reuse_ok, reuse_reason = _reuse_ok(
             row,
@@ -1291,18 +1776,22 @@ def _platform_status(
             catalog=catalog,
             cases=cases,
             l1_lock=l1_lock,
+            source_reader=source_reader,
             visiting=reuse_chain,
         )
         if not reuse_ok:
             stale_reuse.append(str(reuse_reason))
+            continue
+        if _bop919_pending(item):
+            bop919_pending.append(f"BO-P9-19 pending: no owner-approved public verification for {item.evidence_kind}")
             continue
         satisfying.append(str(row.get("entry_id")))
     if hash_mismatch:
         return "HASH_MISMATCH", hash_mismatch, []
     if satisfying:
         return "SATISFIED", [], satisfying
-    if a8_pending:
-        return "MISSING", a8_pending, []
+    if bop919_pending:
+        return "MISSING", bop919_pending, []
     if stale_reuse:
         return "STALE", stale_reuse, []
     return "MISSING", [f"no passing evidence for {item.item_id}"], []
@@ -1317,6 +1806,7 @@ def _item_status_full(
     l1_lock: Mapping[str, Any] | None,
     required_lock: Path | None = None,
     catalog: Mapping[str, ExitItem] | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     resolved_catalog = catalog if catalog is not None else load_exit_catalog()
     item_l1 = _load_l1_lock(l1_lock) if item.required_l1_set is not None else None
@@ -1332,6 +1822,7 @@ def _item_status_full(
             l1_lock=item_l1,
             catalog=resolved_catalog,
             required_lock=required_lock,
+            source_reader=source_reader,
         )
         results.append((platform, status, reasons, satisfying))
     for platform, status, reasons, _ in results:
@@ -1351,8 +1842,10 @@ def item_status(
     *,
     evidence_root: Path,
     cases: Mapping[str, dict],
+    catalog: Mapping[str, ExitItem] | None = None,
     l1_lock: Mapping[str, Any] | None = None,
     required_lock: Path | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> tuple[str, list[str]]:
     """依 target、證據身分、檔案雜湊與案例 sentinel 判定單一出口項目。"""
     status, reasons, _ = _item_status_full(
@@ -1361,7 +1854,9 @@ def item_status(
         evidence_root=evidence_root,
         cases=cases,
         l1_lock=l1_lock,
+        catalog=catalog,
         required_lock=required_lock,
+        source_reader=source_reader,
     )
     return status, reasons
 
@@ -1375,6 +1870,7 @@ def stage_status(
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None = None,
     required_lock: Path | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> dict[str, Any]:
     """彙整指定 stage 的出口狀態。"""
     if stage not in STAGES:
@@ -1391,6 +1887,7 @@ def stage_status(
             l1_lock=l1_lock,
             required_lock=required_lock,
             catalog=catalog,
+            source_reader=source_reader,
         )
         items[item.item_id] = {
             "status": status,
@@ -1431,6 +1928,61 @@ def _read_evidence_file(evidence_root: Path, relative: object) -> tuple[bytes | 
 
 def _json_sha256(value: Any) -> str:
     return _sha256_bytes(dumps_compact(value).encode("utf-8"))
+
+
+def _source_inventory_obligations(
+    sources_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    evidence_root: Path,
+) -> tuple[dict[str, dict[str, Any]], set[str], list[str]]:
+    """只接受來源快照內可機器解析的義務 key／平台／案例／證據 kind。"""
+    obligations: dict[str, dict[str, Any]] = {}
+    inventory_sources: set[str] = set()
+    errors: list[str] = []
+    for source_id, source in sources_by_id.items():
+        snapshot = source.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            continue
+        raw, read_error = _read_evidence_file(evidence_root, snapshot.get("path"))
+        if read_error or raw is None:
+            continue
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            continue
+        if not isinstance(document, dict) or "obligations" not in document:
+            continue
+        rows = document.get("obligations")
+        if not isinstance(rows, list):
+            errors.append(f"source inventory {source_id} obligations must be an array")
+            continue
+        inventory_sources.add(source_id)
+        for number, row in enumerate(rows):
+            fields = {"key", "platform", "case_ids", "evidence_kinds"}
+            if not isinstance(row, dict) or set(row) != fields:
+                errors.append(f"source inventory {source_id} obligations[{number}] lacks machine-readable keys")
+                continue
+            key = row.get("key")
+            if not isinstance(key, str) or not key or key in obligations:
+                errors.append(f"source inventory has an empty or duplicate obligation key: {key!r}")
+                continue
+            if (
+                row.get("platform") not in PLATFORMS
+                or not isinstance(row.get("case_ids"), list)
+                or not row["case_ids"]
+                or any(not isinstance(case_id, str) or not case_id for case_id in row["case_ids"])
+                or len(set(row["case_ids"])) != len(row["case_ids"])
+                or not isinstance(row.get("evidence_kinds"), list)
+                or not row["evidence_kinds"]
+                or any(not isinstance(kind, str) or not kind for kind in row["evidence_kinds"])
+                or len(set(row["evidence_kinds"])) != len(row["evidence_kinds"])
+            ):
+                errors.append(f"source inventory obligation {key} has an invalid platform, case set, or evidence kind")
+                continue
+            obligations[key] = {**row, "source_id": source_id}
+    if not inventory_sources:
+        errors.append("SPEC-GAP: source inventory has no machine-readable obligation key format")
+    return obligations, inventory_sources, errors
 
 
 def validate_legacy_scope(
@@ -1492,6 +2044,12 @@ def validate_legacy_scope(
         sources_by_id[source_id] = source
         source_hashes.append({"source_id": source_id, "sha256": snapshot["sha256"]})
 
+    source_inventory, inventory_source_ids, inventory_errors = _source_inventory_obligations(
+        sources_by_id,
+        evidence_root=evidence_root,
+    )
+    errors.extend(inventory_errors)
+
     obligations_by_key: dict[str, dict[str, Any]] = {}
     for number, obligation in enumerate(scope["obligations"]):
         required_fields = {
@@ -1506,14 +2064,26 @@ def validate_legacy_scope(
             errors.append(f"legacy obligation row {number} has an empty or duplicate key")
             continue
         obligations_by_key[key] = obligation
-        if not isinstance(obligation.get("source_refs"), list) or not obligation["source_refs"]:
+        if (
+            not isinstance(obligation.get("source_refs"), list)
+            or not obligation["source_refs"]
+            or any(not isinstance(source_ref, str) or not source_ref for source_ref in obligation["source_refs"])
+            or len(set(obligation["source_refs"])) != len(obligation["source_refs"])
+        ):
             errors.append(f"legacy obligation {key} lacks source_refs")
         else:
             for source_ref in obligation["source_refs"]:
                 if not isinstance(source_ref, str) or source_ref not in sources_by_id:
                     errors.append(f"legacy obligation {key} has an unresolved source_ref")
         scope_body = obligation.get("required_scope")
-        if not isinstance(scope_body, dict) or not isinstance(scope_body.get("case_ids"), list):
+        if (
+            not isinstance(scope_body, dict)
+            or set(scope_body) != {"case_ids"}
+            or not isinstance(scope_body.get("case_ids"), list)
+            or not scope_body["case_ids"]
+            or any(not isinstance(case_id, str) or not case_id for case_id in scope_body["case_ids"])
+            or len(set(scope_body["case_ids"])) != len(scope_body["case_ids"])
+        ):
             errors.append(f"legacy obligation {key} has invalid required_scope")
         elif _json_sha256(scope_body) != obligation.get("required_scope_sha256"):
             errors.append(f"legacy obligation {key} required_scope_sha256 mismatch")
@@ -1524,13 +2094,25 @@ def validate_legacy_scope(
             not isinstance(allowed, dict)
             or set(allowed) != {"kinds", "case_ids"}
             or not isinstance(allowed.get("kinds"), list)
+            or not allowed["kinds"]
+            or any(not isinstance(kind, str) or not kind for kind in allowed["kinds"])
+            or len(set(allowed["kinds"])) != len(allowed["kinds"])
             or not isinstance(allowed.get("case_ids"), list)
+            or any(not isinstance(case_id, str) or not case_id for case_id in allowed["case_ids"])
+            or len(set(allowed["case_ids"])) != len(allowed["case_ids"])
         ):
             errors.append(f"legacy obligation {key} has invalid allowed_evidence")
         elif scope_body and allowed["case_ids"] != scope_body.get("case_ids"):
             errors.append(f"legacy obligation {key} allowed_evidence cases differ from required_scope")
 
     expected: dict[str, tuple[ExitItem, str]] = {}
+    case_lock: Mapping[str, Any] | None = None
+    try:
+        case_lock_raw = (_index_repo_root(evidence_root) / "tests/acceptance/cases.lock.json").read_bytes()
+        parsed_case_lock = json.loads(case_lock_raw.decode("utf-8"))
+        case_lock = parsed_case_lock if isinstance(parsed_case_lock, dict) else None
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        errors.append("legacy scope cannot read the frozen source case set")
     for item in catalog.values():
         if item.stage == "3" or item.release_requirement != "required":
             continue
@@ -1553,11 +2135,44 @@ def validate_legacy_scope(
         allowed = obligation.get("allowed_evidence")
         if isinstance(allowed, dict) and allowed.get("kinds") != [item.evidence_kind]:
             errors.append(f"legacy obligation {key} allows the wrong evidence kind")
-    if not any(
-        row.get("stage") == "legacy" and row.get("item_id") not in catalog
-        for row in obligations_by_key.values()
-    ):
-        errors.append("legacy scope is missing non-catalog source obligations")
+        scope_body = obligation.get("required_scope")
+        if item.required_case_set is not None:
+            try:
+                expected_case_ids = case_lock["sets"][item.required_case_set]
+            except (KeyError, TypeError):
+                errors.append(f"legacy scope cannot resolve required case set for {key}")
+            else:
+                if not isinstance(scope_body, dict) or scope_body.get("case_ids") != expected_case_ids:
+                    errors.append(f"legacy obligation {key} narrows or changes its required case set")
+
+    scoped_non_catalog = {
+        key: row
+        for key, row in obligations_by_key.items()
+        if row.get("stage") == "legacy" and row.get("item_id") not in catalog
+    }
+    if set(scoped_non_catalog) != set(source_inventory):
+        missing = sorted(set(source_inventory) - set(scoped_non_catalog))
+        extra = sorted(set(scoped_non_catalog) - set(source_inventory))
+        if missing:
+            errors.append("legacy scope omits source inventory obligations: " + ", ".join(missing))
+        if extra:
+            errors.append("legacy scope contains obligations absent from source inventory: " + ", ".join(extra))
+    for key, source_row in source_inventory.items():
+        scope_row = scoped_non_catalog.get(key)
+        if scope_row is None:
+            continue
+        if (
+            scope_row.get("platform") != source_row.get("platform")
+            or not isinstance(scope_row.get("required_scope"), dict)
+            or scope_row["required_scope"].get("case_ids") != source_row.get("case_ids")
+            or not isinstance(scope_row.get("allowed_evidence"), dict)
+            or scope_row["allowed_evidence"].get("kinds") != source_row.get("evidence_kinds")
+            or source_row.get("source_id") not in scope_row.get("source_refs", [])
+        ):
+            errors.append(f"legacy obligation {key} does not cover its source inventory scope")
+    for key, scope_row in scoped_non_catalog.items():
+        if not any(source_id in scope_row.get("source_refs", []) for source_id in inventory_source_ids):
+            errors.append(f"legacy obligation {key} does not reference a machine-readable source inventory")
 
     review = scope.get("review")
     review_fields = {"reviewer_id", "approved_at", "decision_ref", "record"}
@@ -1603,6 +2218,133 @@ def _resolution_files_valid(files: Any, evidence_root: Path) -> tuple[bool, str 
     return _files_status({"files": files}, evidence_root)
 
 
+def _legacy_formal_failures(
+    index: Mapping[str, Any], catalog: Mapping[str, ExitItem],
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """先找出可連到目前或歷史 target 的 Stage 0～2.4 正式 FAIL。"""
+    target_artifacts: set[tuple[str, str, str]] = set()
+    for stage, platforms in index.get("stage_targets", {}).items():
+        if not isinstance(platforms, Mapping):
+            continue
+        for platform, target in platforms.items():
+            if isinstance(target, Mapping) and isinstance(target.get("artifact_id"), str):
+                target_artifacts.add((str(stage), str(platform), target["artifact_id"]))
+    for history in index.get("target_history", []):
+        if not isinstance(history, Mapping):
+            continue
+        target = history.get("target", history)
+        if not isinstance(target, Mapping):
+            continue
+        stage, platform = history.get("stage", target.get("stage")), history.get("platform", target.get("platform"))
+        artifact = target.get("artifact_id")
+        if isinstance(stage, str) and isinstance(platform, str) and isinstance(artifact, str):
+            target_artifacts.add((stage, platform, artifact))
+
+    failures: list[tuple[str, Mapping[str, Any]]] = []
+    for row in index.get("entries", []):
+        if not isinstance(row, Mapping) or row.get("result") != "FAIL":
+            continue
+        item = catalog.get(str(row.get("item_id", "")))
+        platform = row.get("platform")
+        if item is None or item.stage == "3" or platform not in PLATFORMS:
+            continue
+        if item.platform not in (platform, "both"):
+            continue
+        identity = (item.stage, platform, row.get("artifact_id"))
+        if identity in target_artifacts:
+            failures.append((f"{item.stage}:{item.item_id}:{platform}", row))
+    return failures
+
+
+def _legacy_new_od_valid(
+    row: Mapping[str, Any],
+    obligation: Mapping[str, Any],
+    *,
+    scope_sha: str | None,
+    evidence_root: Path,
+) -> tuple[bool, str]:
+    """驗證 new_od 的逐義務核定附件與公開替代證據引用。"""
+    if set(row) != {"key", "method", "decision_ref", "evidence"}:
+        return False, "new_od resolution does not have the exact fields"
+    if obligation.get("safety_invariant") is not False:
+        return False, "new_od cannot waive a safety invariant"
+    files = row.get("evidence")
+    valid, reason = _resolution_files_valid(files, evidence_root)
+    if not valid:
+        return False, reason or "new_od evidence files are invalid"
+    assert isinstance(files, list)
+    file_by_path = {item["path"]: item for item in files if isinstance(item, Mapping) and isinstance(item.get("path"), str)}
+    records: list[Mapping[str, Any]] = []
+    for file_row in files:
+        if not isinstance(file_row, Mapping):
+            continue
+        path = _entry_file_path(evidence_root, file_row)
+        if path is None or path.suffix.lower() != ".json":
+            continue
+        try:
+            record = json.loads(path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            continue
+        if isinstance(record, dict) and record.get("schema_version") == 1 and "origin_od" in record:
+            records.append(record)
+    if len(records) != 1:
+        return False, "new_od requires exactly one structured named decision record"
+    record = records[0]
+    expected_fields = {
+        "schema_version", "origin_od", "key", "platform", "scope_sha256", "decision_ref",
+        "reviewer_id", "approved_at", "od_document", "alternative_evidence",
+    }
+    if set(record) != expected_fields:
+        return False, "new_od named decision record fields are invalid"
+    if (
+        not isinstance(record.get("origin_od"), str)
+        or not re.fullmatch(r"OD-[A-Za-z0-9][A-Za-z0-9._-]*", record["origin_od"])
+        or record.get("key") != obligation.get("key")
+        or record.get("platform") != obligation.get("platform")
+        or record.get("scope_sha256") != obligation.get("required_scope_sha256")
+        or not isinstance(scope_sha, str)
+        or record.get("decision_ref") != row.get("decision_ref")
+        or not isinstance(record.get("reviewer_id"), str)
+        or not record["reviewer_id"]
+    ):
+        return False, "new_od decision does not identify the exact OD, obligation, platform, scope, or reviewer"
+    try:
+        parse_iso(record["approved_at"])
+    except (KeyError, TypeError, ValueError):
+        return False, "new_od approval timestamp is invalid"
+
+    def included(pointer: Any) -> bool:
+        return (
+            isinstance(pointer, Mapping)
+            and set(pointer) == {"path", "sha256"}
+            and file_by_path.get(pointer.get("path")) == dict(pointer)
+        )
+
+    od_document = record.get("od_document")
+    if not included(od_document):
+        return False, "new_od full OD document is not included in the frozen evidence"
+    od_path = _entry_file_path(evidence_root, od_document)
+    if od_path is None:
+        return False, "new_od full OD document is missing"
+    try:
+        od_text = od_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False, "new_od full OD document is not UTF-8 text"
+    if not od_text.lstrip().startswith("# " + record["origin_od"]):
+        return False, "new_od full OD document does not match the named OD"
+    alternative = record.get("alternative_evidence")
+    if not isinstance(alternative, list) or not alternative or any(not included(item) for item in alternative):
+        return False, "new_od lacks frozen alternative evidence"
+    allowed_kinds = obligation.get("allowed_evidence", {}).get("kinds", [])
+    if not isinstance(allowed_kinds, list) or any(
+        kind != "od09-freeze" and kind not in BO_P9_19_AFFECTED_KINDS for kind in allowed_kinds
+    ):
+        return False, "BO-P9-19 pending: required source kind has no owner-approved public verification"
+    if any(kind in BO_P9_19_AFFECTED_KINDS or kind != "od09-freeze" for kind in allowed_kinds):
+        return False, "BO-P9-19 pending: required source kind has no owner-approved public verification"
+    return True, "named new_od and alternative evidence revalidated"
+
+
 def legacy_status(
     index: Mapping[str, Any],
     *,
@@ -1611,17 +2353,29 @@ def legacy_status(
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None = None,
     required_lock: Path | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> dict[str, Any]:
-    """重驗正式遺留義務與核定證據；未裁決的 BO-P9-14／19 保持阻擋。"""
+    """先保留適用 FAIL，再逐筆重驗 scope、resolution 與公開附件。"""
     legacy = index.get("legacy_obligations", {}) if isinstance(index, Mapping) else {}
+    # R8-01：清冊與核定狀態不能遮蔽已登錄且仍適用於歷史／目前 target 的正式 FAIL。
+    formal_failures = _legacy_formal_failures(index, catalog)
+    obligations: dict[str, Any] = {
+        f"{key}:FAIL:{row.get('entry_id', '')}": {
+            "status": "FAIL",
+            "reasons": [f"formal FAIL applies to target artifact: {row.get('entry_id', '')}"],
+            "entry_ids": [str(row.get("entry_id", ""))],
+            "decision_ref": None,
+        }
+        for key, row in formal_failures
+    }
+
     pointer = legacy.get("scope") if isinstance(legacy, Mapping) else None
     scope_errors = validate_legacy_scope(index, catalog=catalog, evidence_root=evidence_root)
-    obligations: dict[str, Any] = {}
     scope_sha = pointer.get("sha256") if _pointer_valid(pointer) else None
     scope: dict[str, Any] | None = None
     if _pointer_valid(pointer):
         raw, error = _read_evidence_file(evidence_root, pointer["path"])
-        if not error and raw is not None:
+        if not error and raw is not None and _sha256_bytes(raw) == pointer["sha256"]:
             try:
                 parsed = json.loads(raw.decode("utf-8"))
                 scope = parsed if isinstance(parsed, dict) else None
@@ -1631,133 +2385,230 @@ def legacy_status(
     if not isinstance(scope_rows, list):
         scope_rows = []
 
-    resolutions: dict[str, dict[str, Any]] = {}
+    resolution_rows: dict[str, dict[str, Any]] = {}
     resolution_pointer = legacy.get("resolutions") if isinstance(legacy, Mapping) else None
     resolution_error: str | None = None
-    if resolution_pointer is not None:
-        if not _pointer_valid(resolution_pointer):
-            resolution_error = "legacy resolutions pointer is invalid"
+    if not _pointer_valid(resolution_pointer):
+        resolution_error = "legacy resolutions pointer is missing or invalid"
+    else:
+        raw, error = _read_evidence_file(evidence_root, resolution_pointer["path"])
+        if error or raw is None:
+            resolution_error = f"legacy resolutions {error}"
+        elif _sha256_bytes(raw) != resolution_pointer["sha256"]:
+            resolution_error = "legacy resolutions file hash mismatch"
         else:
-            raw, error = _read_evidence_file(evidence_root, resolution_pointer["path"])
-            if error or raw is None:
-                resolution_error = f"legacy resolutions {error}"
-            elif _sha256_bytes(raw) != resolution_pointer["sha256"]:
-                resolution_error = "legacy resolutions file hash mismatch"
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                document = None
+            if (
+                not isinstance(document, dict)
+                or set(document) != {"schema_version", "scope_sha256", "resolutions"}
+                or document.get("schema_version") != 1
+                or document.get("scope_sha256") != scope_sha
+                or not isinstance(document.get("resolutions"), list)
+            ):
+                resolution_error = "legacy resolutions schema or scope SHA is invalid"
             else:
-                try:
-                    doc = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError, RecursionError):
-                    doc = None
-                if (
-                    not isinstance(doc, dict)
-                    or set(doc) != {"schema_version", "scope_sha256", "resolutions"}
-                    or doc.get("schema_version") != 1
-                    or doc.get("scope_sha256") != scope_sha
-                    or not isinstance(doc.get("resolutions"), list)
-                ):
-                    resolution_error = "legacy resolutions schema or scope SHA is invalid"
-                else:
-                    for row in doc["resolutions"]:
-                        if not isinstance(row, dict) or not isinstance(row.get("key"), str) or row["key"] in resolutions:
-                            resolution_error = "legacy resolutions contain malformed or duplicate keys"
-                            break
-                        resolutions[row["key"]] = row
+                for row in document["resolutions"]:
+                    if not isinstance(row, dict) or not isinstance(row.get("key"), str) or row["key"] in resolution_rows:
+                        resolution_error = "legacy resolutions contain malformed or duplicate keys"
+                        break
+                    resolution_rows[row["key"]] = row
+
+    scope_keys = [row.get("key") for row in scope_rows if isinstance(row, Mapping) and isinstance(row.get("key"), str)]
+    if len(scope_keys) != len(set(scope_keys)):
+        scope_errors.append("legacy scope contains duplicate obligation keys")
+    if resolution_pointer is not None and resolution_error is None and set(resolution_rows) != set(scope_keys):
+        resolution_error = "legacy resolution key set does not exactly match frozen scope"
+    if resolution_error is None:
+        for key, resolution in resolution_rows.items():
+            method = resolution.get("method")
+            expected_fields = {
+                "pending": {"key", "method"},
+                "retest": {"key", "method", "entry_id", "target_sha256", "files"},
+                "reuse": {"key", "method", "entry_id"},
+                "new_od": {"key", "method", "decision_ref", "evidence"},
+            }.get(method)
+            if expected_fields is None or set(resolution) != expected_fields or resolution.get("key") != key:
+                resolution_error = f"legacy resolution row is malformed: {key}"
+                break
+
+    # Both platform targets must carry the same currently frozen full-scope SHA.
+    targets = index.get("stage_targets", {}).get("3", {})
+    target_scope_errors: list[str] = []
+    for platform in PLATFORMS:
+        target = targets.get(platform) if isinstance(targets, Mapping) else None
+        if not isinstance(target, Mapping) or target.get("legacy_scope_sha256") != scope_sha:
+            target_scope_errors.append(f"Stage 3 {platform} target does not match the current legacy scope SHA")
+    if target_scope_errors:
+        resolution_error = "; ".join(([resolution_error] if resolution_error else []) + target_scope_errors)
 
     by_entry_id = {
         row.get("entry_id"): row
         for row in index.get("entries", [])
         if isinstance(row, dict) and isinstance(row.get("entry_id"), str)
     }
-    overall = "BLOCKED"
+    global_invalid = bool(scope_errors or resolution_error)
+    resolution_validation_errors: list[str] = [resolution_error] if resolution_error else []
     for obligation in scope_rows:
         if not isinstance(obligation, dict) or not isinstance(obligation.get("key"), str):
             continue
         key = obligation["key"]
-        row = resolutions.get(key)
-        result = {"status": "BLOCKED", "reasons": [], "entry_ids": [], "decision_ref": None}
+        resolution = resolution_rows.get(key)
+        result: dict[str, Any] = {"status": "BLOCKED", "reasons": [], "entry_ids": [], "decision_ref": None}
         if scope_errors:
             result["reasons"].extend(scope_errors)
         if resolution_error:
             result["reasons"].append(resolution_error)
-        if row is None:
-            result["reasons"].append("no owner-approved resolution; BO-P9-14")
-        elif row.get("method") == "pending" and set(row) == {"key", "method"}:
+        if resolution is None:
+            result["reasons"].append("no complete owner-approved resolution; BO-P9-14")
+        elif resolution.get("method") == "pending" and set(resolution) == {"key", "method"}:
             result["reasons"].append("resolution is pending; BO-P9-14")
-        elif row.get("method") == "retest":
-            allowed_keys = {"key", "method", "entry_id", "target_sha256", "files"}
-            entry_id = row.get("entry_id")
-            entry = by_entry_id.get(entry_id)
-            valid = set(row) == allowed_keys and isinstance(entry_id, str) and entry is not None
-            if not valid:
-                result["reasons"].append("retest resolution lacks a registered entry or exact fields")
+        elif resolution.get("method") in {"retest", "reuse"}:
+            method = resolution.get("method")
+            expected_fields = (
+                {"key", "method", "entry_id", "target_sha256", "files"}
+                if method == "retest" else {"key", "method", "entry_id"}
+            )
+            entry_id = resolution.get("entry_id")
+            entry = by_entry_id.get(entry_id) if isinstance(entry_id, str) else None
+            if set(resolution) != expected_fields or entry is None:
+                detail = f"{method} resolution lacks a registered entry or exact fields"
+                result["reasons"].append(detail)
+                resolution_validation_errors.append(detail)
             else:
                 item_id = obligation.get("item_id")
                 platform = obligation.get("platform")
                 item = catalog.get(item_id) if isinstance(item_id, str) else None
+                result["entry_ids"] = [entry_id]
                 if item is None or entry.get("item_id") != item_id or entry.get("platform") != platform:
-                    result["reasons"].append("retest entry does not match the catalog obligation")
-                else:
+                    detail = f"{method} entry does not match the single-platform catalog obligation"
+                    result["reasons"].append(detail)
+                    resolution_validation_errors.append(detail)
+                elif method == "retest":
                     target = index.get("stage_targets", {}).get(item.stage, {}).get(platform)
-                    files_ok, file_reason = _resolution_files_valid(row.get("files"), evidence_root)
-                    target_sha = row.get("target_sha256")
+                    files_ok, file_reason = _resolution_files_valid(resolution.get("files"), evidence_root)
+                    target_sha = resolution.get("target_sha256")
                     frozen_target: dict[str, Any] | None = None
-                    if files_ok and isinstance(row.get("files"), list):
-                        for file_row in row["files"]:
-                            if isinstance(file_row, dict):
-                                raw_target, read_error = _read_evidence_file(evidence_root, file_row.get("path"))
-                                if raw_target is not None and not read_error:
-                                    try:
-                                        parsed_target = json.loads(raw_target.decode("utf-8"))
-                                    except (UnicodeDecodeError, ValueError, RecursionError):
-                                        parsed_target = None
-                                    if isinstance(parsed_target, dict):
-                                        frozen_target = parsed_target
-                                        if _sha256_bytes(raw_target) != target_sha:
-                                            frozen_target = None
+                    if files_ok and isinstance(resolution.get("files"), list):
+                        for file_row in resolution["files"]:
+                            if not isinstance(file_row, dict):
+                                continue
+                            raw_target, read_error = _read_evidence_file(evidence_root, file_row.get("path"))
+                            if raw_target is None or read_error or _sha256_bytes(raw_target) != target_sha:
+                                continue
+                            try:
+                                parsed_target = json.loads(raw_target.decode("utf-8"))
+                            except (UnicodeDecodeError, ValueError, RecursionError):
+                                parsed_target = None
+                            if isinstance(parsed_target, dict):
+                                frozen_target = parsed_target
                     if (
                         not files_ok
                         or not isinstance(target_sha, str)
                         or not _SHA256.fullmatch(target_sha)
                         or frozen_target is None
-                        or not isinstance(target, dict)
-                        or dumps_compact(frozen_target) != dumps_compact(target)
+                        or not isinstance(target, Mapping)
+                        or dumps_compact(frozen_target) != dumps_compact(dict(target))
                     ):
-                        result["reasons"].append(file_reason or "retest target snapshot does not match the frozen target")
+                        detail = file_reason or "retest target snapshot does not match the current frozen target"
+                        result["reasons"].append(detail)
+                        resolution_validation_errors.append(detail)
                     else:
-                        status, reasons = item_status(
+                        status, reasons, satisfying = _platform_status(
                             index,
                             item,
+                            platform,
                             evidence_root=evidence_root,
                             cases=cases,
-                            l1_lock=l1_lock,
+                            l1_lock=_load_l1_lock(l1_lock) if item.required_l1_set else None,
+                            catalog=catalog,
                             required_lock=required_lock,
+                            source_reader=source_reader,
                         )
-                        result["entry_ids"] = [entry_id]
                         if status == "FAIL":
                             result["status"] = "FAIL"
                             result["reasons"].extend(reasons)
-                            overall = "FAIL"
-                        elif status == "SATISFIED":
+                        elif not global_invalid and status == "SATISFIED" and entry_id in satisfying:
                             result["status"] = "PASS"
-                            result["reasons"].append("retest entry and frozen target revalidated")
+                            result["reasons"].append("retest entry is in the platform satisfying set and its target revalidated")
                         else:
-                            result["reasons"].extend(reasons or [f"retest evidence is {status}"])
-        elif row.get("method") == "new_od":
-            result["decision_ref"] = row.get("decision_ref")
-            result["reasons"].append("new OD resolution requires exact owner-named scope and evidence; BO-P9-14")
+                            result["reasons"].extend(reasons or [f"selected retest entry is not satisfying: {status}"])
+                            if status == "SATISFIED":
+                                resolution_validation_errors.append("retest selected entry is absent from satisfying_entries")
+                else:
+                    synthetic = dict(entry)
+                    synthetic.update({"entry_id": f"reuse-check-{key}", "item_id": item_id, "platform": platform, "reuse_of": entry_id})
+                    reuse_ok, reuse_reason = _reuse_ok(
+                        synthetic,
+                        by_entry_id,
+                        evidence_root,
+                        index=index,
+                        catalog=catalog,
+                        cases=cases,
+                        l1_lock=l1_lock,
+                        source_reader=source_reader,
+                    )
+                    status, reasons, satisfying = _platform_status(
+                        index,
+                        item,
+                        platform,
+                        evidence_root=evidence_root,
+                        cases=cases,
+                        l1_lock=_load_l1_lock(l1_lock) if item.required_l1_set else None,
+                        catalog=catalog,
+                        required_lock=required_lock,
+                        source_reader=source_reader,
+                    )
+                    if status == "FAIL":
+                        result["status"] = "FAIL"
+                        result["reasons"].extend(reasons)
+                    elif not global_invalid and reuse_ok and status == "SATISFIED" and entry_id in satisfying:
+                        result["status"] = "PASS"
+                        result["reasons"].append("reuse source, scope, platform, and recursive evidence revalidated")
+                    else:
+                        detail = str(reuse_reason or f"reuse evidence is {status}")
+                        result["reasons"].append(detail)
+                        if status == "SATISFIED" or not reuse_ok:
+                            resolution_validation_errors.append(detail)
+        elif resolution.get("method") == "new_od":
+            result["decision_ref"] = resolution.get("decision_ref")
+            valid, reason = _legacy_new_od_valid(
+                resolution,
+                obligation,
+                scope_sha=scope_sha,
+                evidence_root=evidence_root,
+            )
+            if not global_invalid and valid:
+                result["status"] = "PASS"
+                result["reasons"].append(reason)
+            else:
+                result["reasons"].append(reason)
+                if not reason.startswith("BO-P9-19"):
+                    resolution_validation_errors.append(reason)
         else:
-            result["reasons"].append("unknown or malformed resolution method")
-        if result["status"] == "PASS" and result["decision_ref"] is None:
-            # 一筆有效 retest 可覆蓋該義務，但不代表擁有者裁決已解除發布阻擋。
-            pass
+            detail = "unknown or malformed resolution method"
+            result["reasons"].append(detail)
+            resolution_validation_errors.append(detail)
+
+        if global_invalid and result["status"] != "FAIL":
+            result["status"] = "BLOCKED"
         obligations[key] = result
 
-    if overall != "FAIL":
-        overall = "BLOCKED"
-    # A8 的公開替代驗證尚未裁決；即使附件僅含 hash/摘要也不能把 legacy gate 宣稱為 PASS。
-    for result in obligations.values():
-        if result["status"] != "FAIL" and not any("BO-P9-19" in reason for reason in result["reasons"]):
-            result["reasons"].append("public substitute verification is pending owner decision; BO-P9-19")
+    if resolution_validation_errors:
+        detail = "resolution set contains an invalid row: " + "; ".join(dict.fromkeys(resolution_validation_errors))
+        for result in obligations.values():
+            if result["status"] == "PASS":
+                result["status"] = "BLOCKED"
+                result["reasons"].append(detail)
+
+    statuses = [row["status"] for row in obligations.values()]
+    overall = (
+        "FAIL" if formal_failures or "FAIL" in statuses
+        else "PASS" if statuses and all(status == "PASS" for status in statuses)
+        else "BLOCKED"
+    )
     return {"result": overall, "scope_sha256": scope_sha, "obligations": obligations}
 
 
@@ -1769,6 +2620,7 @@ def render_report(
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None = None,
     required_lock: Path | None = None,
+    source_reader: Callable[[str, str], bytes | None] | None = None,
 ) -> str:
     """輸出各 stage 與正式遺留義務清冊的 Markdown 狀態。"""
     lines = ["# Stage 0～3 證據出口", ""]
@@ -1781,6 +2633,7 @@ def render_report(
             cases=cases,
             l1_lock=l1_lock,
             required_lock=required_lock,
+            source_reader=source_reader,
         )
         lines.extend((f"## Stage {stage} — {result['result']}", "", "| 項目 | 平台 | 狀態 | 說明 |", "|---|---|---|---|"))
         for item_id, row in result["items"].items():
@@ -1796,6 +2649,7 @@ def render_report(
         cases=cases,
         l1_lock=l1_lock,
         required_lock=required_lock,
+        source_reader=source_reader,
     )
     lines.extend((f"## Stage 0～2.4 遺留義務 — {legacy['result']}", "", "| 義務 | 狀態 | entry | 原因 |", "|---|---|---|---|"))
     for key, row in legacy["obligations"].items():

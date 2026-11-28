@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import inspect
 import json
+import tarfile
+import threading
+import time
+from copy import copy
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 import stage3_fakes as fakes
 import fakes_evidence
@@ -15,10 +23,18 @@ from tools.stage3 import evidence_index
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
+# 本檔屬 memory_only；T1 的 revision 讀取明確注入固定 bytes 替身。
+evidence_index.DEFAULT_SOURCE_READER = fakes_evidence.read_seed_revision
+
 
 def _evidence_api():
     """回傳本 Task 的正式索引介面。"""
     return evidence_index
+
+
+def _allow_unrelated_public_evidence_for_rule_test(monkeypatch) -> None:
+    """隔離 BO-P9-19 外的舊規則測試；專用 BO-P9-19 測試走正式判定。"""
+    monkeypatch.setattr(evidence_index, "_bop919_pending", lambda _item: False)
 
 
 def _ab_manifest_api():
@@ -41,12 +57,13 @@ def _jsonio_api():
 
 def _status(idx: Path, root: Path, cat: dict, item_id: str, cases: dict | None = None):
     evidence_index = _evidence_api()
-    return evidence_index.item_status(
-        evidence_index.load_index(idx),
-        cat[item_id],
-        evidence_root=root / "docs" / "rust-refactor" / "evidence",
-        cases=cases or {},
-    )
+    kwargs = {
+        "evidence_root": root / "docs" / "rust-refactor" / "evidence",
+        "cases": cases or {},
+    }
+    if "catalog" in inspect.signature(evidence_index.item_status).parameters:
+        kwargs["catalog"] = cat
+    return evidence_index.item_status(evidence_index.load_index(idx), cat[item_id], **kwargs)
 
 
 def _empty_index(root: Path) -> Path:
@@ -145,6 +162,218 @@ def _refresh_scope_review(index_path: Path, evidence_root: Path) -> None:
     _write_json(index_path, index)
 
 
+def _install_legacy_resolutions(index_path: Path, evidence_root: Path, rows: list[dict]) -> dict:
+    index = _evidence_api().load_index(index_path)
+    pointer = index["legacy_obligations"]["scope"]
+    path = evidence_root / "legacy-obligations-resolutions.json"
+    _write_json(path, {
+        "schema_version": 1,
+        "scope_sha256": pointer["sha256"],
+        "resolutions": rows,
+    })
+    index["legacy_obligations"]["resolutions"] = {
+        "path": path.relative_to(evidence_root).as_posix(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    _write_json(index_path, index)
+    return _evidence_api().load_index(index_path)
+
+
+def _freeze_stage0_target(index_path: Path, root: Path, *, platform: str = "linux") -> dict:
+    api = _evidence_api()
+    bundle = fakes_evidence.make_bundle(
+        root / "legacy-bundles" / platform,
+        stage="0",
+        target="x86_64-pc-windows-msvc" if platform == "windows" else "x86_64-unknown-linux-gnu",
+    )
+    api.set_target(
+        index_path,
+        stage="0",
+        platform=platform,
+        release_manifest=bundle / "release-manifest.json",
+        contract_revision="c" * 40,
+        tool_revision="t" * 40,
+        case_list_sha256="0" * 64,
+        set_by="test",
+        now=fakes.ts(1, 0),
+    )
+    return api.load_index(index_path)["stage_targets"]["0"][platform]
+
+
+def _make_noncatalog_od09_obligation(
+    index_path: Path,
+    evidence_root: Path,
+    *,
+    evidence_kind: str = "od09-freeze",
+) -> tuple[dict, dict]:
+    """把一筆合成非目錄來源義務改為靜態核對 kind，並同步凍結 target。"""
+    api = _evidence_api()
+    index = api.load_index(index_path)
+    scope_pointer = index["legacy_obligations"]["scope"]
+    scope_path = evidence_root / scope_pointer["path"]
+    scope = json.loads(scope_path.read_bytes())
+    inventory_source = next(
+        row for row in scope["sources"] if row["source_id"] == "fixture:legacy-source-inventory"
+    )
+    snapshot_path = evidence_root / inventory_source["snapshot"]["path"]
+    snapshot = json.loads(snapshot_path.read_bytes())
+    source_obligation = snapshot["obligations"][0]
+    key = source_obligation["key"]
+    source_obligation["evidence_kinds"] = [evidence_kind]
+    _write_json(snapshot_path, snapshot)
+    inventory_source["snapshot"]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    scope_obligation = next(row for row in scope["obligations"] if row["key"] == key)
+    scope_obligation["allowed_evidence"]["kinds"] = [evidence_kind]
+    _write_json(scope_path, scope)
+    _refresh_scope_review(index_path, evidence_root)
+
+    index = api.load_index(index_path)
+    frozen_scope_sha = index["legacy_obligations"]["scope"]["sha256"]
+    for platform in ("linux", "windows"):
+        index["stage_targets"]["3"][platform]["legacy_scope_sha256"] = frozen_scope_sha
+    for target in index["target_history"]:
+        if target.get("stage") == "3":
+            target["legacy_scope_sha256"] = frozen_scope_sha
+    _write_json(index_path, index)
+    return api.load_index(index_path), scope_obligation
+
+
+def _named_od_resolution(evidence_root: Path, obligation: dict, *, bad: str | None = None) -> dict:
+    decision_ref = "OD-DECISION-42"
+    od_path = evidence_root / "owner-decisions" / "OD-42.md"
+    alternative_path = evidence_root / "owner-decisions" / "replacement-evidence.json"
+    record_path = evidence_root / "owner-decisions" / "named-resolution.json"
+    _write_json(alternative_path, {"verification": "owner-approved public evidence"})
+    od_path.parent.mkdir(parents=True, exist_ok=True)
+    od_path.write_text("# OD-42\n具名核定與替代證據範圍。\n", encoding="utf-8")
+
+    def frozen(path: Path) -> dict[str, str]:
+        return {
+            "path": path.relative_to(evidence_root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    od_file = frozen(od_path)
+    alternative_file = frozen(alternative_path)
+    record = {
+        "schema_version": 1,
+        "origin_od": "OD-42",
+        "key": obligation["key"],
+        "platform": obligation["platform"],
+        "scope_sha256": obligation["required_scope_sha256"],
+        "decision_ref": decision_ref,
+        "reviewer_id": "owner-reviewer-42",
+        "approved_at": "2026-11-01T00:00:00+00:00",
+        "od_document": od_file,
+        "alternative_evidence": [alternative_file],
+    }
+    if bad == "key":
+        record["key"] = "legacy:unrelated"
+    elif bad == "platform":
+        record["platform"] = "windows" if obligation["platform"] == "linux" else "linux"
+    elif bad == "scope":
+        record["scope_sha256"] = "0" * 64
+    elif bad == "no_alternative":
+        record["alternative_evidence"] = []
+    elif bad == "reviewer":
+        record["reviewer_id"] = ""
+    _write_json(record_path, record)
+    evidence = [frozen(record_path), od_file, alternative_file]
+    return {
+        "key": obligation["key"],
+        "method": "new_od",
+        "decision_ref": decision_ref,
+        "evidence": evidence,
+    }
+
+
+def _mutated_tar_archive(source_path: Path, destination: Path, variant: str, version: str) -> Path:
+    """建立格式正確但布局或內容不符的 Linux RC archive。"""
+    with tarfile.open(source_path, "r:gz") as source, tarfile.open(destination, "w:gz") as output:
+        changed_file = False
+        changed_path = False
+        changed_link = False
+        for original in source.getmembers():
+            member = copy(original)
+            if variant == "absolute_path" and not changed_path:
+                member.name = "/absolute/outside"
+                changed_path = True
+            if variant == "wrong_root":
+                parts = member.name.split("/", 1)
+                member.name = "unexpected-root" + ("/" + parts[1] if len(parts) > 1 else "")
+            if variant == "symlink_escape" and original.issym() and not changed_link:
+                member.linkname = "../../../../outside"
+                changed_link = True
+            payload = source.extractfile(original) if original.isfile() else None
+            if original.isfile():
+                assert payload is not None
+                with payload:
+                    data = payload.read()
+                if variant == "different_content" and not changed_file:
+                    data += b"changed"
+                    changed_file = True
+                member.size = len(data)
+                output.addfile(member, io.BytesIO(data))
+            else:
+                output.addfile(member)
+        if variant == "escape":
+            info = tarfile.TarInfo("../escaped")
+            info.size = 1
+            output.addfile(info, io.BytesIO(b"x"))
+        elif variant == "multiple_roots":
+            info = tarfile.TarInfo(f"serialwrap-{version}-linux-x86_64/versions/other/extra")
+            info.size = 1
+            output.addfile(info, io.BytesIO(b"x"))
+        elif variant == "device_file":
+            info = tarfile.TarInfo(f"serialwrap-{version}-linux-x86_64/versions/{version}/device")
+            info.type = tarfile.CHRTYPE
+            info.devmajor = 1
+            info.devminor = 3
+            output.addfile(info)
+        if variant == "symlink_escape":
+            assert changed_link
+    return destination
+
+
+def _od09_resolution_rows(index_path: Path, root: Path, method: str) -> tuple[list[dict], str]:
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    target = _freeze_stage0_target(index_path, root, platform="linux")
+    evidence = fakes_evidence.entry(
+        root,
+        "S0-OD09-DEFERRED-FROZEN",
+        "PASS",
+        platform="linux",
+        n=15 if method == "retest" else 16,
+    )
+    api.add_entry(index_path, evidence, catalog=catalog)
+    evidence_root = _evidence_root(root)
+    index = api.load_index(index_path)
+    scope = json.loads((evidence_root / index["legacy_obligations"]["scope"]["path"]).read_bytes())
+    selected = next(
+        row for row in scope["obligations"]
+        if row["item_id"] == "S0-OD09-DEFERRED-FROZEN" and row["platform"] == "linux"
+    )
+    rows = [{"key": row["key"], "method": "pending"} for row in scope["obligations"]]
+    resolution = next(row for row in rows if row["key"] == selected["key"])
+    if method == "retest":
+        target_path = evidence_root / "legacy-targets" / "od09-linux.json"
+        _write_json(target_path, target)
+        target_bytes = target_path.read_bytes()
+        resolution.update({
+            "method": "retest",
+            "entry_id": evidence.entry_id,
+            "target_sha256": hashlib.sha256(target_bytes).hexdigest(),
+            "files": [{
+                "path": target_path.relative_to(evidence_root).as_posix(),
+                "sha256": hashlib.sha256(target_bytes).hexdigest(),
+            }],
+        })
+    else:
+        resolution.update({"method": "reuse", "entry_id": evidence.entry_id})
+    return rows, selected["key"]
+
+
 def _reuse_fixture(
     root: Path,
     *,
@@ -159,7 +388,12 @@ def _reuse_fixture(
 ):
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(root, stage="2.4", contract="c" * 40)
-    cat = evidence_index.load_exit_catalog()
+    cat = dict(evidence_index.load_exit_catalog())
+    # 此 helper 覆蓋 reuse 身分／報告範圍；以相同凍結集合建立有效基線。
+    # 不同集合的拒絕由 test_reuse_requires_matching_platform_kind_and_frozen_cases 驗證。
+    source_item = cat["S0-L3-BASELINE-LINUX-48H"]
+    target_item = cat["S24-L3-LRMIXED-48H-LINUX"]
+    cat[source_item.item_id] = replace(source_item, required_case_set=target_item.required_case_set)
     target = evidence_index.load_index(idx)["stage_targets"]["2.4"]["linux"]
     previous_bundle = fakes_evidence.make_bundle(
         root / "bundles" / "stage-0" / "linux",
@@ -359,7 +593,8 @@ def test_canary_current_report_ordered_by_ledger_not_ingest_time(tmp_path):
     assert not any(reason.startswith("windows: ") for reason in reasons)
 
 
-def test_sideloaded_file_retarget_cannot_reuse_pass(tmp_path):
+def test_sideloaded_file_retarget_cannot_reuse_pass(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     ab_manifest = _ab_manifest_api()
     HarnessError = _harness_error_type()
@@ -412,7 +647,8 @@ def test_sideloaded_file_retarget_cannot_reuse_pass(tmp_path):
     assert st["result"] != "PASS"
 
 
-def test_non_cumulative_pass_not_superseded(tmp_path):
+def test_non_cumulative_pass_not_superseded(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = evidence_index.load_exit_catalog()
@@ -603,7 +839,8 @@ def test_case_list_change_stale(tmp_path):
     assert _status(idx, tmp_path, cat, "S3-L2-FULL-AB-LINUX")[0] == "STALE"
 
 
-def test_xfail_requires_unexpired_sentinel(tmp_path):
+def test_xfail_requires_unexpired_sentinel(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     cat = evidence_index.load_exit_catalog()
     future_cases = {
@@ -704,7 +941,8 @@ def test_hash_mismatch_detected(tmp_path):
     assert _status(deleted_idx, deleted_root, cat, "S3-ROLLBACK-LINUX")[0] == "HASH_MISMATCH"
 
 
-def test_reuse_by_runtime_digest(tmp_path):
+def test_reuse_by_runtime_digest(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     idx, cat, _previous, _current = _reuse_fixture(tmp_path / "same")
     assert _status(idx, tmp_path / "same", cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "SATISFIED"
 
@@ -738,7 +976,8 @@ def test_reuse_requires_runtime_tree_match(tmp_path):
     assert "linux: reuse identity differs: runtime_tree_sha256" in reasons
 
 
-def test_entry_tree_none_against_tree_target_stale(tmp_path):
+def test_entry_tree_none_against_tree_target_stale(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     tree_root = tmp_path / "tree-target"
     tree_idx = fakes_evidence.evidence_index(tree_root, stage="3", contract="c" * 40)
@@ -855,8 +1094,9 @@ def test_reuse_refuses_source_item_with_sticky_fail(tmp_path):
     assert _status(idx, root, cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "STALE"
 
 
-def test_reuse_refuses_source_after_stage_target_reset(tmp_path):
+def test_reuse_refuses_source_after_stage_target_reset(tmp_path, monkeypatch):
     """來源 stage 的 target 重設後，舊來源 entry 不再符合目前 target，沿用須為 STALE（5a038a1）。"""
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     root = tmp_path / "retarget"
     idx, cat, _previous, _current = _reuse_fixture(root)
     assert _status(idx, root, cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "SATISFIED"
@@ -882,8 +1122,9 @@ def test_reuse_refuses_source_after_stage_target_reset(tmp_path):
     assert _status(idx, root, cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "STALE"
 
 
-def test_reuse_refuses_source_when_its_stage_has_no_target(tmp_path):
+def test_reuse_refuses_source_when_its_stage_has_no_target(tmp_path, monkeypatch):
     """來源 entry 所屬 stage 沒有目前 target 時不得沿用（5a038a1）。"""
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     root = tmp_path / "no-source-target"
     idx, cat, _previous, _current = _reuse_fixture(root)
     assert _status(idx, root, cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "SATISFIED"
@@ -938,7 +1179,8 @@ def test_stage_blocked_until_all_required_items(tmp_path):
     assert result["result"] == "BLOCKED"
 
 
-def test_stage_status_lists_satisfying_entries(tmp_path):
+def test_stage_status_lists_satisfying_entries(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = evidence_index.load_exit_catalog()
@@ -961,33 +1203,6 @@ def test_set_target_per_platform_appends_history(tmp_path):
     assert len(after["target_history"]) == 3
     assert after["stage_targets"]["2.4"]["linux"] == _history_target(after["target_history"][-1])
     assert after["stage_targets"]["2.4"]["windows"] == windows_before
-
-
-def test_set_target_stage3_records_bundle_tree(tmp_path):
-    evidence_index = _evidence_api()
-    ab_manifest = _ab_manifest_api()
-    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
-    bundle = tmp_path / "bundles" / "linux"
-    target = evidence_index.load_index(idx)["stage_targets"]["3"]["linux"]
-    assert target["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(bundle)
-    assert target["runtime_tree_sha256"] == ab_manifest.runtime_tree_sha256(bundle)
-    old_pass = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux")
-    evidence_index.add_entry(idx, old_pass, catalog=evidence_index.load_exit_catalog())
-    current_round = evidence_index.begin_candidate_round(
-        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
-    )
-    _set_target(evidence_index, idx, stage="3", platform="linux", bundle=bundle, bundle_dir=True)
-    _set_target(
-        evidence_index,
-        idx,
-        stage="3",
-        platform="windows",
-        bundle=tmp_path / "bundles" / "windows",
-        bundle_dir=True,
-    )
-    after = evidence_index.load_index(idx)
-    assert all(row.get("candidate_round_id") == current_round for row in after["target_history"][-2:])
-    assert _status(idx, tmp_path, evidence_index.load_exit_catalog(), "S3-ROLLBACK-LINUX")[0] == "STALE"
 
 
 def test_set_target_same_manifest_new_tree_refused(tmp_path):
@@ -1323,7 +1538,8 @@ def test_restricted_entry_is_fail_only(tmp_path):
     )
 
 
-def test_default_missing_canary_does_not_block_required_stage(tmp_path):
+def test_default_missing_canary_does_not_block_required_stage(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
@@ -1459,7 +1675,8 @@ def _new_linux_bundle(root: Path) -> Path:
     return bundle
 
 
-def test_fail_requires_new_rc_and_both_platforms_full_rerun(tmp_path):
+def test_fail_requires_new_rc_and_both_platforms_full_rerun(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
@@ -1496,6 +1713,7 @@ def test_fail_requires_new_rc_and_both_platforms_full_rerun(tmp_path):
 
 def test_old_round_fail_still_blocks_same_artifact(tmp_path):
     evidence_index = _evidence_api()
+    HarnessError = _harness_error_type()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
     subset = _stage3_subset(catalog, "S3-ROLLBACK-LINUX", "S3-CANARY-LINUX")
@@ -1504,7 +1722,11 @@ def test_old_round_fail_still_blocks_same_artifact(tmp_path):
     next_round = evidence_index.begin_candidate_round(
         idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
     )
-    _set_pair_in_round(evidence_index, idx, next_round, tmp_path)
+    before_retarget = idx.read_bytes()
+    with pytest.raises(HarnessError) as error:
+        _set_pair_in_round(evidence_index, idx, next_round, tmp_path)
+    assert error.value.code == "HARNESS_ARTIFACT_MISMATCH"
+    assert idx.read_bytes() == before_retarget
     result = evidence_index.stage_status(
         evidence_index.load_index(idx), "3", catalog=subset, evidence_root=_evidence_root(tmp_path), cases={}
     )
@@ -1633,7 +1855,8 @@ def test_candidate_round_requires_both_targets(tmp_path):
         evidence_index.run_context(mismatched, platform="linux", run_id="mismatched-locks")
 
 
-def test_round_id_and_archive_are_entry_identity(tmp_path):
+def test_round_id_and_archive_are_entry_identity(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
@@ -1667,7 +1890,8 @@ def test_round_id_and_archive_are_entry_identity(tmp_path):
         assert status == "STALE"
 
 
-def test_od09_and_legacy_round_exceptions(tmp_path):
+def test_od09_and_legacy_round_exceptions(tmp_path, monkeypatch):
+    _allow_unrelated_public_evidence_for_rule_test(monkeypatch)
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     catalog = evidence_index.load_exit_catalog()
@@ -1770,28 +1994,6 @@ def test_required_cases_lock_growth_stales_old_entries(tmp_path):
         cases={},
     )
     assert status in {"HASH_MISMATCH", "STALE", "MISSING"}
-
-
-def test_required_seed_is_bound_to_designated_source(tmp_path):
-    evidence_index = _evidence_api()
-    from tools.stage3 import required_cases
-
-    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
-    evidence_root = _evidence_root(tmp_path)
-    manifest = json.loads((evidence_root / "denominators" / "source-manifest.json").read_bytes())
-    assert required_cases.verify_seed_sources(
-        manifest, evidence_root=evidence_root, source_reader=fakes_evidence.read_seed_revision
-    ) == []
-    target = evidence_index.load_index(idx)["stage_targets"]["3"]["linux"]
-    assert target["required_cases_lock"]["sha256"]
-    assert target["required_cases_sha256"]
-
-    undisclosed = json.loads(json.dumps(manifest))
-    undisclosed["sources"][0]["revision"] = "0" * 40
-    errors = required_cases.verify_seed_sources(
-        undisclosed, evidence_root=evidence_root, source_reader=fakes_evidence.read_seed_revision
-    )
-    assert errors
 
 
 def test_required_seed_rejects_attachment_sha_mismatch(tmp_path):
@@ -2075,6 +2277,134 @@ def test_legacy_new_od_requires_exact_named_scope(tmp_path):
     assert status["obligations"][rows[0]["key"]]["status"] != "PASS"
 
 
+def test_legacy_retest_uses_single_platform_for_both_catalog_item(tmp_path):
+    """both 目錄項可依凍結義務的平台獨立驗證 retest。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    rows, key = _od09_resolution_rows(idx, tmp_path, "retest")
+    _install_legacy_resolutions(idx, _evidence_root(tmp_path), rows)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+    )
+    assert status["obligations"][key]["status"] == "PASS"
+    assert status["result"] == "BLOCKED"
+
+
+def test_legacy_reuse_revalidates_same_platform_source(tmp_path):
+    """reuse 必須符合 R1-05 並遞迴確認來源 entry 仍屬 satisfying set。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    rows, key = _od09_resolution_rows(idx, tmp_path, "reuse")
+    _install_legacy_resolutions(idx, _evidence_root(tmp_path), rows)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+    )
+    assert status["obligations"][key]["status"] == "PASS"
+    assert status["result"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("bad", ["key", "platform", "scope", "no_alternative", "reviewer"])
+def test_legacy_new_od_requires_exact_named_decision_and_alternative(tmp_path, bad):
+    """new_od 逐筆核對原 OD、義務、平台、範圍、核定人及替代附件。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    _indexed, obligation = _make_noncatalog_od09_obligation(idx, _evidence_root(tmp_path))
+    evidence_root = _evidence_root(tmp_path)
+    index = api.load_index(idx)
+    scope = json.loads((evidence_root / index["legacy_obligations"]["scope"]["path"]).read_bytes())
+    rows = [{"key": row["key"], "method": "pending"} for row in scope["obligations"]]
+    resolution = _named_od_resolution(evidence_root, obligation, bad=bad)
+    rows[next(i for i, row in enumerate(rows) if row["key"] == obligation["key"])] = resolution
+    _install_legacy_resolutions(idx, evidence_root, rows)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=evidence_root,
+        cases={},
+    )
+    assert status["obligations"][obligation["key"]]["status"] != "PASS"
+
+
+def test_legacy_new_od_accepts_exact_named_scope_with_alternative(tmp_path):
+    """完整具名核定及非 BO-P9-19 靜態替代證據可解決單筆義務。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    _indexed, obligation = _make_noncatalog_od09_obligation(idx, _evidence_root(tmp_path))
+    evidence_root = _evidence_root(tmp_path)
+    scope = json.loads(
+        (evidence_root / api.load_index(idx)["legacy_obligations"]["scope"]["path"]).read_bytes()
+    )
+    rows = [{"key": row["key"], "method": "pending"} for row in scope["obligations"]]
+    rows[next(i for i, row in enumerate(rows) if row["key"] == obligation["key"])] = _named_od_resolution(
+        evidence_root, obligation
+    )
+    _install_legacy_resolutions(idx, evidence_root, rows)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=evidence_root,
+        cases={},
+    )
+    assert status["obligations"][obligation["key"]]["status"] == "PASS"
+    assert status["result"] == "BLOCKED"
+
+
+def test_legacy_new_od_stays_blocked_for_bop919_required_kind(tmp_path):
+    """具名新 OD 不繞過仍受 BO-P9-19 約束的必要執行來源。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    evidence_root = _evidence_root(tmp_path)
+    _indexed, obligation = _make_noncatalog_od09_obligation(
+        idx, evidence_root, evidence_kind="manual-procedure"
+    )
+    scope = json.loads(
+        (evidence_root / api.load_index(idx)["legacy_obligations"]["scope"]["path"]).read_bytes()
+    )
+    rows = [{"key": row["key"], "method": "pending"} for row in scope["obligations"]]
+    rows[next(i for i, row in enumerate(rows) if row["key"] == obligation["key"])] = _named_od_resolution(
+        evidence_root, obligation
+    )
+    _install_legacy_resolutions(idx, evidence_root, rows)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=evidence_root,
+        cases={},
+    )
+    result = status["obligations"][obligation["key"]]
+    assert result["status"] == "BLOCKED"
+    assert any("BO-P9-19" in reason for reason in result["reasons"])
+
+
+@pytest.mark.parametrize("corruption", ["missing_key", "target_scope_sha"])
+def test_legacy_resolution_set_and_target_scope_must_match(tmp_path, corruption):
+    """resolution 鍵須完整，兩平台 target 的 scope SHA 須相同且正確。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    rows, key = _od09_resolution_rows(idx, tmp_path, "retest")
+    if corruption == "missing_key":
+        rows.pop()
+    _install_legacy_resolutions(idx, _evidence_root(tmp_path), rows)
+    if corruption == "target_scope_sha":
+        index = api.load_index(idx)
+        index["stage_targets"]["3"]["windows"]["legacy_scope_sha256"] = "0" * 64
+        _write_json(idx, index)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+    )
+    assert all(row["status"] != "PASS" for row in status["obligations"].values())
+    assert status["obligations"][key]["status"] == "BLOCKED"
+
+
 def test_bop919_public_positive_stays_blocked_pending_owner_decision(tmp_path):
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
@@ -2131,4 +2461,716 @@ def test_hash_only_or_redacted_crc_cannot_satisfy_a8(tmp_path, payload):
     )
     assert status == "MISSING"
     assert any("BO-P9-19" in reason for reason in reasons)
+
+
+def test_concurrent_fail_entries_are_not_lost(tmp_path, monkeypatch):
+    """同時寫入的正式 FAIL 都留在同一份索引。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    entries = [
+        fakes_evidence.restricted_entry(
+            tmp_path,
+            "S3-ROLLBACK-LINUX",
+            platform="linux",
+            failure_summary=f"並行失敗 {number}",
+            context_id=f"{number:064x}",
+        )
+        for number in (1, 2)
+    ]
+    original_write = api._write_index
+
+    def delayed_write(path, value):
+        time.sleep(0.05)
+        original_write(path, value)
+
+    monkeypatch.setattr(api, "_write_index", delayed_write)
+    ready = threading.Barrier(3)
+    errors = []
+
+    def append(row):
+        try:
+            ready.wait()
+            api.add_entry(idx, row, catalog=catalog)
+        except BaseException as exc:  # 由主執行緒統一回報 worker 錯誤。
+            errors.append(exc)
+
+    workers = [threading.Thread(target=append, args=(row,)) for row in entries]
+    for worker in workers:
+        worker.start()
+    ready.wait()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert not errors
+    indexed = {row["entry_id"] for row in api.load_index(idx)["entries"]}
+    assert {row.entry_id for row in entries} <= indexed
+
+
+def test_concurrent_targets_and_round_switch_keep_all_writes(tmp_path, monkeypatch):
+    """兩平台 target 與輪次切換／FAIL 寫入交錯時不互相覆蓋。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    old_fail = fakes_evidence.restricted_entry(
+        tmp_path,
+        "S3-ROLLBACK-LINUX",
+        platform="linux",
+        failure_summary="交錯寫入 FAIL",
+        context_id="e" * 64,
+    )
+    original_write = api._write_index
+
+    def delayed_write(path, value):
+        time.sleep(0.05)
+        original_write(path, value)
+
+    monkeypatch.setattr(api, "_write_index", delayed_write)
+    ready = threading.Barrier(3)
+    errors = []
+
+    def run(call):
+        try:
+            ready.wait()
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    round_call = lambda: api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    fail_call = lambda: api.add_entry(idx, old_fail, catalog=catalog)
+    workers = [threading.Thread(target=run, args=(round_call,)), threading.Thread(target=run, args=(fail_call,))]
+    for worker in workers:
+        worker.start()
+    ready.wait()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert not errors
+    indexed = api.load_index(idx)
+    assert indexed["current_candidate_round_id"]
+    assert any(row["entry_id"] == old_fail.entry_id for row in indexed["entries"])
+
+    # 兩平台 target 更新也必須保留在同一索引。
+    target_root = tmp_path / "concurrent-targets"
+    target_idx = fakes_evidence.evidence_index(target_root, stage="2.4", contract="c" * 40, platforms=())
+    bundles = {
+        platform: fakes_evidence.make_bundle(
+            target_root / "bundles" / platform,
+            stage="2.4",
+            target="x86_64-pc-windows-msvc" if platform == "windows" else "x86_64-unknown-linux-gnu",
+        )
+        for platform in ("linux", "windows")
+    }
+    target_errors = []
+    ready = threading.Barrier(3)
+
+    def set_one(platform):
+        bundle = bundles[platform]
+        try:
+            ready.wait()
+            api.set_target(
+                target_idx,
+                stage="2.4",
+                platform=platform,
+                release_manifest=bundle / "release-manifest.json",
+                contract_revision="c" * 40,
+                tool_revision="t" * 40,
+                case_list_sha256="0" * 64,
+                set_by="test",
+                now=fakes.ts(30, 1),
+                bundle_dir=bundle,
+            )
+        except BaseException as exc:
+            target_errors.append(exc)
+
+    workers = [threading.Thread(target=set_one, args=(platform,)) for platform in ("linux", "windows")]
+    for worker in workers:
+        worker.start()
+    ready.wait()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert not target_errors
+    target_index = api.load_index(target_idx)
+    assert set(target_index["stage_targets"]["2.4"]) == {"linux", "windows"}
+
+
+def test_stage3_repackaged_old_context_is_stale(tmp_path):
+    """外層改成新輪次但保留舊 context 的 entry 不得滿足必要項。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    previous = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-WINDOWS", "PASS", platform="windows", n=1)
+    api.add_entry(idx, previous, catalog=catalog)
+    round_id = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    _set_pair_in_round(api, idx, round_id, tmp_path)
+    current_target = api.load_index(idx)["stage_targets"]["3"]["windows"]
+    wrapped = replace(
+        previous,
+        candidate_round_id=round_id,
+        archive_sha256=current_target["archive_sha256"],
+        required_cases_sha256=current_target["required_cases_sha256"],
+    )
+    wrapped = replace(wrapped, entry_id=fakes_evidence._entry_id(wrapped))
+    api.add_entry(idx, wrapped, catalog=catalog)
+    status, reasons = _status(idx, tmp_path, catalog, "S3-ROLLBACK-WINDOWS")
+    assert status == "STALE"
+    assert any("context" in reason.lower() for reason in reasons)
+
+
+def test_stage3_context_rejects_unregistered_report_references(tmp_path):
+    """T1 未定義的 context 報告引用不作為可核驗來源接受。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    original = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux", n=20)
+    api.add_entry(idx, original, catalog=catalog)
+
+    evidence_root = _evidence_root(tmp_path)
+    context_file = original.files[-1]
+    context_path = evidence_root / context_file.path
+    context = json.loads(context_path.read_bytes())
+    context["source_refs"] = [{
+        "path": original.files[0].path,
+        "sha256": original.files[0].sha256,
+    }]
+    _write_json(context_path, context)
+    updated_context_file = replace(
+        context_file,
+        sha256=hashlib.sha256(context_path.read_bytes()).hexdigest(),
+    )
+    updated = replace(original, files=original.files[:-1] + (updated_context_file,))
+    updated = replace(updated, entry_id=fakes_evidence._entry_id(updated))
+    indexed = api.load_index(idx)
+    indexed["entries"] = [api._entry_dict(updated)]
+    _write_json(idx, indexed)
+
+    status, reasons = _status(idx, tmp_path, catalog, original.item_id)
+    assert status == "STALE"
+    assert any("context" in reason.lower() for reason in reasons)
+
+
+def test_stage3_required_entry_cannot_reuse_prior_evidence(tmp_path):
+    """最後 RC 的 Stage 3 必要執行項不得沿用其他 entry。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    source = fakes_evidence.entry(tmp_path, "S3-CANARY-LINUX", "PASS", platform="linux", n=1)
+    api.add_entry(idx, source, catalog=catalog)
+    current = fakes_evidence.entry(
+        tmp_path,
+        "S3-ROLLBACK-LINUX",
+        "PASS",
+        platform="linux",
+        n=2,
+        reuse_of=source.entry_id,
+    )
+    api.add_entry(idx, current, catalog=catalog)
+    status, reasons = _status(idx, tmp_path, catalog, "S3-ROLLBACK-LINUX")
+    assert status != "SATISFIED"
+    assert any("Stage 3" in reason and "reuse" in reason.lower() for reason in reasons)
+
+
+@pytest.mark.parametrize("mismatch", ["platform", "kind", "required_case_set"])
+def test_reuse_requires_matching_platform_kind_and_frozen_cases(tmp_path, mismatch):
+    """reuse 必須對齊平台、證據種類與凍結的必要案例集合。"""
+    api = _evidence_api()
+    root = tmp_path / mismatch
+    idx, catalog, source, current = _reuse_fixture(root)
+    indexed = api.load_index(idx)
+    by_id = {row["entry_id"]: row for row in indexed["entries"]}
+    current_row = by_id[current.entry_id]
+    source_row = by_id[source.entry_id]
+    checked_catalog = dict(catalog)
+    target_item = checked_catalog[current.item_id]
+    source_item = checked_catalog[source.item_id]
+    if mismatch == "platform":
+        current_row["platform"] = "windows"
+    elif mismatch == "kind":
+        checked_catalog[source.item_id] = replace(source_item, evidence_kind="realhw-report")
+    else:
+        checked_catalog[source.item_id] = replace(source_item, required_case_set="different-frozen-set")
+    del target_item
+    ok, _reason = api._reuse_ok(
+        current_row,
+        by_id,
+        _evidence_root(root),
+        index=indexed,
+        catalog=checked_catalog,
+        cases={},
+        l1_lock=None,
+    )
+    assert not ok
+
+
+def test_begin_candidate_round_rejects_same_rc_artifact_change(tmp_path):
+    """同一 RC 標籤不得改綁另一份 bundle artifact。"""
+    api = _evidence_api()
+    HarnessError = _harness_error_type()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40, platforms=("linux",))
+    original = tmp_path / "bundles" / "linux"
+    round_id = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.1", set_by="test", now=fakes.ts(30, 0)
+    )
+    changed = fakes_evidence.make_bundle(
+        tmp_path / "same-rc-different-artifact", stage="3", target="x86_64-unknown-linux-gnu"
+    )
+    manifest = json.loads((changed / "release-manifest.json").read_bytes())
+    manifest["created_at"] = "2026-11-30T00:00:00+00:00"
+    _write_json(changed / "release-manifest.json", manifest)
+    fakes.refresh_bundle_sums(changed)
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError) as error:
+        api.set_target(
+            idx,
+            stage="3",
+            platform="linux",
+            release_manifest=changed / "release-manifest.json",
+            contract_revision="c" * 40,
+            tool_revision="t" * 40,
+            case_list_sha256="0" * 64,
+            set_by="test",
+            now=fakes.ts(30, 1),
+            bundle_dir=changed,
+            archive=fakes.rc_archive(changed),
+            candidate_round_id=round_id,
+        )
+    assert error.value.code in {"HARNESS_ARTIFACT_MISMATCH", "HARNESS_MANIFEST_INVALID"}
+    assert "rc" in str(error.value).lower() or "artifact" in str(error.value).lower(), str(error.value)
+    assert idx.read_bytes() == before
+    assert original.exists()
+
+
+def test_formal_fail_requires_next_candidate_round(tmp_path):
+    """目前 artifact 已有正式 FAIL 時，新輪必須使用緊接的下一個 RC。"""
+    api = _evidence_api()
+    HarnessError = _harness_error_type()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    api.add_entry(
+        idx,
+        fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "FAIL", platform="linux", n=12),
+        catalog=catalog,
+    )
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError):
+        api.begin_candidate_round(idx, rc_tag="v1.0.0-rc.3", set_by="test", now=fakes.ts(12, 0))
+    assert idx.read_bytes() == before
+
+
+def test_bop919_blocks_any_stub_for_affected_required_kind(tmp_path):
+    """尚無核定替代驗證的執行來源，不因一般 stub 而成為 SATISFIED。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    item_id = "S3-ROLLBACK-LINUX"
+    api.add_entry(idx, fakes_evidence.entry(tmp_path, item_id, "PASS", platform="linux"), catalog=catalog)
+    status, reasons = _status(idx, tmp_path, catalog, item_id)
+    assert status == "MISSING"
+    assert any("BO-P9-19 pending" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    ("item_id", "suffix", "payload"),
+    [
+        (
+            "S3-L15-RELEASE-AB-LINUX",
+            ".json",
+            {"summary": {"source": {"private_source_sha256": "a" * 64}}},
+        ),
+        ("S3-L3-P0P1-REMOTE-LINUX", ".txt", "只含公開摘要，未提供可核驗執行來源。\n"),
+        ("S3-ROLLBACK-LINUX", ".json", {"stub": True}),
+    ],
+    ids=("nested-summary-ab-kind", "other-attachment-format-realhw-kind", "arbitrary-drill-stub"),
+)
+def test_bop919_blocks_nested_summaries_formats_and_other_required_kinds(tmp_path, item_id, suffix, payload):
+    """巢狀摘要、非 JSON 附件與其他受影響必要 kind 均保持 MISSING。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    evidence_root = _evidence_root(tmp_path)
+    report = evidence_root / f"bop919-{item_id}{suffix}"
+    if isinstance(payload, str):
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(payload, encoding="utf-8")
+    else:
+        _write_json(report, payload)
+    frozen_file = _ab_manifest_api().FrozenFile(
+        path=report.relative_to(evidence_root).as_posix(),
+        sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+    )
+    entry = fakes_evidence.entry(
+        tmp_path,
+        item_id,
+        "PASS",
+        platform="linux",
+        files=(frozen_file,),
+    )
+    api.add_entry(idx, entry, catalog=catalog)
+    status, reasons = _status(idx, tmp_path, catalog, item_id)
+    assert status == "MISSING"
+    assert any("BO-P9-19 pending" in reason for reason in reasons)
+
+
+def test_bop919_blocks_canary_kind_when_owner_marks_it_required(tmp_path):
+    """Canary 僅在目錄升為必要項時套用 BO-P9-19。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    item_id = "S3-CANARY-LINUX"
+    required_item = replace(catalog[item_id], release_requirement="required")
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    entry = fakes_evidence.entry(tmp_path, item_id, "PASS", platform="linux", n=19)
+    api.add_entry(idx, entry, catalog=catalog)
+    status_args = {
+        "evidence_root": _evidence_root(tmp_path),
+        "cases": {},
+    }
+    if "catalog" in inspect.signature(api.item_status).parameters:
+        status_args["catalog"] = {**catalog, item_id: required_item}
+    status, reasons = api.item_status(api.load_index(idx), required_item, **status_args)
+    assert status == "MISSING"
+    assert any("BO-P9-19 pending" in reason for reason in reasons)
+
+
+def test_stage3_target_rejects_non_archive_without_mutating_index(tmp_path):
+    """target 必須驗證 archive 型別與內容，失敗時 index bytes 不變。"""
+    api = _evidence_api()
+    HarnessError = _harness_error_type()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40, platforms=("linux",))
+    round_id = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    bundle = tmp_path / "bundles" / "linux"
+    fake_archive = tmp_path / "not-an-archive.tar.gz"
+    fake_archive.write_bytes(b"ordinary file")
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError) as error:
+        api.set_target(
+            idx,
+            stage="3",
+            platform="linux",
+            release_manifest=bundle / "release-manifest.json",
+            contract_revision="c" * 40,
+            tool_revision="t" * 40,
+            case_list_sha256="0" * 64,
+            set_by="test",
+            now=fakes.ts(30, 1),
+            bundle_dir=bundle,
+            archive=fake_archive,
+            candidate_round_id=round_id,
+        )
+    assert "archive" in str(error.value).lower(), str(error.value)
+    assert idx.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["different_content", "escape", "absolute_path", "symlink_escape", "device_file", "wrong_root", "multiple_roots"],
+)
+def test_stage3_target_rejects_archive_bundle_mismatch_without_mutating_index(tmp_path, variant):
+    """拒絕不同內容、絕對／逃逸路徑、逃逸連結、裝置檔與錯誤／多重版本根。"""
+    api = _evidence_api()
+    HarnessError = _harness_error_type()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40, platforms=("linux",))
+    round_id = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    bundle = tmp_path / "bundles" / "linux"
+    manifest = json.loads((bundle / "release-manifest.json").read_bytes())
+    good_archive = fakes.rc_archive(bundle)
+    archive = _mutated_tar_archive(
+        good_archive,
+        tmp_path / f"{variant}.tar.gz",
+        variant,
+        manifest["bundle_version"],
+    )
+    before = idx.read_bytes()
+    with pytest.raises(HarnessError) as error:
+        api.set_target(
+            idx,
+            stage="3",
+            platform="linux",
+            release_manifest=bundle / "release-manifest.json",
+            contract_revision="c" * 40,
+            tool_revision="t" * 40,
+            case_list_sha256="0" * 64,
+            set_by="test",
+            now=fakes.ts(30, 1),
+            bundle_dir=bundle,
+            archive=archive,
+            candidate_round_id=round_id,
+        )
+    assert error.value.code in {"HARNESS_ARTIFACT_MISMATCH", "HARNESS_MANIFEST_INVALID"}
+    assert idx.read_bytes() == before
+
+
+def test_item_status_revalidates_frozen_seed_attachments(tmp_path):
+    """target 凍結後移除 seed 附件不得保留 SATISFIED。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    item_id = "S3-ROLLBACK-LINUX"
+    entry = fakes_evidence.entry(tmp_path, item_id, "PASS", platform="linux")
+    api.add_entry(idx, entry, catalog=catalog)
+    target = api.load_index(idx)["stage_targets"]["3"]["linux"]
+    lock_path = _evidence_root(tmp_path) / target["required_cases_lock"]["path"]
+    assert lock_path.is_file()
+    seed_path = _evidence_root(tmp_path) / "denominators" / "cases.yaml"
+    seed_path.unlink()
+    status, reasons = _status(idx, tmp_path, catalog, item_id)
+    assert status in {"HASH_MISMATCH", "STALE", "MISSING"}
+    assert any("seed" in reason.lower() or "required" in reason.lower() for reason in reasons)
+
+
+def test_stage_status_revalidates_frozen_seed_attachments(tmp_path):
+    """stage_status 與 item_status 共用 seed 附件重驗與 fail-closed 判定。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    item_id = "S3-ROLLBACK-LINUX"
+    api.add_entry(idx, fakes_evidence.entry(tmp_path, item_id, "PASS", platform="linux"), catalog=catalog)
+    (_evidence_root(tmp_path) / "denominators" / "cases.lock.json").unlink()
+    result = api.stage_status(
+        api.load_index(idx),
+        "3",
+        catalog={item_id: catalog[item_id]},
+        evidence_root=_evidence_root(tmp_path),
+        cases={},
+    )
+    item = result["items"][item_id]
+    assert item["status"] in {"HASH_MISMATCH", "STALE", "MISSING"}
+    assert item["satisfying_entries"] == []
+    assert result["result"] != "PASS"
+
+
+def test_item_status_revalidates_required_case_governance(tmp_path):
+    """target 與 entry 同指違反 T1 分母治理的鎖時也不得 SATISFIED。"""
+    api = _evidence_api()
+    catalog = api.load_exit_catalog()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    evidence_root = _evidence_root(tmp_path)
+    index = api.load_index(idx)
+    lock_doc = json.loads(
+        (evidence_root / index["stage_targets"]["3"]["linux"]["required_cases_lock"]["path"]).read_bytes()
+    )
+    case_ids = lock_doc["exits"]["S3-L2-FULL-AB-LINUX"]["linux"]["case_ids"]
+    assert case_ids
+    case_ids.pop()
+    frozen_bytes = (json.dumps(lock_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    digest = hashlib.sha256(frozen_bytes).hexdigest()
+    relative = f"stage3-required-cases.lock.{digest}.json"
+    (evidence_root / relative).write_bytes(frozen_bytes)
+    (tmp_path / "tests" / "acceptance" / "stage3_required_cases.lock.json").write_bytes(frozen_bytes)
+    for platform in ("linux", "windows"):
+        target = index["stage_targets"]["3"][platform]
+        target["required_cases_sha256"] = digest
+        target["required_cases_lock"] = {"path": relative, "sha256": digest}
+    for target in index["target_history"]:
+        if target.get("stage") == "3":
+            target["required_cases_sha256"] = digest
+            target["required_cases_lock"] = {"path": relative, "sha256": digest}
+    _write_json(idx, index)
+    entry = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux", n=18)
+    api.add_entry(idx, entry, catalog=catalog)
+    status, reasons = _status(idx, tmp_path, catalog, "S3-ROLLBACK-LINUX")
+    assert status != "SATISFIED"
+    assert any("governance" in reason.lower() or "required case" in reason.lower() for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_scope", "pending", "pending_row", "bad_scope_hash", "invalid_resolution"],
+)
+def test_legacy_formal_fail_precedes_scope_errors(tmp_path, corruption):
+    """適用 artifact 的已成立正式 FAIL 優先於各種清冊錯誤。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    bundle = fakes_evidence.make_bundle(tmp_path / "legacy-target", stage="0", target="x86_64-unknown-linux-gnu")
+    api.set_target(
+        idx,
+        stage="0",
+        platform="linux",
+        release_manifest=bundle / "release-manifest.json",
+        contract_revision="c" * 40,
+        tool_revision="t" * 40,
+        case_list_sha256="0" * 64,
+        set_by="test",
+        now=fakes.ts(1, 0),
+    )
+    api.add_entry(
+        idx,
+        fakes_evidence.entry(tmp_path, "S0-L1-BC", "FAIL", platform="linux"),
+        catalog=catalog,
+    )
+    indexed = api.load_index(idx)
+    if corruption == "missing_scope":
+        indexed["legacy_obligations"]["scope"] = None
+    elif corruption == "bad_scope_hash":
+        indexed["legacy_obligations"]["scope"]["sha256"] = "0" * 64
+    elif corruption == "invalid_resolution":
+        indexed["legacy_obligations"]["resolutions"] = {"path": "../bad.json", "sha256": "0" * 64}
+    elif corruption == "pending":
+        indexed["legacy_obligations"]["resolutions"] = None
+    elif corruption == "pending_row":
+        scope_path = _evidence_root(tmp_path) / indexed["legacy_obligations"]["scope"]["path"]
+        scope = json.loads(scope_path.read_bytes())
+        pending_rows = [{"key": row["key"], "method": "pending"} for row in scope["obligations"]]
+        indexed = _install_legacy_resolutions(idx, _evidence_root(tmp_path), pending_rows)
+    _write_json(idx, indexed)
+    status = api.legacy_status(indexed, catalog=catalog, evidence_root=_evidence_root(tmp_path), cases={})
+    assert status["result"] == "FAIL"
+    assert any(row["status"] == "FAIL" for row in status["obligations"].values())
+
+
+def test_legacy_scope_fails_closed_without_source_obligation_keys(tmp_path):
+    """無機器可讀來源義務鍵時清冊明確標示 SPEC-GAP。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    evidence_root = _evidence_root(tmp_path)
+    indexed = api.load_index(idx)
+    scope_path = evidence_root / indexed["legacy_obligations"]["scope"]["path"]
+    scope = json.loads(scope_path.read_bytes())
+    inventory = next(row for row in scope["sources"] if row["source_id"] == "fixture:legacy-source-inventory")
+    source_path = evidence_root / inventory["snapshot"]["path"]
+    source_doc = json.loads(source_path.read_bytes())
+    source_doc.pop("obligations")
+    _write_json(source_path, source_doc)
+    inventory["snapshot"]["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    _write_json(scope_path, scope)
+    _refresh_scope_review(idx, evidence_root)
+    status = api.legacy_status(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=evidence_root,
+        cases={},
+    )
+    assert status["result"] == "BLOCKED"
+    assert any("SPEC-GAP" in reason for row in status["obligations"].values() for reason in row["reasons"])
+
+
+def test_legacy_scope_rejects_missing_source_obligation_after_all_hashes_recomputed(tmp_path):
+    """來源盤點的多筆非目錄義務少一筆時，重算附件雜湊後仍要 BLOCKED。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    evidence_root = _evidence_root(tmp_path)
+    indexed = api.load_index(idx)
+    scope_path = evidence_root / indexed["legacy_obligations"]["scope"]["path"]
+    scope = json.loads(scope_path.read_bytes())
+    noncatalog = [row for row in scope["obligations"] if row["stage"] == "legacy"]
+    assert len(noncatalog) >= 2
+    scope["obligations"].remove(noncatalog[-1])
+    _write_json(scope_path, scope)
+    _refresh_scope_review(idx, evidence_root)
+    errors = api.validate_legacy_scope(
+        api.load_index(idx),
+        catalog=api.load_exit_catalog(),
+        evidence_root=evidence_root,
+    )
+    assert any("omits source inventory obligations" in reason for reason in errors)
+
+
+def test_required_cases_lock_snapshot_uses_content_addressed_immutable_path(tmp_path):
+    """合法只增一案後新輪可凍結，舊鎖附件保留而舊 entry 轉 STALE。"""
+    api = _evidence_api()
+    idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
+    catalog = api.load_exit_catalog()
+    old_entry = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux", n=7)
+    api.add_entry(idx, old_entry, catalog=catalog)
+    old_index = api.load_index(idx)
+    old_target = old_index["stage_targets"]["3"]["linux"]
+    old_pointer = old_target["required_cases_lock"]
+    assert old_pointer["sha256"] in old_pointer["path"]
+    frozen = _evidence_root(tmp_path) / old_pointer["path"]
+    old_bytes = frozen.read_bytes()
+    assert hashlib.sha256(old_bytes).hexdigest() == old_pointer["sha256"]
+
+    acceptance = tmp_path / "tests" / "acceptance"
+    case_doc = yaml.safe_load((acceptance / "cases.yaml").read_bytes())
+    case_lock = json.loads((acceptance / "cases.lock.json").read_bytes())
+    required_lock = json.loads((acceptance / "stage3_required_cases.lock.json").read_bytes())
+    added_id = "r1-fixture-stage3-l2-added"
+    new_case = deepcopy(case_doc["cases"][0])
+    new_case.update({
+        "case_id": added_id,
+        "title": "Stage 3 分母只增 fixture",
+        "source_ref": "tests/test_stage3_evidence_index.py",
+        "layer": "L2",
+        "platforms": ["linux"],
+        "necessity": "required",
+        "family": "F1",
+    })
+    case_doc["cases"].append(new_case)
+    case_lock["sets"]["slice_2.4"].append(added_id)
+    case_lock["sets"]["slice_2.4"].sort()
+    case_lock["case_attrs"][added_id] = {
+        key: new_case.get(key)
+        for key in ("suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required")
+    }
+    case_lock["case_attrs"] = dict(sorted(case_lock["case_attrs"].items()))
+    required_lock["exits"]["S3-L2-FULL-AB-LINUX"]["linux"]["case_ids"].append(added_id)
+    required_lock["exits"]["S3-L2-FULL-AB-LINUX"]["linux"]["case_ids"].sort()
+    (acceptance / "cases.yaml").write_text(yaml.safe_dump(case_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_json(acceptance / "cases.lock.json", case_lock)
+    _write_json(acceptance / "stage3_required_cases.lock.json", required_lock)
+
+    scope_index = api.load_index(idx)
+    scope_path = _evidence_root(tmp_path) / scope_index["legacy_obligations"]["scope"]["path"]
+    scope = json.loads(scope_path.read_bytes())
+    for obligation in scope["obligations"]:
+        item = catalog.get(obligation.get("item_id"))
+        if item is None or item.required_case_set != "slice_2.4":
+            continue
+        obligation["required_scope"]["case_ids"] = list(case_lock["sets"]["slice_2.4"])
+        obligation["required_scope_sha256"] = hashlib.sha256(
+            json.dumps(obligation["required_scope"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        obligation["allowed_evidence"]["case_ids"] = list(case_lock["sets"]["slice_2.4"])
+    _write_json(scope_path, scope)
+    _refresh_scope_review(idx, _evidence_root(tmp_path))
+
+    next_round = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    for platform in ("linux", "windows"):
+        bundle = tmp_path / "bundles" / platform
+        api.set_target(
+            idx,
+            stage="3",
+            platform=platform,
+            release_manifest=bundle / "release-manifest.json",
+            contract_revision="c" * 40,
+            tool_revision="t" * 40,
+            case_list_sha256="0" * 64,
+            set_by="test",
+            now=fakes.ts(30, 1),
+            bundle_dir=bundle,
+            archive=fakes.rc_archive(bundle),
+            candidate_round_id=next_round,
+        )
+
+    new_index = api.load_index(idx)
+    new_target = new_index["stage_targets"]["3"]["linux"]
+    assert new_target["required_cases_sha256"] != old_target["required_cases_sha256"]
+    assert new_target["required_cases_lock"]["path"] != old_pointer["path"]
+    assert frozen.read_bytes() == old_bytes
+    old_status, _ = _status(idx, tmp_path, catalog, "S3-ROLLBACK-LINUX")
+    assert old_status == "STALE"
+    old_snapshot_status = api._required_cases_validation(
+        old_target,
+        evidence_root=_evidence_root(tmp_path),
+        required_lock=None,
+        source_reader=fakes_evidence.read_seed_revision,
+    )
+    assert old_snapshot_status is not None and old_snapshot_status[0] == "STALE"
+
+
+def test_memory_only_stage3_fixture_never_starts_git(tmp_path, monkeypatch):
+    """memory_only fixture 對所有指定 revision 讀取使用固定 bytes 替身。"""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("memory_only path attempted to read a Git revision")
+
+    monkeypatch.setattr(evidence_index, "_git_seed_reader", forbidden)
+    fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
 

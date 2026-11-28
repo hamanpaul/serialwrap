@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import inspect
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import fakes_evidence
+import stage3_fakes as fakes
 from tools.stage3 import evidence_index
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
@@ -148,35 +153,6 @@ def _set_ref(repo: Path, name: str, revision: str, *, old: str | None = None) ->
     _git(repo, *args)
 
 
-def _resolve_commit(repo: Path, ref: str) -> str:
-    resolved = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
-    if not resolved:
-        raise HistoryGuardError(f"無法解析 commit：{ref}")
-    return resolved
-
-
-def _tree_index(repo: Path, commit: str, *, allow_missing: bool) -> dict:
-    # 先確認 commit/tree 可讀；只有確認 tree 完整且路徑不存在時才視為首次新增。
-    result = _git_result(repo, "ls-tree", "-r", "--name-only", commit)
-    if result.returncode:
-        raise HistoryGuardError(f"commit 或 tree 物件無法讀取：{commit}")
-    listing = result.stdout.decode("utf-8", errors="replace").strip()
-    if INDEX_PATH not in listing.splitlines():
-        if allow_missing:
-            return {"entries": []}
-        raise HistoryGuardError(f"head 缺少證據索引：{commit}")
-    raw = _git(repo, "cat-file", "blob", f"{commit}:{INDEX_PATH}", check=False)
-    if not raw and _git(repo, "cat-file", "-e", f"{commit}:{INDEX_PATH}", check=False):
-        raise HistoryGuardError(f"索引 blob 無法讀取：{commit}")
-    try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise HistoryGuardError(f"索引 JSON 無效：{commit}") from exc
-    if not isinstance(value, dict) or not isinstance(value.get("entries"), list):
-        raise HistoryGuardError(f"索引結構無效：{commit}")
-    return value
-
-
 def _index_blob(repo: Path, commit: str) -> bytes | None:
     listing_result = _git_result(repo, "ls-tree", "-r", "--name-only", commit)
     if listing_result.returncode:
@@ -196,35 +172,166 @@ def _index_blob(repo: Path, commit: str) -> bytes | None:
     return result.stdout
 
 
-def _compare(repo: Path, base: str, head: str, *, allow_missing_base: bool) -> None:
-    base_index = _tree_index(repo, base, allow_missing=allow_missing_base)
-    head_index = _tree_index(repo, head, allow_missing=False)
-    violations = evidence_index.check_index_append_only(base_index, head_index)
-    if violations:
-        raise HistoryGuardError("索引只增檢查失敗：" + "; ".join(violations))
-
-
 def _check_pr_range(repo: Path, base_ref: str, head_ref: str) -> None:
-    """依 plan 逐提交、逐父節點及最終 merge-base/head 比對純函式。"""
-    if _git(repo, "rev-parse", "--is-shallow-repository") == "true":
-        raise HistoryGuardError("shallow repository 不可驗證")
-    base = _resolve_commit(repo, base_ref)
-    head = _resolve_commit(repo, head_ref)
-    merge_base = _git(repo, "merge-base", base, head, check=False)
-    if not merge_base:
-        raise HistoryGuardError("base 與 head 沒有可解析的 merge-base")
+    """以 production guard 與 workflow 使用的正式 CLI 驗證真實 DAG。"""
+    try:
+        evidence_index.check_pr_history_append_only(repo, base_ref, head_ref)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise HistoryGuardError(str(exc)) from exc
+    checkout = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    current_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(checkout) if not current_pythonpath else str(checkout) + os.pathsep + current_pythonpath
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.stage3.evidence_index",
+            "--repo",
+            str(repo),
+            "--check-pr-history",
+            base_ref,
+            head_ref,
+        ],
+        cwd=checkout,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr + result.stdout).decode("utf-8", errors="replace").strip()
+        raise HistoryGuardError(f"production CLI rejected PR history ({result.returncode}): {detail}")
 
-    commits = _git(repo, "rev-list", "--reverse", "--topo-order", f"{merge_base}..{head}")
-    for commit in commits.splitlines():
-        parents_line = _git(repo, "rev-list", "--parents", "-n", "1", commit)
-        parts = parents_line.split()
-        parents = parts[1:]
-        for parent in parents:
-            if _index_blob(repo, parent) != _index_blob(repo, commit):
-                _compare(repo, parent, commit, allow_missing_base=True)
 
-    # 不以最終 diff 代替逐提交檢查；額外保留整體 merge-base 對 head 的比對。
-    _compare(repo, merge_base, head, allow_missing_base=True)
+def test_pr_history_helper_uses_production_guard_and_cli(tmp_path, monkeypatch):
+    """DAG 驗收必須經 production guard 與正式 CLI。"""
+    repo = _init_repo(tmp_path / "production-guard")
+    base = _commit_tree(repo, {INDEX_PATH: _index_bytes([])}, message="base")
+    _set_ref(repo, "refs/heads/main", base)
+    head = _commit(repo, base, [_row("f" * 20)], "append")
+    calls = []
+    original = evidence_index.check_pr_history_append_only
+
+    def observed(repo_arg, base_arg, head_arg):
+        calls.append((Path(repo_arg), base_arg, head_arg))
+        return original(repo_arg, base_arg, head_arg)
+
+    monkeypatch.setattr(evidence_index, "check_pr_history_append_only", observed)
+    cli_calls = []
+    original_run = subprocess.run
+
+    def observed_run(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and "tools.stage3.evidence_index" in argv and "--check-pr-history" in argv:
+            cli_calls.append(list(argv))
+        return original_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", observed_run)
+    _check_pr_range(repo, "refs/heads/main", head)
+    assert calls == [(repo, "refs/heads/main", head)]
+    assert len(cli_calls) == 1
+    assert cli_calls[0][cli_calls[0].index("--repo") + 1] == str(repo)
+    assert cli_calls[0][-3:] == ["--check-pr-history", "refs/heads/main", head]
+
+
+def test_pr_workflow_always_checks_history_with_full_fetch(tmp_path):
+    """workflow 對每個 PR 執行正確 base/head 的歷史檢查。"""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load((root / ".github/workflows/tests.yml").read_bytes())
+    trigger = workflow.get("on", workflow.get(True))
+    assert isinstance(trigger, dict) and "pull_request" in trigger
+    steps = workflow["jobs"]["pytest"]["steps"]
+    checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout.get("with", {}).get("fetch-depth") == 0
+    guard = next(step for step in steps if "Stage 3 證據索引逐提交只增檢查" in step.get("name", ""))
+    assert guard.get("if") == "${{ github.event_name == 'pull_request' }}"
+    env = guard.get("env", {})
+    assert env.get("BASE_REF") == "origin/${{ github.base_ref }}"
+    assert env.get("HEAD_REF") == "${{ github.event.pull_request.head.sha }}"
+    run = guard.get("run", "")
+    assert "--repo ." in run and "--check-pr-history" in run
+    assert '"$BASE_REF"' in run and '"$HEAD_REF"' in run
+    assert "paths:" not in (workflow.get("on", workflow.get(True)).get("pull_request", {}) or {})
+
+
+def test_required_seed_is_bound_to_designated_source(tmp_path):
+    """透過真實 Git 讀取指定 revision 的 seed，並拒絕改寫來源 revision。"""
+    from tools.stage3 import required_cases
+
+    idx = fakes_evidence.evidence_index(
+        tmp_path,
+        stage="3",
+        contract="c" * 40,
+        source_reader=evidence_index._git_seed_reader,
+    )
+    evidence_root = tmp_path / "docs" / "rust-refactor" / "evidence"
+    source_reader = evidence_index._git_seed_reader
+    manifest = json.loads((evidence_root / "denominators" / "source-manifest.json").read_bytes())
+    assert required_cases.verify_seed_sources(
+        manifest, evidence_root=evidence_root, source_reader=source_reader
+    ) == []
+    target = evidence_index.load_index(idx)["stage_targets"]["3"]["linux"]
+    assert target["required_cases_lock"]["sha256"]
+    assert target["required_cases_sha256"]
+
+    undisclosed = json.loads(json.dumps(manifest))
+    undisclosed["sources"][0]["revision"] = "0" * 40
+    assert required_cases.verify_seed_sources(
+        undisclosed, evidence_root=evidence_root, source_reader=source_reader
+    )
+
+
+def test_set_target_stage3_records_bundle_tree(tmp_path):
+    """Stage 3 target 整合以指定 Git seed source reader 凍結 bundle 身分。"""
+    api = evidence_index
+    from tools.stage3 import ab_manifest
+
+    idx = fakes_evidence.evidence_index(
+        tmp_path,
+        stage="3",
+        contract="c" * 40,
+        source_reader=api._git_seed_reader,
+    )
+    evidence_root = tmp_path / "docs" / "rust-refactor" / "evidence"
+    catalog = api.load_exit_catalog()
+    bundle = tmp_path / "bundles" / "linux"
+    target = api.load_index(idx)["stage_targets"]["3"]["linux"]
+    assert target["bundle_tree_sha256"] == ab_manifest.bundle_tree_sha256(bundle)
+    assert target["runtime_tree_sha256"] == ab_manifest.runtime_tree_sha256(bundle)
+    old_pass = fakes_evidence.entry(tmp_path, "S3-ROLLBACK-LINUX", "PASS", platform="linux")
+    api.add_entry(idx, old_pass, catalog=catalog)
+    current_round = api.begin_candidate_round(
+        idx, rc_tag="v1.0.0-rc.2", set_by="test", now=fakes.ts(30, 0)
+    )
+    for platform in ("linux", "windows"):
+        bundle = tmp_path / "bundles" / platform
+        target_args = {
+            "stage": "3",
+            "platform": platform,
+            "release_manifest": bundle / "release-manifest.json",
+            "contract_revision": "c" * 40,
+            "tool_revision": "t" * 40,
+            "case_list_sha256": "0" * 64,
+            "set_by": "test",
+            "now": fakes.ts(30, 1),
+            "bundle_dir": bundle,
+            "archive": fakes.rc_archive(bundle),
+            "candidate_round_id": current_round,
+        }
+        if "source_reader" in inspect.signature(api.set_target).parameters:
+            target_args["source_reader"] = api._git_seed_reader
+        api.set_target(idx, **target_args)
+    after = api.load_index(idx)
+    assert all(row.get("candidate_round_id") == current_round for row in after["target_history"][-2:])
+    status_args = {"evidence_root": evidence_root, "cases": {}}
+    if "source_reader" in inspect.signature(api.item_status).parameters:
+        status_args["source_reader"] = api._git_seed_reader
+    status, _ = api.item_status(after, catalog["S3-ROLLBACK-LINUX"], **status_args)
+    assert status == "STALE"
 
 
 def _commit(repo: Path, parent: str, entries: list[dict], message: str) -> str:
